@@ -74,7 +74,7 @@ Currently, we support the following storage backends:
 - SimpleStorageUnit: A basic CPU memory storage with minimal data format constraints and easy usability.
 - [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) (beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
 - [Mooncake Store](https://github.com/kvcache-ai/Mooncake) (alpha, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
-- [Ray Direct Transport](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
+- [Ray Direct Transport](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
 
 Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Each storage unit can be deployed on a separate node, allowing for distributed data management.
 
@@ -299,7 +299,7 @@ pre-commit install && pre-commit run --all-files --show-diff-on-failure --color=
 - [ ] Support disaggregated framework (each rank retrieves its own data without going through a centralized node)
 - [ ] Provide a `StreamingDataLoader` interface for disaggregated framework
 - [ ] Support load-balancing and dynamic batching
-- [x] Support high-performance storage backends for RDMA transmission (e.g., [MoonCakeStore](https://github.com/kvcache-ai/Mooncake), [Ray Direct Transport](https://docs.ray.io/en/master/ray-core/direct-transport.html)...)
+- [x] Support high-performance storage backends for RDMA transmission (e.g., [Mooncake Store](https://github.com/kvcache-ai/Mooncake), [Ray Direct Transport](https://docs.ray.io/en/master/ray-core/direct-transport.html)...)
 - [x] High-performance serialization and deserialization
 - [ ] More documentation, examples and tutorials
 
