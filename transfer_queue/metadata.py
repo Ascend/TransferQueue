@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import dataclasses
 import itertools
 import logging
@@ -176,6 +177,9 @@ class BatchMeta:
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
+        self.samples = copy.deepcopy(self.samples)
+        self.extra_info = copy.deepcopy(self.extra_info)
+
         # Basic properties
         object.__setattr__(self, "_size", len(self.samples))
         object.__setattr__(self, "_is_ready", all(sample.is_ready for sample in self.samples))
