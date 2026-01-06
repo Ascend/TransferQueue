@@ -26,6 +26,8 @@ import torch
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
+DEFAULT_TORCH_NUM_THREADS = torch.get_num_threads()
+
 # Ensure logger has a handler
 if not logger.hasHandlers():
     handler = logging.StreamHandler()
@@ -141,10 +143,10 @@ def limit_pytorch_auto_parallel_threads(target_num_threads: Optional[int] = None
         yield
     finally:
         # Restore the original number of threads
-        torch.set_num_threads(pytorch_current_num_threads)
+        torch.set_num_threads(DEFAULT_TORCH_NUM_THREADS)
         logger.debug(
             f"{info} (pid={pid}): torch.get_num_threads() is {torch.get_num_threads()}, "
-            f"restoring to {pytorch_current_num_threads}."
+            f"restoring to {DEFAULT_TORCH_NUM_THREADS}."
         )
 
 
