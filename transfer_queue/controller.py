@@ -59,8 +59,8 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
-TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 0.2))
-TQ_CONTROLLER_CONNECTION_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_CONNECTION_CHECK_INTERVAL", 2))
+TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
+
 
 TQ_INIT_SAMPLE_NUM = int(os.environ.get("TQ_INIT_SAMPLE_NUM", 1))  # Initial number of samples
 TQ_INIT_FIELD_NUM = int(os.environ.get("TQ_INIT_FIELD_NUM", 1))
@@ -1140,27 +1140,35 @@ class TransferQueueController:
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
         self._node_ip = get_node_ip_address()
-        self._handshake_socket_port = get_free_port()
-        self._request_handle_socket_port = get_free_port()
-        self._data_status_update_socket_port = get_free_port()
 
-        self.handshake_socket = create_zmq_socket(
-            ctx=self.zmq_context,
-            socket_type=zmq.ROUTER,
-        )
-        self.handshake_socket.bind(f"tcp://{self._node_ip}:{self._handshake_socket_port}")
+        while True:
+            try:
+                self._handshake_socket_port = get_free_port()
+                self._request_handle_socket_port = get_free_port()
+                self._data_status_update_socket_port = get_free_port()
 
-        self.request_handle_socket = create_zmq_socket(
-            ctx=self.zmq_context,
-            socket_type=zmq.ROUTER,
-        )
-        self.request_handle_socket.bind(f"tcp://{self._node_ip}:{self._request_handle_socket_port}")
+                self.handshake_socket = create_zmq_socket(
+                    ctx=self.zmq_context,
+                    socket_type=zmq.ROUTER,
+                )
+                self.handshake_socket.bind(f"tcp://{self._node_ip}:{self._handshake_socket_port}")
 
-        self.data_status_update_socket = create_zmq_socket(
-            ctx=self.zmq_context,
-            socket_type=zmq.ROUTER,
-        )
-        self.data_status_update_socket.bind(f"tcp://{self._node_ip}:{self._data_status_update_socket_port}")
+                self.request_handle_socket = create_zmq_socket(
+                    ctx=self.zmq_context,
+                    socket_type=zmq.ROUTER,
+                )
+                self.request_handle_socket.bind(f"tcp://{self._node_ip}:{self._request_handle_socket_port}")
+
+                self.data_status_update_socket = create_zmq_socket(
+                    ctx=self.zmq_context,
+                    socket_type=zmq.ROUTER,
+                )
+                self.data_status_update_socket.bind(f"tcp://{self._node_ip}:{self._data_status_update_socket_port}")
+
+                break
+            except zmq.ZMQError:
+                logger.warning(f"[{self.controller_id}]: Try to bind ZMQ sockets failed, retrying...")
+                continue
 
         self.zmq_server_info = ZMQServerInfo(
             role=TransferQueueRole.CONTROLLER,
@@ -1181,7 +1189,7 @@ class TransferQueueController:
         logger.debug(f"Controller {self.controller_id} started waiting for storage connections...")
 
         while True:
-            socks = dict(poller.poll(TQ_CONTROLLER_CONNECTION_CHECK_INTERVAL * 1000))
+            socks = dict(poller.poll(1000))
 
             if self.handshake_socket in socks:
                 try:

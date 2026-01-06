@@ -172,12 +172,6 @@ class SimpleStorageUnit:
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
 
-        self.zmq_server_info = ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
-            id=str(self.storage_unit_id),
-            ip=get_node_ip_address(),
-            ports={"put_get_socket": get_free_port()},
-        )
         self._init_zmq_socket()
         self._start_process_put_get()
 
@@ -188,9 +182,24 @@ class SimpleStorageUnit:
             Handle put/get requests from clients.
         """
         self.zmq_context = zmq.Context()
-
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER)
-        self.put_get_socket.bind(self.zmq_server_info.to_addr("put_get_socket"))
+        self._node_ip = get_node_ip_address()
+
+        while True:
+            try:
+                self._put_get_socket_port = get_free_port()
+                self.put_get_socket.bind(f"tcp://{self._node_ip}:{self._put_get_socket_port}")
+                break
+            except zmq.ZMQError:
+                logger.warning(f"[{self.storage_unit_id}]: Try to bind ZMQ sockets failed, retrying...")
+                continue
+
+        self.zmq_server_info = ZMQServerInfo(
+            role=TransferQueueRole.STORAGE,
+            id=str(self.storage_unit_id),
+            ip=self._node_ip,
+            ports={"put_get_socket": self._put_get_socket_port},
+        )
 
     def _start_process_put_get(self) -> None:
         """Create a daemon thread and start put/get process."""
