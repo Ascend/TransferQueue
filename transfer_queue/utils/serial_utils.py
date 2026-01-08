@@ -33,13 +33,6 @@ from msgspec import msgpack
 
 from transfer_queue.utils.utils import get_env_bool
 
-try:
-    from torch.distributed.rpc.internal import _internal_rpc_pickler
-
-    HAS_RPC_PICKLER = True
-except ImportError:
-    HAS_RPC_PICKLER = False
-
 CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
@@ -48,6 +41,8 @@ TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 tensorenc = tuple[str, tuple[int, ...], int | memoryview]
+META_KEY = "__tq_meta__"
+LARGE_OBJECT_THRESHOLD = 10 * 1024
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -278,7 +273,95 @@ def deserialization(data: list[bytestr] | bytestr) -> Any:
                 f" but got {type(data)}."
             )
 
+def _pack_data(data: Any, buffers: list[memoryview]) -> Any:
+    """
+    递归遍历数据结构。
+    1. 将所有 Tensor 提取为 buffer 并存入 buffers 列表。
+    2. 在原数据结构位置替换为元数据描述符（占位符）。
+    """
+    if isinstance(data, torch.Tensor):
+        if not data.is_contiguous():
+            data = data.contiguous()
 
-def zero_copy_serialization_enabled() -> bool:
-    """Check if zero-copy serialization is enabled."""
-    return TQ_ZERO_COPY_SERIALIZATION
+        if data.device.type != 'cpu':
+            data = data.cpu()
+
+        # 记录元数据
+        meta = {
+            META_KEY: "tensor",
+            # 获取 buffer 长度, 作为当前片段的 idx
+            "idx": len(buffers),
+            "dtype": data.dtype,
+            "shape": data.shape,
+        }
+
+        # 获取零拷贝视图
+        buf = memoryview(data.numpy())
+        buffers.append(buf)
+        return meta
+    elif isinstance(data, str):
+        if len(data) > LARGE_OBJECT_THRESHOLD:
+            encoded_data = data.encode("utf-8")
+            meta = {
+                META_KEY: "str",
+                "idx": len(buffers),
+                "encoding": "utf-8"
+            }
+            buffers.append(memoryview(encoded_data))
+            return meta
+        return data
+    elif isinstance(data, dict):
+        return {k: _pack_data(v, buffers) for k, v in data.items()}
+
+    elif isinstance(data, list):
+        return [_pack_data(v, buffers) for v in data]
+
+    elif isinstance(data, tuple):
+        return tuple(_pack_data(v, buffers) for v in data)
+
+    # 其他类型直接返回 (将在 Header 中被 pickle)
+    return data
+
+
+def _unpack_data(data: Any, buffers: list[bytestr]) -> Any:
+    """
+    递归还原数据结构。
+    """
+    if isinstance(data, dict):
+        # 检查是否是特殊元数据包
+        if META_KEY in data:
+            obj_type = data[META_KEY]
+            idx = data["idx"]
+            raw_buffer = buffers[idx]
+
+            # Case A: Tensor
+            if obj_type == "tensor":
+                dtype = data["dtype"]
+                shape = data["shape"]
+                # Zero-Copy View
+                tensor = torch.frombuffer(raw_buffer, dtype=dtype)
+                return tensor.reshape(shape)
+
+            # Case B: Bytes
+            elif obj_type == "bytes":
+                # 将 memoryview 转回 bytes
+                # 注意：如果用户能接受 memoryview，直接返回 raw_buffer 性能最好
+                # 这里为了兼容性转为 bytes (可能发生拷贝，取决于具体实现)
+                return bytes(raw_buffer)
+
+            # Case C: String
+            elif obj_type == "str":
+                encoding = data["encoding"]
+                # Decode bytes -> str
+                return bytes(raw_buffer).decode(encoding)
+
+        # 常规字典递归
+        return {k: _unpack_data(v, buffers) for k, v in data.items()}
+
+    elif isinstance(data, list):
+        return [_unpack_data(v, buffers) for v in data]
+
+    elif isinstance(data, tuple):
+        return tuple(_unpack_data(v, buffers) for v in data)
+
+    return data

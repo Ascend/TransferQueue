@@ -15,16 +15,17 @@
 
 import logging
 import os
+import pickle
 import socket
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, TypeAlias
 from uuid import uuid4
 
 import psutil
 import zmq
 
-from transfer_queue.utils.serial_utils import deserialization, serialization
+from transfer_queue.utils.serial_utils import _pack_data, _unpack_data
 from transfer_queue.utils.utils import (
     ExplicitEnum,
     TransferQueueRole,
@@ -121,6 +122,9 @@ class ZMQMessage:
     request_id: str
     timestamp: float
 
+    # 仅在序列化/反序列化过程中使用的临时容器，不需要在构造时传入
+    _buffers: list = field(default_factory=list, repr=False)
+
     @classmethod
     def create(
         cls,
@@ -138,18 +142,62 @@ class ZMQMessage:
             timestamp=time.time(),
         )
 
-    def serialize(
-        self,
-    ) -> list[bytestr]:
+    def serialize(self) -> list[bytestr]:
         """
-        Serializes the ZMQMessage object.
+        将消息序列化为 ZMQ Multipart 帧列表。
+        Frame 0: Pickled Header (包含结构树和非 Tensor 数据)
+        Frame 1...N: Raw Tensor Buffers
         """
-        return serialization(self)
+        self._buffers = []
+
+        # 1. 提取所有 Tensor 到 self._buffers，并将 body 转换为轻量级结构
+        packed_body = _pack_data(self.body, self._buffers)
+
+        # 2. 构建 Header
+        header = {
+            "request_type": self.request_type,
+            "sender_id": self.sender_id,
+            "receiver_id": self.receiver_id,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp,
+            "body_structure": packed_body,  # 仅包含结构和元数据
+        }
+
+        # 3. 序列化 Header
+        header_bytes = pickle.dumps(header)
+
+        # 4. 组装最终发送列表：[Header, Buffer_0, Buffer_1, ...]
+        return [header_bytes, *self._buffers]
 
     @classmethod
-    def deserialize(cls, data: list[bytestr] | bytestr) -> "ZMQMessage":
-        """Deserialize a ZMQMessage object from serialized data."""
-        return deserialization(data)
+    def deserialize(cls, frames: list[bytestr]) -> "ZMQMessage":
+        """
+        从 ZMQ Multipart 帧列表反序列化消息。
+        """
+        if not frames:
+            raise ValueError("Empty frames received")
+
+        # 1. 解析 Header
+        header_bytes = frames[0]
+        header = pickle.loads(header_bytes)
+
+        # 2. 获取数据帧 (Frames 1...N)
+        raw_buffers = frames[1:]
+
+        # 3. 递归重构 Body (Zero-Copy)
+        body_structure = header["body_structure"]
+        restored_body = _unpack_data(body_structure, raw_buffers)
+
+        # 4. 构建对象
+        msg = cls(
+            request_type=header["request_type"],
+            sender_id=header["sender_id"],
+            receiver_id=header["receiver_id"],
+            body=restored_body,
+            request_id=header["request_id"],
+            timestamp=header["timestamp"],
+        )
+        return msg
 
 
 def get_free_port() -> str:

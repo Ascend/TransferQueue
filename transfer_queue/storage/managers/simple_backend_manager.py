@@ -30,7 +30,6 @@ from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.storage.simple_backend import StorageMetaGroup
-from transfer_queue.utils.serial_utils import zero_copy_serialization_enabled
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -447,11 +446,6 @@ def _filter_storage_data(storage_meta_group: StorageMetaGroup, data: TensorDict)
         if not isinstance(result, tuple):
             result = (result,)
         results[fname] = list(result)
-
-        if not zero_copy_serialization_enabled():
-            # Explicitly copy tensor slices to prevent pickling the whole tensor for every storage unit.
-            # The tensors may still be contiguous, so we cannot use .contiguous() to trigger copy from parent tensors.
-            results[fname] = [item.clone() if isinstance(item, torch.Tensor) else item for item in results[fname]]
 
     return results
 
