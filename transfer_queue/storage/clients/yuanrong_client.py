@@ -32,7 +32,7 @@ CPU_DS_CLIENT_KEYS_LIMIT: int = 1999
 YUANRONG_DATASYSTEM_IMPORTED: bool = True
 TORCH_NPU_IMPORTED: bool = True
 try:
-    import datasystem
+    from yr import datasystem
 except ImportError:
     YUANRONG_DATASYSTEM_IMPORTED = False
 
@@ -123,7 +123,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             cpu_values = []
 
             for key, value in zip(keys, values, strict=True):
-                if isinstance(value, torch.Tensor) and value.device.type == "npu":
+                if isinstance(value, Tensor) and value.device.type == "npu":
                     if not value.is_contiguous():
                         raise ValueError(f"NPU Tensor is not contiguous: {value}")
                     npu_keys.append(key)
@@ -131,7 +131,9 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
                 else:
                     cpu_keys.append(key)
-                    cpu_values.append(pickle.dumps(value))
+                    # TODO: Optimize serialization of tensors
+                    # Serializing slice of tensors results in entire tensors being serialized
+                    cpu_values.append(pickle.dumps(value.contiguous().clone() if isinstance(value, Tensor) else value))
 
             # put NPU data
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
@@ -153,7 +155,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         else:
             #  All data goes through CPU path
-            pickled_values = [pickle.dumps(v) for v in values]
+            pickled_values = [pickle.dumps(v.contiguous().clone() if isinstance(v, Tensor) else v) for v in values]
             for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_vals = pickled_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
@@ -247,6 +249,17 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 for idx, raw_val in zip(batch_indices, raw_values, strict=False):
                     results[idx] = pickle.loads(raw_val)
 
+            return results
+        else:
+            # npu is not available, goes through cpu_ds_client
+            results = [None] * len(keys)
+            idx = 0
+            for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
+                batch_keys = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
+                raw_values = self._cpu_ds_client.get(batch_keys)
+                for raw_val in raw_values:
+                    results[idx] = pickle.loads(raw_val)
+                    idx += 1
             return results
 
     def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
