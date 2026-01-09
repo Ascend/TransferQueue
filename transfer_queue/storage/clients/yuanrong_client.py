@@ -133,7 +133,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     cpu_keys.append(key)
                     # TODO: Optimize serialization of tensors
                     # Serializing slice of tensors results in entire tensors being serialized
-                    cpu_values.append(pickle.dumps(value.contiguous().clone() if isinstance(value, Tensor) else value))
+                    cpu_values.append(pickle.dumps(value.clone() if isinstance(value, Tensor) else value))
 
             # put NPU data
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
@@ -155,7 +155,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         else:
             #  All data goes through CPU path
-            pickled_values = [pickle.dumps(v.contiguous().clone() if isinstance(v, Tensor) else v) for v in values]
+            pickled_values = [pickle.dumps(v.clone() if isinstance(v, Tensor) else v) for v in values]
             for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_vals = pickled_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
