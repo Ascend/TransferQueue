@@ -4,7 +4,6 @@ import json
 import logging
 import math
 import os
-import random
 import sys
 import time
 import numpy as np
@@ -13,7 +12,6 @@ import torch
 from pathlib import Path
 from omegaconf import OmegaConf
 from tensordict import TensorDict
-from tensordict.tensorclass import NonTensorData
 from tensordict.utils import LinkedList
 
 
@@ -95,31 +93,82 @@ def calculate_stats(data: list) -> dict:
     }
 
 
+# Tensor dtype configs for testing multiple data types
+DTYPE_CONFIGS = [
+    {"dtype": torch.float32, "bytes_per_elem": 4},
+    {"dtype": torch.int64, "bytes_per_elem": 8},
+    {"dtype": torch.float64, "bytes_per_elem": 8},
+    {"dtype": torch.int32, "bytes_per_elem": 4},
+    {"dtype": torch.float16, "bytes_per_elem": 2},
+]
+
+
+def _generate_regular_tensor(batch_size, seq_length, dtype):
+    """Generate regular Tensor"""
+    if dtype in (torch.int32, torch.int64):
+        return torch.randint(0, 10000, (batch_size, seq_length), dtype=dtype)
+    else:
+        return torch.randn(batch_size, seq_length, dtype=dtype)
+
+
+def _generate_nested_tensor(batch_size, total_elements, dtype):
+    """
+    Generate NestedTensor with random lengths per sample, but consistent total elements.
+    Uses Dirichlet distribution to ensure random allocation with fixed sum.
+    """
+    # Use Dirichlet distribution to generate random proportions summing to 1
+    proportions = np.random.dirichlet(np.ones(batch_size))
+    lengths = (proportions * total_elements).astype(int)
+    
+    # Fix rounding errors to ensure exact total element count
+    diff = total_elements - lengths.sum()
+    if diff != 0:
+        # Distribute difference to largest elements
+        indices = np.argsort(lengths)[::-1]
+        for i in range(abs(diff)):
+            lengths[indices[i % batch_size]] += 1 if diff > 0 else -1
+    
+    # Ensure each length is at least 1
+    lengths = np.maximum(lengths, 1)
+    
+    # Generate tensors with different lengths
+    tensors = []
+    for length in lengths:
+        if dtype in (torch.int32, torch.int64):
+            tensors.append(torch.randint(0, 10000, (int(length),), dtype=dtype))
+        else:
+            tensors.append(torch.randn(int(length), dtype=dtype))
+    
+    return torch.nested.nested_tensor(tensors, dtype=dtype)
+
+
 def create_complex_test_case(batch_size, seq_length, field_num):
-    tensor_field_size_bytes = batch_size * seq_length * 4
-    tensor_field_size_gb = tensor_field_size_bytes / (1024 ** 3)
-
-    num_tensor_fields = (field_num + 1) // 2
-    num_nontensor_fields = field_num // 2
-
-    total_tensor_size_gb = tensor_field_size_gb * num_tensor_fields
-    # Estimate String NonTensorData size (assuming 1024 bytes per sample)
-    str_len = 1024
-    total_nontensor_size_gb = (batch_size * str_len / (1024 ** 3)) * num_nontensor_fields
-    total_size_gb = total_tensor_size_gb + total_nontensor_size_gb
-
+    """
+    Create test data using different Tensor types for serialization performance testing.
+    - Even-indexed fields: Regular Tensor (float32, int64, float64, int32, float16 rotating)
+    - Odd-indexed fields: NestedTensor (random lengths, same total data volume)
+    """
+    total_size_bytes = 0
     fields = {}
+    total_elements_per_field = batch_size * seq_length
+
     for i in range(field_num):
         field_name = f"field_{i}"
+        dtype_config = DTYPE_CONFIGS[i % len(DTYPE_CONFIGS)]
+        dtype = dtype_config["dtype"]
+        bytes_per_elem = dtype_config["bytes_per_elem"]
+
         if i % 2 == 0:
-            tensor_data = torch.randn(batch_size, seq_length, dtype=torch.float32)
-            fields[field_name] = tensor_data
+            # Even-indexed fields: Regular Tensor
+            tensor_data = _generate_regular_tensor(batch_size, seq_length, dtype)
         else:
-            non_tensor_data = [
-                ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=str_len))
-                for _ in range(batch_size)
-            ]
-            fields[field_name] = NonTensorData(data=non_tensor_data, batch_size=(batch_size,), device=None)
+            # Odd-indexed fields: NestedTensor (random lengths, same total elements)
+            tensor_data = _generate_nested_tensor(batch_size, total_elements_per_field, dtype)
+
+        fields[field_name] = tensor_data
+        total_size_bytes += total_elements_per_field * bytes_per_elem
+
+    total_size_gb = total_size_bytes / (1024 ** 3)
 
     prompt_batch = TensorDict(
         fields,
@@ -136,13 +185,39 @@ def remove_placement_group(placement_group):
     ray.util.remove_placement_group(placement_group)
 
 
+def _compare_nested_tensors(original, retrieved, path):
+    """Compare two NestedTensors for consistency"""
+    # Unbind to list for element-wise comparison
+    orig_tensors = original.unbind()
+    retr_tensors = retrieved.unbind()
+    
+    if len(orig_tensors) != len(retr_tensors):
+        return False, f"[{path}] NestedTensor batch size mismatch: {len(orig_tensors)} vs {len(retr_tensors)}"
+    
+    for idx, (o, r) in enumerate(zip(orig_tensors, retr_tensors)):
+        if o.shape != r.shape:
+            return False, f"[{path}][{idx}] Shape mismatch: {o.shape} vs {r.shape}"
+        if o.dtype != r.dtype:
+            return False, f"[{path}][{idx}] Dtype mismatch: {o.dtype} vs {r.dtype}"
+        if not torch.equal(o.cpu(), r.cpu()):
+            return False, f"[{path}][{idx}] Values mismatch"
+    
+    return True, "Passed"
+
+
 def check_data_consistency(original, retrieved, path="root"):
     """
-    Data consistency verification
+    Data consistency verification (supports TensorDict, Tensor, and NestedTensor)
     """
     try:
         if isinstance(original, list) and isinstance(retrieved, LinkedList):
             retrieved = list(retrieved)
+
+        # NestedTensor check (must be before regular Tensor since NestedTensor is also a Tensor)
+        if original.is_nested if hasattr(original, 'is_nested') else False:
+            if not (retrieved.is_nested if hasattr(retrieved, 'is_nested') else False):
+                return False, f"[{path}] Type mismatch: NestedTensor vs non-NestedTensor"
+            return _compare_nested_tensors(original, retrieved, path)
 
         if type(original) != type(retrieved):
             return False, f"[{path}] Type mismatch: {type(original)} vs {type(retrieved)}"
@@ -159,15 +234,12 @@ def check_data_consistency(original, retrieved, path="root"):
         elif isinstance(original, torch.Tensor):
             if original.shape != retrieved.shape:
                 return False, f"[{path}] Tensor shape mismatch: {original.shape} vs {retrieved.shape}"
+            if original.dtype != retrieved.dtype:
+                return False, f"[{path}] Tensor dtype mismatch: {original.dtype} vs {retrieved.dtype}"
             t1 = original.cpu()
             t2 = retrieved.cpu()
             if not torch.equal(t1, t2):
                 return False, f"[{path}] Tensor values mismatch"
-            return True, "Passed"
-
-        elif 'NonTensorData' in str(type(original)):
-            if original.data != retrieved.data:
-                return False, f"[{path}] NonTensorData content mismatch"
             return True, "Passed"
 
         else:
