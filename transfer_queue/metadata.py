@@ -174,6 +174,8 @@ class BatchMeta:
 
     samples: list[SampleMeta]
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
+    # internal data for different storage backends: _custom_meta[index][field]
+    _custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
@@ -229,6 +231,16 @@ class BatchMeta:
     def partition_ids(self) -> list[str]:
         """Get partition ids for all samples in this batch as a list (one per sample)"""
         return getattr(self, "_partition_ids", [])
+
+    # Custom meta methods for internal use
+    def _get_all_custom_meta(self) -> Any:
+        """Get all custom meta for all samples and fields"""
+        return self._custom_meta
+
+    def _update_custom_meta(self, new_custom_meta: dict[int, dict[str, Any]] = None):
+        """Update custom meta with a new dictionary"""
+        if new_custom_meta:
+            self._custom_meta.update(new_custom_meta)
 
     # Extra info interface methods
     def get_extra_info(self, key: str, default: Any = None) -> Any:
