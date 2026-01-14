@@ -185,6 +185,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         dtypes: dict[int, dict[str, Any]],
         shapes: dict[int, dict[str, Any]],
+        custom_meta: dict[str, Any],
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -195,6 +196,7 @@ class TransferQueueStorageManager(ABC):
             global_indexes: Data update related global_indexes.
             dtypes: Per-field dtypes for each field, in {global_index: {field: dtype}} format.
             shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
+            custom_meta: Per-field custom_meta for each field, in {global_index: {field: custom_meta}} format.
         """
         # Create zmq poller for notifying data update information
 
@@ -218,6 +220,7 @@ class TransferQueueStorageManager(ABC):
                     "global_indexes": global_indexes,
                     "dtypes": dtypes,
                     "shapes": shapes,
+                    "custom_meta": custom_meta,
                 },
             ).serialize()
 
@@ -445,15 +448,17 @@ class KVStorageManager(TransferQueueStorageManager):
         keys = self._generate_keys(data.keys(), metadata.global_indexes)
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.storage_client.put, keys, values)
+        custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
         per_field_dtypes = {}
         per_field_shapes = {}
+        per_field_custom_meta = {}
 
         # Initialize the data structure for each global index
         for global_idx in metadata.global_indexes:
             per_field_dtypes[global_idx] = {}
             per_field_shapes[global_idx] = {}
+            per_field_custom_meta[global_idx] = {}
 
         for field_name, field_data in data.items():
             for i in range(num_samples):
@@ -465,6 +470,10 @@ class KVStorageManager(TransferQueueStorageManager):
                 per_field_shapes[global_idx][field_name] = (
                     getattr(data_item, "shape", None) if isinstance(data_item, Tensor) else None
                 )
+                per_field_custom_meta[global_idx][field_name] = (
+                    # TODO(@tianyi): the order of custom_meta is changed, how to map it back correctly?
+                    # one option is to send meta data as a dict, but parse the index and field at controller side
+                )
 
         # Get current data partition id
         # Note: Currently we only support putting to & getting data from a single data partition simultaneously,
@@ -472,7 +481,12 @@ class KVStorageManager(TransferQueueStorageManager):
         partition_id = metadata.samples[0].partition_id
         # notify controller that new data is ready
         await self.notify_data_update(
-            partition_id, list(data.keys()), metadata.global_indexes, per_field_dtypes, per_field_shapes
+            partition_id,
+            list(data.keys()),
+            metadata.global_indexes,
+            per_field_dtypes,
+            per_field_shapes,
+            per_field_custom_meta,
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
