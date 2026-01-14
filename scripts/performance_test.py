@@ -29,9 +29,10 @@ logger = logging.getLogger(__name__)
 
 ########################################################################
 # Please set up Ray cluster before running this script
+# e.g. ray start --head --resources='{"node:127.0.0.1": 1}'
 ########################################################################
-HEAD_NODE_IP = "NodeA"  # Replace with your head node IP
-WORKER_NODE_IP = "NodeB"  # Replace with your worker node IP
+HEAD_NODE_IP = "127.0.0.1"  # Replace with your head node IP
+WORKER_NODE_IP = "127.0.0.1"  # Replace with your worker node IP
 
 
 # This is the Medium setting of the performance test.
@@ -41,8 +42,22 @@ config_str = """
   global_batch_size: 1024
   seq_length: 8192
   field_num: 10
-  num_global_batch: 1 
+  num_global_batch: 1
   num_data_storage_units: 8
+  storage_manager_type: AsyncSimpleStorageManager
+
+#   EXAMPLE: to test Ray storage manager, set the following
+#   num_data_storage_units: 0
+#   storage_manager_type: RayStorageManager
+#   client_name: RayStorageClient
+#   tensor_transport: object_store # or nixl
+
+#   EXAMPLE: to test Yuanrong storage manager, set the following
+#   num_data_storage_units: 0
+#   storage_manager_type: YuanrongStorageManager
+#   client_name: YuanrongStorageClient
+#   host: 127.0.0.1
+#   port: 31501
 """
 dict_conf = OmegaConf.create(config_str)
 
@@ -203,23 +218,26 @@ class TQBandwidthTester:
         total_storage_size = self.config.global_batch_size * self.config.num_global_batch
         self.data_system_storage_units = {}
 
-        if self.remote_mode:
-            for storage_unit_rank in range(self.config.num_data_storage_units):
-                storage_node = SimpleStorageUnit.options(
-                    num_cpus=10,
-                    resources={f"node:{WORKER_NODE_IP}": 0.001},
-                ).remote(storage_unit_size=math.ceil(total_storage_size / self.config.num_data_storage_units))
-                self.data_system_storage_units[storage_unit_rank] = storage_node
-        else:
-            storage_placement_group = get_placement_group(self.config.num_data_storage_units, num_cpus_per_actor=10)
-            for storage_unit_rank in range(self.config.num_data_storage_units):
-                storage_node = SimpleStorageUnit.options(
-                    placement_group=storage_placement_group,
-                    placement_group_bundle_index=storage_unit_rank,
-                ).remote(storage_unit_size=math.ceil(total_storage_size / self.config.num_data_storage_units))
-                self.data_system_storage_units[storage_unit_rank] = storage_node
+        if self.config.num_data_storage_units > 0:
+            if self.remote_mode:
+                for storage_unit_rank in range(self.config.num_data_storage_units):
+                    storage_node = SimpleStorageUnit.options(
+                        num_cpus=10,
+                        resources={f"node:{WORKER_NODE_IP}": 0.001},
+                    ).remote(storage_unit_size=math.ceil(total_storage_size / self.config.num_data_storage_units))
+                    self.data_system_storage_units[storage_unit_rank] = storage_node
+            else:
+                storage_placement_group = get_placement_group(self.config.num_data_storage_units, num_cpus_per_actor=1)
+                for storage_unit_rank in range(self.config.num_data_storage_units):
+                    storage_node = SimpleStorageUnit.options(
+                        placement_group=storage_placement_group,
+                        placement_group_bundle_index=storage_unit_rank,
+                    ).remote(storage_unit_size=math.ceil(total_storage_size / self.config.num_data_storage_units))
+                    self.data_system_storage_units[storage_unit_rank] = storage_node
 
-        logger.info(f"TransferQueueStorageSimpleUnit #0 ~ #{storage_unit_rank} has been created.")
+                logger.info(
+                    f"TransferQueueStorageSimpleUnit #0 ~ #{self.config.num_data_storage_units - 1} has been created."
+                )
 
         self.data_system_controller = TransferQueueController.remote()
         logger.info("TransferQueueController has been created.")
@@ -235,7 +253,10 @@ class TQBandwidthTester:
         self.data_system_client = AsyncTransferQueueClient(
             client_id="Trainer", controller_info=self.data_system_controller_info
         )
-        self.data_system_client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=self.config)
+        logger.info(f"Using {self.config.storage_manager_type} as storage backend.")
+        self.data_system_client.initialize_storage_manager(
+            manager_type=self.config.storage_manager_type, config=self.config
+        )
         return self.data_system_client
 
     def run_bandwidth_test(self):

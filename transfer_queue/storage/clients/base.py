@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from typing import Any
 
 from torch import Tensor
 
@@ -25,11 +26,13 @@ class TransferQueueStorageKVClient(ABC):
     """
 
     @abstractmethod
-    def put(self, keys: list[str], values: list[Tensor]) -> None:
+    def put(self, keys: list[str], values: list[Tensor]) -> dict[str, Any]:
         raise NotImplementedError("Subclasses must implement put")
 
     @abstractmethod
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Tensor]:
+    def get(
+        self, keys: list[str], shapes=None, dtypes=None, custom_meta=None
+    ) -> list[Tensor]:
         raise NotImplementedError("Subclasses must implement get")
 
     @abstractmethod

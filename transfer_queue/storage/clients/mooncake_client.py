@@ -104,7 +104,7 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
             if ret != 0:
                 raise RuntimeError(f"put_batch failed with error code: {ret}")
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         if shapes is None or dtypes is None:
             raise ValueError("MooncakeStorageClient needs shapes and dtypes")
         if not (len(keys) == len(shapes) == len(dtypes)):
