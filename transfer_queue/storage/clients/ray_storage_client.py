@@ -8,64 +8,55 @@ from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
 
 
-@ray.remote(max_concurrency=8)
-class RayObjectRefStorage:
-    def __init__(self):
-        self.storage_dict = {}
-
-    def put_obj_ref(self, keys: list[str], obj_refs: list[ray.ObjectRef]):
-        self.storage_dict.update(itertools.starmap(lambda k, v: (k, v), zip(keys, obj_refs, strict=True)))
-
-    def get_obj_ref(self, keys: list[str]) -> list[ray.ObjectRef]:
-        obj_refs = [self.storage_dict.get(key, None) for key in keys]
-        return obj_refs
-
-    def clear_obj_ref(self, keys: list[str]):
-        for key in keys:
-            if key in self.storage_dict:
-                del self.storage_dict[key]
-
-
 @StorageClientFactory.register("RayStorageClient")
 class RayStorageClient(TransferQueueStorageKVClient):
     def __init__(self, config=None):
         if not ray.is_initialized():
-            raise RuntimeError("Ray is not initialized. Please call ray.init() before creating RayStorageClient.")
+            raise RuntimeError(
+                "Ray is not initialized. Please call ray.init() before creating RayStorageClient."
+            )
 
-        # initialize actor
-        try:
-            self.storage_actor = ray.get_actor("RayObjectRefStorage")
-        except ValueError:
-            self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
+        # default to 'nixl' transport
+        self.tensor_transport = (
+            config.get("tensor_transport", "nixl") if config else "nixl"
+        )
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> dict[str, ray.ObjectRef]:
         """
         Store tensors to remote storage.
         Args:
             keys (list): List of string keys
             values (list): List of torch.Tensor on GPU(CUDA) or CPU
+        Returns:
+            dict: A dictionary mapping keys to their corresponding Ray ObjectRefs
         """
         if not isinstance(keys, list) or not isinstance(values, list):
-            raise ValueError(f"keys and values must be lists, but got {type(keys)} and {type(values)}")
+            raise ValueError(
+                f"keys and values must be lists, but got {type(keys)} and {type(values)}"
+            )
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
 
-        transports = itertools.repeat("nixl")
-        obj_refs = list(
-            itertools.starmap(
-                lambda v, tx: ray.put(v, _tensor_transport=tx) if isinstance(v, torch.Tensor) else ray.put(v),
-                zip(values, transports, strict=False),
+        def ray_put_with_transport(v):
+            return (
+                ray.put(v, _tensor_transport=self.tensor_transport)
+                if isinstance(v, torch.Tensor)
+                else ray.put(v)
             )
-        )
-        ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+        custom_meta = {k: ray_put_with_transport(v) for k, v in zip(keys, values)}
+        return custom_meta
+
+    def get(
+        self, keys: list[str], shapes=None, dtypes=None, custom_meta=None
+    ) -> list[Any]:
         """
         Retrieve objects from remote storage.
         Args:
             keys (list): List of string keys to fetch.
             shapes (list, optional): Ignored. For compatibility with KVStorageManager.
             dtypes (list, optional): Ignored. For compatibility with KVStorageManager.
+            custom_meta (dict, optional): A dictionary mapping keys to Ray ObjectRefs.
         Returns:
             list: List of retrieved objects
         """
@@ -73,7 +64,10 @@ class RayStorageClient(TransferQueueStorageKVClient):
         if not isinstance(keys, list):
             raise ValueError(f"keys must be a list, but got {type(keys)}")
 
-        obj_refs = ray.get(self.storage_actor.get_obj_ref.remote(keys))
+        if custom_meta is None:
+            raise ValueError("custom_meta must be provided")
+
+        obj_refs = custom_meta.values()
         try:
             values = ray.get(obj_refs)
         except Exception as e:
@@ -82,8 +76,11 @@ class RayStorageClient(TransferQueueStorageKVClient):
 
     def clear(self, keys: list[str]):
         """
-        Delete entries from storage by keys.
+        Delete entries from storage by keys. Notice that the object refs are stored in
+        controller DataPartitionStatus.field_custom_metas, so here's nothing to do.
+        The object refs will be garbage collected once the controller receives clear meta
+        request.
         Args:
             keys (list): List of keys to delete
         """
-        ray.get(self.storage_actor.clear_obj_ref.remote(keys))
+        pass

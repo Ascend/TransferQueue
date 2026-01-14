@@ -262,7 +262,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     idx += 1
             return results
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
