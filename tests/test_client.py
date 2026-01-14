@@ -110,7 +110,7 @@ class MockController:
                         response_type = ZMQRequestType.CLEAR_PARTITION_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.GET_PARTITION_META:
                         # Mock partition metadata response
-                        response_body = {"metadata": self._mock_batch_meta(request_msg.body)}
+                        response_body = self._mock_batch_meta(request_msg.body)
                         response_type = ZMQRequestType.GET_PARTITION_META_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.CHECK_CONSUMPTION:
                         # Mock consumption status check - all consumed
