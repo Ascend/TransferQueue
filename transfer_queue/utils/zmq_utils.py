@@ -15,17 +15,16 @@
 
 import logging
 import os
-import pickle
 import socket
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional, TypeAlias
 from uuid import uuid4
 
 import psutil
 import zmq
 
-from transfer_queue.utils.serial_utils import _pack_data, _unpack_data
+from transfer_queue.utils.serial_utils import _encoder, _decoder
 from transfer_queue.utils.utils import (
     ExplicitEnum,
     TransferQueueRole,
@@ -122,9 +121,6 @@ class ZMQMessage:
     request_id: str
     timestamp: float
 
-    # Temporary container used only during serialization/deserialization, no need to pass in during construction
-    _buffers: list = field(default_factory=list, repr=False)
-
     @classmethod
     def create(
         cls,
@@ -142,62 +138,38 @@ class ZMQMessage:
             timestamp=time.time(),
         )
 
-    def serialize(self) -> list[bytestr]:
+    def serialize(self) -> list:
         """
-        Serialize message into a ZMQ Multipart frame list.
-        Frame 0: Pickled Header (contains structure tree and non-Tensor data)
-        Frame 1...N: Raw Tensor Buffers
+        Serialize message using unified MsgpackEncoder.
+        Returns: list[bytestr] - [msgpack_header, *tensor_buffers]
         """
-        self._buffers = []
-
-        # 1. Extract all Tensors to self._buffers and convert body to lightweight structure
-        packed_body = _pack_data(self.body, self._buffers)
-
-        # 2. Build Header
-        header = {
-            "request_type": self.request_type,
+        msg_dict = {
+            "request_type": self.request_type.value,  # Enum -> str for msgpack
             "sender_id": self.sender_id,
             "receiver_id": self.receiver_id,
             "request_id": self.request_id,
             "timestamp": self.timestamp,
-            "body_structure": packed_body,  # Contains only structure and metadata
+            "body": self.body,
         }
-
-        # 3. Serialize Header
-        header_bytes = pickle.dumps(header)
-
-        # 4. Assemble final send list: [Header, Buffer_0, Buffer_1, ...]
-        return [header_bytes, *self._buffers]
+        return list(_encoder.encode(msg_dict))
 
     @classmethod
-    def deserialize(cls, frames: list[bytestr]) -> "ZMQMessage":
+    def deserialize(cls, frames: list) -> "ZMQMessage":
         """
-        Deserialize message from a ZMQ Multipart frame list.
+        Deserialize message using unified MsgpackDecoder.
         """
         if not frames:
             raise ValueError("Empty frames received")
 
-        # 1. Parse Header
-        header_bytes = frames[0]
-        header = pickle.loads(header_bytes)
-
-        # 2. Get data frames (Frames 1...N)
-        raw_buffers = frames[1:]
-
-        # 3. Recursively reconstruct Body (Zero-Copy)
-        body_structure = header["body_structure"]
-        restored_body = _unpack_data(body_structure, raw_buffers)
-
-        # 4. Build object
-        msg = cls(
-            request_type=header["request_type"],
-            sender_id=header["sender_id"],
-            receiver_id=header["receiver_id"],
-            body=restored_body,
-            request_id=header["request_id"],
-            timestamp=header["timestamp"],
+        msg_dict = _decoder.decode(frames)
+        return cls(
+            request_type=ZMQRequestType(msg_dict["request_type"]),
+            sender_id=msg_dict["sender_id"],
+            receiver_id=msg_dict["receiver_id"],
+            body=msg_dict["body"],
+            request_id=msg_dict["request_id"],
+            timestamp=msg_dict["timestamp"],
         )
-        return msg
 
 
 def get_free_port() -> str:

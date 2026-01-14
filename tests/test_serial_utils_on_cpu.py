@@ -37,7 +37,7 @@ from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder  # 
 )
 def test_tensor_serialization(dtype):
     encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder(torch.Tensor)
+    decoder = MsgpackDecoder()
 
     tensor = torch.randn(100, 10, dtype=dtype)
     serialized = encoder.encode(tensor)
@@ -112,7 +112,7 @@ def test_zmq_msg_serialization():
 )
 def test_tensor_serialization_with_views(dtype, make_view):
     encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder(torch.Tensor)
+    decoder = MsgpackDecoder()
 
     base = torch.randn(16, 16, dtype=dtype)
     view = make_view(base)
@@ -395,7 +395,7 @@ def test_zero_copy_serialization_dtype_preservation():
 def test_serialization_with_extreme_shapes():
     """Test serialization with extreme tensor shapes."""
     encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder(torch.Tensor)
+    decoder = MsgpackDecoder()
 
     # Very thin tensors
     thin_tensor = torch.randn(1000, 1)
@@ -413,7 +413,7 @@ def test_serialization_with_extreme_shapes():
 def test_serialization_memory_contiguity():
     """Test that serialized tensors maintain proper memory layout."""
     encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder(torch.Tensor)
+    decoder = MsgpackDecoder()
 
     # Create non-contiguous tensor
     base = torch.randn(10, 10)
@@ -466,7 +466,7 @@ def test_tensordict_boundary_batch_sizes(batch_size):
 def test_serialization_with_special_values():
     """Test serialization with special float values."""
     encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder(torch.Tensor)
+    decoder = MsgpackDecoder()
 
     # Test with special values
     special_tensor = torch.tensor([[float("inf"), float("-inf"), float("nan")], [0.0, -0.0, 1e-10]])
@@ -570,3 +570,63 @@ def test_single_nested_tensor_serialization():
     # Both should have the same data but different types
     assert not decoded_msg.body["data"]["normal_tensor"].is_nested
     assert decoded_msg.body["data"]["single_nested_tensor"].is_nested
+
+
+def test_large_string_serialization():
+    """Test serialization of large strings (>10KB).
+    
+    Note: msgpack natively handles str type, so enc_hook is not called for strings.
+    This test verifies large strings are correctly serialized/deserialized.
+    """
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder()
+
+    # Create a string larger than 10KB
+    large_string = "x" * 11000  # ~11KB
+    
+    serialized = encoder.encode({"text": large_string})
+    
+    # Verify content is correctly restored
+    decoded = decoder.decode(serialized)
+    assert decoded["text"] == large_string
+    assert len(decoded["text"]) == len(large_string)
+
+
+def test_large_string_in_zmq_message():
+    """Test large string in ZMQMessage body."""
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    large_text = "Hello World! " * 1000  # ~13KB
+
+    msg = ZMQMessage(
+        request_type=ZMQRequestType.PUT_DATA,
+        sender_id="test",
+        receiver_id="test",
+        request_id="test",
+        timestamp=0.0,
+        body={
+            "large_text": large_text,
+            "tensor": torch.randn(10, 10),  # Combined with tensor
+        },
+    )
+
+    encoded_msg = msg.serialize()
+    decoded_msg = ZMQMessage.deserialize(encoded_msg)
+
+    assert decoded_msg.body["large_text"] == large_text
+    assert torch.allclose(decoded_msg.body["tensor"], msg.body["tensor"])
+
+
+def test_non_ascii_large_string():
+    """Test large string with non-ASCII characters (UTF-8 handling)."""
+    encoder = MsgpackEncoder()
+    decoder = MsgpackDecoder()
+
+    # Create large string with various UTF-8 characters
+    unicode_chars = "你好世界🌍🚀 émojis and ümläuts "
+    large_unicode_string = unicode_chars * 500  # ~12KB
+
+    serialized = encoder.encode({"unicode_text": large_unicode_string})
+    decoded = decoder.decode(serialized)
+
+    assert decoded["unicode_text"] == large_unicode_string
