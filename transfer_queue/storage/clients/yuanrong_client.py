@@ -161,7 +161,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 batch_vals = pickled_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 self._cpu_ds_client.mset(batch_keys, batch_vals)
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any], custom_meta=None):
         """Stores multiple key-value pairs to remote storage.
 
         Automatically routes NPU tensors to high-performance tensor storage,

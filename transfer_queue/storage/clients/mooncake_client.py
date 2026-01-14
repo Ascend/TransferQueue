@@ -53,7 +53,7 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any], custom_meta=None):
         if not isinstance(keys, list) or not isinstance(values, list):
             raise ValueError("keys and values must be lists")
         if len(keys) != len(values):
