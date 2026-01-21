@@ -230,6 +230,7 @@ class DataPartitionStatus:
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     field_dtypes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: dtype}
     field_shapes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: shape}
+    field_custom_metas: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: custom_meta}
 
     # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
     # No need to strictly lock for every read/write operation since freshness is not critical.
@@ -326,6 +327,7 @@ class DataPartitionStatus:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
+        custom_meta: Optional[dict[int, dict[str, Any]]],
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -336,6 +338,7 @@ class DataPartitionStatus:
             field_names: List of field names to mark as produced
             dtypes: Optional per-sample field dtype information
             shapes: Optional per-sample field shape information
+            custom_meta: Optional per-sample field custom metadata
 
         Returns:
             True if update was successful, False on error
@@ -366,7 +369,7 @@ class DataPartitionStatus:
                 self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
-            self._update_field_metadata(global_indices, dtypes, shapes)
+            self._update_field_metadata(global_indices, dtypes, shapes, custom_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
@@ -380,8 +383,9 @@ class DataPartitionStatus:
     def _update_field_metadata(
         self,
         global_indices: list[int],
-        dtypes: Optional[dict[int, dict[str, Any]]],
-        shapes: Optional[dict[int, dict[str, Any]]],
+        dtypes: dict[int, dict[str, Any]],
+        shapes: dict[int, dict[str, Any]],
+        custom_meta: Optional[dict[int, dict[str, Any]]],
     ):
         """Update field dtype and shape metadata."""
         if not global_indices:
@@ -408,6 +412,21 @@ class DataPartitionStatus:
                 self.field_dtypes[global_idx].update(dtype_value[i])
             if shape_value is not None:
                 self.field_shapes[global_idx].update(shape_value[i])
+
+        if custom_meta:
+            if len(global_indices) != len(custom_meta):
+                raise ValueError(
+                    f"Length of global_indices ({len(global_indices)}) does not match "
+                    f"length of custom_meta ({len(custom_meta)})"
+                )
+            custom_meta_value = itemgetter(*global_indices)(custom_meta) if custom_meta else None
+            if not isinstance(custom_meta_value, tuple):
+                custom_meta_value = (custom_meta_value,)
+            for i, global_idx in enumerate(global_indices):
+                if global_idx not in self.field_custom_metas:
+                    self.field_custom_metas[global_idx] = {}
+                if custom_meta_value is not None:
+                    self.field_custom_metas[global_idx].update(custom_meta_value[i])
 
     # ==================== Consumption Status Interface ====================
 
@@ -544,6 +563,14 @@ class DataPartitionStatus:
         """Get shape for a specific sample and field."""
         return self.field_shapes.get(global_index, {}).get(field_name)
 
+    def get_field_custom_meta(self, global_indices: list[int], field_names: list[str]) -> Optional[Any]:
+        """Get custom_meta for a specific sample and field."""
+        return {
+            idx: {f: v for f, v in self.field_custom_metas[idx].items() if f in field_names}
+            for idx in global_indices
+            if idx in self.field_custom_metas
+        }
+
     # ==================== Statistics and Monitoring ====================
 
     def get_statistics(self) -> dict[str, Any]:
@@ -632,6 +659,9 @@ class DataPartitionStatus:
                     consumption_tensor[indexes_to_release] = 0
 
             self.global_indexes.difference_update(indexes_to_release)
+            self.field_dtypes.difference_update(indexes_to_release)
+            self.field_shapes.difference_update(indexes_to_release)
+            self.field_custom_metas.difference_update(indexes_to_release)
 
         except Exception as e:
             logger.error(
@@ -658,7 +688,9 @@ class TransferQueueController:
     """
 
     def __init__(
-        self, sampler: BaseSampler | type[BaseSampler] = SequentialSampler, polling_mode: bool = False
+        self,
+        sampler: BaseSampler | type[BaseSampler] = SequentialSampler,
+        polling_mode: bool = False,
     ) -> None:
         """Initialize the TransferQueue Controller.
 
@@ -791,6 +823,7 @@ class TransferQueueController:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
+        custom_meta: Optional[dict[int, dict[str, Any]]],
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -811,7 +844,7 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes)
+        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_meta)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1070,7 +1103,11 @@ class TransferQueueController:
             )
             samples.append(sample)
 
-        return BatchMeta(samples=samples)
+        custom_meta = partition.get_field_custom_meta(batch_global_indexes, data_fields)
+
+        batch_meta = BatchMeta(samples=samples)
+        batch_meta.update_custom_meta(custom_meta)
+        return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
@@ -1408,6 +1445,7 @@ class TransferQueueController:
                         field_names=message_data.get("fields", []),
                         dtypes=message_data.get("dtypes", {}),
                         shapes=message_data.get("shapes", {}),
+                        custom_meta=message_data.get("custom_meta", {}),
                     )
 
                     if success:

@@ -185,6 +185,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         dtypes: dict[int, dict[str, Any]],
         shapes: dict[int, dict[str, Any]],
+        custom_meta: dict[int, dict[str, Any]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -195,6 +196,7 @@ class TransferQueueStorageManager(ABC):
             global_indexes: Data update related global_indexes.
             dtypes: Per-field dtypes for each field, in {global_index: {field: dtype}} format.
             shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
+            custom_meta: Per-field custom_meta for each field, in {global_index: {field: custom_meta}} format.
         """
         # Create zmq poller for notifying data update information
 
@@ -218,6 +220,7 @@ class TransferQueueStorageManager(ABC):
                     "global_indexes": global_indexes,
                     "dtypes": dtypes,
                     "shapes": shapes,
+                    "custom_meta": custom_meta,
                 },
             ).serialize()
 
@@ -405,16 +408,16 @@ class KVStorageManager(TransferQueueStorageManager):
         return TensorDict(merged_data, batch_size=len(global_indexes))
 
     @staticmethod
-    def _get_shape_type_list(metadata: BatchMeta):
+    def _get_shape_type_custom_meta_list(metadata: BatchMeta):
         """
-        Extract the expected shape and dtype for each field-sample pair in metadata.
+        Extract the expected shape, dtype, and custom meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
 
         Args:
             metadata (BatchMeta): Metadata containing sample and field information.
         Returns:
-            tuple[list[torch.Size], list[torch.dtype]]: Two lists containing the shape and dtype
-            for each tensor to be retrieved.
+            tuple[list[torch.Size], list[torch.dtype], list[Any]]: the shape list, dtype list and
+            custom meta list for each tensor to be retrieved.
         """
         shapes = []
         dtypes = []
@@ -423,7 +426,8 @@ class KVStorageManager(TransferQueueStorageManager):
                 field = metadata.samples[index].get_field_by_name(field_name)
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
-        return shapes, dtypes
+        custom_meta_list = metadata.get_custom_meta_list()
+        return shapes, dtypes, custom_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
@@ -445,7 +449,7 @@ class KVStorageManager(TransferQueueStorageManager):
         keys = self._generate_keys(data.keys(), metadata.global_indexes)
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
-        await loop.run_in_executor(None, self.storage_client.put, keys, values)
+        custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
         per_field_dtypes = {}
         per_field_shapes = {}
@@ -466,13 +470,35 @@ class KVStorageManager(TransferQueueStorageManager):
                     getattr(data_item, "shape", None) if isinstance(data_item, Tensor) else None
                 )
 
+        # Prepare per-field custom_meta if available
+        per_field_custom_meta = {}
+        if custom_meta:
+            if len(custom_meta) != len(keys):
+                raise ValueError(f"Length of custom_meta ({len(custom_meta)}) does not match expected ({len(keys)})")
+            # custom meta is a flat list aligned with keys/values
+            # Use itertools.product to eliminate nested loops
+            for (global_idx, field_name), meta_value in zip(
+                itertools.product(metadata.global_indexes, metadata.field_names),
+                custom_meta,
+                strict=False,
+            ):
+                if global_idx not in per_field_custom_meta:
+                    per_field_custom_meta[global_idx] = {}
+                per_field_custom_meta[global_idx][field_name] = meta_value
+            metadata.update_custom_meta(per_field_custom_meta)
+
         # Get current data partition id
         # Note: Currently we only support putting to & getting data from a single data partition simultaneously,
         # but in the future we may support putting to & getting data from multiple data partitions concurrently.
         partition_id = metadata.samples[0].partition_id
         # notify controller that new data is ready
         await self.notify_data_update(
-            partition_id, list(data.keys()), metadata.global_indexes, per_field_dtypes, per_field_shapes
+            partition_id,
+            list(data.keys()),
+            metadata.global_indexes,
+            per_field_dtypes,
+            per_field_shapes,
+            per_field_custom_meta,
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -486,8 +512,8 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        shapes, dtypes = self._get_shape_type_list(metadata)
-        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes)
+        shapes, dtypes, custom_meta = self._get_shape_type_custom_meta_list(metadata)
+        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes, custom_meta=custom_meta)
         return self._merge_tensors_to_tensordict(metadata, values)
 
     async def clear_data(self, metadata: BatchMeta) -> None:
