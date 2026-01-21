@@ -28,7 +28,12 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.clients.factory import StorageClientFactory
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
+from transfer_queue.utils.zmq_utils import (
+    ZMQMessage,
+    ZMQRequestType,
+    ZMQServerInfo,
+    create_zmq_socket,
+)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -326,6 +331,19 @@ class KVStorageManager(TransferQueueStorageManager):
         self.storage_client = StorageClientFactory.create(client_name, config)
 
     @staticmethod
+    def _generate_key(field_name: str, global_index: int) -> str:
+        """
+        Generate a KV key in the format 'global_index@field_name'.
+
+        Args:
+            field_name : Name of the field.
+            global_index : Global index of the sample.
+        Returns:
+            str: Generated key, e.g., '0@field_a'
+        """
+        return f"{global_index}@{field_name}"
+
+    @staticmethod
     def _generate_keys(field_names: list[str], global_indexes: list[int]) -> list[str]:
         """
         Generate KV keys in the format 'global_index@field_name' for all sample-field pairs.
@@ -338,7 +356,10 @@ class KVStorageManager(TransferQueueStorageManager):
         Returns:
             list[str]: List of keys, e.g., ['0@field_a', '1@field_a', '0@field_b', ...]
         """
-        return [f"{index}@{field}" for field, index in itertools.product(sorted(field_names), global_indexes)]
+        return [
+            KVStorageManager._generate_key(field, index)
+            for field, index in itertools.product(sorted(field_names), global_indexes)
+        ]
 
     @staticmethod
     def _generate_values(data: TensorDict) -> list[Tensor]:

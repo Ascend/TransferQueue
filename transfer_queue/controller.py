@@ -426,6 +426,21 @@ class DataPartitionStatus:
                     self.field_custom_metas[global_idx] = {}
                 self.field_custom_metas[global_idx].update(custom_meta_value[i])
 
+        if custom_meta:
+            if len(global_indices) != len(custom_meta):
+                raise ValueError(
+                    f"Length of global_indices ({len(global_indices)}) does not match "
+                    f"length of custom_meta ({len(custom_meta)})"
+                )
+            custom_meta_value = itemgetter(*global_indices)(custom_meta) if custom_meta else None
+            if not isinstance(custom_meta_value, tuple):
+                custom_meta_value = (custom_meta_value,)
+            for i, global_idx in enumerate(global_indices):
+                if global_idx not in self.field_custom_metas:
+                    self.field_custom_metas[global_idx] = {}
+                if custom_meta_value is not None:
+                    self.field_custom_metas[global_idx].update(custom_meta_value[i])
+
     # ==================== Consumption Status Interface ====================
 
     def get_consumption_status(self, task_name: str) -> torch.Tensor:
@@ -596,7 +611,9 @@ class DataPartitionStatus:
                 field_produced = (self.production_status[:, field_idx] == 1).sum().item()
                 field_stats[field_name] = {
                     "produced_samples": field_produced,
-                    "production_progress": field_produced / self.total_samples_num if self.total_samples_num > 0 else 0,
+                    "production_progress": (
+                        field_produced / self.total_samples_num if self.total_samples_num > 0 else 0
+                    ),
                 }
             stats["field_statistics"] = field_stats
 
@@ -606,7 +623,9 @@ class DataPartitionStatus:
             consumed_samples = (consumption_tensor == 1).sum().item()
             consumption_stats[task_name] = {
                 "consumed_samples": consumed_samples,
-                "consumption_progress": consumed_samples / self.total_samples_num if self.total_samples_num > 0 else 0,
+                "consumption_progress": (
+                    consumed_samples / self.total_samples_num if self.total_samples_num > 0 else 0
+                ),
             }
         stats["consumption_statistics"] = consumption_stats
 
@@ -1128,7 +1147,12 @@ class TransferQueueController:
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
 
-    def clear_meta(self, global_indexes: list[int], partition_ids: list[str], clear_consumption: bool = True):
+    def clear_meta(
+        self,
+        global_indexes: list[int],
+        partition_ids: list[str],
+        clear_consumption: bool = True,
+    ):
         """
         Clear meta for individual samples (preserving the partition).
 
@@ -1266,7 +1290,9 @@ class TransferQueueController:
     def _start_process_handshake(self):
         """Start the handshake process thread."""
         self.wait_connection_thread = Thread(
-            target=self._wait_connection, name="TransferQueueControllerWaitConnectionThread", daemon=True
+            target=self._wait_connection,
+            name="TransferQueueControllerWaitConnectionThread",
+            daemon=True,
         )
         self.wait_connection_thread.start()
 
@@ -1282,7 +1308,9 @@ class TransferQueueController:
     def _start_process_request(self):
         """Start the request processing thread."""
         self.process_request_thread = Thread(
-            target=self._process_request, name="TransferQueueControllerProcessRequestThread", daemon=True
+            target=self._process_request,
+            name="TransferQueueControllerProcessRequestThread",
+            daemon=True,
         )
         self.process_request_thread.start()
 
