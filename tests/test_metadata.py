@@ -773,3 +773,170 @@ class TestEdgeCases:
         with pytest.raises(ValueError) as exc_info:
             BatchMeta.concat([batch1, batch2], validate=True)
         assert "Field names do not match" in str(exc_info.value)
+
+
+class TestCustomMeta:
+    """Unit tests for BatchMeta custom meta methods."""
+
+    def test_get_all_custom_meta_returns_deep_copy(self):
+        """Test get_all_custom_meta returns a deep copy of the custom meta dict."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        custom_meta = {0: {"field_a": {"nested": "value"}}}
+        batch.update_custom_meta(custom_meta)
+
+        # Get all custom meta
+        result = batch.get_all_custom_meta()
+
+        # Verify it's a deep copy - modifying result should not affect original
+        result[0]["field_a"]["nested"] = "modified"
+
+        original = batch.get_all_custom_meta()
+        assert original[0]["field_a"]["nested"] == "value"
+
+    def test_get_all_custom_meta_empty(self):
+        """Test get_all_custom_meta with no custom meta returns empty dict."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        result = batch.get_all_custom_meta()
+
+        assert result == {}
+
+    def test_update_custom_meta_basic(self):
+        """Test update_custom_meta adds new entries."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # Update with custom meta
+        custom_meta = {
+            0: {"field_a": "value_0"},
+            1: {"field_a": "value_1"},
+        }
+        batch.update_custom_meta(custom_meta)
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"] == "value_0"
+        assert result[1]["field_a"] == "value_1"
+
+    def test_update_custom_meta_overwrites_existing(self):
+        """Test update_custom_meta overwrites existing entries at the top level."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # Initial custom meta
+        batch.update_custom_meta({0: {"field_a": "original"}})
+
+        # Update with new value - dict.update replaces the entire value for key 0
+        batch.update_custom_meta({0: {"field_a": "updated"}})
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"] == "updated"
+
+    def test_update_custom_meta_merges_different_keys(self):
+        """Test update_custom_meta merges different top-level keys."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # First update
+        batch.update_custom_meta({0: {"field_a": "value_0"}})
+
+        # Second update with different key
+        batch.update_custom_meta({1: {"field_a": "value_1"}})
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"] == "value_0"
+        assert result[1]["field_a"] == "value_1"
+
+    def test_update_custom_meta_with_none(self):
+        """Test update_custom_meta with None does nothing."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # Set initial value
+        batch.update_custom_meta({0: {"field_a": "value"}})
+
+        # Update with None should not change anything
+        batch.update_custom_meta(None)
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"] == "value"
+
+    def test_update_custom_meta_with_empty_dict(self):
+        """Test update_custom_meta with empty dict does nothing."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # Set initial value
+        batch.update_custom_meta({0: {"field_a": "value"}})
+
+        # Update with empty dict should not change anything
+        batch.update_custom_meta({})
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"] == "value"
+
+    def test_custom_meta_with_complex_values(self):
+        """Test custom meta can store complex values like dicts, lists, tensors."""
+        fields = {
+            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
+        }
+        samples = [
+            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
+        ]
+        batch = BatchMeta(samples=samples)
+
+        # Store complex values
+        custom_meta = {
+            0: {
+                "field_a": {
+                    "nested_dict": {"key": "value"},
+                    "list": [1, 2, 3],
+                    "number": 42,
+                }
+            }
+        }
+        batch.update_custom_meta(custom_meta)
+
+        result = batch.get_all_custom_meta()
+        assert result[0]["field_a"]["nested_dict"]["key"] == "value"
+        assert result[0]["field_a"]["list"] == [1, 2, 3]
+        assert result[0]["field_a"]["number"] == 42

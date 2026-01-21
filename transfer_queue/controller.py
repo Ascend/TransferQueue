@@ -327,7 +327,7 @@ class DataPartitionStatus:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]],
+        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -383,19 +383,21 @@ class DataPartitionStatus:
     def _update_field_metadata(
         self,
         global_indices: list[int],
-        dtypes: dict[int, dict[str, Any]],
-        shapes: dict[int, dict[str, Any]],
+        dtypes: Optional[dict[int, dict[str, Any]]],
+        shapes: Optional[dict[int, dict[str, Any]]],
         custom_meta: Optional[dict[int, dict[str, Any]]],
     ):
         """Update field dtype and shape metadata."""
-        if not global_indices:
+        if not global_indices or not dtypes or not shapes:
             return
 
-        assert len(global_indices) == len(dtypes), "`global_indices` and `dtypes` length mismatch."
-        assert len(global_indices) == len(shapes), "`global_indices` and `shapes` length mismatch."
+        if len(global_indices) != len(dtypes):
+            raise ValueError(f"`global_indices` {len(global_indices)} and `dtypes` {len(dtypes)} length mismatch.")
+        if len(global_indices) != len(shapes):
+            raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
 
-        dtype_value = itemgetter(*global_indices)(dtypes) if dtypes else None
-        shape_value = itemgetter(*global_indices)(shapes) if shapes else None
+        dtype_value = itemgetter(*global_indices)(dtypes)
+        shape_value = itemgetter(*global_indices)(shapes)
 
         if not isinstance(dtype_value, tuple):
             dtype_value = (dtype_value,)
@@ -408,16 +410,13 @@ class DataPartitionStatus:
             if global_idx not in self.field_shapes:
                 self.field_shapes[global_idx] = {}
 
-            if dtype_value is not None:
-                self.field_dtypes[global_idx].update(dtype_value[i])
-            if shape_value is not None:
-                self.field_shapes[global_idx].update(shape_value[i])
+            self.field_dtypes[global_idx].update(dtype_value[i])
+            self.field_shapes[global_idx].update(shape_value[i])
 
         if custom_meta:
             if len(global_indices) != len(custom_meta):
                 raise ValueError(
-                    f"Length of global_indices ({len(global_indices)}) does not match "
-                    f"length of custom_meta ({len(custom_meta)})"
+                    f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_meta)} length mismatch."
                 )
             custom_meta_value = itemgetter(*global_indices)(custom_meta) if custom_meta else None
             if not isinstance(custom_meta_value, tuple):
@@ -425,8 +424,7 @@ class DataPartitionStatus:
             for i, global_idx in enumerate(global_indices):
                 if global_idx not in self.field_custom_metas:
                     self.field_custom_metas[global_idx] = {}
-                if custom_meta_value is not None:
-                    self.field_custom_metas[global_idx].update(custom_meta_value[i])
+                self.field_custom_metas[global_idx].update(custom_meta_value[i])
 
     # ==================== Consumption Status Interface ====================
 
@@ -659,9 +657,10 @@ class DataPartitionStatus:
                     consumption_tensor[indexes_to_release] = 0
 
             self.global_indexes.difference_update(indexes_to_release)
-            self.field_dtypes.difference_update(indexes_to_release)
-            self.field_shapes.difference_update(indexes_to_release)
-            self.field_custom_metas.difference_update(indexes_to_release)
+            for idx in indexes_to_release:
+                self.field_dtypes.pop(idx, None)
+                self.field_shapes.pop(idx, None)
+                self.field_custom_metas.pop(idx, None)
 
         except Exception as e:
             logger.error(
@@ -823,7 +822,7 @@ class TransferQueueController:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]],
+        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.

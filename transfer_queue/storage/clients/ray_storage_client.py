@@ -1,5 +1,5 @@
 import itertools
-from typing import Any
+from typing import Any, Optional
 
 import ray
 import torch
@@ -38,7 +38,7 @@ class RayStorageClient(TransferQueueStorageKVClient):
         except ValueError:
             self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """
         Store tensors to remote storage.
         Args:
@@ -59,13 +59,14 @@ class RayStorageClient(TransferQueueStorageKVClient):
         )
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """
         Retrieve objects from remote storage.
         Args:
             keys (list): List of string keys to fetch.
             shapes (list, optional): Ignored. For compatibility with KVStorageManager.
             dtypes (list, optional): Ignored. For compatibility with KVStorageManager.
+            custom_meta (list, optional): Ray object ref for each key
         Returns:
             list: List of retrieved objects
         """

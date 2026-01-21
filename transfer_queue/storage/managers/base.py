@@ -421,12 +421,15 @@ class KVStorageManager(TransferQueueStorageManager):
         """
         shapes = []
         dtypes = []
+        custom_meta_list = []
+        all_custom_meta = metadata.get_all_custom_meta()
         for field_name in sorted(metadata.field_names):
             for index in range(len(metadata)):
                 field = metadata.samples[index].get_field_by_name(field_name)
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
-        custom_meta_list = metadata.get_custom_meta_list()
+                global_index = metadata.global_indexes[index]
+                custom_meta_list.append(all_custom_meta.get(global_index, {}).get(field_name, None))
         return shapes, dtypes, custom_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
@@ -477,13 +480,13 @@ class KVStorageManager(TransferQueueStorageManager):
                 raise ValueError(f"Length of custom_meta ({len(custom_meta)}) does not match expected ({len(keys)})")
             # custom meta is a flat list aligned with keys/values
             # Use itertools.product to eliminate nested loops
-            for (global_idx, field_name), meta_value in zip(
-                itertools.product(metadata.global_indexes, metadata.field_names),
+            for global_idx in metadata.global_indexes:
+                per_field_custom_meta[global_idx] = {}
+            for (field_name, global_idx), meta_value in zip(
+                itertools.product(sorted(metadata.field_names), metadata.global_indexes),
                 custom_meta,
                 strict=False,
             ):
-                if global_idx not in per_field_custom_meta:
-                    per_field_custom_meta[global_idx] = {}
                 per_field_custom_meta[global_idx][field_name] = meta_value
             metadata.update_custom_meta(per_field_custom_meta)
 
