@@ -1,7 +1,7 @@
 import logging
 import os
 import pickle
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -53,7 +53,7 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
-    def put(self, keys: list[str], values: list[Any]):
+    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         if not isinstance(keys, list) or not isinstance(values, list):
             raise ValueError("keys and values must be lists")
         if len(keys) != len(values):
@@ -82,6 +82,8 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
         if non_tensor_keys:
             self._batch_put_bytes(non_tensor_keys, non_tensor_values)
 
+        return None
+
     def _batch_put_tensors(self, keys: list[str], tensors: list[Tensor]):
         for i in range(0, len(keys), BATCH_SIZE_LIMIT):
             batch_keys = keys[i : i + BATCH_SIZE_LIMIT]
@@ -104,7 +106,7 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
             if ret != 0:
                 raise RuntimeError(f"put_batch failed with error code: {ret}")
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         if shapes is None or dtypes is None:
             raise ValueError("MooncakeStorageClient needs shapes and dtypes")
         if not (len(keys) == len(shapes) == len(dtypes)):

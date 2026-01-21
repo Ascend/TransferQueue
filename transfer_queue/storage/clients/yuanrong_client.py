@@ -16,7 +16,7 @@
 import logging
 import os
 import pickle
-from typing import Any
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -177,7 +177,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             raise ValueError("Number of keys must match number of values")
         self._batch_put(keys, values)
 
-    def _batch_get(self, keys: list[str], shapes: list, dtypes: list) -> list[Any]:
+    def _batch_get(self, keys: list[str], shapes: list, dtypes: list) -> Optional[list[Any]]:
         """Retrieves a batch of values from remote storage using expected metadata.
 
         NPU tensors are fetched via DsTensorClient using pre-allocated buffers.
@@ -262,7 +262,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     idx += 1
             return results
 
-    def get(self, keys: list[str], shapes=None, dtypes=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
