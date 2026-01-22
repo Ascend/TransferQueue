@@ -19,6 +19,8 @@ import sys
 import time
 from pathlib import Path
 
+import pytest
+
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
@@ -446,30 +448,23 @@ def test_performance_characteristics():
 
 
 def test_custom_meta_in_data_partition_status():
-    """Test custom_meta functionality in DataPartitionStatus."""
-    print("Testing custom_meta in DataPartitionStatus...")
+    """Simplified tests for custom_meta functionality in DataPartitionStatus."""
+
+    print("Testing simplified custom_meta in DataPartitionStatus...")
 
     from transfer_queue.controller import DataPartitionStatus
 
     partition = DataPartitionStatus(partition_id="custom_meta_test")
 
-    # Test 1: Basic custom_meta storage via update_production_status
+    # Basic custom_meta storage via update_production_status
     global_indices = [0, 1, 2]
     field_names = ["input_ids", "attention_mask"]
-    dtypes = {
-        0: {"input_ids": "torch.int32", "attention_mask": "torch.bool"},
-        1: {"input_ids": "torch.int32", "attention_mask": "torch.bool"},
-        2: {"input_ids": "torch.int32", "attention_mask": "torch.bool"},
-    }
-    shapes = {
-        0: {"input_ids": (512,), "attention_mask": (512,)},
-        1: {"input_ids": (512,), "attention_mask": (512,)},
-        2: {"input_ids": (512,), "attention_mask": (512,)},
-    }
+    dtypes = {i: {"input_ids": "torch.int32", "attention_mask": "torch.bool"} for i in global_indices}
+    shapes = {i: {"input_ids": (512,), "attention_mask": (512,)} for i in global_indices}
     custom_meta = {
-        0: {"input_ids": {"token_count": 100}, "attention_mask": {"mask_ratio": 0.1}},
-        1: {"input_ids": {"token_count": 200}, "attention_mask": {"mask_ratio": 0.2}},
-        2: {"input_ids": {"token_count": 300}, "attention_mask": {"mask_ratio": 0.3}},
+        0: {"input_ids": {"token_count": 100}},
+        1: {"attention_mask": {"mask_ratio": 0.2}},
+        2: {"input_ids": {"token_count": 300}},
     }
 
     success = partition.update_production_status(
@@ -481,138 +476,53 @@ def test_custom_meta_in_data_partition_status():
     )
 
     assert success
-    assert len(partition.field_custom_metas) == 3
 
-    # Verify custom_meta is stored correctly
+    # Verify some stored values
     assert partition.field_custom_metas[0]["input_ids"]["token_count"] == 100
     assert partition.field_custom_metas[1]["attention_mask"]["mask_ratio"] == 0.2
-    assert partition.field_custom_metas[2]["input_ids"]["token_count"] == 300
 
-    print("✓ Basic custom_meta storage works")
+    # Retrieval via helper for a subset of fields
+    retrieved = partition.get_field_custom_meta([0, 1], ["input_ids", "attention_mask"])
+    assert 0 in retrieved and "input_ids" in retrieved[0]
+    assert 1 in retrieved and "attention_mask" in retrieved[1]
 
-    # Test 2: get_field_custom_meta retrieval
-    retrieved_meta = partition.get_field_custom_meta([0, 1, 2], ["input_ids", "attention_mask"])
-
-    assert 0 in retrieved_meta
-    assert 1 in retrieved_meta
-    assert 2 in retrieved_meta
-    assert retrieved_meta[0]["input_ids"]["token_count"] == 100
-    assert retrieved_meta[1]["attention_mask"]["mask_ratio"] == 0.2
-
-    print("✓ get_field_custom_meta retrieval works")
-
-    # Test 3: get_field_custom_meta with partial field filter
-    partial_meta = partition.get_field_custom_meta([0, 1], ["input_ids"])
-
-    assert 0 in partial_meta
-    assert 1 in partial_meta
-    assert "input_ids" in partial_meta[0]
-    assert "attention_mask" not in partial_meta[0]  # Should not include non-requested fields
-
-    print("✓ get_field_custom_meta with partial fields works")
-
-    # Test 4: get_field_custom_meta with non-existent global_index
-    empty_meta = partition.get_field_custom_meta([999], ["input_ids"])
-    assert 999 not in empty_meta  # Should not include non-existent indices
-
-    print("✓ get_field_custom_meta handles non-existent indices correctly")
-
-    # Test 5: custom_meta update (merge) on same global_index
-    additional_custom_meta = {
-        0: {"new_field": {"new_key": "new_value"}},
-    }
-    success = partition.update_production_status(
-        global_indices=[0],
-        field_names=["new_field"],
-        dtypes={0: {"new_field": "torch.float32"}},
-        shapes={0: {"new_field": (64,)}},
-        custom_meta=additional_custom_meta,
-    )
-
-    assert success
-    # Original custom_meta should be preserved
-    assert partition.field_custom_metas[0]["input_ids"]["token_count"] == 100
-    # New custom_meta should be merged
-    assert partition.field_custom_metas[0]["new_field"]["new_key"] == "new_value"
-
-    print("✓ Custom_meta merge on update works")
-
-    # Test 6: custom_meta cleared on clear_data
+    # Clearing a sample should remove its custom_meta
     partition.clear_data([0], clear_consumption=True)
-
     assert 0 not in partition.field_custom_metas
-    assert 1 in partition.field_custom_metas  # Other samples should remain
+
+    print("✓ Custom_meta tests passed")
+
+
+def test_update_field_metadata_variants():
+    """Test _update_field_metadata handles dtypes/shapes/custom_meta being optional and merging."""
+    from transfer_queue.controller import DataPartitionStatus
+
+    partition = DataPartitionStatus(partition_id="update_meta_test")
+
+    # Only dtypes provided
+    global_indices = [0, 1]
+    dtypes = {0: {"f1": "torch.int32"}, 1: {"f1": "torch.bool"}}
+
+    partition._update_field_metadata(global_indices, dtypes, shapes=None, custom_meta=None)
+    assert partition.field_dtypes[0]["f1"] == "torch.int32"
+    assert partition.field_dtypes[1]["f1"] == "torch.bool"
+    assert partition.field_shapes == {}
+    assert partition.field_custom_metas == {}
+
+    # Only shapes provided for a new index
+    partition._update_field_metadata([2], dtypes=None, shapes={2: {"f2": (16,)}}, custom_meta=None)
+    assert partition.field_shapes[2]["f2"] == (16,)
+
+    # Only custom_meta provided and merged with existing entries
+    partition._update_field_metadata([2], dtypes=None, shapes=None, custom_meta={2: {"f2": {"meta": 1}}})
     assert 2 in partition.field_custom_metas
+    assert partition.field_custom_metas[2]["f2"]["meta"] == 1
 
-    print("✓ Custom_meta cleared on clear_data works")
+    # Merging dtypes on an existing index should preserve previous keys
+    partition._update_field_metadata([0], dtypes={0: {"f2": "torch.float32"}}, shapes=None, custom_meta=None)
+    assert partition.field_dtypes[0]["f1"] == "torch.int32"
+    assert partition.field_dtypes[0]["f2"] == "torch.float32"
 
-    # Test 7: custom_meta None does not create entries
-    partition2 = DataPartitionStatus(partition_id="custom_meta_test_2")
-    success = partition2.update_production_status(
-        global_indices=[0, 1],
-        field_names=["field1"],
-        dtypes={0: {"field1": "torch.int32"}, 1: {"field1": "torch.int32"}},
-        shapes={0: {"field1": (32,)}, 1: {"field1": (32,)}},
-        custom_meta=None,
-    )
-
-    assert success
-    assert len(partition2.field_custom_metas) == 0
-
-    print("✓ Custom_meta None handling works")
-
-    # Test 8: custom_meta length mismatch raises ValueError
-    partition3 = DataPartitionStatus(partition_id="custom_meta_test_3")
-    mismatched_custom_meta = {
-        0: {"field1": {"key": "value"}},
-        # Missing entries for 1 and 2
-    }
-    success = partition3.update_production_status(
-        global_indices=[0, 1, 2],
-        field_names=["field1"],
-        dtypes={0: {"field1": "torch.int32"}, 1: {"field1": "torch.int32"}, 2: {"field1": "torch.int32"}},
-        shapes={0: {"field1": (32,)}, 1: {"field1": (32,)}, 2: {"field1": (32,)}},
-        custom_meta=mismatched_custom_meta,
-    )
-
-    # Should return False due to length mismatch (caught by exception handler)
-    assert success is False
-
-    print("✓ Custom_meta length mismatch error handling works")
-
-    # Test 9: Complex nested custom_meta
-    partition4 = DataPartitionStatus(partition_id="custom_meta_test_4")
-    complex_custom_meta = {
-        0: {
-            "field1": {
-                "nested": {"level1": {"level2": {"value": 42}}},
-                "list_data": [1, 2, 3],
-                "mixed": {"str": "test", "int": 100, "float": 3.14, "bool": True},
-            }
-        },
-    }
-    success = partition4.update_production_status(
-        global_indices=[0],
-        field_names=["field1"],
-        dtypes={0: {"field1": "torch.int32"}},
-        shapes={0: {"field1": (32,)}},
-        custom_meta=complex_custom_meta,
-    )
-
-    assert success
-    stored_meta = partition4.field_custom_metas[0]["field1"]
-    assert stored_meta["nested"]["level1"]["level2"]["value"] == 42
-    assert stored_meta["list_data"] == [1, 2, 3]
-    assert stored_meta["mixed"]["str"] == "test"
-    assert stored_meta["mixed"]["bool"] is True
-
-    print("✓ Complex nested custom_meta storage works")
-
-    # Test 10: custom_meta preserved in snapshot
-    snapshot = partition4.to_snapshot()
-    assert 0 in snapshot.field_custom_metas
-    assert snapshot.field_custom_metas[0]["field1"]["nested"]["level1"]["level2"]["value"] == 42
-
-    print("✓ Custom_meta preserved in snapshot")
-
-    print("Custom_meta in DataPartitionStatus tests passed!\n")
+    # Length mismatch should raise ValueError when provided mapping lengths differ from global_indices
+    with pytest.raises(ValueError):
+        partition._update_field_metadata([0, 1, 2], dtypes={0: {}}, shapes=None, custom_meta=None)

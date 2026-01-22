@@ -125,6 +125,7 @@ class SampleMeta:
         selected_fields = {name: self.fields[name] for name in field_names if name in self.fields}
 
         # construct new SampleMeta instance
+        # TODO(tianyi): move custom_meta to FieldMeta level
         selected_sample_meta = SampleMeta(
             fields=selected_fields,
             partition_id=self.partition_id,

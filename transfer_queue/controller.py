@@ -388,42 +388,56 @@ class DataPartitionStatus:
         custom_meta: Optional[dict[int, dict[str, Any]]],
     ):
         """Update field dtype and shape metadata."""
-        if not global_indices or not dtypes or not shapes:
+        if not global_indices:
             return
 
-        if len(global_indices) != len(dtypes):
+        # Validate lengths only for provided mappings
+        if dtypes and len(global_indices) != len(dtypes):
             raise ValueError(f"`global_indices` {len(global_indices)} and `dtypes` {len(dtypes)} length mismatch.")
-        if len(global_indices) != len(shapes):
+        if shapes and len(global_indices) != len(shapes):
             raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
+        if custom_meta and len(global_indices) != len(custom_meta):
+            raise ValueError(
+                f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_meta)} length mismatch."
+            )
 
-        dtype_value = itemgetter(*global_indices)(dtypes)
-        shape_value = itemgetter(*global_indices)(shapes)
+        # Extract values for each provided mapping; if a mapping is absent, use Nones
+        if dtypes:
+            dtype_value = itemgetter(*global_indices)(dtypes)
+            if not isinstance(dtype_value, tuple):
+                dtype_value = (dtype_value,)
+        else:
+            dtype_value = tuple([None] * len(global_indices))
 
-        if not isinstance(dtype_value, tuple):
-            dtype_value = (dtype_value,)
-        if not isinstance(shape_value, tuple):
-            shape_value = (shape_value,)
-
-        for i, global_idx in enumerate(global_indices):
-            if global_idx not in self.field_dtypes:
-                self.field_dtypes[global_idx] = {}
-            if global_idx not in self.field_shapes:
-                self.field_shapes[global_idx] = {}
-
-            if dtype_value[i] is not None:
-                self.field_dtypes[global_idx].update(dtype_value[i])
-            if shape_value[i] is not None:
-                self.field_shapes[global_idx].update(shape_value[i])
+        if shapes:
+            shape_value = itemgetter(*global_indices)(shapes)
+            if not isinstance(shape_value, tuple):
+                shape_value = (shape_value,)
+        else:
+            shape_value = tuple([None] * len(global_indices))
 
         if custom_meta:
-            if len(global_indices) != len(custom_meta):
-                raise ValueError(
-                    f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_meta)} length mismatch."
-                )
-            custom_meta_value = itemgetter(*global_indices)(custom_meta) if custom_meta else None
+            custom_meta_value = itemgetter(*global_indices)(custom_meta)
             if not isinstance(custom_meta_value, tuple):
                 custom_meta_value = (custom_meta_value,)
-            for i, global_idx in enumerate(global_indices):
+        else:
+            custom_meta_value = tuple([None] * len(global_indices))
+
+        for i, global_idx in enumerate(global_indices):
+            # Only create and update dtype mapping if a dtype value was provided
+            if dtype_value[i] is not None:
+                if global_idx not in self.field_dtypes:
+                    self.field_dtypes[global_idx] = {}
+                self.field_dtypes[global_idx].update(dtype_value[i])
+
+            # Only create and update shape mapping if a shape value was provided
+            if shape_value[i] is not None:
+                if global_idx not in self.field_shapes:
+                    self.field_shapes[global_idx] = {}
+                self.field_shapes[global_idx].update(shape_value[i])
+
+            # Only create and update custom_meta mapping if a custom_meta value was provided
+            if custom_meta_value[i] is not None:
                 if global_idx not in self.field_custom_metas:
                     self.field_custom_metas[global_idx] = {}
                 self.field_custom_metas[global_idx].update(custom_meta_value[i])
