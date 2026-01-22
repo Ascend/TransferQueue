@@ -193,11 +193,7 @@ class BatchMeta:
             for idx, sample in enumerate(self.samples):
                 object.__setattr__(sample, "_batch_index", idx)  # Ensure batch_index is set correctly
 
-            object.__setattr__(
-                self,
-                "_global_indexes",
-                [sample.global_index for sample in self.samples],
-            )
+            object.__setattr__(self, "_global_indexes", [sample.global_index for sample in self.samples])
 
             # check if all samples have the same field names
             first_sample_field_names = sorted(self.samples[0].field_names)
@@ -547,9 +543,7 @@ class BatchMeta:
 
     @classmethod
     def from_samples(
-        cls,
-        samples: SampleMeta | list[SampleMeta],
-        extra_info: Optional[dict[str, Any]] = None,
+        cls, samples: SampleMeta | list[SampleMeta], extra_info: Optional[dict[str, Any]] = None
     ) -> "BatchMeta":
         """
         Create a BatchMeta from a single SampleMeta or a list of SampleMeta objects.
