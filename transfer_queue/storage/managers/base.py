@@ -484,11 +484,10 @@ class KVStorageManager(TransferQueueStorageManager):
                 per_field_custom_meta[global_idx] = {}
 
             # TODO(tianyi): the order of custom meta is coupled with keys/values
-            # if _generate_keys or _generate_values changes, this will break
             for (field_name, global_idx), meta_value in zip(
                 itertools.product(sorted(metadata.field_names), metadata.global_indexes),
                 custom_meta,
-                strict=False,
+                strict=True,
             ):
                 per_field_custom_meta[global_idx][field_name] = meta_value
             metadata.update_custom_meta(per_field_custom_meta)
