@@ -577,8 +577,8 @@ class DataPartitionStatus:
         """Get shape for a specific sample and field."""
         return self.field_shapes.get(global_index, {}).get(field_name)
 
-    def get_field_custom_meta(self, global_indices: list[int], field_names: list[str]) -> Optional[Any]:
-        """Get custom_meta for a specific sample and field."""
+    def get_field_custom_meta(self, global_indices: list[int], field_names: list[str]) -> dict[int, dict[str, Any]]:
+        """Get custom_meta for multiple samples and fields."""
         return {
             idx: {f: v for f, v in self.field_custom_metas[idx].items() if f in field_names}
             for idx in global_indices
