@@ -41,17 +41,17 @@ class TransferQueueStorageKVClient(ABC):
         Retrieve values from the storage backend by key.
         Args:
             keys (list[str]): List of keys whose values should be retrieved.
-            shapes: Optional shape information for the expected tensors. The
+            shapes: Optional shape information for the expected values. The
                 structure and interpretation of this argument are determined
                 by the concrete storage backend implementation.
-            dtypes: Optional data type information for the expected tensors.
+            dtypes: Optional data type information for the expected values.
                 The structure and interpretation of this argument are
                 determined by the concrete storage backend implementation.
             custom_meta: Optional backend-specific metadata used to control
                 or optimize the retrieval process. Its format is defined by
                 the concrete storage backend implementation.
         Returns:
-            list[Tensor]: List of tensors retrieved from the storage backend,
+            list[Any]: List of values retrieved from the storage backend,
             in the same order as the provided keys.
         """
         raise NotImplementedError("Subclasses must implement get")

@@ -410,8 +410,10 @@ class DataPartitionStatus:
             if global_idx not in self.field_shapes:
                 self.field_shapes[global_idx] = {}
 
-            self.field_dtypes[global_idx].update(dtype_value[i])
-            self.field_shapes[global_idx].update(shape_value[i])
+            if dtype_value[i] is not None:
+                self.field_dtypes[global_idx].update(dtype_value[i])
+            if shape_value[i] is not None:
+                self.field_shapes[global_idx].update(shape_value[i])
 
         if custom_meta:
             if len(global_indices) != len(custom_meta):
@@ -425,21 +427,6 @@ class DataPartitionStatus:
                 if global_idx not in self.field_custom_metas:
                     self.field_custom_metas[global_idx] = {}
                 self.field_custom_metas[global_idx].update(custom_meta_value[i])
-
-        if custom_meta:
-            if len(global_indices) != len(custom_meta):
-                raise ValueError(
-                    f"Length of global_indices ({len(global_indices)}) does not match "
-                    f"length of custom_meta ({len(custom_meta)})"
-                )
-            custom_meta_value = itemgetter(*global_indices)(custom_meta) if custom_meta else None
-            if not isinstance(custom_meta_value, tuple):
-                custom_meta_value = (custom_meta_value,)
-            for i, global_idx in enumerate(global_indices):
-                if global_idx not in self.field_custom_metas:
-                    self.field_custom_metas[global_idx] = {}
-                if custom_meta_value is not None:
-                    self.field_custom_metas[global_idx].update(custom_meta_value[i])
 
     # ==================== Consumption Status Interface ====================
 

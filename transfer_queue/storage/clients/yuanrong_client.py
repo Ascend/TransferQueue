@@ -178,7 +178,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         self._batch_put(keys, values)
         return None
 
-    def _batch_get(self, keys: list[str], shapes: list, dtypes: list) -> Optional[list[Any]]:
+    def _batch_get(self, keys: list[str], shapes: list, dtypes: list) -> list[Any]:
         """Retrieves a batch of values from remote storage using expected metadata.
 
         NPU tensors are fetched via DsTensorClient using pre-allocated buffers.

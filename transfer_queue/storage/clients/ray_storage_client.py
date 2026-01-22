@@ -58,6 +58,7 @@ class RayStorageClient(TransferQueueStorageKVClient):
             )
         )
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
+        return None
 
     def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """
