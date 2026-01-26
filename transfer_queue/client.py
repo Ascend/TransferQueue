@@ -809,7 +809,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             controller_info,
         )
 
-        # create new event loop in a separated thread
+        # create new event loop in a separate thread
         self._loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self._start_loop, daemon=True)
         self._thread.start()
@@ -1005,6 +1005,24 @@ class TransferQueueClient(AsyncTransferQueueClient):
             list[str]: List of partition ids managed by the controller
         """
         return self._get_partition_list()
+
+    def close(self) -> None:
+        """Close the client and cleanup resources including event loop and thread."""
+
+        if hasattr(self, "_loop") and self._loop is not None:
+            self._loop.call_soon_threadsafe(self._loop.stop)
+
+            if hasattr(self, "_thread") and self._thread is not None:
+                self._thread.join(timeout=5.0)
+                if self._thread.is_alive():
+                    logger.warning(f"[{self.client_id}]: Background thread did not stop within timeout")
+
+            try:
+                self._loop.close()
+            except Exception as e:
+                logger.warning(f"[{self.client_id}]: Error closing event loop: {e}")
+
+        super().close()
 
 
 def process_zmq_server_info(
