@@ -837,6 +837,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
             return wrapper
 
+        # Bind internal sync wrappers. Public methods are defined explicitly below
+        # to ensure proper type hints and documentation.
         self._put = _make_sync(self.async_put)
         self._get_meta = _make_sync(self.async_get_meta)
         self._get_data = _make_sync(self.async_get_data)
@@ -1003,11 +1005,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
             list[str]: List of partition ids managed by the controller
         """
         return self._get_partition_list()
-
-    def close(self):
-        """Close the client and cleanup resources including the executor."""
-        if hasattr(self, "_executor"):
-            self._executor.shutdown(wait=True)
 
 
 def process_zmq_server_info(
