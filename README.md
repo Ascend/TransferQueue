@@ -153,7 +153,7 @@ pip install TransferQueue
 Follow these steps to build and install:
 1. Clone the source code from the GitHub repository
    ```bash
-   git clone https://github.com/TransferQueue/TransferQueue/
+   git clone https://github.com/Ascend/TransferQueue/
    cd TransferQueue
    ```
 
