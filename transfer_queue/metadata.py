@@ -265,7 +265,7 @@ class BatchMeta:
         """Get the entire custom meta dictionary"""
         return copy.deepcopy(self._custom_meta)
 
-    def update_custom_meta(self, new_custom_meta: dict[int, dict[str, Any]] = None):
+    def update_custom_meta(self, new_custom_meta: Optional[dict[int, dict[str, Any]]]):
         """Update custom meta with a new dictionary"""
         if new_custom_meta:
             self._custom_meta.update(new_custom_meta)

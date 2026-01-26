@@ -188,7 +188,7 @@ class PartitionIndexManager:
         if not partition_indexes:
             self.partition_to_indexes.pop(partition_id, None)
 
-    def get_indexes_for_partition(self, partition_id) -> set[int]:
+    def get_indexes_for_partition(self, partition_id) -> list[int]:
         """
         Get all global_indexes for the specified partition.
 
@@ -196,9 +196,9 @@ class PartitionIndexManager:
             partition_id: Partition ID
 
         Returns:
-            set: Set of global_indexes for this partition
+            list: List of global_indexes for this partition
         """
-        return self.partition_to_indexes.get(partition_id, set()).copy()
+        return list(self.partition_to_indexes.get(partition_id, set()).copy())
 
 
 @dataclass
@@ -216,7 +216,7 @@ class DataPartitionStatus:
 
     # Production status tensor - dynamically expandable
     # Values: 0 = not produced, 1 = ready for consumption
-    production_status: Optional[Tensor] = torch.zeros(TQ_INIT_SAMPLE_NUM, TQ_INIT_FIELD_NUM, dtype=torch.int8)
+    production_status: Tensor = torch.zeros(TQ_INIT_SAMPLE_NUM, TQ_INIT_FIELD_NUM, dtype=torch.int8)
 
     # Consumption status per task - task_name -> consumption_tensor
     # Each tensor tracks which samples have been consumed by that task
@@ -260,7 +260,7 @@ class DataPartitionStatus:
 
     # ==================== Dynamic Expansion Methods ====================
 
-    def ensure_samples_capacity(self, required_samples: int) -> bool:
+    def ensure_samples_capacity(self, required_samples: int):
         """
         Ensure the production status tensor has enough rows for the required samples.
         Dynamically expands if needed using unified minimum expansion size.
@@ -498,7 +498,9 @@ class DataPartitionStatus:
         return partition_global_index, consumption_status
 
     # ==================== Production Status Interface ====================
-    def get_production_status_for_fields(self, field_names: list[str], mask: bool = False) -> tuple[Tensor, Tensor]:
+    def get_production_status_for_fields(
+        self, field_names: list[str], mask: bool = False
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
         """
         Check if all samples for specified fields are fully produced and ready.
 
@@ -512,12 +514,12 @@ class DataPartitionStatus:
             - Production status tensor for the specified task. 1 for ready, 0 for not ready.
         """
         if self.production_status is None or field_names is None or len(field_names) == 0:
-            return False
+            return None, None
 
         # Check if all requested fields are registered
         for field_name in field_names:
             if field_name not in self.field_name_mapping:
-                return False
+                return None, None
 
         # Create column mask for requested fields
         col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
@@ -837,7 +839,7 @@ class TransferQueueController:
 
     # ==================== Partition Index Management API ====================
 
-    def get_partition_index_range(self, partition: DataPartitionStatus) -> set:
+    def get_partition_index_range(self, partition: DataPartitionStatus) -> list[int]:
         """
         Get all indexes for a specific partition.
 
@@ -845,7 +847,7 @@ class TransferQueueController:
             partition: Partition identifier
 
         Returns:
-            Set of indexes allocated to the partition
+            List of indexes allocated to the partition
         """
         return self.index_manager.get_indexes_for_partition(partition)
 
@@ -979,6 +981,9 @@ class TransferQueueController:
         assert task_name is not None
         if mode == "fetch":
             # Find ready samples within current data partition and package into BatchMeta when reading
+
+            if batch_size is None:
+                raise ValueError("must provide batch_size in fetch mode")
 
             start_time = time.time()
             while True:

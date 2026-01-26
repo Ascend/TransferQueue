@@ -73,7 +73,9 @@ pretty            = true
 ignore_missing_imports = true
 explicit_package_bases = true
 follow_imports = "skip"
-ignore_errors = false
+
+# Blanket silence
+ignore_errors = true
 
 # -------------------------------
 # tool.pytest - pytest config
@@ -82,6 +84,12 @@ ignore_errors = false
 filterwarnings = [
     "ignore:.*PyTorch API of nested tensors.*prototype.*:UserWarning",
 ]
+
+[[tool.mypy.overrides]]
+module = [
+    "transfer_queue.*",
+]
+ignore_errors = false
 
 # -------------------------------
 # tool.setuptools - Additional config

@@ -60,7 +60,7 @@ class TransferQueueStorageManager(ABC):
     def __init__(self, config: dict[str, Any]):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
-        self.controller_info = config.get("controller_info", None)  # type: ZMQServerInfo
+        self.controller_info = config.get("controller_info")  # type: ZMQServerInfo
 
         self.data_status_update_socket = None
         self.controller_handshake_socket = None
