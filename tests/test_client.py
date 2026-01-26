@@ -679,3 +679,98 @@ async def test_async_clear_samples_with_empty_metadata(client_setup):
 
     # If no exception is raised, the test passes
     assert True
+
+
+@pytest.mark.asyncio
+async def test_sync_methods_work_in_async_event_loop(client_setup):
+    """Test all synchronous methods can be called from within an asyncio event loop.
+
+    This test verifies that the sync methods can be called directly from an async
+    function without causing "asyncio.run() cannot be called from a running loop" errors.
+    """
+    client, _, _ = client_setup
+
+    test_data = TensorDict({"tokens": torch.randint(0, 100, (3, 64))}, batch_size=3)
+
+    # Test sync put
+    metadata = client.put(data=test_data, partition_id="0")
+    assert metadata is not None
+
+    # Test sync get_meta - use fields that mock returns
+    metadata = client.get_meta(
+        data_fields=["log_probs", "variable_length_sequences", "prompt_text"], batch_size=2, partition_id="0"
+    )
+    assert metadata is not None
+    assert len(metadata.global_indexes) == 2
+
+    # Test sync get_data - verify we get the expected fields from mock
+    result = client.get_data(metadata)
+    assert result is not None
+    assert "log_probs" in result
+    assert "prompt_text" in result
+
+    # Test sync check_consumption_status
+    is_consumed = client.check_consumption_status(task_name="generate_sequences", partition_id="train_0")
+    assert isinstance(is_consumed, bool)
+
+    # Test sync get_consumption_status
+    global_index, consumption_status = client.get_consumption_status(
+        task_name="generate_sequences", partition_id="train_0"
+    )
+    assert global_index is not None
+    assert consumption_status is not None
+
+    # Test sync check_production_status
+    is_produced = client.check_production_status(data_fields=["log_probs", "prompt_text"], partition_id="train_0")
+    assert isinstance(is_produced, bool)
+
+    # Test sync get_production_status
+    global_index, production_status = client.get_production_status(
+        data_fields=["log_probs", "prompt_text"], partition_id="train_0"
+    )
+    assert global_index is not None
+    assert production_status is not None
+
+    # Test sync get_partition_list
+    partition_list = client.get_partition_list()
+    assert isinstance(partition_list, list)
+    assert len(partition_list) > 0
+
+    # Test sync clear_partition
+    client.clear_partition(partition_id="test_partition")
+
+    # Test sync clear_samples
+    metadata = client.get_meta(data_fields=["log_probs", "prompt_text"], batch_size=2, partition_id="0")
+    client.clear_samples(metadata=metadata)
+
+    print("✓ All sync methods work correctly when called from within asyncio event loop")
+
+
+@pytest.mark.asyncio
+async def test_sync_and_async_methods_mixed_usage(client_setup):
+    """Test mixing sync and async method calls within the same async context.
+
+    This test verifies that async methods and sync methods can be used interchangeably
+    without conflicts when called from an async function.
+    """
+    client, _, _ = client_setup
+
+    test_data = TensorDict({"tokens": torch.randint(0, 100, (2, 32))}, batch_size=2)
+
+    # Call sync method first
+    sync_put_result = client.put(data=test_data, partition_id="0")
+    assert sync_put_result is not None
+
+    # Call async method
+    async_metadata = await client.async_get_meta(data_fields=["tokens"], batch_size=2, partition_id="0")
+    assert async_metadata is not None
+
+    # Call sync method again
+    sync_get_meta_result = client.get_meta(data_fields=["tokens"], batch_size=2, partition_id="0")
+    assert sync_get_meta_result is not None
+
+    # Call async method
+    async_data = await client.async_get_data(sync_get_meta_result)
+    assert async_data is not None
+
+    print("✓ Mixed async and sync method calls work correctly")

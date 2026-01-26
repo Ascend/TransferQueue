@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
+import threading
 from functools import wraps
 from typing import Any, Callable, Optional, Union
 from uuid import uuid4
@@ -23,7 +25,6 @@ import ray
 import torch
 import zmq
 import zmq.asyncio
-from asgiref.sync import async_to_sync
 from tensordict import TensorDict
 from torch import Tensor
 
@@ -808,23 +809,44 @@ class TransferQueueClient(AsyncTransferQueueClient):
             controller_info,
         )
 
+        # create new event loop in a separated thread
+        self._loop = asyncio.new_event_loop()
+        self._thread = threading.Thread(target=self._start_loop, daemon=True)
+        self._thread.start()
+
+        # convert and bind sync methods
         self._bind_sync_methods()
+
+    def _start_loop(self):
+        """Start the synchronous loop."""
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
 
     def _bind_sync_methods(
         self,
     ):
         """Convert and bind synchronous methods."""
 
-        self._put = async_to_sync(self.async_put)
-        self._get_meta = async_to_sync(self.async_get_meta)
-        self._get_data = async_to_sync(self.async_get_data)
-        self._clear_partition = async_to_sync(self.async_clear_partition)
-        self._clear_samples = async_to_sync(self.async_clear_samples)
-        self._get_consumption_status = async_to_sync(self.async_get_consumption_status)
-        self._get_production_status = async_to_sync(self.async_get_production_status)
-        self._check_consumption_status = async_to_sync(self.async_check_consumption_status)
-        self._check_production_status = async_to_sync(self.async_check_production_status)
-        self._get_partition_list = async_to_sync(self.async_get_partition_list)
+        def _run(coro):
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            return future.result()
+
+        def _make_sync(async_method):
+            def wrapper(*args, **kwargs):
+                return _run(async_method(*args, **kwargs))
+
+            return wrapper
+
+        self._put = _make_sync(self.async_put)
+        self._get_meta = _make_sync(self.async_get_meta)
+        self._get_data = _make_sync(self.async_get_data)
+        self._clear_partition = _make_sync(self.async_clear_partition)
+        self._clear_samples = _make_sync(self.async_clear_samples)
+        self._get_consumption_status = _make_sync(self.async_get_consumption_status)
+        self._get_production_status = _make_sync(self.async_get_production_status)
+        self._check_consumption_status = _make_sync(self.async_check_consumption_status)
+        self._check_production_status = _make_sync(self.async_check_production_status)
+        self._get_partition_list = _make_sync(self.async_get_partition_list)
 
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
@@ -981,6 +1003,11 @@ class TransferQueueClient(AsyncTransferQueueClient):
             list[str]: List of partition ids managed by the controller
         """
         return self._get_partition_list()
+
+    def close(self):
+        """Close the client and cleanup resources including the executor."""
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=True)
 
 
 def process_zmq_server_info(
