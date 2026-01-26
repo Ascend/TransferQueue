@@ -185,6 +185,12 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         return tensors
 
     def mset_zcopy(self, keys: list[str], objs: list[Any]):
+        """Store multiple objects in zero-copy mode using parallel serialization and buffer packing.
+
+        Args:
+            keys (list[str]): List of string keys under which the objects will be stored.
+            objs (list[Any]): List of Python objects to store (e.g., tensors, strings).
+        """
         items_list = [[memoryview(b) for b in _encoder.encode(obj)] for obj in objs]
         packed_sizes = [calc_packed_size(items) for items in items_list]
         status, buffers = self._cpu_ds_client.mcreate(keys, packed_sizes)
@@ -194,6 +200,14 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         self._cpu_ds_client.mset_buffer(buffers)
 
     def mget_zcopy(self, keys: list[str]) -> list[Any]:
+        """Retrieve multiple objects in zero-copy mode by directly deserializing from shared memory buffers.
+
+        Args:
+            keys (list[str]): List of string keys to retrieve from storage.
+
+        Returns:
+            list[Any]: List of deserialized objects corresponding to the input keys.
+        """
         status, buffers = self._cpu_ds_client.get_buffers(keys, timeout_ms=500)
         return [_decoder.decode(unpack_from(buffer)) if buffer is not None else None for buffer in buffers]
 
