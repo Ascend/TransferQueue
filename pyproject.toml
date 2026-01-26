@@ -73,9 +73,7 @@ pretty            = true
 ignore_missing_imports = true
 explicit_package_bases = true
 follow_imports = "skip"
-
-# Blanket silence
-ignore_errors = true
+ignore_errors = false
 
 # -------------------------------
 # tool.pytest - pytest config
@@ -84,15 +82,6 @@ ignore_errors = true
 filterwarnings = [
     "ignore:.*PyTorch API of nested tensors.*prototype.*:UserWarning",
 ]
-
-[[tool.mypy.overrides]]
-module = [
-    "transfer_queue.data_system.*",
-    "transfer_queue.utils.utils.*",
-    "transfer_queue.utils.zmq_utils.*",
-    "transfer_queue.utils.serial_utils.*",
-]
-ignore_errors = false
 
 # -------------------------------
 # tool.setuptools - Additional config
@@ -108,10 +97,22 @@ version = {file = "transfer_queue/version/version"}
 dependencies = {file = "requirements.txt"}
 
 [project.optional-dependencies]
+
+build = [
+    "build"
+]
+
 test = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.20.0",
+    "flake8",
+    "pytest-mock",
 ]
+
+yuanrong = [
+    "openyuanrong-datasystem"
+]
+
 
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]
