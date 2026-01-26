@@ -57,7 +57,13 @@ def get_meta(data, global_indexes=None):
 @pytest.fixture
 def test_data():
     """Fixture providing test configuration, data, and metadata."""
-    cfg = {"client_name": "YuanrongStorageClient", "host": "127.0.0.1", "port": 31501, "device_id": 0}
+    cfg = {
+        "controller_info": MagicMock(),
+        "client_name": "YuanrongStorageClient",
+        "host": "127.0.0.1",
+        "port": 31501,
+        "device_id": 0,
+    }
     global_indexes = [8, 9, 10]
 
     data = TensorDict(
@@ -288,7 +294,7 @@ def test_put_data_with_custom_meta_from_storage_client(mock_notify, test_data_fo
     mock_storage_client.put.return_value = mock_custom_meta
 
     # Create manager with mocked dependencies
-    config = {"client_name": "MockClient"}
+    config = {"controller_info": MagicMock(), "client_name": "MockClient"}
     with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
         manager = KVStorageManager(config)
 
@@ -338,7 +344,7 @@ def test_put_data_without_custom_meta(mock_notify, test_data_for_put_data):
     mock_storage_client.put.return_value = None
 
     # Create manager with mocked dependencies
-    config = {"client_name": "MockClient"}
+    config = {"controller_info": MagicMock(), "client_name": "MockClient"}
     with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
         manager = KVStorageManager(config)
 
@@ -361,7 +367,7 @@ def test_put_data_custom_meta_length_mismatch_raises_error(test_data_for_put_dat
     mock_storage_client.put.return_value = [{"key": "1"}, {"key": "2"}, {"key": "3"}]
 
     # Create manager with mocked dependencies
-    config = {"client_name": "MockClient"}
+    config = {"controller_info": MagicMock(), "client_name": "MockClient"}
     with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
         manager = KVStorageManager(config)
 

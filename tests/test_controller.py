@@ -75,7 +75,7 @@ class TestTransferQueueController:
             ProductionStatus.NOT_PRODUCED
         )
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id))
-        assert partition_index_range == set(range(gbs * num_n_samples))
+        assert partition_index_range == list(range(gbs * num_n_samples))
 
         print("✓ Initial get metadata correct")
 
@@ -194,7 +194,7 @@ class TestTransferQueueController:
         ray.get(tq_controller.clear_partition.remote(partition_id))
         partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id))
-        assert partition_index_range == set()
+        assert partition_index_range == []
         assert partition is None
         print("✓ Clear partition correct")
 
@@ -307,7 +307,7 @@ class TestTransferQueueController:
             [int(sample.fields.get("attention_mask").production_status) for sample in val_metadata.samples]
         ) == int(ProductionStatus.NOT_PRODUCED)
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id_2))
-        assert partition_index_range == set(range(part1_index_range, part2_index_range + part1_index_range))
+        assert partition_index_range == list(range(part1_index_range, part2_index_range + part1_index_range))
 
         # Update production status
         dtypes = {k: {"prompt_ids": "torch.int64", "attention_mask": "torch.bool"} for k in val_metadata.global_indexes}
@@ -359,11 +359,11 @@ class TestTransferQueueController:
 
         assert not partition_index_range_1_after_clear
         assert partition_1_after_clear is None
-        assert partition_index_range_1_after_clear == set()
+        assert partition_index_range_1_after_clear == []
 
         partition_2 = ray.get(tq_controller.get_partition_snapshot.remote(partition_id_2))
         partition_index_range_2 = ray.get(tq_controller.get_partition_index_range.remote(partition_id_2))
-        assert partition_index_range_2 == set([32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47])
+        assert partition_index_range_2 == [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47]
         assert torch.all(
             partition_2.production_status[list(partition_index_range_2), : len(val_metadata.field_names)] == 1
         )
@@ -387,7 +387,7 @@ class TestTransferQueueController:
             [int(sample.fields.get("attention_mask").production_status) for sample in metadata_2.samples]
         ) == int(ProductionStatus.NOT_PRODUCED)
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id_3))
-        assert partition_index_range == set(list(range(32)) + list(range(48, 80)))
+        assert partition_index_range == list(range(32)) + list(range(48, 80))
         print("✓ Correctly assign partition_3")
 
     def test_controller_clear_meta(self, ray_setup):
