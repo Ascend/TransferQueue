@@ -33,7 +33,7 @@ class MockBuffer:
     def __init__(self, size):
         self.data = bytearray(size)
 
-    def mutable_data(self):
+    def MutableData(self):
         return self.data
 
 
@@ -69,15 +69,15 @@ class TestYuanrongStorageZCopy:
             except UnicodeDecodeError:
                 return data
 
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client.serialization", side_effect=mock_serialization)
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client.deserialization", side_effect=mock_deserialization)
+        mocker.patch("transfer_queue.storage.clients.yuanrong_client._encoder.encode", side_effect=mock_serialization)
+        mocker.patch("transfer_queue.storage.clients.yuanrong_client._decoder.decode", side_effect=mock_deserialization)
 
         stored_raw_buffers = []
 
         def side_effect_mcreate(keys, sizes):
             buffers = [MockBuffer(size) for size in sizes]
             for b in buffers:
-                stored_raw_buffers.append(b.mutable_data())
+                stored_raw_buffers.append(b.MutableData())
             return 0, buffers
 
         storage_client._cpu_ds_client.mcreate.side_effect = side_effect_mcreate
