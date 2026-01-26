@@ -43,8 +43,8 @@ class TestYuanrongStorageZCopy:
         mock_client = MagicMock()
         mock_client.init.return_value = None
 
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client.datasystem.KVClient", return_value=mock_client)
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client.datasystem.DsTensorClient")
+        mocker.patch("yr.datasystem.KVClient", return_value=mock_client)
+        mocker.patch("yr.datasystem.DsTensorClient")
         mocker.patch("transfer_queue.storage.clients.yuanrong_client.TORCH_NPU_IMPORTED", False)
 
         return mock_client
