@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 
 
@@ -23,7 +24,7 @@ class StorageClientFactory:
     """
 
     # Class variable: maps client names to their corresponding classes
-    _registry: dict[str, TransferQueueStorageKVClient] = {}
+    _registry: dict[str, type[TransferQueueStorageKVClient]] = {}
 
     @classmethod
     def register(cls, client_type: str):
@@ -35,7 +36,7 @@ class StorageClientFactory:
             Callable: The decorator function that returns the original class
         """
 
-        def decorator(client_class: TransferQueueStorageKVClient) -> TransferQueueStorageKVClient:
+        def decorator(client_class: type[TransferQueueStorageKVClient]) -> type[TransferQueueStorageKVClient]:
             cls._registry[client_type] = client_class
             return client_class
 

@@ -757,6 +757,7 @@ class AsyncTransferQueueClient:
         )
 
         try:
+            assert socket is not None
             await socket.send_multipart(request_msg.serialize())
             response_serialized = await socket.recv_multipart()
             response_msg = ZMQMessage.deserialize(response_serialized)
@@ -991,10 +992,10 @@ def process_zmq_server_info(
         >>> info_dict = process_zmq_server_info(handlers)"""
     # Handle single handler object case
     if not isinstance(handlers, dict):
-        return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[attr-defined]
+        return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
     else:
         # Handle dictionary case
         server_info = {}
         for name, handler in handlers.items():
-            server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[attr-defined]
+            server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
         return server_info

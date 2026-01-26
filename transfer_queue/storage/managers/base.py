@@ -20,7 +20,7 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import ray
@@ -60,12 +60,14 @@ class TransferQueueStorageManager(ABC):
     def __init__(self, config: dict[str, Any]):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
-        self.controller_info = config.get("controller_info")  # type: ZMQServerInfo
+        controller_info = config.get("controller_info")
+        assert controller_info is not None, "controller_info is required"
+        self.controller_info: ZMQServerInfo = controller_info
 
-        self.data_status_update_socket = None
-        self.controller_handshake_socket = None
+        self.data_status_update_socket: Optional[zmq.Socket[bytes]] = None
+        self.controller_handshake_socket: Optional[zmq.Socket[bytes]] = None
 
-        self.zmq_context = None
+        self.zmq_context: Optional[zmq.Context[Any]] = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -88,6 +90,7 @@ class TransferQueueStorageManager(ABC):
                 zmq.DEALER,
                 identity=f"{self.storage_manager_id}-data_status_update_socket-{uuid4().hex[:8]}".encode(),
             )
+            assert self.data_status_update_socket is not None
             self.data_status_update_socket.connect(self.controller_info.to_addr("data_status_update_socket"))
 
             # do handshake with controller
@@ -106,6 +109,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for handshake confirmation between controller and storage manager
         poller = zmq.Poller()
 
+        assert self.controller_handshake_socket is not None
         self.controller_handshake_socket.connect(self.controller_info.to_addr("handshake_socket"))
         logger.debug(
             f"[{self.storage_manager_id}]: Handshake connection from storage manager id #{self.storage_manager_id} "
@@ -170,6 +174,7 @@ class TransferQueueStorageManager(ABC):
 
     def _send_handshake_requests(self) -> None:
         """Send handshake request to controller."""
+        assert self.controller_handshake_socket is not None
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.HANDSHAKE,
             sender_id=self.storage_manager_id,
@@ -191,7 +196,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         dtypes: dict[int, dict[str, Any]],
         shapes: dict[int, dict[str, Any]],
-        custom_meta: dict[int, dict[str, Any]] = None,
+        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -213,6 +218,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for notifying data update information
         poller = zmq.Poller()
         # Note: data_status_update_socket is already connected during initialization
+        assert self.data_status_update_socket is not None
 
         try:
             poller.register(self.data_status_update_socket, zmq.POLLIN)
@@ -352,7 +358,7 @@ class KVStorageManager(TransferQueueStorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(config)
         self.storage_client = StorageClientFactory.create(client_name, config)
-        self._multi_threads_executor = None
+        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
         # Register a cleanup function: automatically invoke shutdown when the instance is garbage collected.
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
@@ -390,7 +396,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return [row_data for field in sorted(data.keys()) for row_data in data[field]]
 
     @staticmethod
-    def _shutdown_executor(thread_executor: ThreadPoolExecutor):
+    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
         """
         A static method to ensure no strong reference to 'self' is held within the
         finalizer's callback, enabling proper garbage collection.
@@ -421,6 +427,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 max_workers=self._num_threads, thread_name_prefix="KVStorageManager"
             )
 
+        assert self._multi_threads_executor is not None
         return self._multi_threads_executor
 
     def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Tensor]) -> TensorDict:
@@ -519,6 +526,7 @@ class KVStorageManager(TransferQueueStorageManager):
         for field_name in sorted(metadata.field_names):
             for index in range(len(metadata)):
                 field = metadata.samples[index].get_field_by_name(field_name)
+                assert field is not None, f"Field {field_name} not found in sample {index}"
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
                 global_index = metadata.global_indexes[index]
@@ -547,8 +555,8 @@ class KVStorageManager(TransferQueueStorageManager):
         loop = asyncio.get_event_loop()
         custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        per_field_dtypes = {}
-        per_field_shapes = {}
+        per_field_dtypes: dict[int, dict[str, Any]] = {}
+        per_field_shapes: dict[int, dict[str, Any]] = {}
 
         # Initialize the data structure for each global index
         for global_idx in metadata.global_indexes:
@@ -567,7 +575,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 )
 
         # Prepare per-field custom_meta if available
-        per_field_custom_meta = {}
+        per_field_custom_meta: dict[int, dict[str, Any]] = {}
         if custom_meta:
             if len(custom_meta) != len(keys):
                 raise ValueError(f"Length of custom_meta ({len(custom_meta)}) does not match expected ({len(keys)})")

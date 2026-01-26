@@ -57,7 +57,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         super().__init__(config)
 
         self.config = config
-        server_infos = config.get("storage_unit_infos", None)  # type: ZMQServerInfo | dict[str, ZMQServerInfo]
+        server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("storage_unit_infos", None)
 
         if server_infos is None:
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'storage_unit_infos' in config.")
@@ -198,8 +198,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         # Gather per-field dtype and shape information for each field
         # global_indexes, local_indexes, and field_data correspond one-to-one
-        per_field_dtypes = {}
-        per_field_shapes = {}
+        per_field_dtypes: dict[int, dict[str, Any]] = {}
+        per_field_shapes: dict[int, dict[str, Any]] = {}
 
         # Initialize the data structure for each global index
         for global_idx in metadata.global_indexes:
@@ -440,7 +440,7 @@ def _filter_storage_data(storage_meta_group: StorageMetaGroup, data: TensorDict)
     """
 
     # We use dict here instead of TensorDict to avoid unnecessary TensorDict overhead
-    results = {}
+    results: dict[str, Any] = {}
     batch_indexes = storage_meta_group.get_batch_indexes()
 
     if not batch_indexes:

@@ -24,6 +24,15 @@ class TransferQueueStorageKVClient(ABC):
     """
 
     @abstractmethod
+    def __init__(self, config: dict[str, Any]):
+        """
+        Initialize the storage client with configuration.
+        Args:
+            config (dict[str, Any]): Configuration dictionary for the storage client.
+        """
+        ...
+
+    @abstractmethod
     def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """
         Store key-value pairs in the storage backend.
