@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import asyncio
 import logging
 import os
 from functools import wraps
@@ -24,6 +23,7 @@ import ray
 import torch
 import zmq
 import zmq.asyncio
+from asgiref.sync import async_to_sync
 from tensordict import TensorDict
 from torch import Tensor
 
@@ -808,6 +808,24 @@ class TransferQueueClient(AsyncTransferQueueClient):
             controller_info,
         )
 
+        self._bind_sync_methods()
+
+    def _bind_sync_methods(
+        self,
+    ):
+        """Convert and bind synchronous methods."""
+
+        self._put = async_to_sync(self.async_put)
+        self._get_meta = async_to_sync(self.async_get_meta)
+        self._get_data = async_to_sync(self.async_get_data)
+        self._clear_partition = async_to_sync(self.async_clear_partition)
+        self._clear_samples = async_to_sync(self.async_clear_samples)
+        self._get_consumption_status = async_to_sync(self.async_get_consumption_status)
+        self._get_production_status = async_to_sync(self.async_get_production_status)
+        self._check_consumption_status = async_to_sync(self.async_check_consumption_status)
+        self._check_production_status = async_to_sync(self.async_check_production_status)
+        self._get_partition_list = async_to_sync(self.async_get_partition_list)
+
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
     ) -> BatchMeta:
@@ -822,7 +840,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
                        metadata; will be updated in a future version to reflect the post-put state)
         """
-        return asyncio.run(self.async_put(data, metadata, partition_id))
+        return self._put(data=data, metadata=metadata, partition_id=partition_id)
 
     def get_meta(
         self,
@@ -845,14 +863,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Returns:
             BatchMeta: Batch metadata containing data location information
         """
-        return asyncio.run(
-            self.async_get_meta(
-                data_fields=data_fields,
-                batch_size=batch_size,
-                partition_id=partition_id,
-                task_name=task_name,
-                sampling_config=sampling_config,
-            )
+        return self._get_meta(
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            task_name=task_name,
+            sampling_config=sampling_config,
         )
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -864,7 +880,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Returns:
             TensorDict containing requested data fields
         """
-        return asyncio.run(self.async_get_data(metadata))
+        return self._get_data(metadata=metadata)
 
     def clear_partition(self, partition_id: str):
         """Synchronously clear the whole partition from storage units and controller.
@@ -872,7 +888,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Args:
             partition_id: The partition id to clear data for
         """
-        return asyncio.run(self.async_clear_partition(partition_id))
+        return self._clear_partition(partition_id=partition_id)
 
     def clear_samples(self, metadata: BatchMeta):
         """Synchronously clear specific samples from storage units and controller metadata.
@@ -880,7 +896,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Args:
             metadata: The BatchMeta of the corresponding data to be cleared
         """
-        return asyncio.run(self.async_clear_samples(metadata))
+        return self._clear_samples(metadata=metadata)
 
     def check_consumption_status(self, task_name: str, partition_id: str) -> bool:
         """Synchronously check if all samples for a partition have been consumed by a specific task.
@@ -892,7 +908,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Returns:
             bool: True if all samples have been consumed by the task, False otherwise
         """
-        return asyncio.run(self.async_check_consumption_status(task_name, partition_id))
+        return self._check_consumption_status(task_name=task_name, partition_id=partition_id)
 
     def get_consumption_status(
         self,
@@ -917,7 +933,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             ... )
             >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
         """
-        return asyncio.run(self.async_get_consumption_status(task_name, partition_id))
+        return self._get_consumption_status(task_name, partition_id)
 
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
         """Synchronously check if all samples for a partition are ready (produced) for consumption.
@@ -929,7 +945,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Returns:
             bool: True if all samples have been produced and ready, False otherwise
         """
-        return asyncio.run(self.async_check_production_status(data_fields, partition_id))
+        return self._check_production_status(data_fields=data_fields, partition_id=partition_id)
 
     def get_production_status(
         self,
@@ -954,7 +970,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             ... )
             >>> print(f"Global index: {global_index}, Production status: {production_status}")
         """
-        return asyncio.run(self.async_get_production_status(data_fields, partition_id))
+        return self._get_production_status(data_fields=data_fields, partition_id=partition_id)
 
     def get_partition_list(
         self,
@@ -964,7 +980,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Returns:
             list[str]: List of partition ids managed by the controller
         """
-        return asyncio.run(self.async_get_partition_list())
+        return self._get_partition_list()
 
 
 def process_zmq_server_info(

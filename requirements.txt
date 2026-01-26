@@ -5,3 +5,4 @@ hydra-core
 numpy<2.0.0
 msgspec
 psutil
+asgiref
