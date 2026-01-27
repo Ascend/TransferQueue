@@ -78,10 +78,10 @@ class TestYuanrongStorageZCopy:
             buffers = [MockBuffer(size) for size in sizes]
             for b in buffers:
                 stored_raw_buffers.append(b.MutableData())
-            return 0, buffers
+            return buffers
 
         storage_client._cpu_ds_client.mcreate.side_effect = side_effect_mcreate
-        storage_client._cpu_ds_client.get_buffers.return_value = (0, stored_raw_buffers)
+        storage_client._cpu_ds_client.get_buffers.return_value = stored_raw_buffers
 
         storage_client.mset_zcopy(
             ["tensor_key", "string_key"], [torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32), "hello yuanrong"]
