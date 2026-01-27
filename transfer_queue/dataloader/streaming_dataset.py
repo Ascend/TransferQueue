@@ -172,7 +172,9 @@ class StreamingDataset(IterableDataset):
 
         assert self._tq_client is not None, "Failed to create TransferQueue client"
 
-        # TODO: need to consider async scenario where the samples in partition is dynamically increasing
+        # Note: For fully streamed production-consumption, please set the environment variable
+        # TQ_PRE_ALLOC_SAMPLE_NUM to the required global_batch_size to make sure consumers can accurately
+        # determine consumption status even before producers have generated the samples.
         while not self._tq_client.check_consumption_status(self.task_name, self.partition_id):
             try:
                 # Get metadata from controller

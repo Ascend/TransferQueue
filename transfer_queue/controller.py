@@ -62,17 +62,10 @@ if not logger.hasHandlers():
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
 
-
-TQ_INIT_SAMPLE_NUM = int(os.environ.get("TQ_INIT_SAMPLE_NUM", 1))  # Initial number of samples
-TQ_INIT_FIELD_NUM = int(os.environ.get("TQ_INIT_FIELD_NUM", 1))
-
-# Expansion configuration - Unified approach using minimum expansion sizes
-TQ_SAMPLE_MIN_EXPANSION_SIZE = int(
-    os.environ.get("TQ_SAMPLE_MIN_EXPANSION_SIZE", 1)
-)  # Minimum expansion size for samples (rows)
-TQ_FIELD_MIN_EXPANSION_SIZE = int(
-    os.environ.get("TQ_FIELD_MIN_EXPANSION_SIZE", 1)
-)  # Minimum expansion size for fields (columns)
+# Sample pre-allocation for StreamingDataLoader compatibility.
+# By pre-allocating sample indices (typically global_batch_size), consumers can accurately
+# determine consumption status even before producers have generated the samples.
+TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
 
 class PartitionIndexManager:
@@ -94,7 +87,7 @@ class PartitionIndexManager:
         # Track all active indexes
         self.allocated_indexes = set()
 
-    def allocate_indexes(self, partition_id, count=1) -> list:
+    def allocate_indexes(self, partition_id, count=1) -> list[int]:
         """
         Allocate global_indexes for the specified partition.
         Prioritizes obtaining from reusable pool, allocates new indexes when insufficient.
@@ -216,7 +209,8 @@ class DataPartitionStatus:
 
     # Production status tensor - dynamically expandable
     # Values: 0 = not produced, 1 = ready for consumption
-    production_status: Tensor = torch.zeros(TQ_INIT_SAMPLE_NUM, TQ_INIT_FIELD_NUM, dtype=torch.int8)
+
+    production_status: Tensor = torch.zeros(TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
 
     # Consumption status per task - task_name -> consumption_tensor
     # Each tensor tracks which samples have been consumed by that task
@@ -226,6 +220,10 @@ class DataPartitionStatus:
     global_indexes: set[int] = field(
         default_factory=set
     )  # set of global indexes that have been added to this partition
+
+    pre_allocated_global_indexes: set[int] = field(
+        default_factory=set
+    )  # set of global indexes that pre-allocated, but not active in this partition
 
     # Field metadata
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
@@ -258,22 +256,79 @@ class DataPartitionStatus:
         """Current number of allocated rows in the tensor."""
         return self.production_status.shape[0]
 
+    # ==================== Index Pre-Allocation Methods ====================
+
+    def register_pre_allocated_indexes(self, allocated_indexes: list[int]):
+        """
+        Register pre-allocated sample indexes to this partition.
+
+        These indexes are reserved before actual data production, allowing consumers
+        to see the expected total sample count via get_consumption_status even when
+        producers haven't generated all samples yet.
+
+        Args:
+            allocated_indexes: List of global indexes to pre-allocate
+        """
+
+        if len(allocated_indexes) < 1:
+            logger.info("Trying to pre-allocate global_indexes with empty list!")
+            return
+
+        self.pre_allocated_global_indexes.update(allocated_indexes)
+
+        # Expand the state matrices
+        max_sample_idx = max(allocated_indexes)
+        required_samples = max_sample_idx + 1
+
+        with self.data_status_lock:
+            self.ensure_samples_capacity(required_samples)
+
+        logger.debug(f"Pre-allocated indexes in {self.partition_id}: {allocated_indexes}")
+
+    def activate_pre_allocated_indexes(self, sample_num: int) -> list[int]:
+        """
+        Active and retrieve pre-allocated indexes for use in data insertion.
+
+        This method consumes pre-allocated indexes and marks them as active in global_indexes.
+        If pre-allocated indexes are insufficient, returns all available ones.
+
+        Args:
+            sample_num: Number of indexes needed
+
+        Returns:
+            List of retrieved global indexes
+        """
+        available_indexes = len(self.pre_allocated_global_indexes)
+
+        if available_indexes < sample_num:
+            global_index_to_allocate = list(self.pre_allocated_global_indexes)
+            logger.debug(
+                f"Not enough pre-allocated indexes in partition {self.partition_id}. "
+                f"Returning {available_indexes} of {sample_num} requested."
+            )
+        else:
+            global_index_to_allocate = list(self.pre_allocated_global_indexes)[:sample_num]
+
+        self.global_indexes.update(global_index_to_allocate)
+        self.pre_allocated_global_indexes.difference_update(set(global_index_to_allocate))
+
+        return global_index_to_allocate
+
     # ==================== Dynamic Expansion Methods ====================
 
     def ensure_samples_capacity(self, required_samples: int) -> None:
         """
         Ensure the production status tensor has enough rows for the required samples.
-        Dynamically expands if needed using unified minimum expansion size.
 
         Args:
             required_samples: Minimum number of samples needed
         """
+
         current_sample_space = self.allocated_samples_num
         if required_samples > current_sample_space:
-            # Expand rows using minimum expansion size for predictable memory usage
+            # Expand rows
             expansion_needed = required_samples - current_sample_space
-            min_expansion = max(TQ_SAMPLE_MIN_EXPANSION_SIZE, expansion_needed)
-            new_samples = current_sample_space + min_expansion
+            new_samples = current_sample_space + expansion_needed
             new_fields = self.production_status.shape[1]
 
             expanded_tensor = torch.zeros(new_samples, new_fields, dtype=torch.int8)
@@ -286,15 +341,11 @@ class DataPartitionStatus:
                 expanded_consumption[:current_sample_space] = consumption_tensor
                 self.consumption_status[task_name] = expanded_consumption
 
-            logger.debug(
-                f"Expanded partition {self.partition_id} from {current_sample_space} "
-                f"to {new_samples} samples (added {min_expansion} samples)"
-            )
+            logger.debug(f"Expanded partition {self.partition_id} from {current_sample_space} to {new_samples} samples")
 
     def ensure_fields_capacity(self, required_fields: int) -> None:
         """
         Ensure the production status tensor has enough columns for the required fields.
-        Dynamically expands if needed using unified minimum expansion size.
 
         Args:
             required_fields: Minimum number of fields needed
@@ -304,18 +355,14 @@ class DataPartitionStatus:
         if required_fields > current_fields:
             # Expand columns using minimum expansion size for predictable memory usage
             expansion_needed = required_fields - current_fields
-            min_expansion = max(TQ_FIELD_MIN_EXPANSION_SIZE, expansion_needed)
-            new_fields = current_fields + min_expansion
+            new_fields = current_fields + expansion_needed
             new_samples = self.production_status.shape[0]
 
             expanded_tensor = torch.zeros(new_samples, new_fields, dtype=torch.int8)
             expanded_tensor[:, :current_fields] = self.production_status
             self.production_status = expanded_tensor
 
-            logger.debug(
-                f"Expanded partition {self.partition_id} from {current_fields} "
-                f"to {new_fields} fields (added {min_expansion} fields)"
-            )
+            logger.debug(f"Expanded partition {self.partition_id} from {current_fields} to {new_fields} fields")
 
     # ==================== Production Status Interface ====================
 
@@ -487,7 +534,9 @@ class DataPartitionStatus:
         # Get consumption status for requested task
         consumption_status = self.consumption_status[task_name]
 
-        partition_global_index = torch.tensor(sorted(self.global_indexes), dtype=torch.long)
+        partition_global_index = torch.tensor(
+            sorted(self.global_indexes | self.pre_allocated_global_indexes), dtype=torch.long
+        )
 
         if mask:
             consumption_status = consumption_status[partition_global_index]
@@ -526,7 +575,9 @@ class DataPartitionStatus:
 
         production_status = self.production_status[:, col_mask]
 
-        partition_global_index = torch.tensor(sorted(self.global_indexes), dtype=torch.long)
+        partition_global_index = torch.tensor(
+            sorted(self.global_indexes | self.pre_allocated_global_indexes), dtype=torch.long
+        )
 
         if mask:
             production_status = production_status[partition_global_index]
@@ -774,9 +825,11 @@ class TransferQueueController:
 
     def create_partition(self, partition_id: str) -> bool:
         """
-        Create a new data partition.
+        Create a new data partition with pre-allocated sample indexes.
 
-        Note: Partitions now dynamically expand as needed, so initial capacity is not required.
+        Partitions dynamically expand as needed. Additionally, TQ_PRE_ALLOC_SAMPLE_NUM
+        indexes are pre-allocated to allow consumers to determine consumption status
+        before all samples are produced.
 
         Args:
             partition_id: Unique identifier for the partition (e.g., "train@global_batch_0")
@@ -790,7 +843,11 @@ class TransferQueueController:
 
         self.partitions[partition_id] = DataPartitionStatus(partition_id=partition_id)
 
-        logger.info(f"Created partition {partition_id}")
+        # Pre-allocate global indexes for consumer consumption tracking
+        global_indexes = self.index_manager.allocate_indexes(partition_id, count=TQ_PRE_ALLOC_SAMPLE_NUM)
+        self.partitions[partition_id].register_pre_allocated_indexes(global_indexes)
+
+        logger.info(f"Created partition {partition_id} with {TQ_PRE_ALLOC_SAMPLE_NUM} pre-allocated indexes")
         return True
 
     def _get_partition(self, partition_id: str) -> Optional[DataPartitionStatus]:
@@ -965,10 +1022,26 @@ class TransferQueueController:
             self.create_partition(partition_id)
 
         if mode == "insert":
+            partition = self._get_partition(partition_id)
+
             if data_fields:
-                # First put_data call, get_metadata in insert mode
-                batch_global_indexes = self.index_manager.allocate_indexes(partition_id, count=batch_size)
+                # This is called during put_data call without providing metadata.
+                # try to use pre-allocated global index first
+
+                if batch_size is None:
+                    raise ValueError("must provide batch_size for inserting new data")
+
+                assert partition is not None
+                batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+
+                if len(batch_global_indexes) < batch_size:
+                    new_global_indexes = self.index_manager.allocate_indexes(
+                        partition_id, count=(batch_size - len(batch_global_indexes))
+                    )
+                    batch_global_indexes.extend(new_global_indexes)
+
             else:
+                # TODO: separate this "clear" related logic into a separated mode
                 # clear metadata call passes empty data_fields
                 batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)

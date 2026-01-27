@@ -334,7 +334,6 @@ def main():
         - StreamingDataLoader: DataLoader wrapper yielding (batch, batch_meta) tuples
         - RankAwareSampler: Enables correct data consumption across data replica ranks
         - Data Replica Group: Ranks that should receive identical data samples (TP, PP, ...)
-
         """
         )
     )
@@ -342,6 +341,11 @@ def main():
 
     # Step 1: Setup TransferQueue infrastructure
     print("\n[Phase 1] Setting up TransferQueue infrastructure...")
+    print(
+        "\nIn real-world usage, please export the environment variable of TQ_PRE_ALLOC_SAMPLE_NUM to "
+        "global_batch_size to make sure consumers can accurately determine consumption status even before "
+        "producers have generated the samples."
+    )
     controller, storage_units, config = setup_transfer_queue()
 
     # Step 2: Launch data generation actors
