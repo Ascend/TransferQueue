@@ -251,12 +251,12 @@ class DataPartitionStatus:
     @property
     def allocated_fields_num(self) -> int:
         """Current number of allocated columns in the tensor."""
-        return self.production_status.shape[1] if self.production_status is not None else 0
+        return self.production_status.shape[1]
 
     @property
     def allocated_samples_num(self) -> int:
         """Current number of allocated rows in the tensor."""
-        return self.production_status.shape[0] if self.production_status is not None else 0
+        return self.production_status.shape[0]
 
     # ==================== Dynamic Expansion Methods ====================
 
