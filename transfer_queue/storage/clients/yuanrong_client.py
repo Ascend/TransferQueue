@@ -193,7 +193,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         """
         items_list = [[memoryview(b) for b in _encoder.encode(obj)] for obj in objs]
         packed_sizes = [calc_packed_size(items) for items in items_list]
-        status, buffers = self._cpu_ds_client.mcreate(keys, packed_sizes)
+        buffers = self._cpu_ds_client.mcreate(keys, packed_sizes)
         tasks = [(target.MutableData(), item) for target, item in zip(buffers, items_list, strict=False)]
         with ThreadPoolExecutor(max_workers=DS_MAX_WORKERS) as executor:
             list(executor.map(lambda p: pack_into(*p), tasks))
@@ -208,7 +208,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         Returns:
             list[Any]: List of deserialized objects corresponding to the input keys.
         """
-        status, buffers = self._cpu_ds_client.get_buffers(keys, timeout_ms=500)
+        buffers = self._cpu_ds_client.get_buffers(keys)
         return [_decoder.decode(unpack_from(buffer)) if buffer is not None else None for buffer in buffers]
 
     def _batch_put(self, keys: list[str], values: list[Any]):
