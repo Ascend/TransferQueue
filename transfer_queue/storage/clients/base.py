@@ -23,14 +23,13 @@ class TransferQueueStorageKVClient(ABC):
     Subclasses must implement the core methods: put, get, and clear.
     """
 
-    @abstractmethod
     def __init__(self, config: dict[str, Any]):
         """
         Initialize the storage client with configuration.
         Args:
             config (dict[str, Any]): Configuration dictionary for the storage client.
         """
-        ...
+        self.config = config
 
     @abstractmethod
     def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:

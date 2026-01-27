@@ -260,7 +260,7 @@ class DataPartitionStatus:
 
     # ==================== Dynamic Expansion Methods ====================
 
-    def ensure_samples_capacity(self, required_samples: int):
+    def ensure_samples_capacity(self, required_samples: int) -> None:
         """
         Ensure the production status tensor has enough rows for the required samples.
         Dynamically expands if needed using unified minimum expansion size.
@@ -291,7 +291,7 @@ class DataPartitionStatus:
                 f"to {new_samples} samples (added {min_expansion} samples)"
             )
 
-    def ensure_fields_capacity(self, required_fields: int):
+    def ensure_fields_capacity(self, required_fields: int) -> None:
         """
         Ensure the production status tensor has enough columns for the required fields.
         Dynamically expands if needed using unified minimum expansion size.
@@ -299,9 +299,6 @@ class DataPartitionStatus:
         Args:
             required_fields: Minimum number of fields needed
         """
-        if self.production_status is None:
-            # Will be initialized when samples are added
-            return
 
         current_fields = self.production_status.shape[1]
         if required_fields > current_fields:
@@ -513,7 +510,7 @@ class DataPartitionStatus:
             - Partition global index tensor
             - Production status tensor for the specified task. 1 for ready, 0 for not ready.
         """
-        if self.production_status is None or field_names is None or len(field_names) == 0:
+        if field_names is None or len(field_names) == 0:
             return None, None
 
         # Check if all requested fields are registered
@@ -550,8 +547,6 @@ class DataPartitionStatus:
         Returns:
             List of sample indices that are ready for consumption
         """
-        if self.production_status is None:
-            return []
 
         # Check if all requested fields are registered
         for field_name in field_names:
