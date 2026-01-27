@@ -171,6 +171,7 @@ class StreamingDataset(IterableDataset):
             self._create_client()
 
         assert self._tq_client is not None, "Failed to create TransferQueue client"
+
         # TODO: need to consider async scenario where the samples in partition is dynamically increasing
         while not self._tq_client.check_consumption_status(self.task_name, self.partition_id):
             try:

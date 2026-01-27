@@ -243,7 +243,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     cpu_values.append(pickle.dumps(value))
 
             # put NPU data
-            assert self._npu_ds_client is not None
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = npu_keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
                 batch_values = npu_values[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -256,7 +256,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 self._npu_ds_client.dev_mset(batch_keys, batch_values)
 
             # put CPU data
-            assert self._cpu_ds_client is not None
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(cpu_keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = cpu_keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_values = cpu_values[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
@@ -324,7 +324,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             results = [None] * len(keys)
 
             # Fetch NPU tensors
-            assert self._npu_ds_client is not None
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
             for i in range(0, len(npu_keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = npu_keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
                 batch_shapes = npu_shapes[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -352,7 +352,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     cpu_indices.extend([batch_indices[j] for j, k in enumerate(batch_keys) if k in failed_set])
 
             # Fetch CPU/general objects (including NPU fallbacks)
-            assert self._cpu_ds_client is not None
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(cpu_keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch_keys = cpu_keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 batch_indices = cpu_indices[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
@@ -404,8 +404,8 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to delete.
         """
         if self.npu_ds_client_is_available():
-            assert self._npu_ds_client is not None
-            assert self._cpu_ds_client is not None
+            assert self._npu_ds_client is not None, "NPU DS client is not available"
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             # Try to delete all keys via npu client
             for i in range(0, len(keys), NPU_DS_CLIENT_KEYS_LIMIT):
                 batch = keys[i : i + NPU_DS_CLIENT_KEYS_LIMIT]
@@ -416,7 +416,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 sub_batch = keys[j : j + CPU_DS_CLIENT_KEYS_LIMIT]
                 self._cpu_ds_client.delete(sub_batch)
         else:
-            assert self._cpu_ds_client is not None
+            assert self._cpu_ds_client is not None, "CPU DS client is not available"
             for i in range(0, len(keys), CPU_DS_CLIENT_KEYS_LIMIT):
                 batch = keys[i : i + CPU_DS_CLIENT_KEYS_LIMIT]
                 self._cpu_ds_client.delete(batch)

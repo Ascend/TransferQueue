@@ -105,22 +105,18 @@ version = {file = "transfer_queue/version/version"}
 dependencies = {file = "requirements.txt"}
 
 [project.optional-dependencies]
-
 build = [
     "build"
 ]
-
 test = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.20.0",
     "flake8",
     "pytest-mock",
 ]
-
 yuanrong = [
     "openyuanrong-datasystem"
 ]
-
 
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]

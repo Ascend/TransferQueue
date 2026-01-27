@@ -90,7 +90,7 @@ class TransferQueueStorageManager(ABC):
                 zmq.DEALER,
                 identity=f"{self.storage_manager_id}-data_status_update_socket-{uuid4().hex[:8]}".encode(),
             )
-            assert self.data_status_update_socket is not None
+            assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
             self.data_status_update_socket.connect(self.controller_info.to_addr("data_status_update_socket"))
 
             # do handshake with controller
@@ -109,7 +109,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for handshake confirmation between controller and storage manager
         poller = zmq.Poller()
 
-        assert self.controller_handshake_socket is not None
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         self.controller_handshake_socket.connect(self.controller_info.to_addr("handshake_socket"))
         logger.debug(
             f"[{self.storage_manager_id}]: Handshake connection from storage manager id #{self.storage_manager_id} "
@@ -174,7 +174,7 @@ class TransferQueueStorageManager(ABC):
 
     def _send_handshake_requests(self) -> None:
         """Send handshake request to controller."""
-        assert self.controller_handshake_socket is not None
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.HANDSHAKE,
             sender_id=self.storage_manager_id,
@@ -218,7 +218,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for notifying data update information
         poller = zmq.Poller()
         # Note: data_status_update_socket is already connected during initialization
-        assert self.data_status_update_socket is not None
+        assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
 
         try:
             poller.register(self.data_status_update_socket, zmq.POLLIN)
