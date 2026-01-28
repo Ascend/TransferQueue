@@ -22,7 +22,7 @@ TransferQueue is a high-performance data storage and transfer module with panora
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/tq_arch.png?raw=true" width="70%">
 </p>
 
-TransferQueue offers **fine-grained, sample-level** data management and **load-balancing** (on the way) capabilities, serving as a data gateway that decouples explicit data dependencies across computational tasks. This enables a divide-and-conquer approach, significantly simplifies the algorithm controller design.
+TransferQueue offers **fine-grained, sub-sample-level** data management and **load-balancing** (on the way) capabilities, serving as a data gateway that decouples explicit data dependencies across computational tasks. This enables a divide-and-conquer approach, significantly simplifies the algorithm controller design.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/main_func.png?raw=true" width="70%">
@@ -30,6 +30,7 @@ TransferQueue offers **fine-grained, sample-level** data management and **load-b
 
 <h2 id="updates">🔄 Updates</h2>
 
+ - **Jan 28, 2026**:  We experimentally introduce `StreamingDataloader` interface for fully-streamed production-consumption pipeline. Refer to our [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for details.
  - **Dec 30, 2025**:  **TransferQueue x verl** integration is tested with the DAPO algorithm at scale **(64 nodes, 1024 cards)**. It significantly optimizes host memory utilization and accelerates data transfers. Stay tuned for more details!
  - **Dec 20, 2025**: 🔥 The official [tutorial](https://github.com/Ascend/TransferQueue/tree/main/tutorial) is released! Feel free to check it out.
  - **Nov 10, 2025**: We disentangle the data retrieval logic from TransferQueueController [PR#101](https://github.com/TransferQueue/TransferQueue/pull/101). Now you can implement your own `Sampler` to control how to consume the data.
@@ -90,16 +91,10 @@ This data structure design is motivated by the computational characteristics of 
 </p>
 
 ### User Interface: Asynchronous & Synchronous Client
+To simplify the usage of TransferQueue, we have encapsulated this process into `TransferQueueClient`. The client provide both asynchronous and synchronous interfaces for data transfer, allowing users to easily integrate TransferQueue into their framework.
 
-The interaction workflow of TransferQueue system is as follows:
-
-1. A process sends a read request to the `TransferQueueController`.
-2. `TransferQueueController` scans the production and consumption metadata for each sample (row), and dynamically assembles a micro-batch metadata according to the load-balancing policy. This mechanism enables sample-level data scheduling.
-3. The process retrieves the actual data from distributed storage units using the metadata provided by the controller.
-
-To simplify the usage of TransferQueue, we have encapsulated this process into `AsyncTransferQueueClient` and `TransferQueueClient`. These clients provide both asynchronous and synchronous interfaces for data transfer, allowing users to easily integrate TransferQueue into their framework.
-
-> In the future, we will provide a `StreamingDataLoader` interface for disaggregated frameworks as discussed in [issue#85](https://github.com/TransferQueue/TransferQueue/issues/85) and [verl/RFC#2662](https://github.com/volcengine/verl/discussions/2662). Leveraging this abstraction, each rank can automatically get its own data like `DataLoader` in PyTorch. The TransferQueue system will handle the underlying data scheduling and transfer logic caused by different parallelism strategies, significantly simplifying the design of disaggregated frameworks.
+We also experimentally provide a `StreamingDataLoader` interface as a standard PyTorch DataLoader. Leveraging this abstraction, each rank can automatically get its own data like `DataLoader` in PyTorch. The TransferQueue system will handle the underlying data scheduling and transfer logic caused by different parallelism strategies, significantly simplifying the design of disaggregated frameworks.
+This interface simplifies TransferQueue's integration, ensuring seamless compatibility with existing training workflows. Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for more details.
 
 <h2 id="show-cases">🔥 Showcases</h2>
 
@@ -135,7 +130,11 @@ You may refer to the [recipe](https://github.com/Ascend/TransferQueue/tree/dev/r
 
 ### Disaggregated Example
 
-Work in progress :)
+We have implemented a series of PR ([#4](https://github.com/Ascend/TransferQueue/pull/4), [#7](https://github.com/Ascend/TransferQueue/pull/7), [#9](https://github.com/Ascend/TransferQueue/pull/9), [#16](https://github.com/Ascend/TransferQueue/pull/16)) to establish a **standardized, fully-streamed distributed** workflow via TransferQueue. 
+
+By leveraging the `RankAwareSampler` and `StreamingDataLoader` interfaces, we achieve a **streamlined micro-batch-level producer-consumer pipeline**. This design eliminates the need to manually determine data dispatching logics across varying parallelism strategies—a typical complexity in the single-controller paradigm—thereby greatly simplifying framework design. 
+
+Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for more details.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/tq_streaming_dataloader.png?raw=true" width="70%">
@@ -148,24 +147,36 @@ Work in progress :)
 pip install TransferQueue
 ```
 
-### Build wheel package from source code
+### Install from source code
 
-Follow these steps to build and install:
 1. Clone the source code from the GitHub repository
    ```bash
    git clone https://github.com/Ascend/TransferQueue/
    cd TransferQueue
    ```
 
+2. Install from source codes
+   ```bash
+   pip install .
+   ```
+   
+### Build wheel package from source code
+
+1. Clone the source code from the GitHub repository
+   ```bash
+   git clone https://github.com/Ascend/TransferQueue/
+   cd TransferQueue
+   ```
+   
 2. Install dependencies
    ```bash
-   pip install -r requirements.txt
+    pip install build
    ```
 
 3. Build and install
    ```bash
-   python -m build --wheel
-   pip install dist/*.whl
+    python -m build --wheel
+    pip install dist/*.whl
    ```
 
 <h2 id="performance">📊 Performance</h2>
