@@ -54,7 +54,14 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if not YUANRONG_DATASYSTEM_IMPORTED:
             raise ImportError("YuanRong DataSystem not installed.")
 
+        self._strategies: list[StorageStrategy] = []
+        for strategy_cls in [DsTensorClientAdapter, KVClientAdapter]:
+            strategy = strategy_cls.init(config)
+            if strategy is not None:
+                self._strategies.append(strategy)
 
+        if not self._strategies:
+            raise RuntimeError("No storage strategy available for YuanrongStorageClient")
 
     def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """Stores multiple key-value pairs to remote storage.
@@ -70,7 +77,24 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             raise ValueError("keys and values must be lists")
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
-        pass
+        custom_metas = []
+        strategy_batches: dict[StorageStrategy, tuple[list[str], list[Any]]] = {s: ([], []) for s in self._strategies}
+
+        for key, value in zip(keys, values, strict=True):
+            for strategy in self._strategies:
+                if strategy.supports_put(value):
+                    custom_metas.append(strategy.custom_meta())
+                    strategy_batches[strategy][0].append(key)
+                    strategy_batches[strategy][1].append(value)
+                    break
+            else:
+                raise ValueError(f"No strategy supports putting value of type {type(value)}")
+        # Todo: Parallel put
+        for strategy, (s_keys, s_vals) in strategy_batches.items():
+            if s_keys:
+                strategy.put(s_keys, s_vals)
+
+        return custom_metas
 
     def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
@@ -90,7 +114,41 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             raise ValueError("YuanrongStorageClient needs Expected shapes and dtypes")
         if not (len(keys) == len(shapes) == len(dtypes)):
             raise ValueError("Lengths of keys, shapes, dtypes must match")
-        pass
+
+        if custom_meta is None:
+            raise ValueError("custom_meta is required for YuanrongStorageClient.get()")
+
+        if len(custom_meta) != len(keys):
+            raise ValueError("custom_meta length must match keys")
+
+        results: list[Optional[Any]] = [None] * len(keys)
+
+        # {strategy: ([index], [key])}
+        strategy_batches: dict[StorageStrategy, tuple[list[int], list[str]]] = {s: ([], []) for s in self._strategies}
+
+        for i, (key, meta) in enumerate(zip(keys, custom_meta, strict=True)):
+            for strategy in self._strategies:
+                if strategy.supports_get(meta):
+                    strategy_batches[strategy][0].append(i)
+                    strategy_batches[strategy][1].append(key)
+                    break
+            else:
+                raise ValueError(f"No strategy supports getting with meta={meta}")
+        # Todo: Parallel get
+        for strategy, (indices, s_keys) in strategy_batches.items():
+            s_shapes = [shapes[i] for i in indices]
+            s_dtypes = [dtypes[i] for i in indices]
+
+            try:
+                s_results = strategy.get(s_keys, shapes=s_shapes, dtypes=s_dtypes)
+            except Exception as e:
+                logger.error(f"Strategy {strategy.custom_meta()} failed to get keys: {s_keys}, error: {e}")
+                raise
+
+            for idx, res in zip(indices, s_results, strict=True):
+                results[idx] = res
+
+        return results
 
     def clear(self, keys: list[str]):
         """Deletes multiple keys from remote storage.
@@ -342,7 +400,7 @@ class KVClientAdapter(StorageStrategy):
         Args:
             source (memoryview): The packed source buffer.
         Returns:
-            list[]: List of unpacked contiguous buffers.
+            list[memoryview]: List of unpacked contiguous buffers.
         """
         mv = memoryview(source)
         item_count = struct.unpack_from(KVClientAdapter.HEADER_FMT, mv, 0)[0]
