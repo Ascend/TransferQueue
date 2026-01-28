@@ -17,6 +17,7 @@ import logging
 import os
 import pickle
 import struct
+from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional, TypeAlias
 
@@ -428,3 +429,26 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): List of keys to remove.
         """
         self._batch_clear(keys)
+
+
+class StorageStrategy(ABC):
+    @abstractmethod
+    def init(self, value: Any) -> "StorageStrategy": ...
+
+    @abstractmethod
+    def supports_to_put(self, value: Any) -> bool: ...
+
+    @abstractmethod
+    def put(self, keys: list[str], values: list[Any]): ...
+
+    @abstractmethod
+    def supports_to_get(self, value: Any) -> bool: ...
+
+    @abstractmethod
+    def get(self, keys: list[str], meta: list[dict]) -> list[Optional[Any]]: ...
+
+    @abstractmethod
+    def supports_to_clear(self, value: Any) -> bool: ...
+
+    @abstractmethod
+    def clear(self, keys: list[str]): ...
