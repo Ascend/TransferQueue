@@ -287,7 +287,7 @@ class DataPartitionStatus:
 
     def activate_pre_allocated_indexes(self, sample_num: int) -> list[int]:
         """
-        Active and retrieve pre-allocated indexes for use in data insertion.
+        Activate and retrieve pre-allocated indexes for use in data insertion.
 
         This method consumes pre-allocated indexes and marks them as active in global_indexes.
         If pre-allocated indexes are insufficient, returns all available ones.
@@ -307,7 +307,7 @@ class DataPartitionStatus:
                 f"Returning {available_indexes} of {sample_num} requested."
             )
         else:
-            global_index_to_allocate = list(self.pre_allocated_global_indexes)[:sample_num]
+            global_index_to_allocate = list(sorted(self.pre_allocated_global_indexes))[:sample_num]
 
         self.global_indexes.update(global_index_to_allocate)
         self.pre_allocated_global_indexes.difference_update(set(global_index_to_allocate))
@@ -353,7 +353,7 @@ class DataPartitionStatus:
 
         current_fields = self.production_status.shape[1]
         if required_fields > current_fields:
-            # Expand columns using minimum expansion size for predictable memory usage
+            # Expand columns
             expansion_needed = required_fields - current_fields
             new_fields = current_fields + expansion_needed
             new_samples = self.production_status.shape[0]
