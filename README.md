@@ -91,7 +91,7 @@ This data structure design is motivated by the computational characteristics of 
 </p>
 
 ### User Interface: Asynchronous & Synchronous Client
-To simplify the usage of TransferQueue, we have encapsulated this process into `TransferQueueClient`. The client provide both asynchronous and synchronous interfaces for data transfer, allowing users to easily integrate TransferQueue into their framework.
+To simplify the usage of TransferQueue, we have encapsulated this process into `TransferQueueClient`. The client provides both asynchronous and synchronous interfaces for data transfer, allowing users to easily integrate TransferQueue into their framework.
 
 We also experimentally provide a `StreamingDataLoader` interface as a standard PyTorch DataLoader. Leveraging this abstraction, each rank can automatically get its own data like `DataLoader` in PyTorch. The TransferQueue system will handle the underlying data scheduling and transfer logic caused by different parallelism strategies, significantly simplifying the design of disaggregated frameworks.
 This interface simplifies TransferQueue's integration, ensuring seamless compatibility with existing training workflows. Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for more details.
@@ -130,7 +130,7 @@ You may refer to the [recipe](https://github.com/Ascend/TransferQueue/tree/dev/r
 
 ### Disaggregated Example
 
-We have implemented a series of PR ([#4](https://github.com/Ascend/TransferQueue/pull/4), [#7](https://github.com/Ascend/TransferQueue/pull/7), [#9](https://github.com/Ascend/TransferQueue/pull/9), [#16](https://github.com/Ascend/TransferQueue/pull/16)) to establish a **standardized, fully-streamed distributed** workflow via TransferQueue. 
+We have implemented a series of PRs ([#4](https://github.com/Ascend/TransferQueue/pull/4), [#7](https://github.com/Ascend/TransferQueue/pull/7), [#9](https://github.com/Ascend/TransferQueue/pull/9), [#16](https://github.com/Ascend/TransferQueue/pull/16)) to establish a **standardized, fully-streamed distributed** workflow via TransferQueue. 
 
 By leveraging the `RankAwareSampler` and `StreamingDataLoader` interfaces, we achieve a **streamlined micro-batch-level producer-consumer pipeline**. This design eliminates the need to manually determine data dispatching logics across varying parallelism strategies—a typical complexity in the single-controller paradigm—thereby greatly simplifying framework design. 
 
@@ -155,7 +155,7 @@ pip install TransferQueue
    cd TransferQueue
    ```
 
-2. Install from source codes
+2. Install from source code
    ```bash
    pip install .
    ```
@@ -170,13 +170,13 @@ pip install TransferQueue
    
 2. Install dependencies
    ```bash
-    pip install build
+   pip install build
    ```
 
 3. Build and install
    ```bash
-    python -m build --wheel
-    pip install dist/*.whl
+   python -m build --wheel
+   pip install dist/*.whl
    ```
 
 <h2 id="performance">📊 Performance</h2>
