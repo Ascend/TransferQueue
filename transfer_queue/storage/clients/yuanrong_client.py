@@ -19,7 +19,7 @@ import pickle
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional, TypeAlias
+from typing import Any, Optional, TypeAlias, Union
 
 import torch
 from torch import Tensor
@@ -36,7 +36,6 @@ logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 NPU_DS_CLIENT_KEYS_LIMIT: int = 9999
 CPU_DS_CLIENT_KEYS_LIMIT: int = 1999
 YUANRONG_DATASYSTEM_IMPORTED: bool = True
-TORCH_NPU_IMPORTED: bool = True
 DS_MAX_WORKERS: int = 16
 try:
     from yr import datasystem
@@ -433,22 +432,124 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
 class StorageStrategy(ABC):
     @abstractmethod
-    def init(self, value: Any) -> "StorageStrategy": ...
+    @staticmethod
+    def init(config: dict) -> Union["StorageStrategy", None]: ...
 
     @abstractmethod
-    def supports_to_put(self, value: Any) -> bool: ...
+    def custom_meta(self) -> Any: ...
+
+    @abstractmethod
+    def supports_put(self, value: Any) -> bool: ...
 
     @abstractmethod
     def put(self, keys: list[str], values: list[Any]): ...
 
     @abstractmethod
-    def supports_to_get(self, value: Any) -> bool: ...
+    def supports_get(self, custom_meta: Any) -> bool: ...
 
     @abstractmethod
-    def get(self, keys: list[str], meta: list[dict]) -> list[Optional[Any]]: ...
+    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]: ...
 
     @abstractmethod
-    def supports_to_clear(self, value: Any) -> bool: ...
+    def supports_clear(self, custom_meta: Any) -> bool: ...
 
     @abstractmethod
     def clear(self, keys: list[str]): ...
+
+
+class DsTensorClientAdapter(StorageStrategy):
+    KEYS_LIMIT: int = 10_000
+
+    def __init__(self, config: dict):
+        host = config.get("host")
+        port = config.get("port")
+
+        self.device_id = torch.npu.current_device()
+        torch.npu.set_device(self.device_id)
+
+        self._ds_client = datasystem.DsTensorClient(host, port, self.device_id)
+        self._ds_client.init()
+
+    @staticmethod
+    def init(config: dict) -> Union["StorageStrategy", None]:
+        torch_npu_imported: bool = True
+        try:
+            import torch_npu  # noqa: F401
+        except ImportError:
+            torch_npu_imported = False
+        enable = config.get("enable_yr_npu_optimization", True)
+        if not (enable and torch_npu_imported and torch.npu.is_available()):
+            return None
+        logger.info("YuanrongStorageClient: Create DsTensorClient to connect with yuanrong-datasystem backend!")
+        return DsTensorClientAdapter(config)
+
+    def custom_meta(self) -> Any:
+        return "DsTensorClient"
+
+    def supports_put(self, value: Any) -> bool:
+        if not (isinstance(value, torch.Tensor) and value.device.type == "npu"):
+            return False
+        # Todo(dpj): perhaps KVClient can process uncontiguous tensor
+        if not value.is_contiguous():
+            raise ValueError(f"NPU Tensor is not contiguous: {value}")
+        return True
+
+    def put(self, keys: list[str], values: list[Any]):
+        # _npu_ds_client.dev_mset doesn't support to overwrite
+        for i in range(0, len(keys), self.KEYS_LIMIT):
+            batch_keys = keys[i : i + self.KEYS_LIMIT]
+            batch_values = values[i : i + self.KEYS_LIMIT]
+            try:
+                self._ds_client.dev_delete(batch_keys)
+            except Exception:
+                pass
+            self._ds_client.dev_mset(batch_keys, batch_values)
+
+    def supports_get(self, custom_meta: str) -> bool:
+        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+
+    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+        # Fetch NPU tensors
+        shapes = kwargs.get("shapes", None)
+        dtypes = kwargs.get("dtypes", None)
+        if not shapes or not dtypes:
+            raise ValueError("YuanrongStorageClient needs Expected shapes and dtypes")
+        results = []
+        for i in range(0, len(keys), self.KEYS_LIMIT):
+            batch_keys = keys[i : i + self.KEYS_LIMIT]
+            batch_shapes = shapes[i : i + self.KEYS_LIMIT]
+            batch_dtypes = dtypes[i : i + self.KEYS_LIMIT]
+
+            batch_values = self._create_empty_npu_tensorlist(batch_shapes, batch_dtypes)
+            self._ds_client.dev_mget(batch_keys, batch_values)
+            # Todo(dpj): should we check failed keys?
+            # failed_keys = self._ds_client.dev_mget(batch_keys, batch_values)
+            # if failed_keys:
+            #     logging.warning(f"YuanrongStorageClient: Querying keys using 'DsTensorClient' failed: {failed_keys}")
+            results.extend(batch_values)
+        return results
+
+    def supports_clear(self, custom_meta: str) -> bool:
+        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+
+    def clear(self, keys: list[str]):
+        for i in range(0, len(keys), self.KEYS_LIMIT):
+            batch = keys[i : i + self.KEYS_LIMIT]
+            # Todo(dpj): Test call clear when no (key,value) put in ds
+            self._ds_client.dev_delete(batch)
+
+    def _create_empty_npu_tensorlist(self, shapes, dtypes):
+        """
+        Create a list of empty NPU tensors with given shapes and dtypes.
+
+        Args:
+            shapes (list): List of tensor shapes (e.g., [(3,), (2, 4)])
+            dtypes (list): List of torch dtypes (e.g., [torch.float32, torch.int64])
+        Returns:
+            list: List of uninitialized NPU tensors
+        """
+        tensors: list[Tensor] = []
+        for shape, dtype in zip(shapes, dtypes, strict=True):
+            tensor = torch.empty(shape, dtype=dtype, device=f"npu:{self.device_id}")
+            tensors.append(tensor)
+        return tensors
