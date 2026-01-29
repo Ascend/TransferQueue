@@ -139,7 +139,11 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
+<<<<<<< HEAD
             custom_backend_meta (List[str], optional): Device type (npu/cpu) for each key
+=======
+            custom_meta (List[Any], optional): ...
+>>>>>>> acd7686 (Added custom_meta to clear for all TransferQueueKVStorageClient)
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
@@ -216,11 +220,12 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
             results.extend(batch_results)
         return results
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str], custom_meta=None):
         """Deletes multiple keys from MooncakeStore.
 
         Args:
             keys (List[str]): List of keys to remove.
+            custom_meta (List[Any], optional): ...
         """
         for key in keys:
             ret = self._store.remove(key)

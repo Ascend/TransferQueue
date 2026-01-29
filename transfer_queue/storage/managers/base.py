@@ -555,6 +555,8 @@ class KVStorageManager(TransferQueueStorageManager):
         keys = self._generate_keys(data.keys(), metadata.global_indexes)
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
+
+        # put <keys, values> to storage backends
         custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
         per_field_dtypes: dict[int, dict[str, Any]] = {}
@@ -632,4 +634,5 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to clear data, but metadata contains no fields.")
             return
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        self.storage_client.clear(keys=keys)
+        _, _, custom_meta = self._get_shape_type_custom_meta_list(metadata)
+        self.storage_client.clear(keys=keys, custom_meta=custom_meta)
