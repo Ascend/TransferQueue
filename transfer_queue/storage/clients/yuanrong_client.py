@@ -219,8 +219,8 @@ class KVClientAdapter(StorageStrategy):
 
     def clear(self, keys: list[str]):
         for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
-            batch = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
-            self._ds_client.delete(batch)
+            batch_keys = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
+            self._ds_client.delete(batch_keys)
 
     @staticmethod
     def calc_packed_size(items: list[memoryview]) -> int:
@@ -342,7 +342,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if not self._strategies:
             raise RuntimeError("No storage strategy available for YuanrongStorageClient")
 
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[str]:
         """Stores multiple key-value pairs to remote storage.
 
         Automatically routes NPU tensors to high-performance tensor storage,
@@ -353,7 +353,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
 
         Returns:
-            List[Any]: custom metadata of YuanrongStorageCilent in the same order as input keys.
+            List[str]: custom metadata of YuanrongStorageCilent in the same order as input keys.
         """
         if not isinstance(keys, list) or not isinstance(values, list):
             raise ValueError("keys and values must be lists")
@@ -361,7 +361,9 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             raise ValueError("Number of keys must match number of values")
 
         routed_indexes = self._route_to_strategies(values, lambda strategy_, item_: strategy_.supports_put(item_))
-        custom_metas = [None] * len(keys)
+        custom_metas: list[str] = [""] * len(keys)
+
+        # Todo(dpj): Parallel put
         for strategy, indexes in routed_indexes.items():
             if not indexes:
                 continue
@@ -382,7 +384,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str], optional): Device type (npu/cpu) for each key
+            custom_meta (List[str]): StorageStrategy type for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
@@ -414,13 +416,29 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         return results
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str], custom_meta=None):
         """Deletes multiple keys from remote storage.
 
         Args:
             keys (List[str]): List of keys to remove.
+            custom_meta (List[str]): StorageStrategy type for each key
         """
-        pass
+        if not isinstance(keys, list):
+            raise ValueError("keys must be a list")
+        if not isinstance(custom_meta, list):
+            raise ValueError("custom_meta must be a list if provided")
+        if len(custom_meta) != len(keys):
+            raise ValueError("custom_meta length must match keys")
+
+        routed_indexes = self._route_to_strategies(
+            custom_meta, lambda strategy_, item_: strategy_.supports_clear(item_)
+        )
+        # Todo(dpj): Parallel clear
+        for strategy, indexes in routed_indexes.items():
+            if not indexes:
+                continue
+            strategy_keys = [keys[i] for i in indexes]
+            strategy.clear(strategy_keys)
 
     def _route_to_strategies(
         self,
