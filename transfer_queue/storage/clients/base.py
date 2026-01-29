@@ -44,7 +44,7 @@ class TransferQueueStorageKVClient(ABC):
         raise NotImplementedError("Subclasses must implement put")
 
     @abstractmethod
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta: Optional[list[Any]] = None) -> list[Any]:
         """
         Retrieve values from the storage backend by key.
         Args:
@@ -65,6 +65,6 @@ class TransferQueueStorageKVClient(ABC):
         raise NotImplementedError("Subclasses must implement get")
 
     @abstractmethod
-    def clear(self, keys: list[str]) -> None:
+    def clear(self, keys: list[str], custom_meta: Optional[list[Any]] = None) -> None:
         """Clear key-value pairs in the storage backend."""
         raise NotImplementedError("Subclasses must implement clear")
