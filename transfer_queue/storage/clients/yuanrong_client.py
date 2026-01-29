@@ -18,7 +18,7 @@ import os
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional, TypeAlias, Union
+from typing import Any, Callable, Optional, TypeAlias, Union
 
 import torch
 from torch import Tensor
@@ -38,125 +38,6 @@ try:
     from yr import datasystem
 except ImportError:
     YUANRONG_DATASYSTEM_IMPORTED = False
-
-
-@StorageClientFactory.register("YuanrongStorageClient")
-class YuanrongStorageClient(TransferQueueStorageKVClient):
-    """
-    Storage client for YuanRong DataSystem.
-
-    Supports storing and fetching both:
-    - NPU tensors via DsTensorClient (for high performance).
-    - General objects (CPU tensors, str, bool, list, etc.) via KVClient with pickle serialization.
-    """
-
-    def __init__(self, config: dict[str, Any]):
-        if not YUANRONG_DATASYSTEM_IMPORTED:
-            raise ImportError("YuanRong DataSystem not installed.")
-
-        self._strategies: list[StorageStrategy] = []
-        for strategy_cls in [DsTensorClientAdapter, KVClientAdapter]:
-            strategy = strategy_cls.init(config)
-            if strategy is not None:
-                self._strategies.append(strategy)
-
-        if not self._strategies:
-            raise RuntimeError("No storage strategy available for YuanrongStorageClient")
-
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
-        """Stores multiple key-value pairs to remote storage.
-
-        Automatically routes NPU tensors to high-performance tensor storage,
-        and other objects to general-purpose KV storage.
-
-        Args:
-            keys (List[str]): List of unique string identifiers.
-            values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
-        """
-        if not isinstance(keys, list) or not isinstance(values, list):
-            raise ValueError("keys and values must be lists")
-        if len(keys) != len(values):
-            raise ValueError("Number of keys must match number of values")
-        custom_metas = []
-        strategy_batches: dict[StorageStrategy, tuple[list[str], list[Any]]] = {s: ([], []) for s in self._strategies}
-
-        for key, value in zip(keys, values, strict=True):
-            for strategy in self._strategies:
-                if strategy.supports_put(value):
-                    custom_metas.append(strategy.custom_meta())
-                    strategy_batches[strategy][0].append(key)
-                    strategy_batches[strategy][1].append(value)
-                    break
-            else:
-                raise ValueError(f"No strategy supports putting value of type {type(value)}")
-        # Todo: Parallel put
-        for strategy, (s_keys, s_vals) in strategy_batches.items():
-            if s_keys:
-                strategy.put(s_keys, s_vals)
-
-        return custom_metas
-
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
-        """Retrieves multiple values from remote storage with expected metadata.
-
-        Requires shape and dtype hints to reconstruct NPU tensors correctly.
-
-        Args:
-            keys (List[str]): Keys to fetch.
-            shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
-            dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str], optional): Device type (npu/cpu) for each key
-
-        Returns:
-            List[Any]: Retrieved values in the same order as input keys.
-        """
-        if shapes is None or dtypes is None:
-            raise ValueError("YuanrongStorageClient needs Expected shapes and dtypes")
-        if not (len(keys) == len(shapes) == len(dtypes)):
-            raise ValueError("Lengths of keys, shapes, dtypes must match")
-
-        if custom_meta is None:
-            raise ValueError("custom_meta is required for YuanrongStorageClient.get()")
-
-        if len(custom_meta) != len(keys):
-            raise ValueError("custom_meta length must match keys")
-
-        results: list[Optional[Any]] = [None] * len(keys)
-
-        # {strategy: ([index], [key])}
-        strategy_batches: dict[StorageStrategy, tuple[list[int], list[str]]] = {s: ([], []) for s in self._strategies}
-
-        for i, (key, meta) in enumerate(zip(keys, custom_meta, strict=True)):
-            for strategy in self._strategies:
-                if strategy.supports_get(meta):
-                    strategy_batches[strategy][0].append(i)
-                    strategy_batches[strategy][1].append(key)
-                    break
-            else:
-                raise ValueError(f"No strategy supports getting with meta={meta}")
-        # Todo: Parallel get
-        for strategy, (indices, s_keys) in strategy_batches.items():
-            s_shapes = [shapes[i] for i in indices]
-            s_dtypes = [dtypes[i] for i in indices]
-
-            try:
-                s_results = strategy.get(s_keys, shapes=s_shapes, dtypes=s_dtypes)
-            except Exception as e:
-                logger.error(f"Strategy {strategy.custom_meta()} failed to get keys: {s_keys}, error: {e}")
-                raise
-
-            for idx, res in zip(indices, s_results, strict=True):
-                results[idx] = res
-
-        return results
-
-    def clear(self, keys: list[str]):
-        """Deletes multiple keys from remote storage.
-
-        Args:
-            keys (List[str]): List of keys to remove.
-        """
-        pass
 
 
 class StorageStrategy(ABC):
@@ -336,12 +217,10 @@ class KVClientAdapter(StorageStrategy):
     def supports_clear(self, custom_meta: str) -> bool:
         return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
 
-    # Todo(wenlin): Add clear_buffer method
     def clear(self, keys: list[str]):
-        pass
-        # for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
-        #     batch = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
-        #     self._ds_client.delete(batch)
+        for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
+            batch = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
+            self._ds_client.delete(batch)
 
     @staticmethod
     def calc_packed_size(items: list[memoryview]) -> int:
@@ -438,3 +317,134 @@ class KVClientAdapter(StorageStrategy):
         """
         buffers = self._ds_client.get_buffers(keys)
         return [_decoder.decode(self.unpack_from(buffer)) if buffer is not None else None for buffer in buffers]
+
+
+@StorageClientFactory.register("YuanrongStorageClient")
+class YuanrongStorageClient(TransferQueueStorageKVClient):
+    """
+    Storage client for YuanRong DataSystem.
+
+    Supports storing and fetching both:
+    - NPU tensors via DsTensorClient (for high performance).
+    - General objects (CPU tensors, str, bool, list, etc.) via KVClient with pickle serialization.
+    """
+
+    def __init__(self, config: dict[str, Any]):
+        if not YUANRONG_DATASYSTEM_IMPORTED:
+            raise ImportError("YuanRong DataSystem not installed.")
+
+        self._strategies: list[StorageStrategy] = []
+        for strategy_cls in [DsTensorClientAdapter, KVClientAdapter]:
+            strategy = strategy_cls.init(config)
+            if strategy is not None:
+                self._strategies.append(strategy)
+
+        if not self._strategies:
+            raise RuntimeError("No storage strategy available for YuanrongStorageClient")
+
+    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+        """Stores multiple key-value pairs to remote storage.
+
+        Automatically routes NPU tensors to high-performance tensor storage,
+        and other objects to general-purpose KV storage.
+
+        Args:
+            keys (List[str]): List of unique string identifiers.
+            values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
+
+        Returns:
+            List[Any]: custom metadata of YuanrongStorageCilent in the same order as input keys.
+        """
+        if not isinstance(keys, list) or not isinstance(values, list):
+            raise ValueError("keys and values must be lists")
+        if len(keys) != len(values):
+            raise ValueError("Number of keys must match number of values")
+
+        routed_indexes = self._route_to_strategies(values, lambda strategy_, item_: strategy_.supports_put(item_))
+        custom_metas = [None] * len(keys)
+        for strategy, indexes in routed_indexes.items():
+            if not indexes:
+                continue
+            strategy_keys = [keys[i] for i in indexes]
+            strategy_values = [values[i] for i in indexes]
+            strategy.put(strategy_keys, strategy_values)
+            for i in indexes:
+                custom_metas[i] = strategy.custom_meta()
+
+        return custom_metas
+
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+        """Retrieves multiple values from remote storage with expected metadata.
+
+        Requires shape and dtype hints to reconstruct NPU tensors correctly.
+
+        Args:
+            keys (List[str]): Keys to fetch.
+            shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
+            dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
+            custom_meta (List[str], optional): Device type (npu/cpu) for each key
+
+        Returns:
+            List[Any]: Retrieved values in the same order as input keys.
+        """
+        if shapes is None or dtypes is None:
+            raise ValueError("YuanrongStorageClient needs Expected shapes and dtypes")
+        if not (len(keys) == len(shapes) == len(dtypes)):
+            raise ValueError("Lengths of keys, shapes, dtypes must match")
+
+        if custom_meta is None:
+            raise ValueError("custom_meta is required for YuanrongStorageClient.get()")
+
+        if len(custom_meta) != len(keys):
+            raise ValueError("custom_meta length must match keys")
+
+        routed_indexes = self._route_to_strategies(custom_meta, lambda strategy_, item_: strategy_.supports_get(item_))
+
+        # Todo(dpj): Parallel get
+        results = [None] * len(keys)
+        for strategy, indexes in routed_indexes.items():
+            if not indexes:
+                continue
+            strategy_keys = [keys[i] for i in indexes]
+            strategy_shapes = [shapes[i] for i in indexes]
+            strategy_dtypes = [dtypes[i] for i in indexes]
+            strategy_results = strategy.get(strategy_keys, shapes=strategy_shapes, dtypes=strategy_dtypes)
+            for j, i in enumerate(indexes):
+                results[i] = strategy_results[j]
+
+        return results
+
+    def clear(self, keys: list[str]):
+        """Deletes multiple keys from remote storage.
+
+        Args:
+            keys (List[str]): List of keys to remove.
+        """
+        pass
+
+    def _route_to_strategies(
+        self,
+        items: list[Any],
+        selector: Callable[[StorageStrategy, Any], bool],
+    ) -> dict[StorageStrategy, list[int]]:
+        """
+        Groups item indices by storage strategy.
+
+        Args:
+            items: A list of items (e.g., values or custom_meta strings) to be dispatched.
+                   The order must correspond to the original keys.
+            selector: A function that determines whether a strategy supports an item.
+                      Signature: (strategy, item) -> bool
+
+        Returns:
+            A dictionary mapping each strategy to a list of indices in `items`.
+        """
+        routed_indexes: dict[StorageStrategy, list[int]] = {s: [] for s in self._strategies}
+        for i, item in enumerate(items):
+            for strategy in self._strategies:
+                if selector(strategy, item):
+                    routed_indexes[strategy].append(i)
+                    break
+            else:
+                raise ValueError(f"No strategy supports item: {item}")
+        return routed_indexes
