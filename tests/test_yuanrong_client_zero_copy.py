@@ -25,7 +25,7 @@ parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
 from transfer_queue.storage.clients.yuanrong_client import (  # noqa: E402
-    YuanrongStorageClient,
+    KVClientAdapter,
 )
 
 
@@ -37,7 +37,7 @@ class MockBuffer:
         return self.data
 
 
-class TestYuanrongStorageZCopy:
+class TestYuanrongKVClientZCopy:
     @pytest.fixture
     def mock_kv_client(self, mocker):
         mock_client = MagicMock()
@@ -51,7 +51,7 @@ class TestYuanrongStorageZCopy:
 
     @pytest.fixture
     def storage_client(self, mock_kv_client):
-        return YuanrongStorageClient({"host": "127.0.0.1", "port": 31501})
+        return KVClientAdapter({"host": "127.0.0.1", "port": 31501})
 
     def test_mset_mget_p2p(self, storage_client, mocker):
         # Mock serialization/deserialization
@@ -80,13 +80,13 @@ class TestYuanrongStorageZCopy:
                 stored_raw_buffers.append(b.MutableData())
             return buffers
 
-        storage_client._cpu_ds_client.mcreate.side_effect = side_effect_mcreate
-        storage_client._cpu_ds_client.get_buffers.return_value = stored_raw_buffers
+        storage_client._ds_client.mcreate.side_effect = side_effect_mcreate
+        storage_client._ds_client.get_buffers.return_value = stored_raw_buffers
 
-        storage_client.mset_zcopy(
+        storage_client.mset_zero_copy(
             ["tensor_key", "string_key"], [torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32), "hello yuanrong"]
         )
-        results = storage_client.mget_zcopy(["tensor_key", "string_key"])
+        results = storage_client.mget_zero_copy(["tensor_key", "string_key"])
 
         assert torch.allclose(results[0], torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32))
         assert results[1] == "hello yuanrong"
