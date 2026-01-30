@@ -155,6 +155,12 @@ class TestYuanrongStorageE2E:
         dtypes = [v.dtype if isinstance(v, torch.Tensor) else None for v in vals]
         return keys, vals, shapes, dtypes
 
+    def test_mock_can_work(self, config):
+        mock_class = (MockDsTensorClient, MockKVClient)
+        client = self.client_cls(config)
+        for strategy in client._strategies:
+            assert isinstance(strategy._ds_client, mock_class)
+
     def test_cpu_only_flow(self, config):
         client = self.client_cls(config)
         keys, vals, shp, dt = self._create_data("cpu")
