@@ -361,19 +361,21 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             raise ValueError("Number of keys must match number of values")
 
         routed_indexes = self._route_to_strategies(values, lambda strategy_, item_: strategy_.supports_put(item_))
-        custom_metas: list[str] = [""] * len(keys)
 
-        # Todo(dpj): Parallel put
-        for strategy, indexes in routed_indexes.items():
-            if not indexes:
-                continue
-            strategy_keys = [keys[i] for i in indexes]
-            strategy_values = [values[i] for i in indexes]
-            strategy.put(strategy_keys, strategy_values)
+        # Define the work unit: Slicing the input list and calling the backend strategy.
+        # The closure captures local 'keys' and 'values' for zero-overhead parameter passing.
+        def put_task(strategy, indexes):
+            strategy.put([keys[i] for i in indexes], [values[i] for i in indexes])
+            return strategy.custom_meta(), indexes
+
+        # Call the orchestrator to run the tasks (Parallel or Sequential).
+        # We then iterate through the results to map strategy-specific metadata back
+        # to the original global index order.
+        custom_meta: list[str] = [""] * len(keys)
+        for meta_str, indexes in self._dispatch_tasks(routed_indexes, put_task):
             for i in indexes:
-                custom_metas[i] = strategy.custom_meta()
-
-        return custom_metas
+                custom_meta[i] = meta_str
+        return custom_meta
 
     def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
@@ -402,18 +404,20 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         routed_indexes = self._route_to_strategies(custom_meta, lambda strategy_, item_: strategy_.supports_get(item_))
 
-        # Todo(dpj): Parallel get
-        results = [None] * len(keys)
-        for strategy, indexes in routed_indexes.items():
-            if not indexes:
-                continue
-            strategy_keys = [keys[i] for i in indexes]
-            strategy_shapes = [shapes[i] for i in indexes]
-            strategy_dtypes = [dtypes[i] for i in indexes]
-            strategy_results = strategy.get(strategy_keys, shapes=strategy_shapes, dtypes=strategy_dtypes)
-            for j, i in enumerate(indexes):
-                results[i] = strategy_results[j]
+        # Work unit for 'get': handles slicing of keys, shapes, and dtypes simultaneously.
+        def get_task(strategy, indexes):
+            res = strategy.get(
+                [keys[i] for i in indexes], shapes=[shapes[i] for i in indexes], dtypes=[dtypes[i] for i in indexes]
+            )
+            return res, indexes
 
+        # Dispatch the 'get' requests. Multiple backends (e.g. NPU and SSD) will fetch
+        # in parallel if needed. Results are merged back into the 'results' list
+        # according to their original positions.
+        results = [None] * len(keys)
+        for strategy_res, indexes in self._dispatch_tasks(routed_indexes, get_task):
+            for value, original_index in zip(strategy_res, indexes, strict=True):
+                results[original_index] = value
         return results
 
     def clear(self, keys: list[str], custom_meta=None):
@@ -433,12 +437,14 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         routed_indexes = self._route_to_strategies(
             custom_meta, lambda strategy_, item_: strategy_.supports_clear(item_)
         )
-        # Todo(dpj): Parallel clear
-        for strategy, indexes in routed_indexes.items():
-            if not indexes:
-                continue
-            strategy_keys = [keys[i] for i in indexes]
-            strategy.clear(strategy_keys)
+
+        # Cleanup work unit: Does not return values, just executes deletion.
+        def clear_task(strategy, indexes):
+            strategy.clear([keys[i] for i in indexes])
+
+        # Parallelize deletion across strategies.
+        # The 'with' context in _dispatch_tasks will wait for all deletions to finish.
+        self._dispatch_tasks(routed_indexes, clear_task)
 
     def _route_to_strategies(
         self,
@@ -466,3 +472,29 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             else:
                 raise ValueError(f"No strategy supports item: {item}")
         return routed_indexes
+
+    def _dispatch_tasks(self, routed_tasks: dict[StorageStrategy, list[int]], task_function: Callable) -> list[Any]:
+        """
+        Orchestrates task execution across multiple strategies.
+
+        Logic:
+        1. If no tasks are present, return immediately.
+        2. If only one strategy is active, execute synchronously in the main thread (Fast Path)
+            to avoid the overhead of thread creation and context switching.
+        3. If multiple strategies are active, execute in parallel using a ThreadPoolExecutor.
+        """
+        active_tasks = [(strategy, indexes) for strategy, indexes in routed_tasks.items() if indexes]
+
+        if not active_tasks:
+            return []
+
+        # Fast Path: Execute directly if only one backend is targeted.
+        # This significantly reduces latency for homogeneous batches (e.g., NPU-only).
+        if len(active_tasks) == 1:
+            return [task_function(*active_tasks[0])]
+
+        # Parallel Path: Maximize throughput by overlapping NPU and CPU operations.
+        # The 'with' statement ensures immediate thread teardown and resource release.
+        with ThreadPoolExecutor(max_workers=len(active_tasks)) as executor:
+            futures = [executor.submit(task_function, strategy, indexes) for strategy, indexes in active_tasks]
+            return [f.result() for f in futures]
