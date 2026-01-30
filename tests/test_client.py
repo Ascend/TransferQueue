@@ -134,6 +134,9 @@ class MockController:
                             "partition_ids": ["partition_0", "partition_1", "test_partition"],
                         }
                         response_type = ZMQRequestType.LIST_PARTITIONS_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
+                        response_body = {"message": "success"}
+                        response_type = ZMQRequestType.SET_CUSTOM_META_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE

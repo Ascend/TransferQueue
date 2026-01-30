@@ -188,6 +188,33 @@ class TestBatchMeta:
         assert len(chunks[1]) == 3
         assert len(chunks[2]) == 3
 
+    def test_batch_meta_chunk_by_partition(self):
+        """Example: Split a batch into multiple chunks."""
+        fields = {
+            "test_field": FieldMeta(
+                name="test_field", dtype=torch.float32, shape=(2,), production_status=ProductionStatus.READY_FOR_CONSUME
+            )
+        }
+        samples = [SampleMeta(partition_id=f"partition_{i % 4}", global_index=i, fields=fields) for i in range(10)]
+        batch = BatchMeta(samples=samples)
+
+        # Chunk according to partition_id
+        chunks = batch.chunk_by_partition()
+
+        assert len(chunks) == 4
+        assert len(chunks[0]) == 3
+        assert chunks[0].partition_ids == ["partition_0", "partition_0", "partition_0"]
+        assert chunks[0].global_indexes == [0, 4, 8]
+        assert len(chunks[1]) == 3
+        assert chunks[1].partition_ids == ["partition_1", "partition_1", "partition_1"]
+        assert chunks[1].global_indexes == [1, 5, 9]
+        assert len(chunks[2]) == 2
+        assert chunks[2].partition_ids == ["partition_2", "partition_2"]
+        assert chunks[2].global_indexes == [2, 6]
+        assert len(chunks[3]) == 2
+        assert chunks[3].partition_ids == ["partition_3", "partition_3"]
+        assert chunks[3].global_indexes == [3, 7]
+
     def test_batch_meta_init_validation_error_different_field_names(self):
         """Example: Init validation catches samples with different field names."""
         # Create first sample with field1

@@ -1313,7 +1313,7 @@ class TransferQueueController:
 
         batch_meta = BatchMeta(samples=samples)
         batch_meta.update_custom_meta(custom_meta)
-        batch_meta.update_custom_backend_meta(custom_backend_meta)
+        batch_meta._custom_backend_meta.update(custom_backend_meta)
         return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
