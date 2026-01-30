@@ -450,3 +450,156 @@ class TestTransferQueueController:
         assert set(partition_after.global_indexes) == set([4, 5, 7])
 
         print("✓ Clear meta correct")
+
+
+class TestTransferQueueControllerCustomMeta:
+    """Integration tests for TransferQueueController custom_meta and custom_backend_meta methods.
+
+    Note: In this codebase:
+    - custom_meta: per-sample metadata (simple key-value pairs per sample)
+    - custom_backend_meta: per-sample per-field metadata (stored via update_production_status)
+    """
+
+    def test_controller_with_custom_meta(self, ray_setup):
+        """Test TransferQueueController with custom_backend_meta and custom_meta functionality"""
+
+        batch_size = 3
+        partition_id = "custom_meta_test"
+
+        tq_controller = TransferQueueController.remote()
+
+        # Create metadata in insert mode
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+
+        assert metadata.global_indexes == list(range(batch_size))
+
+        # Build custom_backend_meta (per-sample per-field metadata)
+        custom_backend_meta = {
+            0: {"prompt_ids": {"token_count": 100}, "attention_mask": {"mask_ratio": 0.1}},
+            1: {"prompt_ids": {"token_count": 120}, "attention_mask": {"mask_ratio": 0.15}},
+            2: {"prompt_ids": {"token_count": 90}, "attention_mask": {"mask_ratio": 0.12}},
+        }
+
+        # Update production status with custom_backend_meta
+        dtypes = {k: {"prompt_ids": "torch.int64", "attention_mask": "torch.bool"} for k in metadata.global_indexes}
+        shapes = {k: {"prompt_ids": (32,), "attention_mask": (32,)} for k in metadata.global_indexes}
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_names=metadata.field_names,
+                dtypes=dtypes,
+                shapes=shapes,
+                custom_meta=custom_backend_meta,
+            )
+        )
+        assert success
+
+        # Get partition snapshot and verify custom_backend_meta is stored
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert partition is not None
+
+        # Verify custom_backend_meta via get_field_custom_backend_meta
+        result = partition.get_field_custom_backend_meta(list(range(batch_size)), ["prompt_ids", "attention_mask"])
+        assert len(result) == batch_size
+        assert result[0]["prompt_ids"]["token_count"] == 100
+        assert result[2]["attention_mask"]["mask_ratio"] == 0.12
+
+        print("✓ Controller set custom_backend_meta via update_production_status correct")
+
+        # Now set custom_meta (per-sample metadata)
+        # Format: {partition_id: {global_index: custom_meta_dict}}
+        custom_meta = {
+            partition_id: {
+                0: {"sample_score": 0.9, "quality": "high"},
+                1: {"sample_score": 0.8, "quality": "medium"},
+                # You can set partial samples with custom_meta.
+            }
+        }
+
+        # Verify set_custom_meta method exists and can be called
+        ray.get(tq_controller.set_custom_meta.remote(partition_custom_meta=custom_meta))
+
+        # Verify via partition snapshot
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        result = partition.get_custom_meta([0, 1])
+        assert 0 in result
+        assert result[0]["sample_score"] == 0.9
+        assert result[0]["quality"] == "high"
+        assert 1 in result
+        assert result[1]["sample_score"] == 0.8
+        assert 2 not in result
+
+        # Init another partition
+        new_partition_id = "custom_meta_test2"
+        # Create metadata in insert mode
+        data_fields = ["prompt_ids", "attention_mask"]
+        new_metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=new_partition_id,
+                mode="insert",
+            )
+        )
+
+        # Update production status
+        dtypes = {k: {"prompt_ids": "torch.int64", "attention_mask": "torch.bool"} for k in new_metadata.global_indexes}
+        shapes = {k: {"prompt_ids": (32,), "attention_mask": (32,)} for k in new_metadata.global_indexes}
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=new_partition_id,
+                global_indexes=new_metadata.global_indexes,
+                field_names=new_metadata.field_names,
+                dtypes=dtypes,
+                shapes=shapes,
+                custom_meta=None,
+            )
+        )
+        assert success
+
+        # Provide complicated case: update custom_meta with mixed partitions, and update previous custom_meta
+        new_custom_meta = {
+            new_partition_id: {
+                3: {"sample_score": 1, "quality": "high"},
+                4: {"sample_score": 0, "quality": "low"},
+            },
+            partition_id: {
+                2: {"sample_score": 0.7, "quality": "high"},
+                0: {"sample_score": 0.001, "quality": "low"},
+            },
+        }
+
+        # update with new_custom_meta
+        ray.get(tq_controller.set_custom_meta.remote(partition_custom_meta=new_custom_meta))
+
+        # Verify via partition snapshot
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        result = partition.get_custom_meta([0, 1, 2])
+        assert 0 in result
+        assert result[0]["sample_score"] == 0.001  # updated!
+        assert result[0]["quality"] == "low"  # updated!
+        assert 1 in result  # unchanged
+        assert result[1]["sample_score"] == 0.8  # unchanged
+        assert 2 in result  # unchanged
+        assert result[2]["sample_score"] == 0.7  # new
+
+        new_partition = ray.get(tq_controller.get_partition_snapshot.remote(new_partition_id))
+        result = new_partition.get_custom_meta([3, 4, 5])
+        assert 3 in result
+        assert result[3]["sample_score"] == 1
+        assert result[3]["quality"] == "high"
+        assert 4 in result
+        assert result[4]["sample_score"] == 0
+        assert 5 not in result  # 5 has not custom_meta, it will not return even we retrieve for 5
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))

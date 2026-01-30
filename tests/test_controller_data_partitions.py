@@ -448,20 +448,22 @@ def test_performance_characteristics():
 
 
 def test_custom_meta_in_data_partition_status():
-    """Simplified tests for custom_meta functionality in DataPartitionStatus."""
+    """Simple tests for custom_meta and custom_backend_meta functionality in DataPartitionStatus."""
 
-    print("Testing simplified custom_meta in DataPartitionStatus...")
+    print("Testing custom_meta and custom_backend_meta in DataPartitionStatus...")
 
     from transfer_queue.controller import DataPartitionStatus
 
     partition = DataPartitionStatus(partition_id="custom_meta_test")
 
-    # Basic custom_meta storage via update_production_status
+    # First, set up production status
     global_indices = [0, 1, 2]
     field_names = ["input_ids", "attention_mask"]
     dtypes = {i: {"input_ids": "torch.int32", "attention_mask": "torch.bool"} for i in global_indices}
     shapes = {i: {"input_ids": (512,), "attention_mask": (512,)} for i in global_indices}
-    custom_meta = {
+
+    # custom_backend_meta goes to field_custom_backend_meta (per-sample per-field metadata)
+    custom_backend_meta = {
         0: {"input_ids": {"token_count": 100}},
         1: {"attention_mask": {"mask_ratio": 0.2}},
         2: {"input_ids": {"token_count": 300}},
@@ -472,29 +474,44 @@ def test_custom_meta_in_data_partition_status():
         field_names=field_names,
         dtypes=dtypes,
         shapes=shapes,
-        custom_meta=custom_meta,
+        custom_meta=custom_backend_meta,
     )
 
     assert success
 
-    # Verify some stored values
-    assert partition.field_custom_metas[0]["input_ids"]["token_count"] == 100
-    assert partition.field_custom_metas[1]["attention_mask"]["mask_ratio"] == 0.2
+    # Verify custom_backend_meta stored via get_field_custom_backend_meta
+    retrieved_backend = partition.get_field_custom_backend_meta([0, 1, 2], ["input_ids", "attention_mask"])
+    assert 0 in retrieved_backend
+    assert retrieved_backend[0]["input_ids"]["token_count"] == 100
+    assert 1 in retrieved_backend
+    assert retrieved_backend[1]["attention_mask"]["mask_ratio"] == 0.2
 
-    # Retrieval via helper for a subset of fields
-    retrieved = partition.get_field_custom_backend_meta([0, 1], ["input_ids", "attention_mask"])
-    assert 0 in retrieved and "input_ids" in retrieved[0]
-    assert 1 in retrieved and "attention_mask" in retrieved[1]
+    # Test set_custom_meta (goes to custom_meta, per-sample metadata)
+    partition.set_custom_meta({0: {"sample_score": 0.9}, 1: {"sample_score": 0.8}})
+    retrieved_custom = partition.get_custom_meta([0, 1])
+    assert 0 in retrieved_custom
+    assert retrieved_custom[0]["sample_score"] == 0.9
+    assert 1 in retrieved_custom
+    assert retrieved_custom[1]["sample_score"] == 0.8
 
-    # Clearing a sample should remove its custom_meta
+    # Clearing a sample should remove both custom_meta and custom_backend_meta
     partition.clear_data([0], clear_consumption=True)
-    assert 0 not in partition.field_custom_metas
 
-    print("✓ Custom_meta tests passed")
+    # Verify custom_meta is cleared
+    result_custom = partition.get_custom_meta([0, 1])
+    assert 0 not in result_custom
+    assert 1 in result_custom
+
+    # Verify custom_backend_meta is cleared
+    result_backend = partition.get_field_custom_backend_meta([0, 1, 2], ["input_ids", "attention_mask"])
+    assert 0 not in result_backend
+    assert 2 in result_backend  # Sample 2 should still be there
+
+    print("✓ Custom_meta and custom_backend_meta tests passed")
 
 
 def test_update_field_metadata_variants():
-    """Test _update_field_metadata handles dtypes/shapes/custom_meta being optional and merging."""
+    """Test _update_field_metadata handles dtypes/shapes/custom_backend_meta being optional and merging."""
     from transfer_queue.controller import DataPartitionStatus
 
     partition = DataPartitionStatus(partition_id="update_meta_test")
@@ -503,29 +520,29 @@ def test_update_field_metadata_variants():
     global_indices = [0, 1]
     dtypes = {0: {"f1": "torch.int32"}, 1: {"f1": "torch.bool"}}
 
-    partition._update_field_metadata(global_indices, dtypes, shapes=None, custom_meta=None)
+    partition._update_field_metadata(global_indices, dtypes, shapes=None, custom_backend_meta=None)
     assert partition.field_dtypes[0]["f1"] == "torch.int32"
     assert partition.field_dtypes[1]["f1"] == "torch.bool"
     assert partition.field_shapes == {}
-    assert partition.field_custom_metas == {}
+    assert partition.field_custom_backend_meta == {}
 
     # Only shapes provided for a new index
-    partition._update_field_metadata([2], dtypes=None, shapes={2: {"f2": (16,)}}, custom_meta=None)
+    partition._update_field_metadata([2], dtypes=None, shapes={2: {"f2": (16,)}}, custom_backend_meta=None)
     assert partition.field_shapes[2]["f2"] == (16,)
 
-    # Only custom_meta provided and merged with existing entries
-    partition._update_field_metadata([2], dtypes=None, shapes=None, custom_meta={2: {"f2": {"meta": 1}}})
-    assert 2 in partition.field_custom_metas
-    assert partition.field_custom_metas[2]["f2"]["meta"] == 1
+    # Only custom_backend_meta provided and merged with existing entries
+    partition._update_field_metadata([2], dtypes=None, shapes=None, custom_backend_meta={2: {"f2": {"meta": 1}}})
+    assert 2 in partition.field_custom_backend_meta
+    assert partition.field_custom_backend_meta[2]["f2"]["meta"] == 1
 
     # Merging dtypes on an existing index should preserve previous keys
-    partition._update_field_metadata([0], dtypes={0: {"f2": "torch.float32"}}, shapes=None, custom_meta=None)
+    partition._update_field_metadata([0], dtypes={0: {"f2": "torch.float32"}}, shapes=None, custom_backend_meta=None)
     assert partition.field_dtypes[0]["f1"] == "torch.int32"
     assert partition.field_dtypes[0]["f2"] == "torch.float32"
 
     # Length mismatch should raise ValueError when provided mapping lengths differ from global_indices
     with pytest.raises(ValueError):
-        partition._update_field_metadata([0, 1, 2], dtypes={0: {}}, shapes=None, custom_meta=None)
+        partition._update_field_metadata([0, 1, 2], dtypes={0: {}}, shapes=None, custom_backend_meta=None)
 
 
 def test_get_production_status_for_fields():
@@ -822,3 +839,105 @@ def test_pre_allocated_indexes_mixed_with_dynamic():
     print("✓ Mixed pre-allocated and dynamic indexes work correctly")
 
     print("Mixed indexes tests passed!\n")
+
+
+class TestDataPartitionStatusCustomMeta:
+    """Unit tests for DataPartitionStatus custom_meta methods."""
+
+    def test_set_custom_meta_single_partition(self):
+        """Test set_custom_meta sets custom metadata for samples in a partition."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        # Set custom_meta for specific samples
+        custom_meta = {
+            0: {"score": 0.9, "label": "positive"},
+            1: {"score": 0.8, "label": "negative"},
+        }
+        partition.set_custom_meta(custom_meta)
+
+        # Verify
+        result = partition.get_custom_meta([0, 1, 2])
+        assert 0 in result
+        assert result[0]["score"] == 0.9
+        assert 1 in result
+        assert result[1]["label"] == "negative"
+
+    def test_set_custom_meta_updates_existing(self):
+        """Test set_custom_meta updates existing custom metadata."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        # Initial custom_meta
+        partition.set_custom_meta({0: {"score": 0.5}})
+
+        # Update with new values
+        partition.set_custom_meta({0: {"score": 0.9, "label": "updated"}})
+
+        result = partition.get_custom_meta([0])
+        assert result[0]["score"] == 0.9
+        assert result[0]["label"] == "updated"
+
+    def test_get_custom_meta_returns_only_requested(self):
+        """Test get_custom_meta only returns metadata for requested indices."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        partition.set_custom_meta(
+            {
+                0: {"data": "sample_0"},
+                1: {"data": "sample_1"},
+                2: {"data": "sample_2"},
+            }
+        )
+
+        # Request only specific indices
+        result = partition.get_custom_meta([0, 2])
+
+        assert 0 in result
+        assert 2 in result
+        assert 1 not in result
+        assert result[0]["data"] == "sample_0"
+        assert result[2]["data"] == "sample_2"
+
+    def test_get_custom_meta_empty_for_missing(self):
+        """Test get_custom_meta returns empty dict for indices without metadata."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        # Set custom_meta only for sample 0
+        partition.set_custom_meta({0: {"score": 0.9}})
+
+        # Request indices that don't have metadata
+        result = partition.get_custom_meta([1, 2])
+
+        assert 0 not in result
+        assert 1 not in result
+        assert 2 not in result
+
+    def test_custom_meta_cleared_with_data(self):
+        """Test custom_meta is cleared when clearing sample data."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        # Set production status and custom_meta
+        partition.update_production_status(
+            global_indices=[0, 1],
+            field_names=["input_ids"],
+            dtypes={0: {"input_ids": "torch.int32"}, 1: {"input_ids": "torch.int32"}},
+            shapes={0: {"input_ids": (512,)}, 1: {"input_ids": (512,)}},
+        )
+        partition.set_custom_meta({0: {"score": 0.9}, 1: {"score": 0.8}})
+
+        # Clear sample 0
+        partition.clear_data([0], clear_consumption=True)
+
+        # Verify sample 0 custom_meta is cleared
+        result = partition.get_custom_meta([0, 1])
+        assert 0 not in result
+        assert 1 in result  # Sample 1 should still have custom_meta

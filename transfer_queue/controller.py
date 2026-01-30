@@ -700,6 +700,7 @@ class DataPartitionStatus:
             custom_meta: Dictionary mapping global_index to custom metadata dict.
                         Existing entries will be overwritten.
         """
+
         for k in custom_meta.keys():
             self.custom_meta[k] = custom_meta[k]
 
