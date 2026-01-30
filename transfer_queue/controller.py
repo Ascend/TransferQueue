@@ -226,9 +226,11 @@ class DataPartitionStatus:
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     field_dtypes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: dtype}
     field_shapes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: shape}
-    field_custom_backend_metas: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: custom_backend_meta}
+    field_custom_backend_meta: dict[int, dict[str, Any]] = field(
+        default_factory=dict
+    )  # global_idx -> {field: custom_backend_meta}
     # User-defined metadata that may not apply to field level
-    custom_metas: dict[int, dict[str, Any]] = field(default_factory=dict) # global_idx -> {}
+    custom_meta: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {}
 
     # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
     # No need to strictly lock for every read/write operation since freshness is not critical.
@@ -429,7 +431,7 @@ class DataPartitionStatus:
         global_indices: list[int],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]],
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]],
     ):
         """Update field dtype and shape metadata."""
         if not global_indices:
@@ -440,9 +442,9 @@ class DataPartitionStatus:
             raise ValueError(f"`global_indices` {len(global_indices)} and `dtypes` {len(dtypes)} length mismatch.")
         if shapes and len(global_indices) != len(shapes):
             raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
-        if custom_meta and len(global_indices) != len(custom_meta):
+        if custom_backend_meta and len(global_indices) != len(custom_backend_meta):
             raise ValueError(
-                f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_meta)} length mismatch."
+                f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_backend_meta)} length mismatch."
             )
 
         # Extract values for each provided mapping; if a mapping is absent, use Nones
@@ -460,12 +462,12 @@ class DataPartitionStatus:
         else:
             shape_value = tuple([None] * len(global_indices))
 
-        if custom_meta:
-            custom_meta_value = itemgetter(*global_indices)(custom_meta)
-            if not isinstance(custom_meta_value, tuple):
-                custom_meta_value = (custom_meta_value,)
+        if custom_backend_meta:
+            custom_backend_meta_value = itemgetter(*global_indices)(custom_backend_meta)
+            if not isinstance(custom_backend_meta_value, tuple):
+                custom_backend_meta_value = (custom_backend_meta_value,)
         else:
-            custom_meta_value = tuple([None] * len(global_indices))
+            custom_backend_meta_value = tuple([None] * len(global_indices))
 
         for i, global_idx in enumerate(global_indices):
             # Only create and update dtype mapping if a dtype value was provided
@@ -480,11 +482,11 @@ class DataPartitionStatus:
                     self.field_shapes[global_idx] = {}
                 self.field_shapes[global_idx].update(shape_value[i])
 
-            # Only create and update custom_meta mapping if a custom_meta value was provided
-            if custom_meta_value[i] is not None:
-                if global_idx not in self.field_custom_backend_metas:
-                    self.field_custom_backend_metas[global_idx] = {}
-                self.field_custom_backend_metas[global_idx].update(custom_meta_value[i])
+            # Only create and update custom_backend_meta mapping if a custom_backend_meta value was provided
+            if custom_backend_meta_value[i] is not None:
+                if global_idx not in self.field_custom_backend_meta:
+                    self.field_custom_backend_meta[global_idx] = {}
+                self.field_custom_backend_meta[global_idx].update(custom_backend_meta_value[i])
 
     def mark_consumed(self, task_name: str, global_indices: list[int]):
         """
@@ -641,27 +643,65 @@ class DataPartitionStatus:
         """Get shape for a specific sample and field."""
         return self.field_shapes.get(global_index, {}).get(field_name)
 
-    def get_field_custom_backend_meta(self, global_indices: list[int], field_names: list[str]) -> dict[int, dict[str, Any]]:
-        """Get custom_backend_meta for multiple samples and fields."""
+    def get_field_custom_backend_meta(
+        self, global_indices: list[int], field_names: list[str]
+    ) -> dict[int, dict[str, Any]]:
+        """
+        Get custom_backend_meta for multiple samples and fields.
+
+        This method retrieves backend-specific metadata stored at per-sample per-field level.
+        The returned dictionary maps global_index to a dictionary of field_name to metadata.
+
+        Args:
+            global_indices: List of global sample indices to retrieve metadata for
+            field_names: List of field names to filter by. Only metadata for these
+                        fields will be included in the result.
+
+        Returns:
+            Dictionary mapping global_index to field-name-to-metadata mapping.
+            Only includes indices that have custom_backend_meta set.
+
+        Example:
+            >>> partition.get_field_custom_backend_meta([0, 1], ["field_a", "field_b"])
+            {0: {'field_a': {'meta1': 'xxx'}, 'field_b': {'meta1': 'xxx'}}, 1: {...}}
+        """
         return {
-            idx: {f: v for f, v in self.field_custom_backend_metas[idx].items() if f in field_names}
+            idx: {f: v for f, v in self.field_custom_backend_meta[idx].items() if f in field_names}
             for idx in global_indices
-            if idx in self.field_custom_backend_metas
+            if idx in self.field_custom_backend_meta
         }
 
     def get_custom_meta(self, global_indices: list[int]) -> dict[int, dict]:
-        """Get custom_meta for multiple samples."""
-        return {
-            idx: self.custom_metas[idx]
-            for idx in global_indices
-            if idx in self.custom_metas
-        }
+        """
+        Get custom_meta for multiple samples.
 
+        This method retrieves user-defined per-sample metadata.
+
+        Args:
+            global_indices: List of global sample indices to retrieve metadata for
+
+        Returns:
+            Dictionary mapping global_index to custom metadata dict.
+            Only includes indices that have custom_meta set.
+
+        Example:
+            >>> partition.get_custom_meta([0, 2])
+            {0: {'score': 0.9}, 2: {'label': 'positive'}}
+        """
+        return {idx: self.custom_meta[idx] for idx in global_indices if idx in self.custom_meta}
 
     def set_custom_meta(self, custom_meta: dict[int, dict]) -> None:
-        """Set custom_meta for multiple samples."""
+        """
+        Set custom_meta for multiple samples.
+
+        This method sets or updates user-defined per-sample metadata.
+
+        Args:
+            custom_meta: Dictionary mapping global_index to custom metadata dict.
+                        Existing entries will be overwritten.
+        """
         for k in custom_meta.keys():
-            self.custom_metas[k] = custom_meta[k]
+            self.custom_meta[k] = custom_meta[k]
 
     # ==================== Statistics and Monitoring ====================
 
@@ -758,7 +798,8 @@ class DataPartitionStatus:
             for idx in indexes_to_release:
                 self.field_dtypes.pop(idx, None)
                 self.field_shapes.pop(idx, None)
-                self.field_custom_metas.pop(idx, None)
+                self.field_custom_backend_meta.pop(idx, None)
+                self.custom_meta.pop(idx, None)
 
         except Exception as e:
             logger.error(
@@ -998,15 +1039,33 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
-    def set_custom_meta(
-        self, partition_custom_meta: dict[str, dict[int, dict]]
-    ) -> None:
+    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
         """
-        Set custom meta for samples in a partition.
+        Set custom_meta for samples in partitions.
+
+        This method allows setting per-sample custom metadata (custom_meta) for samples
+        identified by their global indexes within specific partitions. Custom metadata
+        is stored per-sample and can be retrieved along with BatchMeta in subsequent
+        get_meta calls.
 
         Args:
-            partition_id: ID of the partition
+            partition_custom_meta: Dictionary mapping partition_id to custom metadata dict.
+                                  Format: {partition_id: {global_index: {metadata_key: metadata_value}}}
+                                  - partition_id: ID of the partition
+                                  - global_index: Global index of the sample
+                                  - metadata_key/value: User-defined metadata key-value pairs
 
+        Example:
+            >>> # Set custom metadata for samples in different partitions
+            >>> controller.set_custom_meta({
+            ...     "train_0": {
+            ...         0: {"score": 0.9, "label": "positive"},
+            ...         1: {"score": 0.8, "label": "negative"}
+            ...     },
+            ...     "train_1": {
+            ...         10: {"score": 0.95, "label": "positive"}
+            ...     }
+            ... })
         """
 
         for partition_id, custom_meta in partition_custom_meta.items():
@@ -1496,19 +1555,15 @@ class TransferQueueController:
             elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
                 with perf_monitor.measure(op_type="SET_CUSTOM_META"):
                     params = request_msg.body
-                    global_indexes = params["global_indexes"]
-                    custom_metadata = params["custom_metadata"]
+                    partition_custom_meta = params["partition_custom_meta"]
 
-                    self.set_custom_meta(
-                        global_indexes=global_indexes,
-                        custom_metadata=custom_metadata,
-                    )
+                    self.set_custom_meta(partition_custom_meta=partition_custom_meta)
 
                     response_msg = ZMQMessage.create(
-                        request_type=ZMQRequestType.SET_CUSTOM_META,
+                        request_type=ZMQRequestType.SET_CUSTOM_META_RESPONSE,
                         sender_id=self.controller_id,
                         receiver_id=request_msg.sender_id,
-                        body={"message": f"Successfully set custom_meta"},
+                        body={"message": "Successfully set custom_meta"},
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_META:
