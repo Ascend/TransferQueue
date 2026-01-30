@@ -4,6 +4,7 @@
   </h2>
   <a href="https://arxiv.org/abs/2507.01663" target="_blank"><strong>Paper</strong></a>
 | <a href="https://zhuanlan.zhihu.com/p/1930244241625449814" target="_blank"><strong>Zhihu</strong></a>
+| <a href="https://github.com/TransferQueue/community_doc/blob/main/other_assets/WeChatGroup.png?raw=true" target="_blank"><strong>WeChat</strong></a>
   <br />
   <br />
 
