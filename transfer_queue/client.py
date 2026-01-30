@@ -209,10 +209,10 @@ class AsyncTransferQueueClient:
             >>> print(batch_meta.is_ready)  # True if all samples ready
             >>>
             >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> so may include unready samples. Consumed samples will not be fetched.)
+            >>> # so may include unready samples. Consumed samples will not be fetched.)
             >>> batch_meta = asyncio.run(client.async_get_meta(
             ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=4,
+            ...     batch_size=4,  # this is optional when using force_fetch
             ...     partition_id="train_0",
             ...     mode="force_fetch",
             ...     task_name="generate_sequences"
@@ -252,6 +252,14 @@ class AsyncTransferQueueClient:
                 )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_meta: {str(e)}") from e
+
+
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_set_meta_extra_info(
+        self,
+        metadata: BatchMeta,
+    ):
+
 
     async def async_put(
         self,
@@ -337,6 +345,8 @@ class AsyncTransferQueueClient:
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
         ):
             await self.storage_manager.put_data(data, metadata)
+
+        await self.async_set_meta_extra_info(metadata)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."

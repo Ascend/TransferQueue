@@ -201,9 +201,15 @@ class BatchMeta:
     """Records the metadata of a batch of data samples."""
 
     samples: list[SampleMeta]
+
+    # external meta for non-sample level information
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # internal data for different storage backends: _custom_meta[global_index][field]
-    _custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+    # external user-defined meta for each sample
+    custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+    # internal meta for different storage backends for each sample
+    _custom_backend_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
@@ -260,44 +266,47 @@ class BatchMeta:
         """Get partition ids for all samples in this batch as a list (one per sample)"""
         return getattr(self, "_partition_ids", [])
 
-    # Custom meta methods for different storage backends
-    def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
-        """Get the entire custom meta dictionary"""
-        return copy.deepcopy(self._custom_meta)
-
-    def update_custom_meta(self, new_custom_meta: Optional[dict[int, dict[str, Any]]]):
-        """Update custom meta with a new dictionary"""
-        if new_custom_meta:
-            self._custom_meta.update(new_custom_meta)
-
-    # Extra info interface methods
-    def get_extra_info(self, key: str, default: Any = None) -> Any:
-        """Get extra info by key"""
-        return self.extra_info.get(key, default)
-
-    def set_extra_info(self, key: str, value: Any) -> None:
-        """Set extra info by key"""
-        self.extra_info[key] = value
+    def get_all_extra_info(self) -> dict[str, Any]:
+        """Get all extra info as a dictionary"""
+        return copy.deepcopy(self.extra_info)
 
     def update_extra_info(self, info_dict: dict[str, Any]) -> None:
         """Update extra info with multiple key-value pairs"""
         self.extra_info.update(info_dict)
 
-    def remove_extra_info(self, key: str) -> Any:
-        """Remove extra info by key and return its value"""
-        return self.extra_info.pop(key, None)
-
     def clear_extra_info(self) -> None:
         """Clear all extra info"""
         self.extra_info.clear()
 
-    def has_extra_info(self, key: str) -> bool:
-        """Check if extra info contains a specific key"""
-        return key in self.extra_info
+    def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
+        """Get the entire custom_meta dictionary"""
+        return copy.deepcopy(self.custom_meta)
 
-    def get_all_extra_info(self) -> dict[str, Any]:
-        """Get all extra info as a dictionary"""
-        return copy.deepcopy(self.extra_info)
+    def update_custom_meta(self, new_custom_meta: dict[int, dict[str, Any]]):
+        """Update custom_meta with a new dictionary"""
+        self._custom_meta.update(new_custom_meta)
+
+    def clear_custom_meta(self) -> None:
+        """Clear custom_meta"""
+        self._custom_meta.clear()
+
+    def get_all_custom_backend_meta(self) -> dict[int, dict[str, Any]]:
+        """Get the entire _custom_backend_meta dictionary"""
+        return copy.deepcopy(self._custom_backend_meta)
+
+    def update_custom_backend_meta(self, new_custom_meta: Optional[dict[int, dict[str, Any]]]):
+        """Update _custom_backend_meta with a new dictionary"""
+        if new_custom_meta:
+            self._custom_backend_meta.update(new_custom_meta)
+
+    def clear_custom_backend_meta(self) -> None:
+        """Clear _custom_backend_meta"""
+        self._custom_backend_meta.clear()
+
+
+
+
+
 
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """
