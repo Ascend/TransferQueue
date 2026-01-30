@@ -208,13 +208,15 @@ class BatchMeta:
     # external user-defined meta for each sample
     custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
-    # internal meta for different storage backends for each sample
+    # internal meta for different storage backends in per-sample per-field level
     _custom_backend_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
         self.samples = copy.deepcopy(self.samples)
         self.extra_info = copy.deepcopy(self.extra_info)
+        self.custom_meta = copy.deepcopy(self.custom_meta)
+        self._custom_backend_meta = copy.deepcopy(self._custom_backend_meta)
 
         # Basic properties
         object.__setattr__(self, "_size", len(self.samples))
@@ -235,7 +237,12 @@ class BatchMeta:
 
             object.__setattr__(self, "_partition_ids", [sample.partition_id for sample in self.samples])
 
+            # filter custom_meta and _custom_backend_meta
+            self.custom_meta = copy.deepcopy({k: self.custom_meta[k] for k in self.global_indexes if k in self.custom_meta})
+            self._custom_backend_meta = copy.deepcopy({k: self._custom_backend_meta[k] for k in self.global_indexes if k in self._custom_backend_meta})
         else:
+            self.custom_meta = {}
+            self._custom_backend_meta = {}
             object.__setattr__(self, "_global_indexes", [])
             object.__setattr__(self, "_field_names", [])
             object.__setattr__(self, "_partition_ids", [])
@@ -266,47 +273,72 @@ class BatchMeta:
         """Get partition ids for all samples in this batch as a list (one per sample)"""
         return getattr(self, "_partition_ids", [])
 
+    def set_extra_info(self, key: str, value: Any) -> None:
+        """Set extra_info by key"""
+        self.extra_info[key] = value
+
     def get_all_extra_info(self) -> dict[str, Any]:
-        """Get all extra info as a dictionary"""
+        """Get all extra_info as a dictionary"""
         return copy.deepcopy(self.extra_info)
 
     def update_extra_info(self, info_dict: dict[str, Any]) -> None:
-        """Update extra info with multiple key-value pairs"""
+        """Update extra_info with multiple key-value pairs"""
         self.extra_info.update(info_dict)
 
     def clear_extra_info(self) -> None:
-        """Clear all extra info"""
+        """Clear all extra_info"""
         self.extra_info.clear()
+
+    def set_custom_meta(self, key: int, value: dict[str, Any]) -> None:
+        """Set custom_meta by key"""
+        if key not in self.global_indexes:
+            raise ValueError(f"key {key} not found in global_indexes {self.global_indexes}.")
+
+        self.custom_meta[key] = copy.deepcopy(value)
 
     def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
         """Get the entire custom_meta dictionary"""
         return copy.deepcopy(self.custom_meta)
 
-    def update_custom_meta(self, new_custom_meta: dict[int, dict[str, Any]]):
+    def update_custom_meta(self, new_meta: dict[int, dict[str, Any]]):
         """Update custom_meta with a new dictionary"""
-        self._custom_meta.update(new_custom_meta)
+
+        non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
+        if bool(non_exist_global_indexes):
+            raise ValueError(f"Trying to update custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
+                             f"do not exist in this batch.")
+
+        self.custom_meta.update(new_meta)
 
     def clear_custom_meta(self) -> None:
         """Clear custom_meta"""
-        self._custom_meta.clear()
+        self.custom_meta.clear()
+
+    def set_custom_backend_meta(self, key: int, value: dict[str, Any]) -> None:
+        """Set custom_meta by key"""
+        if key not in self.global_indexes:
+            raise ValueError(f"key {key} not found in global_indexes {self.global_indexes}.")
+
+        self._custom_backend_meta[key] = copy.deepcopy(value)
 
     def get_all_custom_backend_meta(self) -> dict[int, dict[str, Any]]:
         """Get the entire _custom_backend_meta dictionary"""
         return copy.deepcopy(self._custom_backend_meta)
 
-    def update_custom_backend_meta(self, new_custom_meta: Optional[dict[int, dict[str, Any]]]):
+    def update_custom_backend_meta(self, new_meta: Optional[dict[int, dict[str, Any]]]):
         """Update _custom_backend_meta with a new dictionary"""
-        if new_custom_meta:
-            self._custom_backend_meta.update(new_custom_meta)
+
+        non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
+        if bool(non_exist_global_indexes):
+            raise ValueError(f"Trying to update _custom_backend_meta with non-exist global_indexes! "
+                             f"{non_exist_global_indexes} do not exist in this batch.")
+
+        if new_meta:
+            self._custom_backend_meta.update(new_meta)
 
     def clear_custom_backend_meta(self) -> None:
         """Clear _custom_backend_meta"""
         self._custom_backend_meta.clear()
-
-
-
-
-
 
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """
@@ -415,6 +447,22 @@ class BatchMeta:
             chunk = BatchMeta(samples=chunk_samples, extra_info=self.extra_info)
             chunk_list.append(chunk)
             start = end
+        return chunk_list
+
+    def chunk_by_partition(self, ) -> list["BatchMeta"]:
+        """
+        Split this batch into smaller chunks according to partition_ids.
+
+        Return:
+            List of smaller BatchMeta chunks, each chunk has samples with identical partition_id
+        """
+
+        grouped_global_indexes = defaultdict(list)
+        for partition_id, global_index in zip(self.partition_ids, self.global_indexes):
+            grouped_global_indexes[partition_id].append(global_index)
+
+        chunk_list = [self.select_samples(samples) for samples in grouped_global_indexes.values()]
+
         return chunk_list
 
     @classmethod

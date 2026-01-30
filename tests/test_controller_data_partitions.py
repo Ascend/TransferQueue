@@ -482,7 +482,7 @@ def test_custom_meta_in_data_partition_status():
     assert partition.field_custom_metas[1]["attention_mask"]["mask_ratio"] == 0.2
 
     # Retrieval via helper for a subset of fields
-    retrieved = partition.get_field_custom_meta([0, 1], ["input_ids", "attention_mask"])
+    retrieved = partition.get_field_custom_backend_meta([0, 1], ["input_ids", "attention_mask"])
     assert 0 in retrieved and "input_ids" in retrieved[0]
     assert 1 in retrieved and "attention_mask" in retrieved[1]
 
