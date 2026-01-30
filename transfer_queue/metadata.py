@@ -137,7 +137,7 @@ class SampleMeta:
         selected_fields = {name: self.fields[name] for name in field_names if name in self.fields}
 
         # construct new SampleMeta instance
-        # TODO(tianyi): (maybe) move _custom_backend_meta and _custom_meta to FieldMeta level?
+        # TODO(tianyi): (maybe) move _custom_backend_meta and custom_meta to FieldMeta level?
         selected_sample_meta = SampleMeta(
             fields=selected_fields,
             partition_id=self.partition_id,
@@ -205,8 +205,8 @@ class BatchMeta:
     # external meta for non-sample level information
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
 
-    # internal user-defined meta for each sample
-    _custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    # user-defined meta for each sample
+    custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     # internal meta for different storage backends in per-sample per-field level
     _custom_backend_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
@@ -215,7 +215,7 @@ class BatchMeta:
         """Initialize all computed properties during initialization"""
         self.samples = copy.deepcopy(self.samples)
         self.extra_info = copy.deepcopy(self.extra_info)
-        self._custom_meta = copy.deepcopy(self._custom_meta)
+        self.custom_meta = copy.deepcopy(self.custom_meta)
         self._custom_backend_meta = copy.deepcopy(self._custom_backend_meta)
 
         # Basic properties
@@ -237,15 +237,15 @@ class BatchMeta:
 
             object.__setattr__(self, "_partition_ids", [sample.partition_id for sample in self.samples])
 
-            # filter _custom_meta and _custom_backend_meta
-            self._custom_meta = copy.deepcopy(
-                {k: self._custom_meta[k] for k in self.global_indexes if k in self._custom_meta}
+            # filter custom_meta and _custom_backend_meta
+            self.custom_meta = copy.deepcopy(
+                {k: self.custom_meta[k] for k in self.global_indexes if k in self.custom_meta}
             )
             self._custom_backend_meta = copy.deepcopy(
                 {k: self._custom_backend_meta[k] for k in self.global_indexes if k in self._custom_backend_meta}
             )
         else:
-            self._custom_meta = {}
+            self.custom_meta = {}
             self._custom_backend_meta = {}
             object.__setattr__(self, "_global_indexes", [])
             object.__setattr__(self, "_field_names", [])
@@ -277,16 +277,6 @@ class BatchMeta:
         """Get partition ids for all samples in this batch as a list (one per sample)"""
         return getattr(self, "_partition_ids", [])
 
-    def set_extra_info(self, key: str, value: Any) -> None:
-        """
-        Set extra_info value for a specific key.
-
-        Args:
-            key: The key to set in extra_info
-            value: The value to associate with the key
-        """
-        self.extra_info[key] = value
-
     def get_all_extra_info(self) -> dict[str, Any]:
         """Get all extra_info as a dictionary (deep copy for immutability).
 
@@ -317,7 +307,7 @@ class BatchMeta:
 
     def set_custom_meta(self, global_index: int, meta_dict: dict[str, Any]) -> None:
         """
-        Set _custom_meta for a specific sample by global_index.
+        Set custom_meta for a specific sample by global_index.
 
         Custom metadata is user-defined per-sample metadata that can be stored
         and retrieved along with the BatchMeta.
@@ -333,22 +323,22 @@ class BatchMeta:
         if global_index not in self.global_indexes:
             raise ValueError(f"key {global_index} not found in global_indexes {self.global_indexes}.")
 
-        self._custom_meta[global_index] = copy.deepcopy(meta_dict)
+        self.custom_meta[global_index] = copy.deepcopy(meta_dict)
 
     def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
         """
-        Get all _custom_meta as a dictionary.
+        Get all custom_meta as a dictionary.
 
         Returns:
-            A deep copy of the _custom_meta dictionary
+            A deep copy of the custom_meta dictionary
         """
-        return copy.deepcopy(self._custom_meta)
+        return copy.deepcopy(self.custom_meta)
 
     def update_custom_meta(self, new_meta: dict[int, dict[str, Any]]):
         """
-        Update _custom_meta with a dictionary of new metadata.
+        Update custom_meta with a dictionary of new metadata.
 
-        This method updates the _custom_meta dictionary with the provided metadata.
+        This method updates the custom_meta dictionary with the provided metadata.
         Existing keys will be overwritten with new values.
 
         Args:
@@ -364,86 +354,19 @@ class BatchMeta:
         non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
         if bool(non_exist_global_indexes):
             raise ValueError(
-                f"Trying to update _custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
+                f"Trying to update custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
                 f"do not exist in this batch."
             )
 
-        self._custom_meta.update(new_meta)
+        self.custom_meta.update(new_meta)
 
     def clear_custom_meta(self) -> None:
         """
-        Clear all _custom_meta.
+        Clear all custom_meta.
 
-        This method removes all entries from the _custom_meta dictionary.
+        This method removes all entries from the custom_meta dictionary.
         """
-        self._custom_meta.clear()
-
-    def set_custom_backend_meta(self, global_index: int, meta_dict: dict[str, Any]) -> None:
-        """
-        Set _custom_backend_meta for a specific sample by global_index.
-
-        Custom backend metadata is internal metadata for storage backends,
-        stored at per-sample per-field level. This is typically used by
-        storage backends to store backend-specific information.
-
-        Args:
-            global_index: The global_index of the sample to set backend meta for
-            meta_dict: Dictionary mapping field names to backend metadata
-
-        Raises:
-            ValueError: If the key is not in global_indexes
-        """
-
-        if global_index not in self.global_indexes:
-            raise ValueError(f"key {global_index} not found in global_indexes {self.global_indexes}.")
-
-        self._custom_backend_meta[global_index] = copy.deepcopy(meta_dict)
-
-    def get_all_custom_backend_meta(self) -> dict[int, dict[str, Any]]:
-        """
-        Get all _custom_backend_meta as a dictionary.
-
-        Returns:
-            A deep copy of the _custom_backend_meta dictionary
-        """
-
-        return copy.deepcopy(self._custom_backend_meta)
-
-    def update_custom_backend_meta(self, new_meta: Optional[dict[int, dict[str, Any]]]):
-        """
-        Update _custom_backend_meta with a dictionary of new metadata.
-
-        This method updates the _custom_backend_meta dictionary with the provided metadata.
-        Existing keys will be overwritten with new values.
-
-        Args:
-            new_meta: Dictionary of new metadata
-
-        Raises:
-            ValueError: If any key in new_meta is not in global_indexes
-        """
-
-        if new_meta is None:
-            return
-
-        non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
-        if bool(non_exist_global_indexes):
-            raise ValueError(
-                f"Trying to update _custom_backend_meta with non-exist global_indexes! "
-                f"{non_exist_global_indexes} do not exist in this batch."
-            )
-
-        if new_meta:
-            self._custom_backend_meta.update(new_meta)
-
-    def clear_custom_backend_meta(self) -> None:
-        """
-        Clear all _custom_backend_meta.
-
-        This method removes all entries from the _custom_backend_meta dictionary.
-
-        """
-        self._custom_backend_meta.clear()
+        self.custom_meta.clear()
 
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """
