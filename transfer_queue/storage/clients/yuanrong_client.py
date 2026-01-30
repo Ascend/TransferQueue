@@ -41,6 +41,8 @@ except ImportError:
 
 
 class StorageStrategy(ABC):
+    """Abstract base class for storage strategies."""
+
     @staticmethod
     @abstractmethod
     def init(config: dict) -> Union["StorageStrategy", None]:
