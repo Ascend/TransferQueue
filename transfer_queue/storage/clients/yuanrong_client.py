@@ -374,7 +374,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                     results[idx] = obj
             return results
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
@@ -383,7 +383,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str], optional): Device type (npu/cpu) for each key
+            custom_backend_meta (List[str], optional): Device type (npu/cpu) for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.

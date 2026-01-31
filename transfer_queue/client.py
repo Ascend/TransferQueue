@@ -211,13 +211,10 @@ class AsyncTransferQueueClient:
             >>> print(batch_meta.is_ready)  # True if all samples ready
             >>>
             >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> so may include unready samples. Consumed samples will not be fetched.)
+            >>> # so may include unready samples. Consumed samples will not be fetched.)
             >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
+            ...     partition_id="train_0",   # optional
             ...     mode="force_fetch",
-            ...     task_name="generate_sequences"
             ... ))
             >>> print(batch_meta.is_ready)  # May be False if some samples not ready
         """
@@ -236,24 +233,92 @@ class AsyncTransferQueueClient:
             },
         )
 
-        try:
-            await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
-            response_msg = ZMQMessage.deserialize(response_serialized)
-            logger.debug(
-                f"[{self.client_id}]: Client get_meta response: {response_msg} from controller {self._controller.id}"
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart()
+        response_msg = ZMQMessage.deserialize(response_serialized)
+        logger.debug(
+            f"[{self.client_id}]: Client get_meta response: {response_msg} from controller {self._controller.id}"
+        )
+
+        if response_msg.request_type == ZMQRequestType.GET_META_RESPONSE:
+            metadata_dict = response_msg.body["metadata"]
+            return BatchMeta.from_dict(metadata_dict) if isinstance(metadata_dict, dict) else metadata_dict
+        else:
+            raise RuntimeError(
+                f"[{self.client_id}]: Failed to get metadata from controller {self._controller.id}: "
+                f"{response_msg.body.get('message', 'Unknown error')}"
             )
 
-            if response_msg.request_type == ZMQRequestType.GET_META_RESPONSE:
-                metadata_dict = response_msg.body["metadata"]
-                return BatchMeta.from_dict(metadata_dict) if isinstance(metadata_dict, dict) else metadata_dict
-            else:
-                raise RuntimeError(
-                    f"[{self.client_id}]: Failed to get metadata from controller {self._controller.id}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-        except Exception as e:
-            raise RuntimeError(f"[{self.client_id}]: Error in get_meta: {str(e)}") from e
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_set_custom_meta(
+        self,
+        metadata: BatchMeta,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> None:
+        """
+        Asynchronously send custom metadata to the controller.
+
+        This method sends per-sample custom metadata (custom_meta) to the controller.
+        The custom_meta is stored in the controller and can be retrieved along with
+        the BatchMeta in subsequent get_meta calls.
+
+        Args:
+            metadata: BatchMeta containing the samples and their custom metadata to store.
+                     The custom_meta should be set using BatchMeta.update_custom_meta() or
+                     BatchMeta.set_custom_meta() before calling this method.
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Create batch with custom metadata
+            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=4, ...)
+            >>> batch_meta.update_custom_meta({0: {"score": 0.9}, 1: {"score": 0.8}})
+            >>> asyncio.run(client.async_set_custom_meta(batch_meta))
+        """
+        assert socket is not None
+
+        if not self._controller:
+            raise RuntimeError("No controller registered")
+
+        global_indexes = metadata.global_indexes
+        custom_meta = metadata.get_all_custom_meta()
+
+        if len(global_indexes) == 0 or len(custom_meta) == 0:
+            logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
+            return
+
+        # chunk metadata according to partition_ids
+        metadata_chunks = metadata.chunk_by_partition()
+
+        # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
+        partition_custom_meta: dict[str, dict[int, dict]] = {pid: {} for pid in set(metadata.partition_ids)}
+
+        for meta in metadata_chunks:
+            partition_custom_meta[meta.partition_ids[0]].update(meta.get_all_custom_meta())
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.SET_CUSTOM_META,
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "partition_custom_meta": partition_custom_meta,
+            },
+        )
+
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart()
+        response_msg = ZMQMessage.deserialize(response_serialized)
+        logger.debug(
+            f"[{self.client_id}]: Client set_custom_meta response: {response_msg} from controller {self._controller.id}"
+        )
+
+        if response_msg.request_type != ZMQRequestType.SET_CUSTOM_META_RESPONSE:
+            raise RuntimeError(
+                f"[{self.client_id}]: Failed to set custom metadata from controller {self._controller.id}: "
+                f"{response_msg.body.get('message', 'Unknown error')}"
+            )
 
     async def async_put(
         self,
@@ -339,6 +404,8 @@ class AsyncTransferQueueClient:
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
         ):
             await self.storage_manager.put_data(data, metadata)
+
+        await self.async_set_custom_meta(metadata)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -850,6 +917,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._check_consumption_status = _make_sync(self.async_check_consumption_status)
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
+        self._set_custom_meta = _make_sync(self.async_set_custom_meta)
 
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
@@ -1006,6 +1074,30 @@ class TransferQueueClient(AsyncTransferQueueClient):
             list[str]: List of partition ids managed by the controller
         """
         return self._get_partition_list()
+
+    def set_custom_meta(self, metadata: BatchMeta) -> None:
+        """Synchronously send custom metadata to the controller.
+
+        This method sends per-sample custom metadata (custom_meta) to the controller.
+        The custom_meta is stored in the controller and can be retrieved along with
+        the BatchMeta in subsequent get_meta calls.
+
+        Args:
+            metadata: BatchMeta containing the samples and their custom metadata to store.
+                     The custom_meta should be set using BatchMeta.update_custom_meta() or
+                     BatchMeta.set_custom_meta() before calling this method.
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Create batch with custom metadata
+            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=4, ...)
+            >>> batch_meta.update_custom_meta({0: {"score": 0.9}, 1: {"score": 0.8}})
+            >>> client.set_custom_meta(batch_meta)
+        """
+
+        return self._set_custom_meta(metadata=metadata)
 
     def close(self) -> None:
         """Close the client and cleanup resources including event loop and thread."""

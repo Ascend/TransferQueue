@@ -44,7 +44,7 @@ class TransferQueueStorageKVClient(ABC):
         raise NotImplementedError("Subclasses must implement put")
 
     @abstractmethod
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """
         Retrieve values from the storage backend by key.
         Args:
@@ -55,9 +55,9 @@ class TransferQueueStorageKVClient(ABC):
             dtypes: Optional data type information for the expected values.
                 The structure and interpretation of this argument are
                 determined by the concrete storage backend implementation.
-            custom_meta: Optional backend-specific metadata used to control
-                or optimize the retrieval process. Its format is defined by
-                the concrete storage backend implementation.
+            custom_backend_meta: Optional backend-specific metadata used to
+                control or optimize the retrieval process. Its format is
+                defined by the concrete storage backend implementation.
         Returns:
             list[Any]: List of values retrieved from the storage backend,
             in the same order as the provided keys.

@@ -134,6 +134,9 @@ class MockController:
                             "partition_ids": ["partition_0", "partition_1", "test_partition"],
                         }
                         response_type = ZMQRequestType.LIST_PARTITIONS_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
+                        response_body = {"message": "success"}
+                        response_type = ZMQRequestType.SET_CUSTOM_META_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
@@ -774,3 +777,51 @@ async def test_sync_and_async_methods_mixed_usage(client_setup):
     assert async_data is not None
 
     print("✓ Mixed async and sync method calls work correctly")
+
+
+# =====================================================
+# Custom Meta Interface Tests
+# =====================================================
+
+
+class TestClientCustomMetaInterface:
+    """Tests for client custom_meta interface methods."""
+
+    def test_set_custom_meta_sync(self, client_setup):
+        """Test synchronous set_custom_meta method."""
+        client, _, _ = client_setup
+
+        # Test synchronous set_custom_meta
+
+        # First get metadata
+        metadata = client.get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
+        # Set custom_meta on the metadata
+        metadata.update_custom_meta(
+            {
+                0: {"input_ids": {"token_count": 100}},
+                1: {"input_ids": {"token_count": 120}},
+            }
+        )
+
+        # Call set_custom_meta with metadata (BatchMeta)
+        client.set_custom_meta(metadata)
+        print("✓ set_custom_meta sync method works")
+
+    @pytest.mark.asyncio
+    async def test_set_custom_meta_async(self, client_setup):
+        """Test asynchronous async_set_custom_meta method."""
+        client, _, _ = client_setup
+
+        # First get metadata
+        metadata = await client.async_get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
+        # Set custom_meta on the metadata
+        metadata.update_custom_meta(
+            {
+                0: {"input_ids": {"token_count": 100}},
+                1: {"input_ids": {"token_count": 120}},
+            }
+        )
+
+        # Call async_set_custom_meta with metadata (BatchMeta)
+        await client.async_set_custom_meta(metadata)
+        print("✓ async_set_custom_meta async method works")
