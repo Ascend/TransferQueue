@@ -106,10 +106,11 @@ class RayStorageClient(TransferQueueStorageKVClient):
             raise RuntimeError(f"Failed to retrieve value for key '{keys}': {e}") from e
         return values
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str], custom_meta=None):
         """
         Delete entries from storage by keys.
         Args:
             keys (list): List of keys to delete
+            custom_meta (List[Any], optional): ...
         """
         ray.get(self.storage_actor.clear_obj_ref.remote(keys))
