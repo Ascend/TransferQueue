@@ -132,14 +132,14 @@ class MooncakeStorageClient(TransferQueueStorageKVClient):
             if ret != 0:
                 raise RuntimeError(f"put_batch failed with error code: {ret}")
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """Get multiple key-value pairs from MooncakeStore.
 
         Args:
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str], optional): Device type (npu/cpu) for each key
+            custom_backend_meta (List[str], optional): Device type (npu/cpu) for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
