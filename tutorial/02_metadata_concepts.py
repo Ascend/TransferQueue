@@ -357,7 +357,7 @@ def demonstrate_real_workflow():
         global_index: {"uid": uuid.uuid4().hex[:4], "session_id": uuid.uuid4().hex[:4], "model_version": 0}
         for global_index in batch_meta.global_indexes
     }
-    batch_meta.set_custom_meta(custom_meta)
+    batch_meta.update_custom_meta(custom_meta)
     print(f"✓ Set custom_meta into BatchMeta: {batch_meta.get_all_custom_meta()}")
 
     client.set_custom_meta(batch_meta)
@@ -449,7 +449,8 @@ def main():
         print("2. SampleMeta describes a single data sample")
         print("3. BatchMeta manages collections of samples with operations")
         print("4. Metadata operations: chunk, concat, union, select, reorder... You can retrieve subsets easily!")
-        print("5. concat combines batches; union merges fields of same samples")
+        print("5. extra_info is in batch-level, and custom_meta is in sample-level.")
+        print("6. You can put custom_meta into TQ controller, so you can retrieve them from anywhere!")
 
         # Cleanup
         ray.shutdown()
