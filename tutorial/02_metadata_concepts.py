@@ -16,6 +16,7 @@
 import os
 import sys
 import textwrap
+import uuid
 import warnings
 from pathlib import Path
 
@@ -203,37 +204,45 @@ def demonstrate_batch_meta():
     print(f"  Size: {batch.size}")
 
     # Example 2: Add extra_info
-    print("[Example 2] Adding batch-level information...")
-    batch.set_extra_info("epoch", 1)
-    batch.set_extra_info("batch_idx", 0)
+    print("[Example 2] Adding batch-level information through extra_info...")
+    print("Note: The extra info will not be stored into TransferQueueController.")
+    batch.extra_info["epoch"] = 1
+    batch.extra_info["batch_idx"] = 0
     print(f"✓ Extra info: {batch.get_all_extra_info()}")
 
-    # Example 3: Chunk a batch
-    print("[Example 3] Chunking a batch into parts...")
+    print("[Example 3] Adding sample-level information through custom_meta...")
+    batch.set_custom_meta(
+        global_index=0, meta_dict={"uid": "prompt@0", "session_id": "session@0", "model_version": "epoch@0"}
+    )
+    batch.update_custom_meta({1: {"uid": "prompt@1", "session_id": "session@0", "model_version": "epoch@0"}})
+    print(f"✓ Extra info: {batch.get_all_custom_meta()}")
+
+    # Example 4: Chunk a batch
+    print("[Example 4] Chunking a batch into parts...")
     chunks = batch.chunk(3)
     print(f"✓ Split into {len(chunks)} chunks:")
     for i, chunk in enumerate(chunks):
         print(f"  Chunk {i}: {len(chunk)} samples, indexes={chunk.global_indexes}")
 
-    # Example 4: Select specific fields
-    print("[Example 4] Selecting specific fields...")
+    # Example 5: Select specific fields
+    print("[Example 5] Selecting specific fields...")
     selected_batch = batch.select_fields(["input_ids", "responses"])
     print(f"✓ Selected fields: {selected_batch.field_names}")
     print(f"  Original fields: {batch.field_names}")
 
-    # Example 5: Select specific samples
-    print("[Example 5] Selecting specific samples...")
+    # Example 6: Select specific samples
+    print("[Example 6] Selecting specific samples...")
     selected_samples = batch.select_samples([0, 2, 4])
     print(f"✓ Selected samples at indexes: {selected_samples.global_indexes}")
 
-    # Example 6: Reorder samples
-    print("[Example 6] Reordering samples...")
+    # Example 7: Reorder samples
+    print("[Example 7] Reordering samples...")
     print(f"  Original order: {batch.global_indexes}")
     batch.reorder([4, 3, 2, 1, 0])
     print(f"  After reorder: {batch.global_indexes}")
 
-    # Example 7: Concat batches
-    print("[Example 7] Concatenating batches...")
+    # Example 8: Concat batches
+    print("[Example 8] Concatenating batches...")
     batch1 = BatchMeta(samples=[SampleMeta(partition_id="train_0", global_index=i, fields=fields) for i in range(3)])
     batch2 = BatchMeta(samples=[SampleMeta(partition_id="train_0", global_index=i, fields=fields) for i in range(3, 6)])
     concatenated = BatchMeta.concat([batch1, batch2])
@@ -241,8 +250,8 @@ def demonstrate_batch_meta():
     print(f"  Global indexes: {concatenated.global_indexes}")
     print("  Note: concat combines multiple batches into one (same structure)")
 
-    # Example 8: Union batches
-    print("[Example 8] Unioning batches (different fields, same samples)...")
+    # Example 9: Union batches
+    print("[Example 9] Unioning batches (different fields, same samples)...")
     batch_with_input = BatchMeta(
         samples=[
             SampleMeta(
@@ -342,6 +351,18 @@ def demonstrate_real_workflow():
     batch_meta = client.put(data=data_batch, partition_id=partition_id)
     print(f"✓ Put {data_batch.batch_size[0]} samples into partition '{partition_id}', got BatchMeta back {batch_meta}.")
 
+    print("[Step 2] [Optional] Setting sample-level custom_meta...")
+
+    custom_meta = {
+        global_index: {"uid": uuid.uuid4().hex[:4], "session_id": uuid.uuid4().hex[:4], "model_version": 0}
+        for global_index in batch_meta.global_indexes
+    }
+    batch_meta.set_custom_meta(custom_meta)
+    print(f"✓ Set custom_meta into BatchMeta: {batch_meta.get_all_custom_meta()}")
+
+    client.set_custom_meta(batch_meta)
+    print("✓ Successful to store custom_meta into TQ controller. Now you can retrieve the custom_meta from anywhere.")
+
     print("[Step 2] Try to get metadata from TransferQueue from other places...")
     batch_meta = client.get_meta(
         data_fields=["input_ids", "attention_mask"],
@@ -355,6 +376,7 @@ def demonstrate_real_workflow():
     print(f"  Field names: {batch_meta.field_names}")
     print(f"  Partition ID: {batch_meta.samples[0].partition_id}")
     print(f"  Sample structure: {batch_meta.samples[0]}")
+    print(f"  Custom Meta: {batch_meta.get_all_custom_meta()}")
 
     print("[Step 3] Retrieve samples with specific fields..")
     selected_meta = batch_meta.select_fields(["input_ids"])
@@ -404,8 +426,8 @@ def main():
 
         Key Concepts:
         - Metadata tracks data structure without storing actual data
-        - Production status tracks whether data is ready for consumption
-        - BatchMeta provides operations: chunk, concat, union, select, reorder
+        - User can set their own custom metadata into BatchMeta, and use TQ controller to store them.
+        - BatchMeta provides operations: chunk, concat, union, select, reorder...
         - Metadata is lightweight and can be passed around efficiently
         - Union requires samples to have identical partition_id and global_index
         """

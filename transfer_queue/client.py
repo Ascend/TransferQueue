@@ -284,7 +284,7 @@ class AsyncTransferQueueClient:
         custom_meta = metadata.get_all_custom_meta()
 
         if len(global_indexes) == 0 or len(custom_meta) == 0:
-            logger.warning(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
+            logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
         # chunk metadata according to partition_ids
