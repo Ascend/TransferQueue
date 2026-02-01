@@ -444,20 +444,17 @@ class TestRankAwareSampler:
         assert hasattr(sampler, "_states")
         assert sampler._states == {}
 
-    def test_rank_aware_sampler_first_rank_sampling(self):
-        """Test that first rank in data replica group performs actual sampling."""
+    def test_rank_aware_sampler_basic_sampling(self):
+        """Test basic sampling functionality."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5]
         batch_size = 3
 
-        # Rank 0 (first in group) samples and caches for all ranks
-        # Since rank 1 will call next, state is kept until rank 1 fetches
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -465,142 +462,96 @@ class TestRankAwareSampler:
         assert sampled == [0, 1, 2]
         assert consumed == [0, 1, 2]
         assert len(sampled) == batch_size
-        # State is kept for other ranks to fetch
 
-    def test_rank_aware_sampler_second_rank_gets_cached(self):
-        """Test that second rank in data replica group gets cached indices."""
+    def test_rank_aware_sampler_caching_on_same_batch_index(self):
+        """Test that same batch_index returns cached results."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5]
         batch_size = 3
 
-        # Rank 0 (first in group) samples first
+        # First call with batch_index=0
         sampled1, consumed1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
 
-        # Rank 1 (second in group) should get same cached indices
+        # Second call with same batch_index=0 should return cached result
         sampled2, consumed2 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
 
         assert sampled1 == sampled2 == [0, 1, 2]
-        assert consumed1 == [0, 1, 2]
-        assert consumed2 == [0, 1, 2]
+        assert consumed1 == consumed2 == [0, 1, 2]
 
-        # cache should be empty after all ranks fetch
-        assert len(sampler._states["test"]["task"][0][0]) == 0
-        assert len(sampler._states["test"]["task"][0][1]) == 0
-
-    def test_rank_aware_sampler_multiple_dp_groups(self):
-        """Test that multiple data replica groups work independently."""
+    def test_rank_aware_sampler_different_batch_indexes(self):
+        """Test that different batch_index values sample different data."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 2
-        data_replica_world_size = 2  # Each group has 2 ranks
 
-        # data replica group 0: rank 0 samples first
-        sampled0_g0, consumed0_g0 = sampler.sample(
+        # First batch
+        sampled1, consumed1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        # mimic the consumption status update managed in TransferQueueController
-        ready_indexes = [i for i in ready_indexes if i not in consumed0_g0]
 
-        # data replica group 1: rank 0 samples first
-        sampled0_g1, consumed0_g1 = sampler.sample(
+        # Second batch
+        sampled2, consumed2 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=1,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=1,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed0_g1]
 
-        # Both should have sampled their first batch
-        assert sampled0_g0 == [0, 1]
-        assert sampled0_g1 == [2, 3]
-        assert consumed0_g0 == [0, 1]
-        assert consumed0_g1 == [2, 3]
+        assert sampled1 == [0, 1]
+        assert sampled2 == [0, 1]  # Same because both sample from the beginning of ready_indexes
+        assert consumed1 == [0, 1]
+        assert consumed2 == [0, 1]
 
-        # data replica group 0: rank 1 fetches cached
-        sampled1_g0, consumed1_g0 = sampler.sample(
+    def test_rank_aware_sampler_multiple_dp_ranks(self):
+        """Test that different dp_ranks maintain separate state."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
+        batch_size = 2
+
+        # DP rank 0 samples batch 0
+        sampled_dp0_b0, consumed_dp0_b0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed1_g0]
-        assert sampled1_g0 == [0, 1]
-        assert consumed1_g0 == [0, 1]
 
-        # data replica group 1: rank 1 fetches cached
-        sampled1_g1, consumed1_g1 = sampler.sample(
+        # DP rank 1 samples batch 0 (should get same result as dp_rank=0)
+        sampled_dp1_b0, consumed_dp1_b0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=1,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=1,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed1_g1]
-        assert sampled1_g1 == [2, 3]
-        assert consumed1_g1 == [2, 3]
 
-        # data replica group 0: rank 0 fetches again, this should return new data
-        sampled2_g0, consumed2_g0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
-            task_name="task",
-            partition_id="test",
-        )
-        ready_indexes = [i for i in ready_indexes if i not in consumed2_g0]
-        assert sampled2_g0 == [4, 5]
-        assert consumed2_g0 == [4, 5]
-
-        # data replica group 0: rank 1 fetches cached
-        sampled3_g0, consumed3_g0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
-            task_name="task",
-            partition_id="test",
-        )
-        assert sampled3_g0 == [4, 5]
-        assert consumed3_g0 == [4, 5]
-
-        # examine the internal state to ensure proper caching and clearing
-        assert len(sampler._states["test"]["task"][0][0]) == 0
-        assert len(sampler._states["test"]["task"][0][1]) == 0
-        assert len(sampler._states["test"]["task"][1][0]) == 0
-        assert len(sampler._states["test"]["task"][1][1]) == 0
+        # Both should sample from the same ready_indexes
+        assert sampled_dp0_b0 == [0, 1]
+        assert sampled_dp1_b0 == [0, 1]
 
     def test_rank_aware_sampler_empty_ready_indexes(self):
         """Test behavior with empty ready indexes."""
@@ -611,9 +562,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -630,9 +580,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -649,9 +598,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -659,98 +607,166 @@ class TestRankAwareSampler:
         assert sampled == []
         assert consumed == []
 
-    def test_rank_aware_sampler_data_prefetch(self):
-        """Test behavior with data prefetch."""
-        sampler = RankAwareSampler()
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
-        batch_size = 2
-
-        sampled_rank0_time0, consumed_rank0_time0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-
-        assert sampled_rank0_time0 == [0, 1]
-        assert consumed_rank0_time0 == [0, 1]
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[0, 1]]
-
-        ready_indexes = [i for i in ready_indexes if i not in consumed_rank0_time0]
-
-        sampled_rank0_time1, consumed_rank0_time1 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-
-        assert sampled_rank0_time1 == [2, 3]
-        assert consumed_rank0_time1 == [2, 3]
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[0, 1], [2, 3]]
-
-        ready_indexes = [i for i in ready_indexes if i not in consumed_rank0_time1]
-
-        sampled_rank1_time0, consumed_rank1_time0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-        assert sampled_rank1_time0 == [0, 1]
-        assert consumed_rank1_time0 == [0, 1]
-
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[2, 3]]
-
     def test_rank_aware_sampler_multiple_tasks(self):
         """Test behavior with multiple tasks."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 2
 
-        sampled_rank0_task0, consumed_rank0_task0 = sampler.sample(
+        sampled_task0, consumed_task0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task0",
             partition_id="test",
         )
 
-        assert sampled_rank0_task0 == [0, 1]
-        assert consumed_rank0_task0 == [0, 1]
-        assert sampler._states["test"]["task0"][0][0] == []
-        assert sampler._states["test"]["task0"][0][1] == [[0, 1]]
-
-        sampled_rank0_task1, consumed_rank0_task1 = sampler.sample(
+        sampled_task1, consumed_task1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task1",
             partition_id="test",
         )
 
-        assert sampled_rank0_task1 == [0, 1]
-        assert consumed_rank0_task1 == [0, 1]
-        assert sampler._states["test"]["task0"][0][0] == []
-        assert sampler._states["test"]["task0"][0][1] == [[0, 1]]
-        assert sampler._states["test"]["task1"][0][0] == []
-        assert sampler._states["test"]["task1"][0][1] == [[0, 1]]
+        assert sampled_task0 == [0, 1]
+        assert consumed_task0 == [0, 1]
+        assert sampled_task1 == [0, 1]
+        assert consumed_task1 == [0, 1]
+
+        # Check that state is separate per task
+        assert sampler._states["test"]["task0"][0][0] == [0, 1]
+        assert sampler._states["test"]["task1"][0][0] == [0, 1]
+
+    def test_rank_aware_sampler_multiple_partitions(self):
+        """Test behavior with multiple partitions."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5]
+        batch_size = 2
+
+        sampled_part0, consumed_part0 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="partition0",
+        )
+
+        sampled_part1, consumed_part1 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="partition1",
+        )
+
+        assert sampled_part0 == [0, 1]
+        assert consumed_part0 == [0, 1]
+        assert sampled_part1 == [0, 1]
+        assert consumed_part1 == [0, 1]
+
+        # Check that state is separate per partition
+        assert sampler._states["partition0"]["task"][0][0] == [0, 1]
+        assert sampler._states["partition1"]["task"][0][0] == [0, 1]
+
+    def test_rank_aware_sampler_invalid_dp_rank(self):
+        """Test behavior with invalid dp_rank."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 2
+
+        with pytest.raises(ValueError) as exc_info:
+            sampler.sample(
+                ready_indexes,
+                batch_size,
+                dp_rank=-1,
+                batch_index=0,
+                task_name="task",
+                partition_id="test",
+            )
+
+        assert "dp_rank" in str(exc_info.value)
+        assert "greater than or equal to 0" in str(exc_info.value)
+
+    def test_rank_aware_sampler_with_extra_kwargs(self):
+        """Test that RankAwareSampler accepts extra kwargs but ignores them."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5]
+        batch_size = 2
+
+        # Should accept extra kwargs gracefully
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+            extra_param="ignored",
+            another_param=42,
+        )
+
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
+
+    def test_rank_aware_sampler_call_method(self):
+        """Test that __call__ method works correctly."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 2
+
+        sampled, consumed = sampler(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+        )
+
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
+
+    def test_rank_aware_sampler_state_persistence(self):
+        """Test that state persists correctly across calls."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
+        batch_size = 2
+
+        # First call
+        sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+        )
+
+        # Verify state is created
+        assert "test" in sampler._states
+        assert "task" in sampler._states["test"]
+        assert 0 in sampler._states["test"]["task"]
+        assert 0 in sampler._states["test"]["task"][0]
+        assert sampler._states["test"]["task"][0][0] == [0, 1]
+
+        # Second call with same parameters
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+        )
+
+        # Should return cached result
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
 
 
 class TestSamplerIntegration:

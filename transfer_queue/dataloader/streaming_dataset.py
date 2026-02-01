@@ -15,7 +15,6 @@
 
 import logging
 import os
-import time
 import uuid
 from typing import Any, Iterator
 
@@ -53,9 +52,7 @@ class StreamingDataset(IterableDataset):
         ...     required_fields=["input_ids", "attention_mask"],
         ...     partition_id="train",
         ...     task_name="update_actor",
-        ...     data_replica_group=data_replica_group_id,          # Same for all ranks in data replica group
-        ...     data_replica_rank=local_rank,                      # local rank in data replica group
-        ...     data_replica_world_size=world_size/dp_world_size,  # size of data replica group
+        ...     dp_rank=dp_rank,          # Same for all ranks in data replica group
         ... )
         >>> dataloader = StreamingDataLoader(
         ...     dataset,
@@ -71,13 +68,15 @@ class StreamingDataset(IterableDataset):
     def __init__(
         self,
         config: dict[str, Any],
+        batch_size: int,
         micro_batch_size: int,
-        required_fields: list[str],
+        data_fields: list[str],
         partition_id: str,
         task_name: str,
-        data_replica_group: int,
-        data_replica_rank: int,
-        data_replica_world_size: int,
+        dp_rank: int,
+        n_samples_per_prompt: int,
+        custom_get_batch_func: Any = None,
+        custom_post_process_for_micro_func: Any = None,
     ):
         """Initialize the StreamingDataset.
 
@@ -86,20 +85,22 @@ class StreamingDataset(IterableDataset):
                 - controller_info: ZMQServerInfo for the TransferQueueController
                 - storage_backend: Storage backend type (e.g., "AsyncSimpleStorageManager")
                 - Other backend-specific configuration
+            batch_size: Batch size for data loading per iter.
             micro_batch_size: Number of samples per micro-batch. This is the batch size
                 that will be requested from TransferQueue for each iteration.
-            required_fields: List of field names to retrieve from storage. Only these
+            data_fields: List of field names to retrieve from storage. Only these
                 fields will be included in the returned batch.
             partition_id: Partition ID for data versioning. Different partitions can
                 be used for different data versions or splits (e.g., "train", "val").
             task_name: Unique identifier for the training task. This is used to track
                 which samples have been consumed by which task.
-            data_replica_group: The group ID of the current data replica group. All
-                ranks with the same data_replica_group will receive identical samples.
-            data_replica_rank: Local rank index within the data_replica_group. Range:
-                [0, data_replica_world_size - 1]
-            data_replica_world_size: Total number of ranks in this data_replica_group.
-                Must be >= 1.
+            dp_rank: The group ID of the current data group. All
+                ranks with the same dp_rank will receive identical samples.
+            n_samples_per_prompt: Number of samples generated per prompt for training.
+            custom_get_batch_func: Optional custom function to retrieve batch data.
+                If None, uses default_get_batch function.
+            custom_post_process_for_micro_func: Optional custom function to post-process
+                and split data into micro-batches. If None, uses default_post_process_for_micro_func.
 
         Raises:
             ValueError: If input parameters are invalid.
@@ -108,41 +109,49 @@ class StreamingDataset(IterableDataset):
         if micro_batch_size < 1:
             raise ValueError(f"micro_batch_size must be >= 1, got {micro_batch_size}")
 
-        if len(required_fields) < 1:
-            raise ValueError(f"required_fields must be a list with at least one field name, got {required_fields}")
+        if len(data_fields) < 1:
+            raise ValueError(f"required_fields must be a list with at least one field name, got {data_fields}")
 
-        if data_replica_world_size < 1:
-            raise ValueError(f"data_replica_world_size {data_replica_world_size} must >= 1")
-
-        if data_replica_rank >= data_replica_world_size or data_replica_rank < 0:
-            raise ValueError(
-                f"data_replica_rank {data_replica_rank} must be greater than or equal to 0 and less than "
-                f"data_replica_world_size {data_replica_world_size}"
-            )
+        if dp_rank < 0:
+            raise ValueError(f"dp_rank {dp_rank} must be greater than or equal to 0")
 
         self.config = config
+        self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
-        self.required_fields = required_fields
+        self.data_fields = data_fields
         self.partition_id = partition_id
         self.task_name = task_name
-        self.data_replica_group = data_replica_group
-        self.data_replica_rank = data_replica_rank
-        self.data_replica_world_size = data_replica_world_size
+        self.dp_rank = dp_rank
+        self.n_samples_per_prompt = n_samples_per_prompt
+        self.get_batch_func = custom_get_batch_func if custom_get_batch_func else default_get_batch
+        self.post_process_for_micro_func = (
+            custom_post_process_for_micro_func
+            if custom_post_process_for_micro_func
+            else default_post_process_for_micro_func
+        )
 
         # Build sampling config for controller
         self.sampling_config = {
-            "data_replica_group": self.data_replica_group,
-            "data_replica_rank": self.data_replica_rank,
-            "data_replica_world_size": self.data_replica_world_size,
+            "dp_rank": self.dp_rank,
             "task_name": self.task_name,
-            "partition_id": self.partition_id,
+            "n_samples_per_prompt": self.n_samples_per_prompt,
         }
 
         self._tq_client = None
+        self.buffer: list[tuple] = []
+        self.batch_index = 0
 
         super().__init__()
 
     def _create_client(self):
+        """Create and initialize a TransferQueue client.
+
+        This method initializes the TransferQueueClient with the provided configuration
+        and storage backend, and sets up the storage manager for data retrieval.
+
+        Raises:
+            ValueError: If controller_info or storage_backend is missing or invalid.
+        """
         client_id = uuid.uuid4().hex[:8]
         controller_info = self.config.get("controller_info", None)
         if not controller_info or not isinstance(controller_info, ZMQServerInfo):
@@ -175,30 +184,141 @@ class StreamingDataset(IterableDataset):
         # Note: For fully streamed production-consumption, please set the environment variable
         # TQ_PRE_ALLOC_SAMPLE_NUM to the required global_batch_size to make sure consumers can accurately
         # determine consumption status even before producers have generated the samples.
-        while not self._tq_client.check_consumption_status(self.task_name, self.partition_id):
+        while (
+            not self._tq_client.check_consumption_status(self.task_name, self.partition_id)
+            or self.batch_index <= len(self.buffer) - 1
+        ):
             try:
-                # Get metadata from controller
-                batch_meta = self._tq_client.get_meta(
-                    data_fields=self.required_fields,
-                    batch_size=self.micro_batch_size,
-                    partition_id=self.partition_id,
-                    task_name=self.task_name,
-                    sampling_config=self.sampling_config,
-                )
+                if self.batch_index <= len(self.buffer) - 1:
+                    current_data = self.buffer[self.batch_index]
+                    self.batch_index += 1
+                    yield from self.post_process_for_micro_func(*current_data, micro_batch_size=self.micro_batch_size)
 
-                # Check if we got valid data
-                if batch_meta.size == 0:
-                    logger.debug(
-                        f"[StreamingDataset]: Received empty batch, waiting for more data... "
-                        f"Required batch_size={self.micro_batch_size}, data_fields={self.required_fields},"
-                        f"partition_id={self.partition_id}, task_name={self.task_name}."
-                    )
-
-                    time.sleep(TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL)
                 else:
-                    batch = self._tq_client.get_data(batch_meta)
-                    yield (batch, batch_meta)
+                    batch_data, batch_meta = self.get_batch_func(
+                        self._tq_client,
+                        self.data_fields,
+                        self.batch_size,
+                        self.partition_id,
+                        self.task_name,
+                        self.sampling_config,
+                        self.batch_index,
+                    )
+                    if batch_data is not None:
+                        self.buffer.append((batch_data, batch_meta))
 
             except Exception as e:
                 logger.error(f"[StreamingDataset]: Error in data iteration: {e}")
                 raise
+
+    def reset(self):
+        """Reset the dataset iterator to the beginning.
+
+        Clears the buffer and resets the batch index for a fresh iteration.
+        """
+        self.batch_index = 0
+
+    def step(self, partition_id):
+        """Switch to a new partition and reset the dataset state.
+
+        This method clears the buffer, resets the batch index, and updates the partition_id
+        to fetch data from a different partition (e.g., switching from "train" to "val").
+
+        Args:
+            partition_id: The new partition ID to switch to.
+        """
+        self.buffer = []
+        self.batch_index = 0
+        self.partition_id = partition_id
+
+
+def default_get_batch(tq_client, data_fields, batch_size, partition_id, task_name, sampling_config, batch_index):
+    """Retrieve a batch of data from TransferQueue.
+
+    This function queries the TransferQueue controller for batch metadata and retrieves
+    the actual data if available. It handles empty batches gracefully.
+
+    Args:
+        tq_client: The TransferQueueClient instance for data retrieval.
+        data_fields: List of field names to retrieve from the batch.
+        batch_size: The requested batch size.
+        partition_id: The partition ID for data versioning.
+        task_name: Unique identifier for the training task.
+        sampling_config: Configuration dictionary for sampling strategy.
+        batch_index: Current batch index for tracking consumption progress.
+
+    Returns:
+        tuple: A tuple containing:
+            - batch: TensorDict with the retrieved data, or None if batch is empty.
+            - batch_meta: BatchMeta object containing batch metadata.
+    """
+    # Get metadata from controller
+    sampling_config["batch_index"] = batch_index
+    sampling_config["partition_id"] = partition_id
+    batch_meta = tq_client.get_meta(
+        data_fields=data_fields,
+        batch_size=batch_size,
+        partition_id=partition_id,
+        task_name=task_name,
+        sampling_config=sampling_config,
+    )
+
+    # Check if we got valid data
+    if batch_meta.size == 0:
+        logger.debug(
+            f"[StreamingDataset]: Received empty batch, waiting for more data... "
+            f"Required batch_size={batch_size}, data_fields={data_fields},"
+            f"partition_id={partition_id}, task_name={task_name}."
+        )
+        return None, batch_meta
+    else:
+        batch = tq_client.get_data(batch_meta)
+        return batch, batch_meta
+
+
+def default_post_process_for_micro_func(td, batch_meta, micro_batch_size=1):
+    """Split TensorDict into micro-batches along the batch dimension.
+
+    This function chunks a TensorDict into smaller micro-batches with the specified size,
+    along with corresponding metadata chunks. Handles cases where batch size is not
+    evenly divisible by micro_batch_size.
+
+    Args:
+        td: Input TensorDict with non-empty batch_size.
+        batch_meta: BatchMeta object to be chunked along with the TensorDict.
+        micro_batch_size: Target size for each micro-batch (positive integer, default: 1).
+
+    Returns:
+        list: List of tuples (micro_batch_td, micro_batch_meta) where each tuple
+              contains a TensorDict chunk and corresponding metadata chunk.
+
+    Raises:
+        TypeError: If td is not a TensorDict.
+        ValueError: If micro_batch_size is not a positive integer, batch_size is empty,
+                   or micro_batch_size exceeds total batch size.
+    """
+    if not isinstance(td, TensorDict):
+        raise TypeError(f"Expected TensorDict, got {type(td).__name__}")
+
+    if not isinstance(micro_batch_size, int) or micro_batch_size <= 0:
+        raise ValueError(f"micro_batch_size must be a positive integer, got {micro_batch_size}")
+
+    if len(td.batch_size) == 0:
+        raise ValueError("Input TensorDict must have non-empty batch_size")
+
+    total_size = td.batch_size[0]
+    if micro_batch_size > total_size:
+        raise ValueError(f"micro_batch_size ({micro_batch_size}) exceeds total batch size ({total_size})")
+
+    # Calculate number of splits (handles uneven division)
+    num_splits = (total_size + micro_batch_size - 1) // micro_batch_size
+    splits = []
+    batch_meta_list = batch_meta.chunk(num_splits)
+
+    # Chunk the TensorDict and pair with corresponding metadata chunks
+    for i in range(num_splits):
+        start = i * micro_batch_size
+        end = min(start + micro_batch_size, total_size)
+        splits.append((td[start:end], batch_meta_list[i]))
+
+    return splits

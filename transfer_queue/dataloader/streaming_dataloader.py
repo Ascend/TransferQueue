@@ -111,6 +111,7 @@ class StreamingDataLoader(torch.utils.data.DataLoader):
             parameter in PyTorch DataLoader is set to None because batching is managed
             by the StreamingDataset in coordination with RankAwareSampler.
         """
+        self.dataset: StreamingDataset = dataset
 
         if collate_fn is None:
             # use identical collate function to directly return the self-defined
@@ -137,3 +138,32 @@ class StreamingDataLoader(torch.utils.data.DataLoader):
             persistent_workers=persistent_workers,
             pin_memory_device=pin_memory_device,
         )
+
+    def reset(self):
+        """Reset the dataset iterator to the beginning.
+
+        Clears the buffer and resets the batch index for a fresh iteration.
+        """
+        self.dataset.reset()
+
+    def step(self, partition_id):
+        """Switch to a new partition and reset the dataset state.
+
+        This method clears the buffer, resets the batch index, and updates the partition_id
+        to fetch data from a different partition (e.g., switching from "train" to "val").
+
+        Args:
+            partition_id: The new partition ID to switch to.
+        """
+        self.dataset.step(partition_id)
+
+    def get_buffer(self):
+        """Get the current buffer from the underlying dataset.
+
+        Returns the batch buffer maintained by StreamingDataset, which stores
+        pre-fetched batches for efficient data access.
+
+        Returns:
+            list: Buffer containing pre-fetched (TensorDict, BatchMeta) tuples.
+        """
+        return self.dataset.buffer
