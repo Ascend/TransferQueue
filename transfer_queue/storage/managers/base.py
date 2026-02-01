@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import asyncio
+import copy
 import itertools
 import logging
 import os
@@ -508,9 +510,9 @@ class KVStorageManager(TransferQueueStorageManager):
         return TensorDict(merged_data, batch_size=num_samples)
 
     @staticmethod
-    def _get_shape_type_custom_meta_list(metadata: BatchMeta):
+    def _get_shape_type_custom_backend_meta_list(metadata: BatchMeta):
         """
-        Extract the expected shape, dtype, and custom meta for each field-sample pair in metadata.
+        Extract the expected shape, dtype, and custom_backend_meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
 
         Args:
@@ -521,8 +523,8 @@ class KVStorageManager(TransferQueueStorageManager):
         """
         shapes = []
         dtypes = []
-        custom_meta_list = []
-        all_custom_meta = metadata.get_all_custom_meta()
+        custom_backend_meta_list = []
+        all_custom_backend_meta = copy.deepcopy(metadata._custom_backend_meta)
         for field_name in sorted(metadata.field_names):
             for index in range(len(metadata)):
                 field = metadata.samples[index].get_field_by_name(field_name)
@@ -530,8 +532,8 @@ class KVStorageManager(TransferQueueStorageManager):
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
                 global_index = metadata.global_indexes[index]
-                custom_meta_list.append(all_custom_meta.get(global_index, {}).get(field_name, None))
-        return shapes, dtypes, custom_meta_list
+                custom_backend_meta_list.append(all_custom_backend_meta.get(global_index, {}).get(field_name, None))
+        return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
@@ -618,8 +620,10 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        shapes, dtypes, custom_meta = self._get_shape_type_custom_meta_list(metadata)
-        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes, custom_meta=custom_meta)
+        shapes, dtypes, custom_backend_meta = self._get_shape_type_custom_backend_meta_list(metadata)
+        values = self.storage_client.get(
+            keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
+        )
         return self._merge_tensors_to_tensordict(metadata, values)
 
     async def clear_data(self, metadata: BatchMeta) -> None:
