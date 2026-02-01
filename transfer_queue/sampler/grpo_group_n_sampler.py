@@ -82,6 +82,8 @@ class GRPOGroupNSampler(BaseSampler):
         ready_indexes: list[int],
         batch_size: int,
         n_samples_per_prompt: int,
+        task_name: str = "",
+        partition_id: str = "",
         *args: Any,
         **kwargs: Any,
     ) -> tuple[list[int], list[int]]:
@@ -96,14 +98,24 @@ class GRPOGroupNSampler(BaseSampler):
                 such that consecutive indices belong to the same prompt group.
             batch_size: Total number of samples to select. Must be divisible by n_samples_per_prompt.
             n_samples_per_prompt: Number of samples per prompt group. Must be > 0.
-            *args: Additional positional arguments (ignored in current implementation)
-            **kwargs: Additional keyword arguments (ignored in current implementation)
+            task_name: Unique identifier for the training task. Used for state caching and
+                tracking consumed samples.
+            partition_id: Partition ID for data versioning. Used for state organization.
+            *args: Additional positional arguments (ignored in current implementation).
+            **kwargs: Additional keyword arguments, key ones are:
+                - dp_rank: Data parallel rank for multi-GPU training. Used for state cache organization.
+                - batch_index: Current batch index. Used with dp_rank to cache sampling results.
 
         Returns:
             Tuple of (sampled_indexes, consumed_indexes):
-            - sampled_indexes: List of selected global indices, length = batch_size or empty
+            - sampled_indexes: List of selected global indices, length = batch_size or empty if
+              insufficient complete groups are available.
             - consumed_indexes: List of indices to mark as consumed, identical to sampled_indexes
-              (without replacement semantics)
+              (without replacement semantics).
+
+        Raises:
+            ValueError: If n_samples_per_prompt <= 0 or batch_size is not divisible by
+                n_samples_per_prompt.
 
         Examples:
             >>> sampler = GRPOGroupNSampler()
@@ -121,6 +133,14 @@ class GRPOGroupNSampler(BaseSampler):
             >>> consumed
             [3, 4, 5, 9, 10, 11]
         """
+        states = self._states.get(partition_id, {}).get(task_name, {})
+        dp_rank = kwargs.get("dp_rank", None)
+        batch_index = kwargs.get("batch_index", None)
+
+        # Return cached result if available
+        if dp_rank in states.keys() and batch_index in states[dp_rank].keys():
+            return states[dp_rank][batch_index]
+
         # Basic validation
         if n_samples_per_prompt <= 0:
             raise ValueError(f"n_samples_per_prompt must be positive, got {n_samples_per_prompt}")
@@ -136,6 +156,7 @@ class GRPOGroupNSampler(BaseSampler):
         complete_group_indices = []
         found_groups = 0
 
+        # Scan for consecutive groups
         i = 0
         while i <= len(sorted_ready_indexes) - n_samples_per_prompt and found_groups < required_groups:
             potential_group = sorted_ready_indexes[i : i + n_samples_per_prompt]
@@ -150,9 +171,21 @@ class GRPOGroupNSampler(BaseSampler):
             else:
                 i += 1
 
+        # Return empty if insufficient complete groups
         if found_groups < required_groups:
             return [], []
+
         sampled_indexes = complete_group_indices
         consumed_indexes = sampled_indexes.copy()
 
+        # Cache the sampling result for deterministic future calls
+        if dp_rank is not None:
+            if dp_rank not in states:
+                states[dp_rank] = {}
+                states[dp_rank][batch_index] = (sampled_indexes, consumed_indexes, 1)
+            elif batch_index not in states[dp_rank]:
+                states[dp_rank][batch_index] = (sampled_indexes, consumed_indexes, 1)
+            if partition_id not in self._states:
+                self._states[partition_id] = {}
+            self._states[partition_id][task_name] = states
         return sampled_indexes, consumed_indexes

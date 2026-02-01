@@ -16,6 +16,7 @@
 import os
 
 from .client import (
+    AsyncTransferQueueClient,
     TransferQueueClient,
     process_zmq_server_info,
 )
@@ -32,6 +33,7 @@ from .utils.zmq_utils import ZMQServerInfo
 
 __all__ = [
     "TransferQueueClient",
+    "AsyncTransferQueueClient",
     "StreamingDataset",
     "StreamingDataLoader",
     "BatchMeta",

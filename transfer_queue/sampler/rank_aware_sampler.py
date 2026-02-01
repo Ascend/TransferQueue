@@ -54,9 +54,8 @@ class RankAwareSampler(BaseSampler):
         self,
         ready_indexes: list[int],
         batch_size: int,
-        data_replica_group: int,
-        data_replica_rank: int,
-        data_replica_world_size: int,
+        dp_rank: int,
+        batch_index: int,
         task_name: str,
         partition_id: str,
         *args: Any,
@@ -76,9 +75,7 @@ class RankAwareSampler(BaseSampler):
             self._states = {
                 "partition_id": {
                     "task_name": {
-                        data_replica_group: {
-                            data_replica_rank: [[sampled_indexes], ...]  # Buffer of cached sampled indices
-                        }
+                        dp_rank: [sampled_indexes]
                     }
                 }
             }
@@ -93,10 +90,7 @@ class RankAwareSampler(BaseSampler):
                 as consumed in the corresponding task.
             batch_size: Number of samples to select. If larger than available
                 ready samples, no samples are returned and both lists are empty.
-            data_replica_group: The group id of current data replica group. Used to
-                identify which data replica group this rank belongs to.
-            data_replica_rank: Local rank inside this data_replica_group.
-            data_replica_world_size: Total number of ranks in this data_replica_group.
+            dp_rank: The group id of current dp_rank. Used to identify which dp_rank belongs to.
             task_name: Identifier for the task.
             partition_id: Partition ID for data management.
             *args: Additional positional arguments (ignored).
@@ -114,14 +108,8 @@ class RankAwareSampler(BaseSampler):
 
         """
 
-        if data_replica_world_size < 1:
-            raise ValueError(f"data_replica_world_size {data_replica_world_size} must >= 1")
-
-        if data_replica_rank >= data_replica_world_size or data_replica_rank < 0:
-            raise ValueError(
-                f"data_replica_rank {data_replica_rank} must be greater than or equal to 0 and less than "
-                f"data_replica_world_size {data_replica_world_size}"
-            )
+        if dp_rank < 0:
+            raise ValueError(f"dp_rank {dp_rank} must be greater than or equal to 0")
 
         if partition_id not in self._states:
             self._states[partition_id] = {}
@@ -129,10 +117,10 @@ class RankAwareSampler(BaseSampler):
         if task_name not in self._states[partition_id]:
             self._states[partition_id][task_name] = {}
 
-        if data_replica_group not in self._states[partition_id][task_name]:
-            self._states[partition_id][task_name][data_replica_group] = {i: [] for i in range(data_replica_world_size)}
+        if dp_rank not in self._states[partition_id][task_name]:
+            self._states[partition_id][task_name][dp_rank] = {}
 
-        if len(self._states[partition_id][task_name][data_replica_group][data_replica_rank]) == 0:
+        if batch_index not in self._states[partition_id][task_name][dp_rank]:
             # Select first batch_size indices from ready_indexes
             sampled_indexes = ready_indexes[:batch_size]
 
@@ -141,14 +129,10 @@ class RankAwareSampler(BaseSampler):
 
             consumed_indexes = sampled_indexes
 
-            # Cache the sampled indices for other ranks in this data replica group
-            for i in range(data_replica_world_size):
-                if i != data_replica_rank:
-                    self._states[partition_id][task_name][data_replica_group][i].append(sampled_indexes)
-
+            self._states[partition_id][task_name][dp_rank][batch_index] = sampled_indexes
         else:
             # Return the cached indices (identical to what first rank received)
-            sampled_indexes = self._states[partition_id][task_name][data_replica_group][data_replica_rank].pop(0)
+            sampled_indexes = self._states[partition_id][task_name][dp_rank][batch_index]
             consumed_indexes = sampled_indexes
 
         return sampled_indexes, consumed_indexes

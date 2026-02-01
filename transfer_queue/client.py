@@ -698,7 +698,7 @@ class AsyncTransferQueueClient:
             partition_id=partition_id,
         )
 
-        if consumption_status is None:
+        if consumption_status is None or consumption_status.numel() == 0:
             return False
         return torch.all(consumption_status == 1).item()
 
