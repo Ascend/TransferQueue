@@ -373,7 +373,7 @@ class DataPartitionStatus:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -384,7 +384,8 @@ class DataPartitionStatus:
             field_names: List of field names to mark as produced
             dtypes: Optional per-sample field dtype information
             shapes: Optional per-sample field shape information
-            custom_meta: Optional per-sample field custom metadata
+            custom_backend_meta: Optional per-sample per-field
+                custom metadata provided by storage backend
 
         Returns:
             True if update was successful, False on error
@@ -415,7 +416,7 @@ class DataPartitionStatus:
                 self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
-            self._update_field_metadata(global_indices, dtypes, shapes, custom_meta)
+            self._update_field_metadata(global_indices, dtypes, shapes, custom_backend_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
@@ -969,7 +970,7 @@ class TransferQueueController:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -981,6 +982,7 @@ class TransferQueueController:
             field_names: List of field names to mark as produced
             dtypes: Optional per-sample field dtype information
             shapes: Optional per-sample field shape information
+            custom_backend_meta: Optional custom backend metadata
 
         Returns:
             True if update was successful, False otherwise
@@ -990,7 +992,7 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_meta)
+        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_backend_meta)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1679,7 +1681,7 @@ class TransferQueueController:
                         field_names=message_data.get("fields", []),
                         dtypes=message_data.get("dtypes", {}),
                         shapes=message_data.get("shapes", {}),
-                        custom_meta=message_data.get("custom_meta", {}),
+                        custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
 
                     if success:

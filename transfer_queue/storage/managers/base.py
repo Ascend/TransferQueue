@@ -198,7 +198,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         dtypes: dict[int, dict[str, Any]],
         shapes: dict[int, dict[str, Any]],
-        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -209,7 +209,7 @@ class TransferQueueStorageManager(ABC):
             global_indexes: Data update related global_indexes.
             dtypes: Per-field dtypes for each field, in {global_index: {field: dtype}} format.
             shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
-            custom_meta: Per-field custom_meta for each field, in {global_index: {field: custom_meta}} format.
+            custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
         """
         # Create zmq poller for notifying data update information
 
@@ -234,7 +234,7 @@ class TransferQueueStorageManager(ABC):
                     "global_indexes": global_indexes,
                     "dtypes": dtypes,
                     "shapes": shapes,
-                    "custom_meta": custom_meta,
+                    "custom_backend_meta": custom_backend_meta,
                 },
             ).serialize()
 
