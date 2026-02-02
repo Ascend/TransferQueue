@@ -89,7 +89,7 @@ class TestTransferQueueController:
                 field_names=metadata.field_names,
                 dtypes=dtypes,
                 shapes=shapes,
-                custom_meta=None,
+                custom_backend_meta=None,
             )
         )
         assert success
@@ -498,7 +498,7 @@ class TestTransferQueueControllerCustomMeta:
                 field_names=metadata.field_names,
                 dtypes=dtypes,
                 shapes=shapes,
-                custom_meta=custom_backend_meta,
+                custom_backend_meta=custom_backend_meta,
             )
         )
         assert success
@@ -561,7 +561,7 @@ class TestTransferQueueControllerCustomMeta:
                 field_names=new_metadata.field_names,
                 dtypes=dtypes,
                 shapes=shapes,
-                custom_meta=None,
+                custom_backend_meta=None,
             )
         )
         assert success

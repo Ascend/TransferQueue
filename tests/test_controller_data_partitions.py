@@ -65,7 +65,7 @@ def test_data_partition_status():
             1: {"input_ids": (512,), "attention_mask": (512,)},
             2: {"input_ids": (512,), "attention_mask": (512,)},
         },
-        custom_meta=None,
+        custom_backend_meta=None,
     )
 
     assert success
@@ -175,7 +175,7 @@ def test_dynamic_expansion_scenarios():
             5: {"field_1": (32,)},
             10: {"field_1": (32,)},
         },
-        custom_meta=None,
+        custom_backend_meta=None,
     )
     assert partition.total_samples_num == 3
     assert partition.allocated_samples_num >= 11  # Should accommodate index 10
@@ -474,7 +474,7 @@ def test_custom_meta_in_data_partition_status():
         field_names=field_names,
         dtypes=dtypes,
         shapes=shapes,
-        custom_meta=custom_backend_meta,
+        custom_backend_meta=custom_backend_meta,
     )
 
     assert success
