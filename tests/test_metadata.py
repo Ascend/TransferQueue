@@ -215,11 +215,11 @@ class TestBatchMeta:
                 name="test_field", dtype=torch.float32, shape=(2,), production_status=ProductionStatus.READY_FOR_CONSUME
             )
         }
-        samples = [SampleMeta(partition_id=f"partition_{i % 4}", global_index=i, fields=fields) for i in range(10)]
+        samples = [SampleMeta(partition_id=f"partition_{i % 4}", global_index=i + 10, fields=fields) for i in range(10)]
         batch = BatchMeta(
             samples=samples,
-            custom_meta={i: {"uid": i} for i in range(10)},
-            _custom_backend_meta={i: {"test_field": {"dtype": torch.float32}} for i in range(10)},
+            custom_meta={i + 10: {"uid": i + 10} for i in range(10)},
+            _custom_backend_meta={i + 10: {"test_field": {"dtype": torch.float32}} for i in range(10)},
         )
 
         # Chunk according to partition_id
@@ -228,30 +228,30 @@ class TestBatchMeta:
         assert len(chunks) == 4
         assert len(chunks[0]) == 3
         assert chunks[0].partition_ids == ["partition_0", "partition_0", "partition_0"]
-        assert chunks[0].global_indexes == [0, 4, 8]
+        assert chunks[0].global_indexes == [10, 14, 18]
         assert len(chunks[1]) == 3
         assert chunks[1].partition_ids == ["partition_1", "partition_1", "partition_1"]
-        assert chunks[1].global_indexes == [1, 5, 9]
+        assert chunks[1].global_indexes == [11, 15, 19]
         assert len(chunks[2]) == 2
         assert chunks[2].partition_ids == ["partition_2", "partition_2"]
-        assert chunks[2].global_indexes == [2, 6]
+        assert chunks[2].global_indexes == [12, 16]
         assert len(chunks[3]) == 2
         assert chunks[3].partition_ids == ["partition_3", "partition_3"]
-        assert chunks[3].global_indexes == [3, 7]
+        assert chunks[3].global_indexes == [13, 17]
 
         # validate _custom_backend_meta is chunked
-        assert 0 in chunks[0].custom_meta
-        assert 4 in chunks[0].custom_meta
-        assert 8 in chunks[0].custom_meta
-        assert 1 not in chunks[0].custom_meta
-        assert 1 in chunks[1].custom_meta
+        assert 10 in chunks[0].custom_meta
+        assert 14 in chunks[0].custom_meta
+        assert 18 in chunks[0].custom_meta
+        assert 11 not in chunks[0].custom_meta
+        assert 11 in chunks[1].custom_meta
 
         # validate _custom_backend_meta is chunked
-        assert 0 in chunks[0]._custom_backend_meta
-        assert 4 in chunks[0]._custom_backend_meta
-        assert 8 in chunks[0]._custom_backend_meta
-        assert 1 not in chunks[0]._custom_backend_meta
-        assert 1 in chunks[1]._custom_backend_meta
+        assert 10 in chunks[0]._custom_backend_meta
+        assert 14 in chunks[0]._custom_backend_meta
+        assert 18 in chunks[0]._custom_backend_meta
+        assert 11 not in chunks[0]._custom_backend_meta
+        assert 11 in chunks[1]._custom_backend_meta
 
     def test_batch_meta_init_validation_error_different_field_names(self):
         """Example: Init validation catches samples with different field names."""

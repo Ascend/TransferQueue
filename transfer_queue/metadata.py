@@ -409,13 +409,10 @@ class BatchMeta:
 
         selected_samples = [self.samples[i] for i in indexes]
 
-        selected_custom_meta = {
-            i: self.custom_meta[self.global_indexes[i]] for i in indexes if self.global_indexes[i] in self.custom_meta
-        }
+        global_indexes = [self.global_indexes[i] for i in indexes]
+        selected_custom_meta = {i: self.custom_meta[i] for i in global_indexes if i in self.custom_meta}
         selected_custom_backend_meta = {
-            i: self._custom_backend_meta[self.global_indexes[i]]
-            for i in indexes
-            if self.global_indexes[i] in self._custom_backend_meta
+            i: self._custom_backend_meta[i] for i in global_indexes if i in self._custom_backend_meta
         }
 
         # construct new BatchMeta instance
@@ -470,11 +467,22 @@ class BatchMeta:
         if isinstance(item, int | np.integer):
             sample_meta = self.samples[item] if self.samples else []
             global_idx = self.global_indexes[item]
+
+            if global_idx in self.custom_meta:
+                custom_meta = {global_idx: self.custom_meta[global_idx]}
+            else:
+                custom_meta = {}
+
+            if global_idx in self._custom_backend_meta:
+                custom_backend_meta = {global_idx: self._custom_backend_meta[global_idx]}
+            else:
+                custom_backend_meta = {}
+
             return BatchMeta(
                 samples=[sample_meta],
                 extra_info=self.extra_info,
-                custom_meta={global_idx: self.custom_meta[global_idx]},
-                _custom_backend_meta={global_idx: self._custom_backend_meta[global_idx]},
+                custom_meta=custom_meta,
+                _custom_backend_meta=custom_backend_meta,
             )
         else:
             raise TypeError(f"Indexing with {type(item)} is not supported now!")
@@ -533,11 +541,11 @@ class BatchMeta:
             List of smaller BatchMeta chunks, each chunk has samples with identical partition_id
         """
 
-        grouped_global_indexes = defaultdict(list)
-        for partition_id, global_index in zip(self.partition_ids, self.global_indexes, strict=False):
-            grouped_global_indexes[partition_id].append(global_index)
+        grouped_indexes = defaultdict(list)
+        for partition_id, indexes in zip(self.partition_ids, range(self.size), strict=False):
+            grouped_indexes[partition_id].append(indexes)
 
-        chunk_list = [self.select_samples(global_indices) for global_indices in grouped_global_indexes.values()]
+        chunk_list = [self.select_samples(idx) for idx in grouped_indexes.values()]
 
         return chunk_list
 
