@@ -444,7 +444,8 @@ class DataPartitionStatus:
             raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
         if custom_backend_meta and len(global_indices) != len(custom_backend_meta):
             raise ValueError(
-                f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_backend_meta)} length mismatch."
+                f"`global_indices` {len(global_indices)} and `custom_backend_meta` {len(custom_backend_meta)} "
+                f"length mismatch."
             )
 
         # Extract values for each provided mapping; if a mapping is absent, use Nones

@@ -391,26 +391,27 @@ class BatchMeta:
             object.__setattr__(self, "_is_ready", all(sample.is_ready for sample in self.samples))
         return self
 
-    def select_samples(self, sample_indices: list[int]) -> "BatchMeta":
+    def select_samples(self, global_indices: list[int]) -> "BatchMeta":
         """
         Select specific samples from this batch.
         This will construct a new BatchMeta instance containing only the specified samples.
 
         Args:
-            sample_indices (list[int]): List of sample indices to retain.
+            global_indices (list[int]): List of sample indices to retain. It used the relative
+
 
         Returns:
             BatchMeta: A new BatchMeta instance containing only the specified samples.
         """
 
-        if any(i < 0 or i >= len(self.samples) for i in sample_indices):
-            raise ValueError(f"Sample indices must be in range [0, {len(self.samples)})")
+        if any(i not in self.global_indexes for i in global_indices):
+            raise ValueError("selected global_indices do not exist in this batch!)")
 
-        selected_samples = [self.samples[i] for i in sample_indices]
+        selected_samples = [self.samples[i] for i in global_indices]
 
-        selected_custom_meta = {i: self.custom_meta[i] for i in sample_indices if i in self.custom_meta}
+        selected_custom_meta = {i: self.custom_meta[i] for i in global_indices if i in self.custom_meta}
         selected_custom_backend_meta = {
-            i: self._custom_backend_meta[i] for i in sample_indices if i in self._custom_backend_meta
+            i: self._custom_backend_meta[i] for i in global_indices if i in self._custom_backend_meta
         }
 
         # construct new BatchMeta instance
