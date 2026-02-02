@@ -435,7 +435,6 @@ class AsyncTransferQueueClient:
             >>> batch = asyncio.run(client.async_get_data(batch_meta))
             >>> print(batch)
             >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
-
         """
 
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
@@ -1000,29 +999,48 @@ class TransferQueueClient(AsyncTransferQueueClient):
         )
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
-        """Synchronously fetch data from storage units.
+        """Synchronously fetch data from storage units and organize into TensorDict.
 
         Args:
-            metadata: Batch metadata containing data location information
+            metadata: Batch metadata containing data location information and global indexes
 
         Returns:
-            TensorDict containing requested data fields
+            TensorDict containing:
+                - Requested data fields (e.g., "prompts", "attention_mask")
+
+        Example:
+            >>> batch_meta = client.get_data(
+            ...     data_fields=["prompts", "attention_mask"],
+            ...     batch_size=4,
+            ...     partition_id="train_0",
+            ...     mode="fetch",
+            ...     task_name="generate_sequences",
+            ... )
+            >>> batch = client.get_data(batch_meta)
+            >>> print(batch)
+            >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
         """
         return self._get_data(metadata=metadata)
 
     def clear_partition(self, partition_id: str):
-        """Synchronously clear the whole partition from storage units and controller.
+        """Synchronously clear the whole partition from all storage units and the controller.
 
         Args:
             partition_id: The partition id to clear data for
+
+        Raises:
+            RuntimeError: If clear operation fails
         """
         return self._clear_partition(partition_id=partition_id)
 
     def clear_samples(self, metadata: BatchMeta):
-        """Synchronously clear specific samples from storage units and controller metadata.
+        """Synchronously clear specific samples from all storage units and the controller.
 
         Args:
             metadata: The BatchMeta of the corresponding data to be cleared
+
+        Raises:
+            RuntimeError: If clear operation fails
         """
         return self._clear_samples(metadata=metadata)
 
@@ -1035,6 +1053,17 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         Returns:
             bool: True if all samples have been consumed by the task, False otherwise
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Check if all samples have been consumed
+            >>> is_consumed = client.check_consumption_status(
+            ...     task_name="generate_sequences",
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"All samples consumed: {is_consumed}")
         """
         return self._check_consumption_status(task_name=task_name, partition_id=partition_id)
 
@@ -1070,8 +1099,16 @@ class TransferQueueClient(AsyncTransferQueueClient):
             data_fields: Data fields to check production status for
             partition_id: Partition id to check production status for
 
-        Returns:
-            bool: True if all samples have been produced and ready, False otherwise
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Check if all samples are ready for consumption
+            >>> is_ready = client.check_production_status(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"All samples ready: {is_ready}")
         """
         return self._check_production_status(data_fields=data_fields, partition_id=partition_id)
 
@@ -1102,7 +1139,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
     def get_partition_list(
         self,
-    ):
+    ) -> list[str]:
         """Synchronously fetch the list of partition ids from the controller.
 
         Returns:
