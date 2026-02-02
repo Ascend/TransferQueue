@@ -21,12 +21,12 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta
-from transfer_queue.storage.managers.base import KVStorageManager
-
 # Setup path
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
+
+from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
+from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
 
 
 def get_meta(data, global_indexes=None):
@@ -163,9 +163,11 @@ def test_merge_tensors_to_tensordict(mock_create, test_data):
             assert complex_tensordict[key] == complex_data[key]
 
 
-def test_get_shape_type_custom_meta_list_without_custom_meta(test_data):
-    """Test _get_shape_type_custom_meta_list returns correct shapes and dtypes without custom_meta."""
-    shapes, dtypes, custom_meta_list = KVStorageManager._get_shape_type_custom_meta_list(test_data["metadata"])
+def test_get_shape_type_custom_backend_meta_list_without_custom_meta(test_data):
+    """Test _get_shape_type_custom_backend_meta_list returns correct shapes and dtypes without custom_meta."""
+    shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(
+        test_data["metadata"]
+    )
 
     # Expected order: sorted by field name (label, mask, text), then by global_index order
     # 3 fields * 3 samples = 9 entries
@@ -184,25 +186,25 @@ def test_get_shape_type_custom_meta_list_without_custom_meta(test_data):
     ]
     expected_dtypes = [torch.int64] * (len(test_data["field_names"]) * len(test_data["global_indexes"]))
     # No custom_meta provided, so all should be None
-    expected_custom_meta = [None] * (len(test_data["field_names"]) * len(test_data["global_indexes"]))
+    expected_custom_backend_meta = [None] * (len(test_data["field_names"]) * len(test_data["global_indexes"]))
 
     assert shapes == expected_shapes
     assert dtypes == expected_dtypes
-    assert custom_meta_list == expected_custom_meta
+    assert custom_backend_meta_list == expected_custom_backend_meta
 
 
-def test_get_shape_type_custom_meta_list_with_custom_meta(test_data):
+def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
     """Test _get_shape_type_custom_meta_list returns correct custom_meta when provided."""
     # Add custom_meta to metadata
-    custom_meta = {
+    custom_backend_meta = {
         8: {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},
         9: {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},
         10: {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},
     }
     metadata = test_data["metadata"]
-    metadata.update_custom_meta(custom_meta)
+    metadata._custom_backend_meta.update(custom_backend_meta)
 
-    shapes, dtypes, custom_meta_list = KVStorageManager._get_shape_type_custom_meta_list(metadata)
+    shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
     # Check custom_meta - order is label, mask, text (sorted alphabetically) by global_index
     expected_custom_meta = [
@@ -216,24 +218,24 @@ def test_get_shape_type_custom_meta_list_with_custom_meta(test_data):
         {"key4": "value4"},  # text, global_index=9
         {"key7": "value7"},  # text, global_index=10
     ]
-    assert custom_meta_list == expected_custom_meta
+    assert custom_backend_meta_list == expected_custom_meta
 
 
-def test_get_shape_type_custom_meta_list_with_partial_custom_meta(test_data):
-    """Test _get_shape_type_custom_meta_list handles partial custom_meta correctly."""
+def test_get_shape_type_custom_backend_meta_list_with_partial_custom_meta(test_data):
+    """Test _get_shape_type_custom_backend_meta_list handles partial custom_meta correctly."""
     # Add custom_meta only for some global_indexes and fields
-    custom_meta = {
+    custom_backend_meta = {
         8: {"text": {"key1": "value1"}},  # Only text field
         # global_index 9 has no custom_meta
         10: {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # label and mask only
     }
     metadata = test_data["metadata"]
-    metadata.update_custom_meta(custom_meta)
+    metadata._custom_backend_meta.update(custom_backend_meta)
 
-    shapes, dtypes, custom_meta_list = KVStorageManager._get_shape_type_custom_meta_list(metadata)
+    shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
     # Check custom_meta - order is label, mask, text (sorted alphabetically) by global_index
-    expected_custom_meta = [
+    expected_custom_backend_meta = [
         None,  # label, global_index=8 (not in custom_meta)
         None,  # label, global_index=9 (not in custom_meta)
         {"key2": "value2"},  # label, global_index=10
@@ -244,7 +246,7 @@ def test_get_shape_type_custom_meta_list_with_partial_custom_meta(test_data):
         None,  # text, global_index=9 (not in custom_meta)
         None,  # text, global_index=10 (not in custom_meta for text)
     ]
-    assert custom_meta_list == expected_custom_meta
+    assert custom_backend_meta_list == expected_custom_backend_meta
 
 
 @pytest.fixture
