@@ -378,7 +378,7 @@ def demonstrate_real_workflow():
     print(f"  Sample structure: {batch_meta.samples[0]}")
     print(f"  Custom Meta: {batch_meta.get_all_custom_meta()}")
 
-    print("[Step 3] Retrieve samples with specific fields..")
+    print("[Step 4] Retrieve samples with specific fields..")
     selected_meta = batch_meta.select_fields(["input_ids"])
     print("✓ Selected 'input_ids' field only:")
     print(f"  New field names: {selected_meta.field_names}")
@@ -386,7 +386,7 @@ def demonstrate_real_workflow():
     retrieved_data = client.get_data(selected_meta)
     print(f"  Retrieved data keys: {list(retrieved_data.keys())}")
 
-    print("[Step 4] Select specific samples from the retrieved BatchMeta...")
+    print("[Step 5] Select specific samples from the retrieved BatchMeta...")
     partial_meta = batch_meta.select_samples([0, 2, 4, 6])
     print("✓ Selected samples at indices [0, 2, 4, 6]:")
     print(f"  New global indexes: {partial_meta.global_indexes}")
@@ -394,7 +394,7 @@ def demonstrate_real_workflow():
     retrieved_data = client.get_data(partial_meta)
     print(f"  Retrieved data samples: {retrieved_data}, all the data samples: {data_batch}")
 
-    print("[Step 5] Demonstrate chunk operation...")
+    print("[Step 6] Demonstrate chunk operation...")
     chunks = batch_meta.chunk(2)
     print(f"✓ Chunked into {len(chunks)} parts:")
     for i, chunk in enumerate(chunks):

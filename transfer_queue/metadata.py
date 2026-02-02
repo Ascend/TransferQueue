@@ -391,27 +391,31 @@ class BatchMeta:
             object.__setattr__(self, "_is_ready", all(sample.is_ready for sample in self.samples))
         return self
 
-    def select_samples(self, global_indices: list[int]) -> "BatchMeta":
+    def select_samples(self, indexes: list[int]) -> "BatchMeta":
         """
         Select specific samples from this batch.
         This will construct a new BatchMeta instance containing only the specified samples.
 
         Args:
-            global_indices (list[int]): List of sample indices to retain. It used the relative
-
+            indexes (list[int]): List of indexes (relative to this batch, not global_indexes)
+                to retain.
 
         Returns:
             BatchMeta: A new BatchMeta instance containing only the specified samples.
         """
 
-        if any(i not in self.global_indexes for i in global_indices):
-            raise ValueError("selected global_indices do not exist in this batch!)")
+        if any(i < 0 or i >= len(self.samples) for i in indexes):
+            raise ValueError(f"Sample indices must be in range [0, {len(self.samples)})")
 
-        selected_samples = [self.samples[i] for i in global_indices]
+        selected_samples = [self.samples[i] for i in indexes]
 
-        selected_custom_meta = {i: self.custom_meta[i] for i in global_indices if i in self.custom_meta}
+        selected_custom_meta = {
+            i: self.custom_meta[self.global_indexes[i]] for i in indexes if self.global_indexes[i] in self.custom_meta
+        }
         selected_custom_backend_meta = {
-            i: self._custom_backend_meta[i] for i in global_indices if i in self._custom_backend_meta
+            i: self._custom_backend_meta[self.global_indexes[i]]
+            for i in indexes
+            if self.global_indexes[i] in self._custom_backend_meta
         }
 
         # construct new BatchMeta instance
@@ -465,11 +469,12 @@ class BatchMeta:
     def __getitem__(self, item):
         if isinstance(item, int | np.integer):
             sample_meta = self.samples[item] if self.samples else []
+            global_idx = self.global_indexes[item]
             return BatchMeta(
                 samples=[sample_meta],
                 extra_info=self.extra_info,
-                custom_meta=self.custom_meta,
-                _custom_backend_meta=self._custom_backend_meta,
+                custom_meta={global_idx: self.custom_meta[global_idx]},
+                _custom_backend_meta={global_idx: self._custom_backend_meta[global_idx]},
             )
         else:
             raise TypeError(f"Indexing with {type(item)} is not supported now!")
@@ -532,7 +537,7 @@ class BatchMeta:
         for partition_id, global_index in zip(self.partition_ids, self.global_indexes, strict=False):
             grouped_global_indexes[partition_id].append(global_index)
 
-        chunk_list = [self.select_samples(samples) for samples in grouped_global_indexes.values()]
+        chunk_list = [self.select_samples(global_indices) for global_indices in grouped_global_indexes.values()]
 
         return chunk_list
 
@@ -665,7 +670,7 @@ class BatchMeta:
         # Merge custom_backend_meta dictionaries
         merged_custom_backend_meta = {}
         for idx in self.global_indexes:
-            if idx in self._custom_backend_meta and other._custom_backend_meta[idx]:
+            if idx in self._custom_backend_meta and idx in other._custom_backend_meta:
                 merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx], **other._custom_backend_meta[idx]}
             elif idx in self._custom_backend_meta:
                 merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx]}
@@ -679,38 +684,38 @@ class BatchMeta:
             _custom_backend_meta=merged_custom_backend_meta,
         )
 
-    def reorder(self, indices: list[int]):
+    def reorder(self, indexes: list[int]):
         """
-        Reorder the SampleMeta in the BatchMeta according to the given indices (must equal to the length of samples).
+        Reorder the SampleMeta in the BatchMeta according to the given indexes (must equal to the length of samples).
 
         The operation is performed in-place, modifying the current BatchMeta's SampleMeta order.
 
         To select a subset of samples or repeat specific samples, please use the non-inplace method select_samples().
 
         Args:
-            indices : list[int]
+            indexes : list[int]
                 A list of integers specifying the new order of SampleMeta. Each integer
                 represents the current index of the SampleMeta in the BatchMeta.
         """
 
-        if len(indices) != self.size:
+        if len(indexes) != self.size:
             raise ValueError(
-                f"Attempted to reorder with indices length {len(indices)} that does not match samples length "
+                f"Attempted to reorder with indexes length {len(indexes)} that does not match samples length "
                 f"{self.size}. Please use non-inplace method select_samples() instead if you want to "
                 f"select a subset of samples or repeat specific samples."
             )
 
-        if len(set(indices)) != self.size:
+        if len(set(indexes)) != self.size:
             raise ValueError(
-                f"Indices={indices} contain duplicates. Please use non-inplace method "
+                f"Indexes={indexes} contain duplicates. Please use non-inplace method "
                 f"select_samples() instead if you want to select a subset of samples or repeat specific samples."
             )
 
-        if any(i < 0 or i >= len(self.samples) for i in indices):
-            raise ValueError(f"Reorder indices must be in the range [0, {self.size}).")
+        if any(i < 0 or i >= len(self.samples) for i in indexes):
+            raise ValueError(f"Reorder indexes must be in the range [0, {self.size}).")
 
         # Reorder the samples
-        reordered_samples = [self.samples[i] for i in indices]
+        reordered_samples = [self.samples[i] for i in indexes]
         object.__setattr__(self, "samples", reordered_samples)
 
         # Update necessary attributes

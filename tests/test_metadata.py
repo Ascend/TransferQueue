@@ -469,16 +469,16 @@ class TestBatchMeta:
             )
         }
         samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=2, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=4, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=5, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=6, fields=fields),
         ]
         batch = BatchMeta(samples=samples)
 
         # Reorder to [2, 0, 1]
         batch.reorder([2, 0, 1])
 
-        assert batch.global_indexes == [2, 0, 1]
+        assert batch.global_indexes == [6, 4, 5]
         # Batch indexes are updated
         assert batch.samples[0].batch_index == 0
         assert batch.samples[1].batch_index == 1
@@ -645,20 +645,20 @@ class TestBatchMeta:
             "field2": FieldMeta(name="field2", dtype=torch.int64, shape=(3,)),
         }
         samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=2, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=3, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=4, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=5, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=6, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=7, fields=fields),
         ]
         batch = BatchMeta(samples=samples, extra_info={"test_key": "test_value"})
 
         # Select samples at indices [0, 2]
-        selected_batch = batch.select_samples([0, 2])
+        selected_batch = batch.select_samples([0, 2])  # This will select the first two samples with global_index=4/5
 
         # Check number of samples
         assert len(selected_batch) == 2
         # Check global indexes
-        assert selected_batch.global_indexes == [0, 2]
+        assert selected_batch.global_indexes == [4, 6]
         # Check fields are preserved
         for sample in selected_batch.samples:
             assert "field1" in sample.fields
@@ -676,9 +676,9 @@ class TestBatchMeta:
             )
         }
         samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=2, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=4, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=5, fields=fields),
+            SampleMeta(partition_id="partition_0", global_index=6, fields=fields),
         ]
         batch = BatchMeta(samples=samples, extra_info={"test_key": "test_value"})
 
@@ -687,7 +687,7 @@ class TestBatchMeta:
 
         # All samples are selected
         assert len(selected_batch) == 3
-        assert selected_batch.global_indexes == [0, 1, 2]
+        assert selected_batch.global_indexes == [4, 5, 6]
         # Extra info is preserved
         assert selected_batch.extra_info["test_key"] == "test_value"
 
