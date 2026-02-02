@@ -178,7 +178,11 @@ class TestBatchMeta:
             )
         }
         samples = [SampleMeta(partition_id="partition_0", global_index=i, fields=fields) for i in range(10)]
-        batch = BatchMeta(samples=samples)
+        batch = BatchMeta(
+            samples=samples,
+            custom_meta={i: {"uid": i} for i in range(10)},
+            _custom_backend_meta={i: {"test_field": {"dtype": torch.float32}} for i in range(10)},
+        )
 
         # Chunk into 3 parts
         chunks = batch.chunk(3)
@@ -188,6 +192,22 @@ class TestBatchMeta:
         assert len(chunks[1]) == 3
         assert len(chunks[2]) == 3
 
+        # validate custom_meta is chunked
+        assert 0 in chunks[0].custom_meta
+        assert 1 in chunks[0].custom_meta
+        assert 2 in chunks[0].custom_meta
+        assert 3 in chunks[0].custom_meta
+        assert 4 not in chunks[0].custom_meta
+        assert 4 in chunks[1].custom_meta
+
+        # validate _custom_backend_meta is chunked
+        assert 0 in chunks[0]._custom_backend_meta
+        assert 1 in chunks[0]._custom_backend_meta
+        assert 2 in chunks[0]._custom_backend_meta
+        assert 3 in chunks[0]._custom_backend_meta
+        assert 4 not in chunks[0]._custom_backend_meta
+        assert 4 in chunks[1]._custom_backend_meta
+
     def test_batch_meta_chunk_by_partition(self):
         """Example: Split a batch into multiple chunks."""
         fields = {
@@ -196,7 +216,11 @@ class TestBatchMeta:
             )
         }
         samples = [SampleMeta(partition_id=f"partition_{i % 4}", global_index=i, fields=fields) for i in range(10)]
-        batch = BatchMeta(samples=samples)
+        batch = BatchMeta(
+            samples=samples,
+            custom_meta={i: {"uid": i} for i in range(10)},
+            _custom_backend_meta={i: {"test_field": {"dtype": torch.float32}} for i in range(10)},
+        )
 
         # Chunk according to partition_id
         chunks = batch.chunk_by_partition()
@@ -214,6 +238,20 @@ class TestBatchMeta:
         assert len(chunks[3]) == 2
         assert chunks[3].partition_ids == ["partition_3", "partition_3"]
         assert chunks[3].global_indexes == [3, 7]
+
+        # validate _custom_backend_meta is chunked
+        assert 0 in chunks[0].custom_meta
+        assert 4 in chunks[0].custom_meta
+        assert 8 in chunks[0].custom_meta
+        assert 1 not in chunks[0].custom_meta
+        assert 1 in chunks[1].custom_meta
+
+        # validate _custom_backend_meta is chunked
+        assert 0 in chunks[0]._custom_backend_meta
+        assert 4 in chunks[0]._custom_backend_meta
+        assert 8 in chunks[0]._custom_backend_meta
+        assert 1 not in chunks[0]._custom_backend_meta
+        assert 1 in chunks[1]._custom_backend_meta
 
     def test_batch_meta_init_validation_error_different_field_names(self):
         """Example: Init validation catches samples with different field names."""
@@ -243,14 +281,18 @@ class TestBatchMeta:
             samples=[
                 SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
                 SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
-            ]
+            ],
+            custom_meta={i: {"uid": i} for i in [0, 1]},
+            _custom_backend_meta={i: {"test_field": {"dtype": torch.float32}} for i in [0, 1]},
         )
 
         batch2 = BatchMeta(
             samples=[
                 SampleMeta(partition_id="partition_0", global_index=2, fields=fields),
                 SampleMeta(partition_id="partition_0", global_index=3, fields=fields),
-            ]
+            ],
+            custom_meta={i: {"uid": i} for i in [2, 3]},
+            _custom_backend_meta={i: {"test_field": {"dtype": torch.float32}} for i in [2, 3]},
         )
 
         # Concatenate batches
@@ -258,6 +300,8 @@ class TestBatchMeta:
 
         assert len(result) == 4
         assert result.global_indexes == [0, 1, 2, 3]
+        assert result.custom_meta == {i: {"uid": i} for i in [0, 1, 2, 3]}
+        assert result._custom_backend_meta == {i: {"test_field": {"dtype": torch.float32}} for i in [0, 1, 2, 3]}
 
     def test_batch_meta_concat_with_tensor_extra_info(self):
         """Example: Concat handles tensor extra_info by concatenating along dim=0."""
@@ -364,7 +408,10 @@ class TestBatchMeta:
             samples=[
                 SampleMeta(partition_id="partition_0", global_index=0, fields=fields1),
                 SampleMeta(partition_id="partition_0", global_index=1, fields=fields1),
-            ]
+            ],
+            _custom_backend_meta={
+                i: {"field1": {"dtype": torch.float32}, "field2": {"dtype": torch.int64}} for i in [0, 1]
+            },
         )
         batch1.extra_info["info1"] = "value1"
 
@@ -372,7 +419,10 @@ class TestBatchMeta:
             samples=[
                 SampleMeta(partition_id="partition_0", global_index=0, fields=fields2),
                 SampleMeta(partition_id="partition_0", global_index=1, fields=fields2),
-            ]
+            ],
+            _custom_backend_meta={
+                i: {"field2": {"dtype": torch.int64}, "field3": {"dtype": torch.bool}} for i in [0, 1]
+            },
         )
         batch2.extra_info["info2"] = "value2"
 
@@ -387,6 +437,12 @@ class TestBatchMeta:
         # Extra info is merged
         assert result.extra_info["info1"] == "value1"
         assert result.extra_info["info2"] == "value2"
+
+        # _custom_backend_meta is merged
+        assert result._custom_backend_meta == {
+            i: {"field1": {"dtype": torch.float32}, "field2": {"dtype": torch.int64}, "field3": {"dtype": torch.bool}}
+            for i in [0, 1]
+        }
 
     def test_batch_meta_union_validation(self):
         """Example: Union validation catches mismatched conditions."""
@@ -463,7 +519,18 @@ class TestBatchMeta:
             SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
             SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
         ]
-        batch = BatchMeta(samples=samples, extra_info={"test_key": "test_value"})
+        batch = BatchMeta(
+            samples=samples,
+            extra_info={"test_key": "test_value"},
+            _custom_backend_meta={
+                i: {
+                    "field1": {"dtype": torch.float32},
+                    "field2": {"dtype": torch.int64},
+                    "field3": {"dtype": torch.bool},
+                }
+                for i in [0, 1]
+            },
+        )
 
         # Select only field1 and field3
         selected_batch = batch.select_fields(["field1", "field3"])
@@ -480,6 +547,14 @@ class TestBatchMeta:
         assert selected_batch.extra_info["test_key"] == "test_value"
         # Global indexes are preserved
         assert selected_batch.global_indexes == [0, 1]
+
+        # _custom_backend_meta is selected
+        assert "field1" in selected_batch._custom_backend_meta[0]
+        assert "field2" not in selected_batch._custom_backend_meta[0]
+        assert "field3" in selected_batch._custom_backend_meta[0]
+        assert "field1" in selected_batch._custom_backend_meta[1]
+        assert "field2" not in selected_batch._custom_backend_meta[1]
+        assert "field3" in selected_batch._custom_backend_meta[1]
 
     def test_batch_meta_select_fields_with_nonexistent_fields(self):
         """Example: Select fields ignores non-existent field names in batch."""

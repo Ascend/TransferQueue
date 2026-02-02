@@ -1192,6 +1192,7 @@ class TransferQueueController:
                 consumed_indexes = []
             else:
                 batch_global_indexes = list(sorted(self.index_manager.allocated_indexes))
+                consumed_indexes = []
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)

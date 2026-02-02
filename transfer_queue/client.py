@@ -209,7 +209,7 @@ class AsyncTransferQueueClient:
             >>> print(batch_meta.is_ready)  # True if all samples ready
             >>>
             >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> # so may include unready samples. Consumed samples will not be fetched.)
+            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
             >>> batch_meta = asyncio.run(client.async_get_meta(
             ...     partition_id="train_0",   # optional
             ...     mode="force_fetch",
@@ -941,17 +941,55 @@ class TransferQueueClient(AsyncTransferQueueClient):
         task_name: Optional[str] = None,
         sampling_config: Optional[dict[str, Any]] = None,
     ) -> BatchMeta:
-        """Synchronously fetch data metadata from controller.
+        """Synchronously fetch data metadata from the controller via ZMQ.
 
         Args:
             data_fields: List of data field names to retrieve metadata for
             batch_size: Number of samples to request in the batch
-            partition_id: Target data partition id
+            partition_id: Current data partition id
+            mode: Data fetch mode. Options:
+                - 'fetch': Get ready data only
+                - 'force_fetch': Get data regardless of readiness (may return unready samples)
+                - 'insert': Internal usage - should not be used by users
             task_name: Optional task name associated with the request
             sampling_config: Optional sampling configuration for custom samplers.
 
+
         Returns:
-            BatchMeta: Batch metadata containing data location information
+            BatchMeta: Metadata object containing data structure, sample information, and readiness status
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Example 1: Basic fetch metadata
+            >>> batch_meta = client.get_meta(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     batch_size=4,
+            ...     partition_id="train_0",
+            ...     mode="fetch",
+            ...     task_name="generate_sequences"
+            ... )
+            >>> print(batch_meta.is_ready)  # True if all samples ready
+            >>>
+            >>> # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
+            >>> batch_meta = client.get_meta(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     batch_size=8,
+            ...     partition_id="train_0",
+            ...     mode="fetch",
+            ...     task_name="generate_sequences",
+            ...     sampling_config={"n_samples_per_prompt": 4}
+            ... )
+            >>> print(batch_meta.is_ready)  # True if all samples ready
+            >>>
+            >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
+            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
+            >>> batch_meta = client.get_meta(
+            ...     partition_id="train_0",   # optional
+            ...     mode="force_fetch",
+            ... )
+            >>> print(batch_meta.is_ready)  # May be False if some samples not ready
         """
         return self._get_meta(
             data_fields=data_fields,

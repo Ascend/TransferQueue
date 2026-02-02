@@ -599,7 +599,7 @@ class TestTransferQueueControllerCustomMeta:
         assert result[3]["quality"] == "high"
         assert 4 in result
         assert result[4]["sample_score"] == 0
-        assert 5 not in result  # 5 has not custom_meta, it will not return even we retrieve for 5
+        assert 5 not in result  # 5 has no custom_meta, it will not return even we retrieve for 5
 
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))

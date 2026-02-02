@@ -215,7 +215,7 @@ def demonstrate_batch_meta():
         global_index=0, meta_dict={"uid": "prompt@0", "session_id": "session@0", "model_version": "epoch@0"}
     )
     batch.update_custom_meta({1: {"uid": "prompt@1", "session_id": "session@0", "model_version": "epoch@0"}})
-    print(f"✓ Extra info: {batch.get_all_custom_meta()}")
+    print(f"✓ Custom meta: {batch.get_all_custom_meta()}")
 
     # Example 4: Chunk a batch
     print("[Example 4] Chunking a batch into parts...")

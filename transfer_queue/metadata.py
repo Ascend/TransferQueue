@@ -408,8 +408,18 @@ class BatchMeta:
 
         selected_samples = [self.samples[i] for i in sample_indices]
 
+        selected_custom_meta = {i: self.custom_meta[i] for i in sample_indices if i in self.custom_meta}
+        selected_custom_backend_meta = {
+            i: self._custom_backend_meta[i] for i in sample_indices if i in self._custom_backend_meta
+        }
+
         # construct new BatchMeta instance
-        selected_batch_meta = BatchMeta(samples=selected_samples, extra_info=self.extra_info)
+        selected_batch_meta = BatchMeta(
+            samples=selected_samples,
+            extra_info=self.extra_info,
+            custom_meta=selected_custom_meta,
+            _custom_backend_meta=selected_custom_backend_meta,
+        )
 
         return selected_batch_meta
 
@@ -427,8 +437,23 @@ class BatchMeta:
         # select fields for each SampleMeta
         new_samples = [sample.select_fields(field_names=field_names) for sample in self.samples]
 
+        # select fields in _custom_backend_meta
+        selected_custom_backend_meta = {}
+        for idx in self.global_indexes:
+            if idx in self._custom_backend_meta:
+                custom_backend_meta_idx = self._custom_backend_meta[idx]
+
+                selected_custom_backend_meta[idx] = {
+                    field: custom_backend_meta_idx[field] for field in field_names if field in custom_backend_meta_idx
+                }
+
         # construct new BatchMeta instance
-        new_batch_meta = BatchMeta(samples=new_samples, extra_info=self.extra_info)
+        new_batch_meta = BatchMeta(
+            samples=new_samples,
+            extra_info=self.extra_info,
+            custom_meta=self.custom_meta,
+            _custom_backend_meta=selected_custom_backend_meta,
+        )
 
         return new_batch_meta
 
@@ -439,7 +464,12 @@ class BatchMeta:
     def __getitem__(self, item):
         if isinstance(item, int | np.integer):
             sample_meta = self.samples[item] if self.samples else []
-            return BatchMeta(samples=[sample_meta], extra_info=self.extra_info)
+            return BatchMeta(
+                samples=[sample_meta],
+                extra_info=self.extra_info,
+                custom_meta=self.custom_meta,
+                _custom_backend_meta=self._custom_backend_meta,
+            )
         else:
             raise TypeError(f"Indexing with {type(item)} is not supported now!")
 
@@ -472,7 +502,17 @@ class BatchMeta:
             current_chunk_size = base_size + 1 if i < remainder else base_size
             end = start + current_chunk_size
             chunk_samples = self.samples[start:end]
-            chunk = BatchMeta(samples=chunk_samples, extra_info=self.extra_info)
+            global_indexes = self.global_indexes[start:end]
+            chunk_custom_meta = {i: self.custom_meta[i] for i in global_indexes if i in self.custom_meta}
+            chunk_custom_backend_meta = {
+                i: self._custom_backend_meta[i] for i in global_indexes if i in self._custom_backend_meta
+            }
+            chunk = BatchMeta(
+                samples=chunk_samples,
+                extra_info=self.extra_info,
+                custom_meta=chunk_custom_meta,
+                _custom_backend_meta=chunk_custom_backend_meta,
+            )
             chunk_list.append(chunk)
             start = end
         return chunk_list
@@ -512,14 +552,14 @@ class BatchMeta:
         """
         if not data:
             logger.warning("Try to concat empty BatchMeta chunks. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={})
+            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
 
         # skip empty chunks
         data = [chunk for chunk in data if chunk and len(chunk.samples) > 0]
 
         if len(data) == 0:
             logger.warning("No valid BatchMeta chunks to concatenate. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={})
+            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
 
         if validate:
             base_fields = data[0].field_names
@@ -533,11 +573,20 @@ class BatchMeta:
 
         # Merge all extra_info dictionaries from the chunks
         merged_extra_info = dict()
+        merged_custom_meta = dict()
+        merged_custom_backend_meta = dict()
 
         values_by_key = defaultdict(list)
         for chunk in data:
+            # For the sample-level custom_meta and field-level _custom_backend_meta, we directly update the dict.
+            merged_custom_meta.update(chunk.custom_meta)
+            merged_custom_backend_meta.update(chunk._custom_backend_meta)
+
             for key, value in chunk.extra_info.items():
                 values_by_key[key].append(value)
+
+        # For the batch-level extra_info, we concat the tensor/NonTensorStack/NonTensorData/list
+        # objects to prevent information losses.
         for key, values in values_by_key.items():
             if all(isinstance(v, torch.Tensor) for v in values):
                 try:
@@ -558,7 +607,12 @@ class BatchMeta:
             else:
                 merged_extra_info[key] = values[-1]
 
-        return BatchMeta(samples=all_samples, extra_info=merged_extra_info)
+        return BatchMeta(
+            samples=all_samples,
+            extra_info=merged_extra_info,
+            custom_meta=merged_custom_meta,
+            _custom_backend_meta=merged_custom_backend_meta,
+        )
 
     def union(self, other: "BatchMeta", validate: bool = True) -> Optional["BatchMeta"]:
         """
@@ -603,7 +657,26 @@ class BatchMeta:
 
         # Merge extra info dictionaries
         merged_extra_info = {**self.extra_info, **other.extra_info}
-        return BatchMeta(samples=merged_samples, extra_info=merged_extra_info)
+
+        # Merge custom_meta dictionaries
+        merged_custom_meta = {**self.custom_meta, **other.custom_meta}
+
+        # Merge custom_backend_meta dictionaries
+        merged_custom_backend_meta = {}
+        for idx in self.global_indexes:
+            if idx in self._custom_backend_meta and other._custom_backend_meta[idx]:
+                merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx], **other._custom_backend_meta[idx]}
+            elif idx in self._custom_backend_meta:
+                merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx]}
+            elif idx in other._custom_backend_meta:
+                merged_custom_backend_meta[idx] = other._custom_backend_meta[idx]
+
+        return BatchMeta(
+            samples=merged_samples,
+            extra_info=merged_extra_info,
+            custom_meta=merged_custom_meta,
+            _custom_backend_meta=merged_custom_backend_meta,
+        )
 
     def reorder(self, indices: list[int]):
         """
@@ -699,7 +772,7 @@ class BatchMeta:
         """
         if extra_info is None:
             extra_info = {}
-        return cls(samples=[], extra_info=extra_info)
+        return cls(samples=[], extra_info=extra_info, custom_meta={}, _custom_backend_meta={})
 
     def __str__(self):
         sample_strs = ", ".join(str(sample) for sample in self.samples)
@@ -718,6 +791,8 @@ class BatchMeta:
         return cls(
             samples=samples,
             extra_info=data.get("extra_info", {}),
+            custom_meta=data.get("custom_meta", {}),
+            _custom_backend_meta=data.get("_custom_backend_meta", {}),
         )
 
 
