@@ -215,8 +215,6 @@ class BatchMeta:
         """Initialize all computed properties during initialization"""
         self.samples = copy.deepcopy(self.samples)
         self.extra_info = copy.deepcopy(self.extra_info)
-        self.custom_meta = copy.deepcopy(self.custom_meta)
-        self._custom_backend_meta = copy.deepcopy(self._custom_backend_meta)
 
         # Basic properties
         object.__setattr__(self, "_size", len(self.samples))
@@ -352,7 +350,7 @@ class BatchMeta:
             return
 
         non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
-        if bool(non_exist_global_indexes):
+        if non_exist_global_indexes:
             raise ValueError(
                 f"Trying to update custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
                 f"do not exist in this batch."
@@ -683,7 +681,7 @@ class BatchMeta:
             elif idx in self._custom_backend_meta:
                 merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx]}
             elif idx in other._custom_backend_meta:
-                merged_custom_backend_meta[idx] = other._custom_backend_meta[idx]
+                merged_custom_backend_meta[idx] = {**other._custom_backend_meta[idx]}
 
         return BatchMeta(
             samples=merged_samples,

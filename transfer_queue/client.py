@@ -314,7 +314,7 @@ class AsyncTransferQueueClient:
 
         if response_msg.request_type != ZMQRequestType.SET_CUSTOM_META_RESPONSE:
             raise RuntimeError(
-                f"[{self.client_id}]: Failed to set custom metadata from controller {self._controller.id}: "
+                f"[{self.client_id}]: Failed to set custom metadata to controller {self._controller.id}: "
                 f"{response_msg.body.get('message', 'Unknown error')}"
             )
 

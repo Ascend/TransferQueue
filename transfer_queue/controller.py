@@ -703,8 +703,7 @@ class DataPartitionStatus:
                         Existing entries will be overwritten.
         """
 
-        for k in custom_meta.keys():
-            self.custom_meta[k] = custom_meta[k]
+        self.custom_meta.update(custom_meta)
 
     # ==================== Statistics and Monitoring ====================
 
@@ -1076,6 +1075,11 @@ class TransferQueueController:
             partition = self._get_partition(partition_id)
             if partition:
                 partition.set_custom_meta(custom_meta)
+            else:
+                logger.warning(
+                    f"set_custom_meta: partition {partition_id}' not found; "
+                    f"custom_metadata for this partition will be ignored"
+                )
 
     def get_metadata(
         self,

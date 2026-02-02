@@ -239,7 +239,7 @@ class TestBatchMeta:
         assert chunks[3].partition_ids == ["partition_3", "partition_3"]
         assert chunks[3].global_indexes == [13, 17]
 
-        # validate _custom_backend_meta is chunked
+        # validate custom_meta is chunked
         assert 10 in chunks[0].custom_meta
         assert 14 in chunks[0].custom_meta
         assert 18 in chunks[0].custom_meta
@@ -406,22 +406,22 @@ class TestBatchMeta:
 
         batch1 = BatchMeta(
             samples=[
-                SampleMeta(partition_id="partition_0", global_index=0, fields=fields1),
-                SampleMeta(partition_id="partition_0", global_index=1, fields=fields1),
+                SampleMeta(partition_id="partition_0", global_index=8, fields=fields1),
+                SampleMeta(partition_id="partition_0", global_index=9, fields=fields1),
             ],
             _custom_backend_meta={
-                i: {"field1": {"dtype": torch.float32}, "field2": {"dtype": torch.int64}} for i in [0, 1]
+                i: {"field1": {"dtype": torch.float32}, "field2": {"dtype": torch.int64}} for i in [8, 9]
             },
         )
         batch1.extra_info["info1"] = "value1"
 
         batch2 = BatchMeta(
             samples=[
-                SampleMeta(partition_id="partition_0", global_index=0, fields=fields2),
-                SampleMeta(partition_id="partition_0", global_index=1, fields=fields2),
+                SampleMeta(partition_id="partition_0", global_index=8, fields=fields2),
+                SampleMeta(partition_id="partition_0", global_index=9, fields=fields2),
             ],
             _custom_backend_meta={
-                i: {"field2": {"dtype": torch.int64}, "field3": {"dtype": torch.bool}} for i in [0, 1]
+                i: {"field2": {"dtype": torch.int64}, "field3": {"dtype": torch.bool}} for i in [8, 9]
             },
         )
         batch2.extra_info["info2"] = "value2"
