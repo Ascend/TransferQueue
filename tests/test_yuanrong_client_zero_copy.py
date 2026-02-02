@@ -25,7 +25,7 @@ parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
 from transfer_queue.storage.clients.yuanrong_client import (  # noqa: E402
-    KVClientAdapter,
+    GeneralKVClientAdapter,
 )
 
 
@@ -50,7 +50,7 @@ class TestYuanrongKVClientZCopy:
 
     @pytest.fixture
     def storage_client(self, mock_kv_client):
-        return KVClientAdapter({"host": "127.0.0.1", "port": 31501})
+        return GeneralKVClientAdapter({"host": "127.0.0.1", "port": 31501})
 
     def test_mset_mget_p2p(self, storage_client, mocker):
         # Mock serialization/deserialization
