@@ -49,8 +49,8 @@ class StorageStrategy(ABC):
         """Initialize strategy from config; return None if not applicable."""
 
     @abstractmethod
-    def custom_meta(self) -> Any:
-        """Return metadata identifying this strategy (e.g., string name)."""
+    def strategy_tag(self) -> Any:
+        """Return metadata identifying this strategy (e.g., string name, byte tag)."""
 
     @abstractmethod
     def supports_put(self, value: Any) -> bool:
@@ -77,7 +77,7 @@ class StorageStrategy(ABC):
         """Delete keys from storage."""
 
 
-class DsTensorClientAdapter(StorageStrategy):
+class NPUTensorKVClientAdapter(StorageStrategy):
     """Adapter for YuanRong's high-performance NPU tensor storage."""
 
     KEYS_LIMIT: int = 10_000
@@ -105,11 +105,11 @@ class DsTensorClientAdapter(StorageStrategy):
         if not (enable and torch_npu_imported and torch.npu.is_available()):
             return None
 
-        return DsTensorClientAdapter(config)
+        return NPUTensorKVClientAdapter(config)
 
-    def custom_meta(self) -> Any:
-        """Metadata tag for NPU tensor storage."""
-        return "DsTensorClient"
+    def strategy_tag(self) -> bytes:
+        """Strategy tag for NPU tensor storage. Using a single byte is for better performance."""
+        return b"\x01"
 
     def supports_put(self, value: Any) -> bool:
         """Supports contiguous NPU tensors only."""
@@ -131,8 +131,8 @@ class DsTensorClientAdapter(StorageStrategy):
             self._ds_client.dev_mset(batch_keys, batch_values)
 
     def supports_get(self, custom_meta: str) -> bool:
-        """Matches 'DsTensorClient' custom metadata."""
-        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+        """Matches 'DsTensorClient' Strategy tag."""
+        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
 
     def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
         """Fetch NPU tensors using pre-allocated empty buffers."""
@@ -153,8 +153,8 @@ class DsTensorClientAdapter(StorageStrategy):
         return results
 
     def supports_clear(self, custom_meta: str) -> bool:
-        """Matches 'DsTensorClient' metadata."""
-        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+        """Matches 'DsTensorClient' strategy tag."""
+        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
 
     def clear(self, keys: list[str]):
         """Delete NPU tensor keys in batches."""
@@ -180,7 +180,7 @@ class DsTensorClientAdapter(StorageStrategy):
         return tensors
 
 
-class KVClientAdapter(StorageStrategy):
+class GeneralKVClientAdapter(StorageStrategy):
     """
     Adapter for general-purpose KV storage with serialization.
     The serialization method uses '_decoder' and '_encoder' from 'transfer_queue.utils.serial_utils'.
@@ -209,11 +209,11 @@ class KVClientAdapter(StorageStrategy):
     @staticmethod
     def init(config: dict) -> Optional["StorageStrategy"]:
         """Always enabled for general objects."""
-        return KVClientAdapter(config)
+        return GeneralKVClientAdapter(config)
 
-    def custom_meta(self) -> Any:
-        """Metadata tag for general KV storage."""
-        return "KVClient"
+    def strategy_tag(self) -> bytes:
+        """Strategy tag for general KV storage. Using a single byte is for better performance."""
+        return b"\x02"
 
     def supports_put(self, value: Any) -> bool:
         """Accepts any Python object."""
@@ -227,8 +227,8 @@ class KVClientAdapter(StorageStrategy):
             self.mset_zero_copy(batch_keys, batch_vals)
 
     def supports_get(self, custom_meta: str) -> bool:
-        """Matches 'KVClient' metadata."""
-        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+        """Matches 'KVClient' strategy tag."""
+        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
 
     def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
         """Retrieve and deserialize objects in batches."""
@@ -240,8 +240,8 @@ class KVClientAdapter(StorageStrategy):
         return results
 
     def supports_clear(self, custom_meta: str) -> bool:
-        """Matches 'KVClient' metadata."""
-        return isinstance(custom_meta, str) and custom_meta == self.custom_meta()
+        """Matches 'KVClient' strategy tag."""
+        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
 
     def clear(self, keys: list[str]):
         """Delete keys in batches."""
@@ -249,8 +249,8 @@ class KVClientAdapter(StorageStrategy):
             batch_keys = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
             self._ds_client.delete(batch_keys)
 
-    @staticmethod
-    def calc_packed_size(items: list[memoryview]) -> int:
+    @classmethod
+    def calc_packed_size(cls, items: list[memoryview]) -> int:
         """
         Calculate the total size (in bytes) required to pack a list of memoryview items
         into the structured binary format used by pack_into.
@@ -261,12 +261,10 @@ class KVClientAdapter(StorageStrategy):
         Returns:
             Total buffer size in bytes.
         """
-        return (
-            KVClientAdapter.HEADER_SIZE + len(items) * KVClientAdapter.ENTRY_SIZE + sum(item.nbytes for item in items)
-        )
+        return cls.HEADER_SIZE + len(items) * cls.ENTRY_SIZE + sum(item.nbytes for item in items)
 
-    @staticmethod
-    def pack_into(target: memoryview, items: list[memoryview]):
+    @classmethod
+    def pack_into(cls, target: memoryview, items: list[memoryview]):
         """
         Pack multiple contiguous buffers into a single buffer.
             ┌───────────────┐
@@ -285,22 +283,22 @@ class KVClientAdapter(StorageStrategy):
                 Each item must support the buffer protocol and be readable as raw bytes.
 
         """
-        struct.pack_into(KVClientAdapter.HEADER_FMT, target, 0, len(items))
+        struct.pack_into(cls.HEADER_FMT, target, 0, len(items))
 
-        entry_offset = KVClientAdapter.HEADER_SIZE
-        payload_offset = KVClientAdapter.HEADER_SIZE + len(items) * KVClientAdapter.ENTRY_SIZE
+        entry_offset = cls.HEADER_SIZE
+        payload_offset = cls.HEADER_SIZE + len(items) * cls.ENTRY_SIZE
 
         target_tensor = torch.frombuffer(target, dtype=torch.uint8)
 
         for item in items:
-            struct.pack_into(KVClientAdapter.ENTRY_FMT, target, entry_offset, payload_offset, item.nbytes)
+            struct.pack_into(cls.ENTRY_FMT, target, entry_offset, payload_offset, item.nbytes)
             src_tensor = torch.frombuffer(item, dtype=torch.uint8)
             target_tensor[payload_offset : payload_offset + item.nbytes].copy_(src_tensor)
-            entry_offset += KVClientAdapter.ENTRY_SIZE
+            entry_offset += cls.ENTRY_SIZE
             payload_offset += item.nbytes
 
-    @staticmethod
-    def unpack_from(source: memoryview) -> list[memoryview]:
+    @classmethod
+    def unpack_from(cls, source: memoryview) -> list[memoryview]:
         """
         Unpack multiple contiguous buffers from a single packed buffer.
         Args:
@@ -309,12 +307,10 @@ class KVClientAdapter(StorageStrategy):
             list[memoryview]: List of unpacked contiguous buffers.
         """
         mv = memoryview(source)
-        item_count = struct.unpack_from(KVClientAdapter.HEADER_FMT, mv, 0)[0]
+        item_count = struct.unpack_from(cls.HEADER_FMT, mv, 0)[0]
         offsets = []
         for i in range(item_count):
-            offset, length = struct.unpack_from(
-                KVClientAdapter.ENTRY_FMT, mv, KVClientAdapter.HEADER_SIZE + i * KVClientAdapter.ENTRY_SIZE
-            )
+            offset, length = struct.unpack_from(cls.ENTRY_FMT, mv, cls.HEADER_SIZE + i * cls.ENTRY_SIZE)
             offsets.append((offset, length))
         return [mv[offset : offset + length] for offset, length in offsets]
 
@@ -351,17 +347,21 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
     """
     Storage client for YuanRong DataSystem.
 
+    Use different storage strategies depending on the data type.
     Supports storing and fetching both:
-    - NPU tensors via DsTensorClient (for high performance).
-    - General objects (CPU tensors, str, bool, list, etc.) via KVClient with serialization.
+    - NPU tensors via NPUTensorKVClientAdapter (for high performance).
+    - General objects (CPU tensors, str, bool, list, etc.) via GeneralKVClientAdapter with serialization.
     """
 
     def __init__(self, config: dict[str, Any]):
         if not YUANRONG_DATASYSTEM_IMPORTED:
             raise ImportError("YuanRong DataSystem not installed.")
 
+        # Storage strategies are prioritized in ascending order of list element index.
+        # In other words, the later in the order, the lower the priority.
+        storage_strategies_priority = [NPUTensorKVClientAdapter, GeneralKVClientAdapter]
         self._strategies: list[StorageStrategy] = []
-        for strategy_cls in [DsTensorClientAdapter, KVClientAdapter]:
+        for strategy_cls in storage_strategies_priority:
             strategy = strategy_cls.init(config)
             if strategy is not None:
                 self._strategies.append(strategy)
@@ -380,7 +380,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
 
         Returns:
-            List[str]: custom metadata of YuanrongStorageClient in the same order as input keys.
+            List[str]: storage strategy tag of YuanrongStorageClient in the same order as input keys.
         """
         if not isinstance(keys, list) or not isinstance(values, list):
             raise ValueError("keys and values must be lists")
@@ -393,7 +393,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         # The closure captures local 'keys' and 'values' for zero-overhead parameter passing.
         def put_task(strategy, indexes):
             strategy.put([keys[i] for i in indexes], [values[i] for i in indexes])
-            return strategy.custom_meta(), indexes
+            return strategy.strategy_tag(), indexes
 
         # Dispatch tasks and map metadata back to original positions
         custom_meta: list[str] = [""] * len(keys)
