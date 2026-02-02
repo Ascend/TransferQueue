@@ -363,7 +363,7 @@ def demonstrate_real_workflow():
     client.set_custom_meta(batch_meta)
     print("✓ Successful to store custom_meta into TQ controller. Now you can retrieve the custom_meta from anywhere.")
 
-    print("[Step 2] Try to get metadata from TransferQueue from other places...")
+    print("[Step 3] Try to get metadata from TransferQueue from other places...")
     batch_meta = client.get_meta(
         data_fields=["input_ids", "attention_mask"],
         batch_size=8,
