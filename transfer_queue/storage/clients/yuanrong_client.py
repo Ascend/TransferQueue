@@ -18,7 +18,7 @@ import os
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional, TypeAlias, Union
+from typing import Any, Callable, Optional, TypeAlias
 
 import torch
 from torch import Tensor
@@ -94,7 +94,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         logger.info("YuanrongStorageClient: Create DsTensorClient to connect with yuanrong-datasystem backend!")
 
     @staticmethod
-    def init(config: dict) -> Union["StorageStrategy", None]:
+    def init(config: dict) -> Optional["StorageStrategy"]:
         """Initialize only if NPU and torch_npu are available."""
         torch_npu_imported: bool = True
         try:
@@ -468,10 +468,12 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
     ) -> dict[StorageStrategy, list[int]]:
         """Groups item indices by the first strategy that supports them.
 
-        Used to route keys/values/custom_meta to storage backends by grouped indexes.
+        Used to route data to storage strategies by grouped indexes.
 
         Args:
-            items: A list of items (e.g., values for put, or custom_meta strings for get/clear).
+            items: A list used to distinguish which storage strategy the data is routed to.
+                   e.g., route <keys, values> for put based on types of values,
+                   or route <keys, Optional[shapes], Optional[dtypes]> for get/clear based on strategy_tag.
                    The order must correspond to the original keys.
             selector: A function that determines whether a strategy supports an item.
                      Signature: `(strategy: StorageStrategy, item: Any) -> bool`.
