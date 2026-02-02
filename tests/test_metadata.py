@@ -441,7 +441,7 @@ class TestBatchMeta:
         # _custom_backend_meta is merged
         assert result._custom_backend_meta == {
             i: {"field1": {"dtype": torch.float32}, "field2": {"dtype": torch.int64}, "field3": {"dtype": torch.bool}}
-            for i in [0, 1]
+            for i in [8, 9]
         }
 
     def test_batch_meta_union_validation(self):
