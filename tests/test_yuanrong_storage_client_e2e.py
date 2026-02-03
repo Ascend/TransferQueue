@@ -30,6 +30,7 @@ except ImportError:
 # Here, each mockClient is implemented with independent storage using a simple dictionary,
 # and is only suitable for unit testing.
 
+
 class MockDsTensorClient:
     def __init__(self, host, port, device_id):
         self.storage = {}
@@ -169,8 +170,8 @@ class TestYuanrongStorageE2E:
 
         # Put & Verify Meta
         meta = client.put(keys, vals)
-        # b"\x01" is a tag added by YuanrongStorageClient, indicating that it is processed via General KV path.
-        assert all(m == b"\x02" for m in meta)
+        # "2" is a tag added by YuanrongStorageClient, indicating that it is processed via General KV path.
+        assert all(m == "2" for m in meta)
 
         # Get & Verify Values
         ret = client.get(keys, shp, dt, meta)
@@ -189,8 +190,8 @@ class TestYuanrongStorageE2E:
         client = self.client_cls(config)
 
         meta = client.put(keys, vals)
-        # b"\x01" is a tag added by YuanrongStorageClient, indicating that it is processed via NPU path.
-        assert all(m == b"\x01" for m in meta)
+        # "1" is a tag added by YuanrongStorageClient, indicating that it is processed via NPU path.
+        assert all(m == "1" for m in meta)
 
         ret = client.get(keys, shp, dt, meta)
         for o, r in zip(vals, ret, strict=True):
@@ -203,7 +204,7 @@ class TestYuanrongStorageE2E:
         client = self.client_cls(config)
 
         meta = client.put(keys, vals)
-        assert set(meta) == {b"\x01", b"\x02"}
+        assert set(meta) == {"1", "2"}
 
         ret = client.get(keys, shp, dt, meta)
         for o, r in zip(vals, ret, strict=True):

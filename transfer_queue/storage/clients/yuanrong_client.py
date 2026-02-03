@@ -61,15 +61,15 @@ class StorageStrategy(ABC):
         """Store key-value pairs using this strategy."""
 
     @abstractmethod
-    def supports_get(self, custom_meta: Any) -> bool:
-        """Check if this strategy can retrieve data with given metadata."""
+    def supports_get(self, strategy_tag: Any) -> bool:
+        """Check if this strategy can retrieve data with given tag."""
 
     @abstractmethod
     def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
         """Retrieve values by keys; kwargs may include shapes/dtypes."""
 
     @abstractmethod
-    def supports_clear(self, custom_meta: Any) -> bool:
+    def supports_clear(self, strategy_tag: Any) -> bool:
         """Check if this strategy owns data identified by metadata."""
 
     @abstractmethod
@@ -101,15 +101,15 @@ class NPUTensorKVClientAdapter(StorageStrategy):
             import torch_npu  # noqa: F401
         except ImportError:
             torch_npu_imported = False
-        enable = config.get("enable_yr_npu_optimization", True)
+        enable = config.get("enable_yr_npu_transport", True)
         if not (enable and torch_npu_imported and torch.npu.is_available()):
             return None
 
         return NPUTensorKVClientAdapter(config)
 
-    def strategy_tag(self) -> bytes:
+    def strategy_tag(self) -> str:
         """Strategy tag for NPU tensor storage. Using a single byte is for better performance."""
-        return b"\x01"
+        return "1"
 
     def supports_put(self, value: Any) -> bool:
         """Supports contiguous NPU tensors only."""
@@ -130,15 +130,15 @@ class NPUTensorKVClientAdapter(StorageStrategy):
                 pass
             self._ds_client.dev_mset(batch_keys, batch_values)
 
-    def supports_get(self, custom_meta: str) -> bool:
+    def supports_get(self, strategy_tag: str) -> bool:
         """Matches 'DsTensorClient' Strategy tag."""
-        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
+        return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
     def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
         """Fetch NPU tensors using pre-allocated empty buffers."""
         shapes = kwargs.get("shapes", None)
         dtypes = kwargs.get("dtypes", None)
-        if not shapes or not dtypes:
+        if shapes is None or dtypes is None:
             raise ValueError("YuanrongStorageClient needs Expected shapes and dtypes")
         results = []
         for i in range(0, len(keys), self.KEYS_LIMIT):
@@ -152,9 +152,9 @@ class NPUTensorKVClientAdapter(StorageStrategy):
             results.extend(batch_values)
         return results
 
-    def supports_clear(self, custom_meta: str) -> bool:
+    def supports_clear(self, strategy_tag: str) -> bool:
         """Matches 'DsTensorClient' strategy tag."""
-        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
+        return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
     def clear(self, keys: list[str]):
         """Delete NPU tensor keys in batches."""
@@ -211,9 +211,9 @@ class GeneralKVClientAdapter(StorageStrategy):
         """Always enabled for general objects."""
         return GeneralKVClientAdapter(config)
 
-    def strategy_tag(self) -> bytes:
+    def strategy_tag(self) -> str:
         """Strategy tag for general KV storage. Using a single byte is for better performance."""
-        return b"\x02"
+        return "2"
 
     def supports_put(self, value: Any) -> bool:
         """Accepts any Python object."""
@@ -226,9 +226,9 @@ class GeneralKVClientAdapter(StorageStrategy):
             batch_vals = values[i : i + self.PUT_KEYS_LIMIT]
             self.mset_zero_copy(batch_keys, batch_vals)
 
-    def supports_get(self, custom_meta: str) -> bool:
+    def supports_get(self, strategy_tag: str) -> bool:
         """Matches 'KVClient' strategy tag."""
-        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
+        return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
     def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
         """Retrieve and deserialize objects in batches."""
@@ -239,9 +239,9 @@ class GeneralKVClientAdapter(StorageStrategy):
             results.extend(objects)
         return results
 
-    def supports_clear(self, custom_meta: str) -> bool:
+    def supports_clear(self, strategy_tag: str) -> bool:
         """Matches 'KVClient' strategy tag."""
-        return isinstance(custom_meta, bytes) and custom_meta == self.strategy_tag()
+        return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
     def clear(self, keys: list[str]):
         """Delete keys in batches."""
@@ -357,6 +357,8 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if not YUANRONG_DATASYSTEM_IMPORTED:
             raise ImportError("YuanRong DataSystem not installed.")
 
+        super().__init__(config)
+
         # Storage strategies are prioritized in ascending order of list element index.
         # In other words, the later in the order, the lower the priority.
         storage_strategies_priority = [NPUTensorKVClientAdapter, GeneralKVClientAdapter]
@@ -369,7 +371,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if not self._strategies:
             raise RuntimeError("No storage strategy available for YuanrongStorageClient")
 
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[str]:
         """Stores multiple key-value pairs to remote storage.
 
         Automatically routes NPU tensors to high-performance tensor storage,
@@ -396,11 +398,11 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             return strategy.strategy_tag(), indexes
 
         # Dispatch tasks and map metadata back to original positions
-        custom_meta: list[str] = [""] * len(keys)
-        for meta_str, indexes in self._dispatch_tasks(routed_indexes, put_task):
+        strategy_tags: list[str] = [""] * len(keys)
+        for tag, indexes in self._dispatch_tasks(routed_indexes, put_task):
             for i in indexes:
-                custom_meta[i] = meta_str
-        return custom_meta
+                strategy_tags[i] = tag
+        return strategy_tags
 
     def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
@@ -411,7 +413,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str]): StorageStrategy type for each key
+            custom_meta (List[str]): StorageStrategy tag for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
@@ -422,7 +424,10 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if not (len(keys) == len(shapes) == len(dtypes) == len(custom_meta)):
             raise ValueError("Lengths of keys, shapes, dtypes, custom_meta must match")
 
-        routed_indexes = self._route_to_strategies(custom_meta, lambda strategy_, item_: strategy_.supports_get(item_))
+        strategy_tags = custom_meta
+        routed_indexes = self._route_to_strategies(
+            strategy_tags, lambda strategy_, item_: strategy_.supports_get(item_)
+        )
 
         # Work unit for 'get': handles slicing of keys, shapes, and dtypes simultaneously.
         def get_task(strategy, indexes):
@@ -443,7 +448,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
 
         Args:
             keys (List[str]): List of keys to remove.
-            custom_meta (List[str]): StorageStrategy type for each key
+            custom_meta (List[str]): StorageStrategy tag for each key
         """
         if not isinstance(keys, list) or not isinstance(custom_meta, list):
             raise ValueError("keys and custom_meta must be a list")
@@ -451,8 +456,9 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         if len(custom_meta) != len(keys):
             raise ValueError("custom_meta length must match keys")
 
+        strategy_tags = custom_meta
         routed_indexes = self._route_to_strategies(
-            custom_meta, lambda strategy_, item_: strategy_.supports_clear(item_)
+            strategy_tags, lambda strategy_, item_: strategy_.supports_clear(item_)
         )
 
         def clear_task(strategy, indexes):
@@ -473,7 +479,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
         Args:
             items: A list used to distinguish which storage strategy the data is routed to.
                    e.g., route <keys, values> for put based on types of values,
-                   or route <keys, Optional[shapes], Optional[dtypes]> for get/clear based on strategy_tag.
+                   or route <keys, Optional[shapes], Optional[dtypes]> for get/clear based on strategy_tags.
                    The order must correspond to the original keys.
             selector: A function that determines whether a strategy supports an item.
                      Signature: `(strategy: StorageStrategy, item: Any) -> bool`.
