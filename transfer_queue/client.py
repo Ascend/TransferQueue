@@ -768,6 +768,63 @@ class AsyncTransferQueueClient:
             return False
         return torch.all(consumption_status == 1).item()
 
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_reset_consumption(
+        self,
+        partition_id: str,
+        task_name: Optional[str] = None,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> bool:
+        """Reset consumption status for a partition, allowing data to be re-consumed.
+        This is useful for debugging scenarios where the same rollout data needs to be
+        trained multiple times without regenerating the data.
+        Args:
+            partition_id: Partition id to reset consumption status for
+            task_name: Name of the task to reset. If None, resets all tasks.
+            socket: ZMQ async socket for message transmission (injected by decorator)
+        Returns:
+            bool: True if reset was successful, False otherwise
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+        Example:
+            >>> # Reset consumption for train task to re-train on same data
+            >>> success = asyncio.run(client.async_reset_consumption(
+            ...     partition_id="train_0",
+            ...     task_name="train"
+            ... ))
+            >>> print(f"Reset successful: {success}")
+        """
+        assert socket is not None
+        body = {"partition_id": partition_id}
+        if task_name is not None:
+            body["task_name"] = task_name
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.RESET_CONSUMPTION,
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body=body,
+        )
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart()
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Client reset consumption response: {response_msg} "
+                f"from controller {self._controller.id}"
+            )
+            if response_msg.request_type == ZMQRequestType.RESET_CONSUMPTION_RESPONSE:
+                success = response_msg.body.get("success", False)
+                if not success:
+                    logger.warning(f"[{self.client_id}]: Reset consumption failed: {response_msg.body.get('message')}")
+                return success
+            else:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Failed to reset consumption from controller {self._controller.id}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in reset_consumption: {str(e)}") from e
+
     async def async_check_production_status(
         self,
         data_fields: list[str],
@@ -917,6 +974,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
+        self._reset_consumption = _make_sync(self.async_reset_consumption)
 
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
@@ -1137,6 +1195,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
         """
         return self._get_consumption_status(task_name, partition_id)
+
+    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None) -> bool:
+        """Synchronously reset consumption status for a partition.
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
+        Args:
+            partition_id: Partition id to reset consumption status for
+            task_name: Name of the task to reset. If None, resets all tasks.
+        Returns:
+            bool: True if reset was successful, False otherwise
+        """
+        return self._reset_consumption(partition_id, task_name)
 
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
         """Synchronously check if all samples for a partition are ready (produced) for consumption.

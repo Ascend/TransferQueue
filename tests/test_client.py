@@ -137,6 +137,13 @@ class MockController:
                     elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
                         response_body = {"message": "success"}
                         response_type = ZMQRequestType.SET_CUSTOM_META_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
+                        # Mock reset consumption - always succeed
+                        response_body = {
+                            "success": True,
+                            "message": "Consumption reset successfully",
+                        }
+                        response_type = ZMQRequestType.RESET_CONSUMPTION_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
@@ -529,6 +536,52 @@ def test_get_partition_list(client_setup):
     assert "partition_0" in partition_list
     assert "partition_1" in partition_list
     assert "test_partition" in partition_list
+
+
+def test_reset_consumption(client_setup):
+    """Test synchronous reset_consumption - resets consumption status for a partition"""
+    client, _, _ = client_setup
+
+    # Test synchronous reset_consumption with task_name
+    success = client.reset_consumption(partition_id="train_0", task_name="generate_sequences")
+    assert success is True
+
+    print("✓ reset_consumption with task_name returns True")
+
+
+def test_reset_consumption_all_tasks(client_setup):
+    """Test synchronous reset_consumption without task_name (resets all tasks)"""
+    client, _, _ = client_setup
+
+    # Test synchronous reset_consumption without task_name (reset all tasks)
+    success = client.reset_consumption(partition_id="train_0")
+    assert success is True
+
+    print("✓ reset_consumption without task_name (all tasks) returns True")
+
+
+@pytest.mark.asyncio
+async def test_async_reset_consumption(client_setup):
+    """Test async reset_consumption - resets consumption status for a partition"""
+    client, _, _ = client_setup
+
+    # Test async_reset_consumption with task_name
+    success = await client.async_reset_consumption(partition_id="train_0", task_name="generate_sequences")
+    assert success is True
+
+    print("✓ async_reset_consumption with task_name returns True")
+
+
+@pytest.mark.asyncio
+async def test_async_reset_consumption_all_tasks(client_setup):
+    """Test async reset_consumption without task_name (resets all tasks)"""
+    client, _, _ = client_setup
+
+    # Test async_reset_consumption without task_name (reset all tasks)
+    success = await client.async_reset_consumption(partition_id="train_0")
+    assert success is True
+
+    print("✓ async_reset_consumption without task_name (all tasks) returns True")
 
 
 @pytest.mark.asyncio

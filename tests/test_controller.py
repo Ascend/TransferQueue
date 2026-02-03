@@ -198,6 +198,163 @@ class TestTransferQueueController:
         assert partition is None
         print("✓ Clear partition correct")
 
+    def test_controller_reset_consumption(self, ray_setup):
+        """Test reset_consumption functionality - allows data to be re-consumed"""
+        gbs = 4
+        num_n_samples = 2
+        partition_id = "test_reset_consumption"
+
+        tq_controller = TransferQueueController.remote()
+
+        # Step 1: Create metadata in insert mode
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+        assert metadata.global_indexes == list(range(gbs * num_n_samples))
+
+        # Step 2: Update production status
+        dtypes = {k: {"prompt_ids": "torch.int64", "attention_mask": "torch.bool"} for k in metadata.global_indexes}
+        shapes = {k: {"prompt_ids": (32,), "attention_mask": (32,)} for k in metadata.global_indexes}
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_names=metadata.field_names,
+                dtypes=dtypes,
+                shapes=shapes,
+            )
+        )
+        assert success
+
+        # Step 3: Verify consumption status BEFORE consumption (should be all zeros)
+        global_index, consumption_status = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+        expected_consumption_before = torch.zeros(gbs * num_n_samples, dtype=torch.int8)
+        assert torch.equal(consumption_status, expected_consumption_before)
+        print("✓ Consumption status before fetch is all zeros")
+
+        # Step 4: Fetch data (mark as consumed)
+        gen_meta = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["prompt_ids"],
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="generate_sequences",
+            )
+        )
+        assert gen_meta.global_indexes == list(range(gbs * num_n_samples))
+
+        # Step 5: Verify consumption status AFTER consumption (should be all ones)
+        global_index, consumption_status = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+        expected_consumption_after = torch.ones(gbs * num_n_samples, dtype=torch.int8)
+        assert torch.equal(consumption_status, expected_consumption_after)
+        print("✓ Consumption status after fetch is all ones")
+
+        # Step 6: Reset consumption for specific task
+        ray.get(
+            tq_controller.reset_consumption.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+
+        # Step 7: Verify consumption status is reset (should be all zeros again)
+        global_index, consumption_status = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+        expected_consumption_reset = torch.zeros(gbs * num_n_samples, dtype=torch.int8)
+        assert torch.equal(consumption_status, expected_consumption_reset)
+        print("✓ Consumption status after reset is all zeros")
+
+        # Step 8: Consume again and test reset all tasks
+        gen_meta_2 = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["prompt_ids"],
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="generate_sequences",
+            )
+        )
+        assert gen_meta_2.global_indexes == list(range(gbs * num_n_samples))
+
+        # Also consume with another task
+        gen_meta_3 = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=["attention_mask"],
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="another_task",
+            )
+        )
+        assert gen_meta_3.global_indexes == list(range(gbs * num_n_samples))
+
+        # Verify both tasks have consumed
+        _, consumption_status_task1 = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+        _, consumption_status_task2 = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="another_task",
+            )
+        )
+        assert torch.equal(consumption_status_task1, torch.ones(gbs * num_n_samples, dtype=torch.int8))
+        assert torch.equal(consumption_status_task2, torch.ones(gbs * num_n_samples, dtype=torch.int8))
+        print("✓ Both tasks consumed successfully")
+
+        # Step 9: Reset all tasks (task_name=None)
+        ray.get(
+            tq_controller.reset_consumption.remote(
+                partition_id=partition_id,
+                task_name=None,  # Reset all tasks
+            )
+        )
+
+        # Step 10: Verify all tasks are reset
+        _, consumption_status_task1_reset = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="generate_sequences",
+            )
+        )
+        _, consumption_status_task2_reset = ray.get(
+            tq_controller.get_consumption_status.remote(
+                partition_id=partition_id,
+                task_name="another_task",
+            )
+        )
+        assert torch.equal(consumption_status_task1_reset, torch.zeros(gbs * num_n_samples, dtype=torch.int8))
+        assert torch.equal(consumption_status_task2_reset, torch.zeros(gbs * num_n_samples, dtype=torch.int8))
+        print("✓ Reset all tasks successful - both tasks have zero consumption status")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+        print("✓ Reset consumption test completed successfully")
+
     def test_controller_with_multi_partitions(self, ray_setup):
         gbs_1 = 8
         num_n_samples_1 = 4

@@ -546,6 +546,28 @@ class DataPartitionStatus:
 
         return partition_global_index, consumption_status
 
+    def reset_consumption(self, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a specific task or all tasks.
+
+        This allows the same data to be re-consumed without clearing the actual data.
+        Useful for debugging scenarios where the same rollout data needs to be
+        trained multiple times.
+        Args:
+            task_name: Name of the task to reset consumption for.
+                      If None, resets consumption status for all tasks.
+        """
+        if task_name is not None:
+            # Reset specific task
+            if task_name in self.consumption_status:
+                self.consumption_status[task_name].zero_()
+                logger.debug(f"Reset consumption status for task '{task_name}' in partition {self.partition_id}")
+        else:
+            # Reset all tasks
+            for name, status_tensor in self.consumption_status.items():
+                status_tensor.zero_()
+            logger.debug(f"Reset consumption status for all tasks in partition {self.partition_id}")
+
     # ==================== Production Status Interface ====================
     def get_production_status_for_fields(
         self, field_names: list[str], mask: bool = False
@@ -1341,6 +1363,24 @@ class TransferQueueController:
         self.partitions.pop(partition_id)
         self.sampler.clear_cache(partition_id)
 
+    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a partition without clearing the actual data.
+
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
+        Args:
+            partition_id: ID of the partition to reset consumption for
+            task_name: Name of the task to reset. If None, resets all tasks.
+        Raises:
+            ValueError: If partition not found
+        """
+        logger.debug(f"[{self.controller_id}]: Resetting consumption for partition {partition_id}, task={task_name}")
+        partition = self._get_partition(partition_id)
+        if not partition:
+            raise ValueError(f"Partition {partition_id} not found")
+        partition.reset_consumption(task_name)
+
     def clear_meta(
         self,
         global_indexes: list[int],
@@ -1623,6 +1663,36 @@ class TransferQueueController:
                             "consumption_status": consumption_status,
                         },
                     )
+
+            elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
+                with perf_monitor.measure(op_type="RESET_CONSUMPTION"):
+                    # Handle reset consumption status request
+                    params = request_msg.body
+                    partition_id = params["partition_id"]
+                    task_name = params.get("task_name")  # Optional
+                    try:
+                        self.reset_consumption(partition_id, task_name)
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": True,
+                                "message": f"Consumption reset for partition {partition_id}",
+                            },
+                        )
+                    except Exception as e:
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": False,
+                                "message": str(e),
+                            },
+                        )
 
             elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
                 with perf_monitor.measure(op_type="GET_PRODUCTION"):
