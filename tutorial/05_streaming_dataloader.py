@@ -22,11 +22,11 @@ for efficient streaming data loading in distributed training scenarios.
 Key Components:
 - StreamingDataset: PyTorch IterableDataset that integrates with TransferQueue
 - StreamingDataLoader: DataLoader wrapper that yields (batch, batch_meta) tuples
-- RankAwareSampler: Enables data replica group coordination for consistent
+- RankAwareSampler: Enables DP group coordination for consistent
   sampling across multiple ranks
 
 Use Cases:
-- Distributed training with multiple data replica groups
+- Distributed training with multiple DP groups
 - Fine-grained micro-batch-level data retrieval
 """
 
@@ -94,7 +94,7 @@ def setup_transfer_queue():
     print("[Setup]: Setup TransferQueue components")
     print(
         "Note: Using RankAwareSampler when each rank retrieves data independently. It guarantees that "
-        "all ranks within the same data replica group receive the same sample indices."
+        "The same DP rank receives the same sample indices."
     )
     print(
         "Note: When using streaming data retrieval, please set polling_mode=True when initializing "
@@ -102,7 +102,7 @@ def setup_transfer_queue():
         "available data cannot meet the consumption requirements. User side need to retry later."
     )
     controller = TransferQueueController.remote(
-        sampler=RankAwareSampler,  # RankAwareSampler enables consistent sampling across ranks in same replica group
+        sampler=RankAwareSampler,  # RankAwareSampler enables consistent sampling for each DP rank
         polling_mode=True,  # Enable polling mode for streaming data retrieval
     )
 
@@ -186,7 +186,7 @@ def update_worker(
         max_steps: Maximum number of batches to consume
 
     Returns:
-        dict: Contains data_replica_rank, data_replica_group, and consumed_ids
+        dict: Contains dp_rank and consumed_ids
 
     Example:
         For a setup with 2 data rank (0 and 1):
@@ -317,8 +317,8 @@ def main():
         Key Concepts:
         - StreamingDataset: PyTorch IterableDataset that integrates with TransferQueue
         - StreamingDataLoader: DataLoader wrapper yielding (batch, batch_meta) tuples
-        - RankAwareSampler: Enables correct data consumption across data replica ranks
-        - Data Replica Group: Ranks that should receive identical data samples (TP, PP, ...)
+        - RankAwareSampler: Enables correct data consumption across DP ranks
+        - DP Rank: Ranks that should receive identical data samples
         """
         )
     )
@@ -358,10 +358,7 @@ def main():
     print("Results Summary")
     print("=" * 80)
     for result in update_results:
-        print(
-            f"  Rank {result['data_replica_rank']} (Group {result['data_replica_group']}): "
-            f"consumed {len(result['consumed_ids'])} samples"
-        )
+        print(f"  DP Rank {result['dp_rank']}: consumed {len(result['consumed_ids'])} samples")
 
     print("\n" + "=" * 80)
     print("Tutorial Complete!")
@@ -369,7 +366,7 @@ def main():
     print("Key Takeaways:")
     print("1. StreamingDataset provides PyTorch IterableDataset interface for TransferQueue")
     print("2. StreamingDataLoader wraps the dataset and yields (batch, batch_meta) tuples")
-    print("3. Ranks in the same data_replica_group receive identical samples")
+    print("3. Ranks with the same DP rank receive identical samples")
     print("4. The system enables efficient streaming capabilities")
 
 
