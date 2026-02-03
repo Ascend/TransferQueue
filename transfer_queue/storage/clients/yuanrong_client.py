@@ -18,7 +18,7 @@ import os
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional, TypeAlias
+from typing import Any, Callable, Optional
 
 import torch
 from torch import Tensor
@@ -26,8 +26,6 @@ from torch import Tensor
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
 from transfer_queue.utils.serial_utils import _decoder, _encoder
-
-bytestr: TypeAlias = bytes | bytearray | memoryview
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -404,7 +402,7 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 strategy_tags[i] = tag
         return strategy_tags
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
         Requires shape and dtype hints to reconstruct NPU tensors correctly.
@@ -413,18 +411,18 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
             keys (List[str]): Keys to fetch.
             shapes (List[List[int]]): Expected tensor shapes (use [] for scalars).
             dtypes (List[Optional[torch.dtype]]): Expected dtypes; use None for non-tensor data.
-            custom_meta (List[str]): StorageStrategy tag for each key
+            custom_backend_meta (List[str]): StorageStrategy tag for each key
 
         Returns:
             List[Any]: Retrieved values in the same order as input keys.
         """
-        if shapes is None or dtypes is None or custom_meta is None:
-            raise ValueError("YuanrongStorageClient.get() needs Expected shapes, dtypes and custom_meta")
+        if shapes is None or dtypes is None or custom_backend_meta is None:
+            raise ValueError("YuanrongStorageClient.get() needs Expected shapes, dtypes and custom_backend_meta")
 
-        if not (len(keys) == len(shapes) == len(dtypes) == len(custom_meta)):
-            raise ValueError("Lengths of keys, shapes, dtypes, custom_meta must match")
+        if not (len(keys) == len(shapes) == len(dtypes) == len(custom_backend_meta)):
+            raise ValueError("Lengths of keys, shapes, dtypes, custom_backend_meta must match")
 
-        strategy_tags = custom_meta
+        strategy_tags = custom_backend_meta
         routed_indexes = self._route_to_strategies(
             strategy_tags, lambda strategy_, item_: strategy_.supports_get(item_)
         )
@@ -443,20 +441,20 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
                 results[original_index] = value
         return results
 
-    def clear(self, keys: list[str], custom_meta=None):
+    def clear(self, keys: list[str], custom_backend_meta=None):
         """Deletes multiple keys from remote storage.
 
         Args:
             keys (List[str]): List of keys to remove.
-            custom_meta (List[str]): StorageStrategy tag for each key
+            custom_backend_meta (List[str]): StorageStrategy tag for each key
         """
-        if not isinstance(keys, list) or not isinstance(custom_meta, list):
-            raise ValueError("keys and custom_meta must be a list")
+        if not isinstance(keys, list) or not isinstance(custom_backend_meta, list):
+            raise ValueError("keys and custom_backend_meta must be a list")
 
-        if len(custom_meta) != len(keys):
-            raise ValueError("custom_meta length must match keys")
+        if len(custom_backend_meta) != len(keys):
+            raise ValueError("custom_backend_meta length must match keys")
 
-        strategy_tags = custom_meta
+        strategy_tags = custom_backend_meta
         routed_indexes = self._route_to_strategies(
             strategy_tags, lambda strategy_, item_: strategy_.supports_clear(item_)
         )

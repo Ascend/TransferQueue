@@ -634,5 +634,5 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to clear data, but metadata contains no fields.")
             return
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        _, _, custom_meta = self._get_shape_type_custom_meta_list(metadata)
-        self.storage_client.clear(keys=keys, custom_meta=custom_meta)
+        _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
+        self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)
