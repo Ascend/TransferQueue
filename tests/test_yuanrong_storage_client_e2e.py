@@ -26,7 +26,9 @@ except ImportError:
 
 
 # --- Mock Backend Implementation ---
-
+# In real scenarios, multiple DsTensorClients or KVClients share storage.
+# Here, each mockClient is implemented with independent storage using a simple dictionary,
+# and is only suitable for unit testing.
 
 class MockDsTensorClient:
     def __init__(self, host, port, device_id):
@@ -38,13 +40,13 @@ class MockDsTensorClient:
     def dev_mset(self, keys, values):
         for k, v in zip(keys, values, strict=True):
             assert v.device.type == "npu"
-            self.storage[k] = v.clone()
+            self.storage[k] = v
 
     def dev_mget(self, keys, out_tensors):
         for i, k in enumerate(keys):
+            # Note: If key is missing, tensor remains unchanged (mock limitation)
             if k in self.storage:
                 out_tensors[i].copy_(self.storage[k])
-            # Note: If key is missing, tensor remains unchanged (mock limitation)
 
     def dev_delete(self, keys):
         for k in keys:
