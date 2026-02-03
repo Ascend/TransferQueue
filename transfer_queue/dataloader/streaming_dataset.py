@@ -121,8 +121,8 @@ class StreamingDataset(IterableDataset):
         self.partition_id = partition_id
         self.task_name = task_name
         self.dp_rank = dp_rank
-        self.get_batch_func = fetch_batch_fn if fetch_batch_fn else default_fetch_batch_fn
-        self.post_process_for_micro_func = process_batch_fn if process_batch_fn else chunk_batch_fn
+        self.fetch_batch_fn = fetch_batch_fn if fetch_batch_fn else default_fetch_batch_fn
+        self.process_batch_fn = process_batch_fn if process_batch_fn else chunk_batch_fn
 
         # Build sampling config for controller
         self.sampling_config = {
@@ -195,10 +195,10 @@ class StreamingDataset(IterableDataset):
                 if self.batch_index <= len(self.buffer) - 1:
                     current_data = self.buffer[self.batch_index]
                     self.batch_index += 1
-                    yield from self.post_process_for_micro_func(*current_data, micro_batch_size=self.micro_batch_size)
+                    yield from self.process_batch_fn(*current_data, micro_batch_size=self.micro_batch_size)
 
                 else:
-                    batch_data, batch_meta = self.get_batch_func(
+                    batch_data, batch_meta = self.fetch_batch_fn(
                         self._tq_client,
                         self.data_fields,
                         self.batch_size,
