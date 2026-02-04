@@ -54,7 +54,7 @@ def e2e_client(ray_cluster):
     controller_actor = TransferQueueController.options(
         name="test_controller",
         get_if_exists=True,
-    ).remote()
+    ).remote(polling_mode=True)
     controller_info = ray.get(controller_actor.get_zmq_server_info.remote())
 
     # Start two storage units to test sharding/scatter
@@ -266,19 +266,18 @@ def verify_data_consistency(
     max_retries = 10
     meta = None
     for _ in range(max_retries):
-        try:
-            meta = client.get_meta(
-                partition_id=partition_id,
-                data_fields=data_fields,
-                batch_size=batch_size,
-                mode=mode,
-                task_name=task_name,
-            )
+        meta = client.get_meta(
+            partition_id=partition_id,
+            data_fields=data_fields,
+            batch_size=batch_size,
+            mode=mode,
+            task_name=task_name,
+        )
+        if meta is not None and meta.size > 0:
             break
-        except Exception:
-            time.sleep(0.5)
+        time.sleep(0.5)
 
-    assert meta is not None, f"Failed to retrieve metadata for {task_name}"
+    assert meta is not None and meta.size > 0, f"Failed to retrieve metadata for {task_name}"
 
     retrieved_data = client.get_data(meta)
 
