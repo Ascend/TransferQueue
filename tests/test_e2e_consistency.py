@@ -8,15 +8,15 @@ import ray
 import torch
 from tensordict import NonTensorStack, TensorDict
 
-from transfer_queue import (
+# Setup paths
+parent_dir = Path(__file__).resolve().parent.parent
+sys.path.append(str(parent_dir))
+
+from transfer_queue import (  # noqa: E402
     SimpleStorageUnit,
     TransferQueueClient,
     TransferQueueController,
 )
-
-# Setup paths
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
 
 
 @pytest.fixture(scope="module")
