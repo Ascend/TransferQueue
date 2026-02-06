@@ -16,10 +16,10 @@
 from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
+    RayStorageManager,
     TransferQueueStorageManager,
     TransferQueueStorageManagerFactory,
     YuanrongStorageManager,
-    RayStorageManager,
 )
 from .simple_backend import SimpleStorageUnit, StorageMetaGroup, StorageUnitData
 

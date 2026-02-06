@@ -24,6 +24,7 @@ from transfer_queue.utils.zmq_utils import ZMQServerInfo
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
+
 @TransferQueueStorageManagerFactory.register("RayStore")
 class RayStorageManager(KVStorageManager):
     """Storage manager for Ray-RDT backend."""
