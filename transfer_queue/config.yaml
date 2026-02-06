@@ -24,6 +24,9 @@ backend:
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
+  RayStore:
+    client_name: RayStorageClient
+
   # For Yuanrong:
   # TODO
 
