@@ -19,6 +19,7 @@ from .managers import (
     TransferQueueStorageManager,
     TransferQueueStorageManagerFactory,
     YuanrongStorageManager,
+    RayStorageManager,
 )
 from .simple_backend import SimpleStorageUnit, StorageMetaGroup, StorageUnitData
 
@@ -31,4 +32,5 @@ __all__ = [
     "AsyncSimpleStorageManager",
     "MooncakeStorageManager",
     "YuanrongStorageManager",
+    "RayStorageManager",
 ]
