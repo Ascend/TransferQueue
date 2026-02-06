@@ -192,12 +192,11 @@ class TestGRPOGroupNSampler:
 
     def test_grpo_sampler_basic_functionality(self):
         """Test basic grouped sampling functionality."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 indexes
         batch_size = 8
-        n_samples_per_prompt = 4  # 2 groups of 4
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
         assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
@@ -206,77 +205,58 @@ class TestGRPOGroupNSampler:
 
     def test_grpo_sampler_partial_batch(self):
         """Test partial batch sampling."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]  # 12 indexes
         batch_size = 8  # Want 8 samples total
-        n_samples_per_prompt = 4  # 2 groups of 4
+        # 2 groups of 4
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
         assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
         assert len(sampled) == batch_size
         assert len(consumed) == batch_size
 
-    def test_grpo_sampler_different_group_sizes(self):
-        """Test different n_samples_per_prompt values."""
-        sampler = GRPOGroupNSampler()
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
-
-        # Test with 2 samples per prompt (8 groups)
-        sampled, consumed = sampler.sample(ready_indexes, 8, n_samples_per_prompt=2)
-        assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
-        assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
-
-        # Test with 8 samples per prompt (2 groups)
-        sampled, consumed = sampler.sample(ready_indexes, 8, n_samples_per_prompt=8)
-        assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
-        assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
-
     def test_grpo_sampler_batch_size_divisibility(self):
         """Test that batch_size must be divisible by n_samples_per_prompt."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 indexes, sufficient for batch_size=7
         batch_size = 7
-        n_samples_per_prompt = 4
 
         with pytest.raises(ValueError) as exc_info:
-            sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+            sampler.sample(ready_indexes, batch_size)
 
         assert "must be a multiple of n_samples_per_prompt" in str(exc_info.value)
 
     def test_grpo_sampler_insufficient_ready_indexes(self):
         """Test behavior when not enough ready indexes are available."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3]  # Only 4 indexes, but need 8 for 2 groups of 4
         batch_size = 8
-        n_samples_per_prompt = 4
 
         # Should return empty lists when insufficient complete groups
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
         assert sampled == []
         assert consumed == []
 
     def test_grpo_sampler_exact_multiple_available(self):
         """Test when ready_indexes length is exactly a multiple of n_samples_per_prompt."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 indexes
         batch_size = 8
-        n_samples_per_prompt = 4
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
         assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
 
     def test_grpo_sampler_zero_batch_size(self):
         """Test behavior with zero batch size."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=2)
         ready_indexes = [0, 1, 2, 3]
         batch_size = 0
-        n_samples_per_prompt = 2
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == []
         assert consumed == []
@@ -286,73 +266,53 @@ class TestGRPOGroupNSampler:
         sampler = GRPOGroupNSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5]
         batch_size = 3
-        n_samples_per_prompt = 1
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == [0, 1, 2]
         assert consumed == [0, 1, 2]
 
     def test_grpo_sampler_large_group_size(self):
         """Test with large n_samples_per_prompt."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=10)
         ready_indexes = list(range(20))  # 20 indexes
         batch_size = 20
-        n_samples_per_prompt = 10
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         assert sampled == list(range(20))
         assert consumed == list(range(20))
 
     def test_grpo_sampler_call_method(self):
         """Test that __call__ method works correctly."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=2)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 4
-        n_samples_per_prompt = 2
 
-        sampled, consumed = sampler(ready_indexes, batch_size, n_samples_per_prompt=n_samples_per_prompt)
+        sampled, consumed = sampler(ready_indexes, batch_size)
 
         assert sampled == [0, 1, 2, 3]
         assert consumed == [0, 1, 2, 3]
 
-    def test_grpo_sampler_parameter_order_independence(self):
-        """Test that parameter order doesn't matter when using kwargs."""
-        sampler = GRPOGroupNSampler()
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
-
-        # Try different parameter orders
-        sampled1, consumed1 = sampler.sample(n_samples_per_prompt=4, batch_size=8, ready_indexes=ready_indexes)
-
-        sampled2, consumed2 = sampler.sample(batch_size=8, ready_indexes=ready_indexes, n_samples_per_prompt=4)
-
-        assert sampled1 == sampled2
-        assert consumed1 == consumed2
-
     def test_grpo_sampler_with_extra_kwargs(self):
         """Test that GRPOGroupNSampler accepts extra kwargs but ignores them."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 8
-        n_samples_per_prompt = 4
 
         # GRPOGroupNSampler should accept extra kwargs but ignore them
-        sampled, consumed = sampler.sample(
-            ready_indexes, batch_size, n_samples_per_prompt, extra_param="ignored", another_param=42
-        )
+        sampled, consumed = sampler.sample(ready_indexes, batch_size, extra_param="ignored", another_param=42)
 
         assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
         assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
 
     def test_grpo_sampler_non_sequential_indexes(self):
         """Test with non-sequential ready indexes that get sorted."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [3, 4, 5, 6, 9, 10, 11, 12]  # Non-sequential order but has consecutive groups after sorting
         batch_size = 8
-        n_samples_per_prompt = 4
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         # Should find consecutive groups after sorting: [3,4,5,6] and [9,10,11,12]
         expected = [3, 4, 5, 6, 9, 10, 11, 12]
@@ -361,52 +321,44 @@ class TestGRPOGroupNSampler:
 
     def test_grpo_sampler_invalid_n_samples_per_prompt(self):
         """Test behavior with invalid n_samples_per_prompt values."""
-        sampler = GRPOGroupNSampler()
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
-        batch_size = 8
-
         # Test zero n_samples_per_prompt
         with pytest.raises(ValueError) as exc_info:
-            sampler.sample(ready_indexes, batch_size, n_samples_per_prompt=0)
+            GRPOGroupNSampler(n_samples_per_prompt=0)
         assert "must be positive" in str(exc_info.value)
-
         # Test negative n_samples_per_prompt
         with pytest.raises(ValueError) as exc_info:
-            sampler.sample(ready_indexes, batch_size, n_samples_per_prompt=-2)
+            GRPOGroupNSampler(n_samples_per_prompt=-2)
         assert "must be positive" in str(exc_info.value)
 
     def test_grpo_sampler_no_complete_groups(self):
         """Test behavior when no complete groups are available."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=3)
         ready_indexes = [0, 1, 3, 4, 6, 7]  # No consecutive groups of size 3
         batch_size = 6
-        n_samples_per_prompt = 3
 
         # Should return empty lists when no complete groups found
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
         assert sampled == []
         assert consumed == []
 
     def test_grpo_sampler_mixed_groups(self):
         """Test behavior with mixed complete and incomplete groups."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=3)
         ready_indexes = [0, 1, 3, 4, 5, 6, 7, 9, 10, 11]  # Mixed groups
         batch_size = 6
-        n_samples_per_prompt = 3
 
         # Should find the complete groups [3,4,5] and [9,10,11]
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
         assert sampled == [3, 4, 5, 9, 10, 11]
         assert consumed == [3, 4, 5, 9, 10, 11]
 
     def test_grpo_sampler_sorting_functionality(self):
         """Test that ready_indexes are properly sorted before group detection."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [10, 11, 12, 5, 6, 7, 8, 9]  # Out of order but contains consecutive groups
         batch_size = 8
-        n_samples_per_prompt = 4
 
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         # After sorting: [5,6,7,8,9,10,11,12], should find [5,6,7,8] and [9,10,11,12]
         expected = [5, 6, 7, 8, 9, 10, 11, 12]
@@ -415,19 +367,18 @@ class TestGRPOGroupNSampler:
 
     def test_grpo_sampler_insufficient_groups(self):
         """Test behavior when requesting more groups than available."""
-        sampler = GRPOGroupNSampler()
+        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]  # 4 groups of 4
         batch_size = 12  # Requesting 3 groups of 4 - this should work
-        n_samples_per_prompt = 4
 
         # This should actually work fine since we have 4 groups and request 3
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
         assert len(sampled) == 12
         assert len(consumed) == 12
 
         # Now test requesting more than available
         batch_size = 20  # Requesting 5 groups of 4, but only have 4
-        sampled, consumed = sampler.sample(ready_indexes, batch_size, n_samples_per_prompt)
+        sampled, consumed = sampler.sample(ready_indexes, batch_size)
 
         # Should return empty lists when requesting more complete groups than available
         assert sampled == []
@@ -444,20 +395,17 @@ class TestRankAwareSampler:
         assert hasattr(sampler, "_states")
         assert sampler._states == {}
 
-    def test_rank_aware_sampler_first_rank_sampling(self):
-        """Test that first rank in data replica group performs actual sampling."""
+    def test_rank_aware_sampler_basic_sampling(self):
+        """Test basic sampling functionality."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5]
         batch_size = 3
 
-        # Rank 0 (first in group) samples and caches for all ranks
-        # Since rank 1 will call next, state is kept until rank 1 fetches
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -465,142 +413,97 @@ class TestRankAwareSampler:
         assert sampled == [0, 1, 2]
         assert consumed == [0, 1, 2]
         assert len(sampled) == batch_size
-        # State is kept for other ranks to fetch
 
-    def test_rank_aware_sampler_second_rank_gets_cached(self):
-        """Test that second rank in data replica group gets cached indices."""
+    def test_rank_aware_sampler_caching_on_same_batch_index(self):
+        """Test that same batch_index returns cached results."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5]
         batch_size = 3
 
-        # Rank 0 (first in group) samples first
+        # First call with batch_index=0
         sampled1, consumed1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
 
-        # Rank 1 (second in group) should get same cached indices
+        # Second call with same batch_index=0 should return cached result
         sampled2, consumed2 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
 
         assert sampled1 == sampled2 == [0, 1, 2]
-        assert consumed1 == [0, 1, 2]
-        assert consumed2 == [0, 1, 2]
+        assert consumed1 == consumed2 == [0, 1, 2]
 
-        # cache should be empty after all ranks fetch
-        assert len(sampler._states["test"]["task"][0][0]) == 0
-        assert len(sampler._states["test"]["task"][0][1]) == 0
-
-    def test_rank_aware_sampler_multiple_dp_groups(self):
-        """Test that multiple data replica groups work independently."""
+    def test_rank_aware_sampler_different_batch_indexes(self):
+        """Test that different batch_index values sample different data."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 2
-        data_replica_world_size = 2  # Each group has 2 ranks
 
-        # data replica group 0: rank 0 samples first
-        sampled0_g0, consumed0_g0 = sampler.sample(
+        # First batch
+        sampled1, consumed1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        # mimic the consumption status update managed in TransferQueueController
-        ready_indexes = [i for i in ready_indexes if i not in consumed0_g0]
 
-        # data replica group 1: rank 0 samples first
-        sampled0_g1, consumed0_g1 = sampler.sample(
+        # Second batch
+        ready_indexes = [2, 3, 4, 5, 6, 7]
+        sampled2, consumed2 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=1,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=1,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed0_g1]
 
-        # Both should have sampled their first batch
-        assert sampled0_g0 == [0, 1]
-        assert sampled0_g1 == [2, 3]
-        assert consumed0_g0 == [0, 1]
-        assert consumed0_g1 == [2, 3]
+        assert sampled1 == [0, 1]
+        assert sampled2 == [2, 3]
+        assert consumed1 == [0, 1]
+        assert consumed2 == [2, 3]
 
-        # data replica group 0: rank 1 fetches cached
-        sampled1_g0, consumed1_g0 = sampler.sample(
+    def test_rank_aware_sampler_multiple_dp_ranks(self):
+        """Test that same dp_ranks reuse state cache."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
+        batch_size = 2
+
+        # DP rank 0 samples batch 0
+        sampled_dp0_b0, consumed_dp0_b0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed1_g0]
-        assert sampled1_g0 == [0, 1]
-        assert consumed1_g0 == [0, 1]
-
-        # data replica group 1: rank 1 fetches cached
-        sampled1_g1, consumed1_g1 = sampler.sample(
+        ready_indexes = [2, 3, 4, 5, 6, 7]
+        # DP rank 0 samples batch 0 (should get same result as dp_rank=0)
+        sampled_dp1_b0, consumed_dp1_b0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=1,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
-        ready_indexes = [i for i in ready_indexes if i not in consumed1_g1]
-        assert sampled1_g1 == [2, 3]
-        assert consumed1_g1 == [2, 3]
 
-        # data replica group 0: rank 0 fetches again, this should return new data
-        sampled2_g0, consumed2_g0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=data_replica_world_size,
-            task_name="task",
-            partition_id="test",
-        )
-        ready_indexes = [i for i in ready_indexes if i not in consumed2_g0]
-        assert sampled2_g0 == [4, 5]
-        assert consumed2_g0 == [4, 5]
-
-        # data replica group 0: rank 1 fetches cached
-        sampled3_g0, consumed3_g0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=data_replica_world_size,
-            task_name="task",
-            partition_id="test",
-        )
-        assert sampled3_g0 == [4, 5]
-        assert consumed3_g0 == [4, 5]
-
-        # examine the internal state to ensure proper caching and clearing
-        assert len(sampler._states["test"]["task"][0][0]) == 0
-        assert len(sampler._states["test"]["task"][0][1]) == 0
-        assert len(sampler._states["test"]["task"][1][0]) == 0
-        assert len(sampler._states["test"]["task"][1][1]) == 0
+        # Both should sample from the same ready_indexes
+        assert sampled_dp0_b0 == [0, 1]
+        assert sampled_dp1_b0 == [0, 1]
 
     def test_rank_aware_sampler_empty_ready_indexes(self):
         """Test behavior with empty ready indexes."""
@@ -611,9 +514,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -630,9 +532,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -649,9 +550,8 @@ class TestRankAwareSampler:
         sampled, consumed = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task",
             partition_id="test",
         )
@@ -659,98 +559,129 @@ class TestRankAwareSampler:
         assert sampled == []
         assert consumed == []
 
-    def test_rank_aware_sampler_data_prefetch(self):
-        """Test behavior with data prefetch."""
-        sampler = RankAwareSampler()
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
-        batch_size = 2
-
-        sampled_rank0_time0, consumed_rank0_time0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-
-        assert sampled_rank0_time0 == [0, 1]
-        assert consumed_rank0_time0 == [0, 1]
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[0, 1]]
-
-        ready_indexes = [i for i in ready_indexes if i not in consumed_rank0_time0]
-
-        sampled_rank0_time1, consumed_rank0_time1 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-
-        assert sampled_rank0_time1 == [2, 3]
-        assert consumed_rank0_time1 == [2, 3]
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[0, 1], [2, 3]]
-
-        ready_indexes = [i for i in ready_indexes if i not in consumed_rank0_time1]
-
-        sampled_rank1_time0, consumed_rank1_time0 = sampler.sample(
-            ready_indexes,
-            batch_size,
-            data_replica_group=0,
-            data_replica_rank=1,
-            data_replica_world_size=2,
-            task_name="task",
-            partition_id="test",
-        )
-        assert sampled_rank1_time0 == [0, 1]
-        assert consumed_rank1_time0 == [0, 1]
-
-        assert sampler._states["test"]["task"][0][0] == []
-        assert sampler._states["test"]["task"][0][1] == [[2, 3]]
-
     def test_rank_aware_sampler_multiple_tasks(self):
         """Test behavior with multiple tasks."""
         sampler = RankAwareSampler()
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 2
 
-        sampled_rank0_task0, consumed_rank0_task0 = sampler.sample(
+        sampled_task0, consumed_task0 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task0",
             partition_id="test",
         )
 
-        assert sampled_rank0_task0 == [0, 1]
-        assert consumed_rank0_task0 == [0, 1]
-        assert sampler._states["test"]["task0"][0][0] == []
-        assert sampler._states["test"]["task0"][0][1] == [[0, 1]]
-
-        sampled_rank0_task1, consumed_rank0_task1 = sampler.sample(
+        sampled_task1, consumed_task1 = sampler.sample(
             ready_indexes,
             batch_size,
-            data_replica_group=0,
-            data_replica_rank=0,
-            data_replica_world_size=2,
+            dp_rank=0,
+            batch_index=0,
             task_name="task1",
             partition_id="test",
         )
 
-        assert sampled_rank0_task1 == [0, 1]
-        assert consumed_rank0_task1 == [0, 1]
-        assert sampler._states["test"]["task0"][0][0] == []
-        assert sampler._states["test"]["task0"][0][1] == [[0, 1]]
-        assert sampler._states["test"]["task1"][0][0] == []
-        assert sampler._states["test"]["task1"][0][1] == [[0, 1]]
+        assert sampled_task0 == [0, 1]
+        assert consumed_task0 == [0, 1]
+        assert sampled_task1 == [0, 1]
+        assert consumed_task1 == [0, 1]
+
+        # Check that state is separate per task
+        assert sampler._states["test"]["task0"][0][0] == [0, 1]
+        assert sampler._states["test"]["task1"][0][0] == [0, 1]
+
+    def test_rank_aware_sampler_multiple_partitions(self):
+        """Test behavior with multiple partitions."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5]
+        batch_size = 2
+
+        sampled_part0, consumed_part0 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="partition0",
+        )
+
+        sampled_part1, consumed_part1 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="partition1",
+        )
+
+        assert sampled_part0 == [0, 1]
+        assert consumed_part0 == [0, 1]
+        assert sampled_part1 == [0, 1]
+        assert consumed_part1 == [0, 1]
+
+        # Check that state is separate per partition
+        assert sampler._states["partition0"]["task"][0][0] == [0, 1]
+        assert sampler._states["partition1"]["task"][0][0] == [0, 1]
+
+    def test_rank_aware_sampler_invalid_dp_rank(self):
+        """Test behavior with invalid dp_rank."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 2
+
+        with pytest.raises(ValueError) as exc_info:
+            sampler.sample(
+                ready_indexes,
+                batch_size,
+                dp_rank=-1,
+                batch_index=0,
+                task_name="task",
+                partition_id="test",
+            )
+
+        assert "dp_rank" in str(exc_info.value)
+        assert "greater than or equal to 0" in str(exc_info.value)
+
+    def test_rank_aware_sampler_with_extra_kwargs(self):
+        """Test that RankAwareSampler accepts extra kwargs but ignores them."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3, 4, 5]
+        batch_size = 2
+
+        # Should accept extra kwargs gracefully
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+            extra_param="ignored",
+            another_param=42,
+        )
+
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
+
+    def test_rank_aware_sampler_call_method(self):
+        """Test that __call__ method works correctly."""
+        sampler = RankAwareSampler()
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 2
+
+        sampled, consumed = sampler(
+            ready_indexes,
+            batch_size,
+            dp_rank=0,
+            batch_index=0,
+            task_name="task",
+            partition_id="test",
+        )
+
+        assert sampled == [0, 1]
+        assert consumed == [0, 1]
 
 
 class TestSamplerIntegration:
@@ -772,7 +703,7 @@ class TestSamplerIntegration:
 
     def test_samplers_return_consistent_types(self):
         """Test that all samplers return consistent tuple types."""
-        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(), {"n_samples_per_prompt": 2})]
+        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(n_samples_per_prompt=2), {})]
 
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 4
@@ -792,7 +723,7 @@ class TestSamplerIntegration:
 
     def test_samplers_handle_edge_cases_consistently(self):
         """Test that samplers handle edge cases consistently."""
-        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(), {"n_samples_per_prompt": 2})]
+        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(n_samples_per_prompt=2), {})]
 
         # Test empty ready indexes
         for sampler, kwargs in samplers:

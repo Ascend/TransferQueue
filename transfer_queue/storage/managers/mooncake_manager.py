@@ -19,16 +19,17 @@ from typing import Any
 
 from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
 
-@TransferQueueStorageManagerFactory.register("MooncakeStorageManager")
+@TransferQueueStorageManagerFactory.register("MooncakeStore")
 class MooncakeStorageManager(KVStorageManager):
     """Storage manager for MooncakeStorage backend."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
         # Required: Address of the HTTP metadata server (e.g., "localhost:8080")
         metadata_server = config.get("metadata_server", None)
         # Required: Address of the master server RPC endpoint (e.g., "localhost:8081")
@@ -45,4 +46,4 @@ class MooncakeStorageManager(KVStorageManager):
             config["client_name"] = "MooncakeStorageClient"
         elif client_name != "MooncakeStorageClient":
             raise ValueError(f"Invalid 'client_name': {client_name} in config. Expecting 'MooncakeStorageClient'")
-        super().__init__(config)
+        super().__init__(controller_info, config)

@@ -29,7 +29,7 @@ sys.path.append(str(parent_dir))
 
 from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
 from transfer_queue.storage import AsyncSimpleStorageManager  # noqa: E402
-from transfer_queue.utils.utils import TransferQueueRole  # noqa: E402
+from transfer_queue.utils.enum_utils import TransferQueueRole  # noqa: E402
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo  # noqa: E402
 
 
@@ -62,8 +62,7 @@ async def mock_async_storage_manager():
     )
 
     config = {
-        "storage_unit_infos": storage_unit_infos,
-        "controller_info": controller_info,
+        "zmq_info": storage_unit_infos,
     }
 
     # Mock the handshake process entirely to avoid ZMQ complexity
@@ -199,8 +198,7 @@ async def test_async_storage_manager_mapping_functions():
     )
 
     config = {
-        "storage_unit_infos": storage_unit_infos,
-        "controller_info": controller_info,
+        "zmq_info": storage_unit_infos,
     }
 
     # Mock ZMQ operations
@@ -230,7 +228,7 @@ async def test_async_storage_manager_mapping_functions():
         mock_socket.recv_multipart = Mock(return_value=handshake_response.serialize())
 
         # Create manager
-        manager = AsyncSimpleStorageManager(config)
+        manager = AsyncSimpleStorageManager(controller_info, config)
 
         # Test round-robin mapping for 3 storage units
         # global_index -> storage_unit mapping: 0->storage_0, 1->storage_1, 2->storage_2,
@@ -266,7 +264,7 @@ async def test_async_storage_manager_error_handling():
     }
 
     # Mock controller info
-    controller_infos = ZMQServerInfo(
+    controller_info = ZMQServerInfo(
         role=TransferQueueRole.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
@@ -274,8 +272,7 @@ async def test_async_storage_manager_error_handling():
     )
 
     config = {
-        "storage_unit_infos": storage_unit_infos,
-        "controller_info": controller_infos,
+        "zmq_info": storage_unit_infos,
     }
 
     # Mock ZMQ operations
@@ -305,7 +302,7 @@ async def test_async_storage_manager_error_handling():
         mock_socket.recv_multipart = Mock(return_value=handshake_response.serialize())
 
         # Create manager
-        manager = AsyncSimpleStorageManager(config)
+        manager = AsyncSimpleStorageManager(controller_info, config)
 
         # Mock operations that raise exceptions
         manager._put_to_single_storage_unit = AsyncMock(side_effect=RuntimeError("Mock PUT error"))

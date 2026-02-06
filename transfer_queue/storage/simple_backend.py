@@ -27,8 +27,9 @@ import zmq
 from ray.util import get_node_ip_address
 
 from transfer_queue.metadata import SampleMeta
+from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.utils import TransferQueueRole, limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket, get_free_port
 
 logger = logging.getLogger(__name__)

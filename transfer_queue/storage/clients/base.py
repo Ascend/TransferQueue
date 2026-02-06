@@ -23,6 +23,14 @@ class TransferQueueStorageKVClient(ABC):
     Subclasses must implement the core methods: put, get, and clear.
     """
 
+    def __init__(self, config: dict[str, Any]):
+        """
+        Initialize the storage client with configuration.
+        Args:
+            config (dict[str, Any]): Configuration dictionary for the storage client.
+        """
+        self.config = config
+
     @abstractmethod
     def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """
@@ -36,7 +44,7 @@ class TransferQueueStorageKVClient(ABC):
         raise NotImplementedError("Subclasses must implement put")
 
     @abstractmethod
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """
         Retrieve values from the storage backend by key.
         Args:
@@ -47,9 +55,9 @@ class TransferQueueStorageKVClient(ABC):
             dtypes: Optional data type information for the expected values.
                 The structure and interpretation of this argument are
                 determined by the concrete storage backend implementation.
-            custom_meta: Optional backend-specific metadata used to control
-                or optimize the retrieval process. Its format is defined by
-                the concrete storage backend implementation.
+            custom_backend_meta: Optional backend-specific metadata used to
+                control or optimize the retrieval process. Its format is
+                defined by the concrete storage backend implementation.
         Returns:
             list[Any]: List of values retrieved from the storage backend,
             in the same order as the provided keys.
@@ -57,6 +65,6 @@ class TransferQueueStorageKVClient(ABC):
         raise NotImplementedError("Subclasses must implement get")
 
     @abstractmethod
-    def clear(self, keys: list[str]) -> None:
+    def clear(self, keys: list[str], custom_backend_meta=None) -> None:
         """Clear key-value pairs in the storage backend."""
         raise NotImplementedError("Subclasses must implement clear")

@@ -20,6 +20,7 @@
 import pickle
 import warnings
 from collections.abc import Sequence
+from contextvars import ContextVar
 from types import FunctionType
 from typing import Any, TypeAlias
 
@@ -41,28 +42,36 @@ bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 # the tensors are writable to users.
 warnings.filterwarnings(action="ignore", message=r"The given buffer is not writable*", category=UserWarning)
 
+# ContextVar for thread/coroutine-safe buffer storage during serialization/deserialization
+# This enables the global _encoder/_decoder instances to be safely used across threads
+_encoder_aux_buffers: ContextVar[list[bytestr] | None] = ContextVar("encoder_aux_buffers", default=None)
+_decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder_aux_buffers", default=None)
+
 
 class MsgpackEncoder:
     """Encoder with custom torch tensor and numpy array serialization.
 
-    Note that unlike vanilla `msgspec` Encoders, this interface is generally
-    not thread-safe when encoding tensors / numpy arrays.
+    This implementation uses ContextVar for thread-safe buffer storage,
+    allowing the global encoder instance to be safely used across multiple
+    threads and async coroutines.
 
-    By default, arrays below 256B are serialized inline Larger will get sent
-    via dedicated messages. Note that this is a per-tensor limit.
     """
 
     def __init__(self):
         self.encoder = msgpack.Encoder(enc_hook=self.enc_hook)
-        # This is used as a local stash of buffers that we can then access from
-        # our custom `msgspec` hook, `enc_hook`. We don't have a way to
-        # pass custom data to the hook otherwise.
-        self.aux_buffers: list[bytestr] = []
+
+    @property
+    def aux_buffers(self) -> list[bytestr]:
+        """Get the current context's aux_buffers."""
+        buffers = _encoder_aux_buffers.get()
+        assert buffers is not None, "aux_buffers accessed outside of encode() context"
+        return buffers
 
     def encode(self, obj: Any) -> Sequence[bytestr]:
         """Encode a given object to a byte array."""
+        bufs: list[bytestr] = [b""]
+        token = _encoder_aux_buffers.set(bufs)
         try:
-            self.aux_buffers = bufs = [b""]
             bufs[0] = self.encoder.encode(obj)
             # This `bufs` list allows us to collect direct pointers to backing
             # buffers of tensors and np arrays, and return them along with the
@@ -70,7 +79,7 @@ class MsgpackEncoder:
             # new buffer.
             return bufs
         finally:
-            self.aux_buffers = []
+            _encoder_aux_buffers.reset(token)
 
     def enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for types msgspec doesn't natively support.
@@ -88,8 +97,17 @@ class MsgpackEncoder:
             return self._encode_tensordict(obj)
 
         # Handle numpy arrays by converting to tensor
+        # Only numeric dtypes are supported by torch.from_numpy:
+        # f=float, i=signed int, u=unsigned int, b=bool, c=complex
         if isinstance(obj, np.ndarray):
-            return self._encode_tensor(torch.from_numpy(obj))
+            if obj.dtype.kind in ("f", "i", "u", "b", "c"):
+                try:
+                    return self._encode_tensor(torch.from_numpy(obj))
+                except (TypeError, RuntimeError):
+                    # Fallback to pickle for unsupported dtypes (e.g., float16 on some platforms)
+                    pass
+            # For object arrays, strings, or other unsupported types, use pickle
+            return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if isinstance(obj, FunctionType):
             # cloudpickle for functions/methods
@@ -204,24 +222,31 @@ class MsgpackEncoder:
 class MsgpackDecoder:
     """Decoder with custom torch tensor and numpy array serialization.
 
-    Note that unlike vanilla `msgspec` Decoders, this interface is generally
-    not thread-safe when encoding tensors / numpy arrays.
+    This implementation uses ContextVar for thread-safe buffer storage,
+    allowing the global decoder instance to be safely used across multiple
+    threads and async coroutines.
     """
 
     def __init__(self):
         self.decoder = msgpack.Decoder(ext_hook=self.ext_hook)
-        self.aux_buffers: Sequence[bytestr] = ()
+
+    @property
+    def aux_buffers(self) -> Sequence[bytestr]:
+        """Get the current context's aux_buffers."""
+        buffers = _decoder_aux_buffers.get()
+        assert buffers is not None, "aux_buffers accessed outside of decode() context"
+        return buffers
 
     def decode(self, bufs: bytestr | Sequence[bytestr]) -> Any:
         """Decode a list of bytes."""
         if isinstance(bufs, bytestr):
             result = self.decoder.decode(bufs)
         else:
-            self.aux_buffers = bufs
+            token = _decoder_aux_buffers.set(bufs)
             try:
                 result = self.decoder.decode(bufs[0])  # type: ignore[index]
             finally:
-                self.aux_buffers = ()
+                _decoder_aux_buffers.reset(token)
 
         # Post-process to reconstruct TensorDict from marked dicts
         return self._reconstruct_special_types(result)

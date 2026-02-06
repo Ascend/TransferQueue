@@ -28,6 +28,7 @@ from uuid import uuid4
 import ray
 import torch
 import zmq
+from omegaconf import DictConfig
 from ray.util import get_node_ip_address
 from torch import Tensor
 
@@ -37,11 +38,8 @@ from transfer_queue.metadata import (
     SampleMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
+from transfer_queue.utils.enum_utils import ProductionStatus, TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.utils import (
-    ProductionStatus,
-    TransferQueueRole,
-)
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -62,17 +60,10 @@ if not logger.hasHandlers():
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
 
-
-TQ_INIT_SAMPLE_NUM = int(os.environ.get("TQ_INIT_SAMPLE_NUM", 1))  # Initial number of samples
-TQ_INIT_FIELD_NUM = int(os.environ.get("TQ_INIT_FIELD_NUM", 1))
-
-# Expansion configuration - Unified approach using minimum expansion sizes
-TQ_SAMPLE_MIN_EXPANSION_SIZE = int(
-    os.environ.get("TQ_SAMPLE_MIN_EXPANSION_SIZE", 1)
-)  # Minimum expansion size for samples (rows)
-TQ_FIELD_MIN_EXPANSION_SIZE = int(
-    os.environ.get("TQ_FIELD_MIN_EXPANSION_SIZE", 1)
-)  # Minimum expansion size for fields (columns)
+# Sample pre-allocation for StreamingDataLoader compatibility.
+# By pre-allocating sample indices (typically global_batch_size), consumers can accurately
+# determine consumption status even before producers have generated the samples.
+TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
 
 class PartitionIndexManager:
@@ -94,7 +85,7 @@ class PartitionIndexManager:
         # Track all active indexes
         self.allocated_indexes = set()
 
-    def allocate_indexes(self, partition_id, count=1) -> list:
+    def allocate_indexes(self, partition_id, count=1) -> list[int]:
         """
         Allocate global_indexes for the specified partition.
         Prioritizes obtaining from reusable pool, allocates new indexes when insufficient.
@@ -188,7 +179,7 @@ class PartitionIndexManager:
         if not partition_indexes:
             self.partition_to_indexes.pop(partition_id, None)
 
-    def get_indexes_for_partition(self, partition_id) -> set[int]:
+    def get_indexes_for_partition(self, partition_id) -> list[int]:
         """
         Get all global_indexes for the specified partition.
 
@@ -196,9 +187,9 @@ class PartitionIndexManager:
             partition_id: Partition ID
 
         Returns:
-            set: Set of global_indexes for this partition
+            list: List of global_indexes for this partition
         """
-        return self.partition_to_indexes.get(partition_id, set()).copy()
+        return list(self.partition_to_indexes.get(partition_id, set()).copy())
 
 
 @dataclass
@@ -216,7 +207,8 @@ class DataPartitionStatus:
 
     # Production status tensor - dynamically expandable
     # Values: 0 = not produced, 1 = ready for consumption
-    production_status: Optional[Tensor] = torch.zeros(TQ_INIT_SAMPLE_NUM, TQ_INIT_FIELD_NUM, dtype=torch.int8)
+
+    production_status: Tensor = torch.zeros(TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
 
     # Consumption status per task - task_name -> consumption_tensor
     # Each tensor tracks which samples have been consumed by that task
@@ -227,11 +219,19 @@ class DataPartitionStatus:
         default_factory=set
     )  # set of global indexes that have been added to this partition
 
-    # Field metadata
+    pre_allocated_global_indexes: set[int] = field(
+        default_factory=set
+    )  # set of global indexes that pre-allocated, but not active in this partition
+
+    # Metadata
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     field_dtypes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: dtype}
     field_shapes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: shape}
-    field_custom_metas: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: custom_meta}
+    field_custom_backend_meta: dict[int, dict[str, Any]] = field(
+        default_factory=dict
+    )  # global_idx -> {field: custom_backend_meta}
+    # User-defined metadata that may not apply to field level
+    custom_meta: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {}
 
     # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
     # No need to strictly lock for every read/write operation since freshness is not critical.
@@ -251,29 +251,86 @@ class DataPartitionStatus:
     @property
     def allocated_fields_num(self) -> int:
         """Current number of allocated columns in the tensor."""
-        return self.production_status.shape[1] if self.production_status is not None else 0
+        return self.production_status.shape[1]
 
     @property
     def allocated_samples_num(self) -> int:
         """Current number of allocated rows in the tensor."""
-        return self.production_status.shape[0] if self.production_status is not None else 0
+        return self.production_status.shape[0]
+
+    # ==================== Index Pre-Allocation Methods ====================
+
+    def register_pre_allocated_indexes(self, allocated_indexes: list[int]):
+        """
+        Register pre-allocated sample indexes to this partition.
+
+        These indexes are reserved before actual data production, allowing consumers
+        to see the expected total sample count via get_consumption_status even when
+        producers haven't generated all samples yet.
+
+        Args:
+            allocated_indexes: List of global indexes to pre-allocate
+        """
+
+        if len(allocated_indexes) < 1:
+            logger.info("Trying to pre-allocate global_indexes with empty list!")
+            return
+
+        self.pre_allocated_global_indexes.update(allocated_indexes)
+
+        # Expand the state matrices
+        max_sample_idx = max(allocated_indexes)
+        required_samples = max_sample_idx + 1
+
+        with self.data_status_lock:
+            self.ensure_samples_capacity(required_samples)
+
+        logger.debug(f"Pre-allocated indexes in {self.partition_id}: {allocated_indexes}")
+
+    def activate_pre_allocated_indexes(self, sample_num: int) -> list[int]:
+        """
+        Activate and retrieve pre-allocated indexes for use in data insertion.
+
+        This method consumes pre-allocated indexes and marks them as active in global_indexes.
+        If pre-allocated indexes are insufficient, returns all available ones.
+
+        Args:
+            sample_num: Number of indexes needed
+
+        Returns:
+            List of retrieved global indexes
+        """
+        available_indexes = len(self.pre_allocated_global_indexes)
+
+        if available_indexes < sample_num:
+            global_index_to_allocate = list(self.pre_allocated_global_indexes)
+            logger.debug(
+                f"Not enough pre-allocated indexes in partition {self.partition_id}. "
+                f"Returning {available_indexes} of {sample_num} requested."
+            )
+        else:
+            global_index_to_allocate = list(sorted(self.pre_allocated_global_indexes))[:sample_num]
+
+        self.global_indexes.update(global_index_to_allocate)
+        self.pre_allocated_global_indexes.difference_update(set(global_index_to_allocate))
+
+        return global_index_to_allocate
 
     # ==================== Dynamic Expansion Methods ====================
 
-    def ensure_samples_capacity(self, required_samples: int) -> bool:
+    def ensure_samples_capacity(self, required_samples: int) -> None:
         """
         Ensure the production status tensor has enough rows for the required samples.
-        Dynamically expands if needed using unified minimum expansion size.
 
         Args:
             required_samples: Minimum number of samples needed
         """
+
         current_sample_space = self.allocated_samples_num
         if required_samples > current_sample_space:
-            # Expand rows using minimum expansion size for predictable memory usage
+            # Expand rows
             expansion_needed = required_samples - current_sample_space
-            min_expansion = max(TQ_SAMPLE_MIN_EXPANSION_SIZE, expansion_needed)
-            new_samples = current_sample_space + min_expansion
+            new_samples = current_sample_space + expansion_needed
             new_fields = self.production_status.shape[1]
 
             expanded_tensor = torch.zeros(new_samples, new_fields, dtype=torch.int8)
@@ -286,39 +343,28 @@ class DataPartitionStatus:
                 expanded_consumption[:current_sample_space] = consumption_tensor
                 self.consumption_status[task_name] = expanded_consumption
 
-            logger.debug(
-                f"Expanded partition {self.partition_id} from {current_sample_space} "
-                f"to {new_samples} samples (added {min_expansion} samples)"
-            )
+            logger.debug(f"Expanded partition {self.partition_id} from {current_sample_space} to {new_samples} samples")
 
-    def ensure_fields_capacity(self, required_fields: int):
+    def ensure_fields_capacity(self, required_fields: int) -> None:
         """
         Ensure the production status tensor has enough columns for the required fields.
-        Dynamically expands if needed using unified minimum expansion size.
 
         Args:
             required_fields: Minimum number of fields needed
         """
-        if self.production_status is None:
-            # Will be initialized when samples are added
-            return
 
         current_fields = self.production_status.shape[1]
         if required_fields > current_fields:
-            # Expand columns using minimum expansion size for predictable memory usage
+            # Expand columns
             expansion_needed = required_fields - current_fields
-            min_expansion = max(TQ_FIELD_MIN_EXPANSION_SIZE, expansion_needed)
-            new_fields = current_fields + min_expansion
+            new_fields = current_fields + expansion_needed
             new_samples = self.production_status.shape[0]
 
             expanded_tensor = torch.zeros(new_samples, new_fields, dtype=torch.int8)
             expanded_tensor[:, :current_fields] = self.production_status
             self.production_status = expanded_tensor
 
-            logger.debug(
-                f"Expanded partition {self.partition_id} from {current_fields} "
-                f"to {new_fields} fields (added {min_expansion} fields)"
-            )
+            logger.debug(f"Expanded partition {self.partition_id} from {current_fields} to {new_fields} fields")
 
     # ==================== Production Status Interface ====================
 
@@ -328,7 +374,7 @@ class DataPartitionStatus:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -339,7 +385,8 @@ class DataPartitionStatus:
             field_names: List of field names to mark as produced
             dtypes: Optional per-sample field dtype information
             shapes: Optional per-sample field shape information
-            custom_meta: Optional per-sample field custom metadata
+            custom_backend_meta: Optional per-sample per-field
+                custom metadata provided by storage backend
 
         Returns:
             True if update was successful, False on error
@@ -370,7 +417,7 @@ class DataPartitionStatus:
                 self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
-            self._update_field_metadata(global_indices, dtypes, shapes, custom_meta)
+            self._update_field_metadata(global_indices, dtypes, shapes, custom_backend_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
@@ -386,7 +433,7 @@ class DataPartitionStatus:
         global_indices: list[int],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]],
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]],
     ):
         """Update field dtype and shape metadata."""
         if not global_indices:
@@ -397,9 +444,10 @@ class DataPartitionStatus:
             raise ValueError(f"`global_indices` {len(global_indices)} and `dtypes` {len(dtypes)} length mismatch.")
         if shapes and len(global_indices) != len(shapes):
             raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
-        if custom_meta and len(global_indices) != len(custom_meta):
+        if custom_backend_meta and len(global_indices) != len(custom_backend_meta):
             raise ValueError(
-                f"`global_indices` {len(global_indices)} and `custom_meta` {len(custom_meta)} length mismatch."
+                f"`global_indices` {len(global_indices)} and `custom_backend_meta` {len(custom_backend_meta)} "
+                f"length mismatch."
             )
 
         # Extract values for each provided mapping; if a mapping is absent, use Nones
@@ -417,12 +465,12 @@ class DataPartitionStatus:
         else:
             shape_value = tuple([None] * len(global_indices))
 
-        if custom_meta:
-            custom_meta_value = itemgetter(*global_indices)(custom_meta)
-            if not isinstance(custom_meta_value, tuple):
-                custom_meta_value = (custom_meta_value,)
+        if custom_backend_meta:
+            custom_backend_meta_value = itemgetter(*global_indices)(custom_backend_meta)
+            if not isinstance(custom_backend_meta_value, tuple):
+                custom_backend_meta_value = (custom_backend_meta_value,)
         else:
-            custom_meta_value = tuple([None] * len(global_indices))
+            custom_backend_meta_value = tuple([None] * len(global_indices))
 
         for i, global_idx in enumerate(global_indices):
             # Only create and update dtype mapping if a dtype value was provided
@@ -437,11 +485,11 @@ class DataPartitionStatus:
                     self.field_shapes[global_idx] = {}
                 self.field_shapes[global_idx].update(shape_value[i])
 
-            # Only create and update custom_meta mapping if a custom_meta value was provided
-            if custom_meta_value[i] is not None:
-                if global_idx not in self.field_custom_metas:
-                    self.field_custom_metas[global_idx] = {}
-                self.field_custom_metas[global_idx].update(custom_meta_value[i])
+            # Only create and update custom_backend_meta mapping if a custom_backend_meta value was provided
+            if custom_backend_meta_value[i] is not None:
+                if global_idx not in self.field_custom_backend_meta:
+                    self.field_custom_backend_meta[global_idx] = {}
+                self.field_custom_backend_meta[global_idx].update(custom_backend_meta_value[i])
 
     def mark_consumed(self, task_name: str, global_indices: list[int]):
         """
@@ -490,15 +538,41 @@ class DataPartitionStatus:
         # Get consumption status for requested task
         consumption_status = self.consumption_status[task_name]
 
-        partition_global_index = torch.tensor(sorted(self.global_indexes), dtype=torch.long)
+        partition_global_index = torch.tensor(
+            sorted(self.global_indexes | self.pre_allocated_global_indexes), dtype=torch.long
+        )
 
         if mask:
             consumption_status = consumption_status[partition_global_index]
 
         return partition_global_index, consumption_status
 
+    def reset_consumption(self, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a specific task or all tasks.
+
+        This allows the same data to be re-consumed without clearing the actual data.
+        Useful for debugging scenarios where the same rollout data needs to be
+        trained multiple times.
+        Args:
+            task_name: Name of the task to reset consumption for.
+                      If None, resets consumption status for all tasks.
+        """
+        if task_name is not None:
+            # Reset specific task
+            if task_name in self.consumption_status:
+                self.consumption_status[task_name].zero_()
+                logger.debug(f"Reset consumption status for task '{task_name}' in partition {self.partition_id}")
+        else:
+            # Reset all tasks
+            for name, status_tensor in self.consumption_status.items():
+                status_tensor.zero_()
+            logger.debug(f"Reset consumption status for all tasks in partition {self.partition_id}")
+
     # ==================== Production Status Interface ====================
-    def get_production_status_for_fields(self, field_names: list[str], mask: bool = False) -> tuple[Tensor, Tensor]:
+    def get_production_status_for_fields(
+        self, field_names: list[str], mask: bool = False
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
         """
         Check if all samples for specified fields are fully produced and ready.
 
@@ -511,13 +585,13 @@ class DataPartitionStatus:
             - Partition global index tensor
             - Production status tensor for the specified task. 1 for ready, 0 for not ready.
         """
-        if self.production_status is None or field_names is None or len(field_names) == 0:
-            return False
+        if field_names is None or len(field_names) == 0:
+            return None, None
 
         # Check if all requested fields are registered
         for field_name in field_names:
             if field_name not in self.field_name_mapping:
-                return False
+                return None, None
 
         # Create column mask for requested fields
         col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
@@ -527,7 +601,9 @@ class DataPartitionStatus:
 
         production_status = self.production_status[:, col_mask]
 
-        partition_global_index = torch.tensor(sorted(self.global_indexes), dtype=torch.long)
+        partition_global_index = torch.tensor(
+            sorted(self.global_indexes | self.pre_allocated_global_indexes), dtype=torch.long
+        )
 
         if mask:
             production_status = production_status[partition_global_index]
@@ -548,8 +624,6 @@ class DataPartitionStatus:
         Returns:
             List of sample indices that are ready for consumption
         """
-        if self.production_status is None:
-            return []
 
         # Check if all requested fields are registered
         for field_name in field_names:
@@ -584,7 +658,7 @@ class DataPartitionStatus:
 
         return ready_sample_indices
 
-    # ==================== Field Metadata Methods ====================
+    # ==================== Metadata Methods ====================
 
     def get_field_dtype(self, global_index: int, field_name: str) -> Optional[Any]:
         """Get dtype for a specific sample and field."""
@@ -594,13 +668,65 @@ class DataPartitionStatus:
         """Get shape for a specific sample and field."""
         return self.field_shapes.get(global_index, {}).get(field_name)
 
-    def get_field_custom_meta(self, global_indices: list[int], field_names: list[str]) -> dict[int, dict[str, Any]]:
-        """Get custom_meta for multiple samples and fields."""
+    def get_field_custom_backend_meta(
+        self, global_indices: list[int], field_names: list[str]
+    ) -> dict[int, dict[str, Any]]:
+        """
+        Get custom_backend_meta for multiple samples and fields.
+
+        This method retrieves backend-specific metadata stored at per-sample per-field level.
+        The returned dictionary maps global_index to a dictionary of field_name to metadata.
+
+        Args:
+            global_indices: List of global sample indices to retrieve metadata for
+            field_names: List of field names to filter by. Only metadata for these
+                        fields will be included in the result.
+
+        Returns:
+            Dictionary mapping global_index to field-name-to-metadata mapping.
+            Only includes indices that have custom_backend_meta set.
+
+        Example:
+            >>> partition.get_field_custom_backend_meta([0, 1], ["field_a", "field_b"])
+            {0: {'field_a': {'meta1': 'xxx'}, 'field_b': {'meta1': 'xxx'}}, 1: {...}}
+        """
         return {
-            idx: {f: v for f, v in self.field_custom_metas[idx].items() if f in field_names}
+            idx: {f: v for f, v in self.field_custom_backend_meta[idx].items() if f in field_names}
             for idx in global_indices
-            if idx in self.field_custom_metas
+            if idx in self.field_custom_backend_meta
         }
+
+    def get_custom_meta(self, global_indices: list[int]) -> dict[int, dict]:
+        """
+        Get custom_meta for multiple samples.
+
+        This method retrieves user-defined per-sample metadata.
+
+        Args:
+            global_indices: List of global sample indices to retrieve metadata for
+
+        Returns:
+            Dictionary mapping global_index to custom metadata dict.
+            Only includes indices that have custom_meta set.
+
+        Example:
+            >>> partition.get_custom_meta([0, 2])
+            {0: {'score': 0.9}, 2: {'label': 'positive'}}
+        """
+        return {idx: self.custom_meta[idx] for idx in global_indices if idx in self.custom_meta}
+
+    def set_custom_meta(self, custom_meta: dict[int, dict]) -> None:
+        """
+        Set custom_meta for multiple samples.
+
+        This method sets or updates user-defined per-sample metadata.
+
+        Args:
+            custom_meta: Dictionary mapping global_index to custom metadata dict.
+                        Existing entries will be overwritten.
+        """
+
+        self.custom_meta.update(custom_meta)
 
     # ==================== Statistics and Monitoring ====================
 
@@ -697,7 +823,8 @@ class DataPartitionStatus:
             for idx in indexes_to_release:
                 self.field_dtypes.pop(idx, None)
                 self.field_shapes.pop(idx, None)
-                self.field_custom_metas.pop(idx, None)
+                self.field_custom_backend_meta.pop(idx, None)
+                self.custom_meta.pop(idx, None)
 
         except Exception as e:
             logger.error(
@@ -736,7 +863,7 @@ class TransferQueueController:
                     - If a BaseSampler subclass is provided, it will be instantiated
                     - Defaults to SequentialSampler for simple sequential sampling
                     - Example: sampler=GRPOGroupNSampler() (instance)
-                    - Example: sampler=GRPOGroupNSampler (class)
+                    - Example: sampler=SequentialSampler (class)
             polling_mode: Whether to use polling mode for TransferQueue controller.
                     - If False, the controller will raise an error when no enough data is available.
                     - If True, the controller will return an empty BatchMeta when no enough data is available.
@@ -753,6 +880,7 @@ class TransferQueueController:
 
         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
         self.polling_mode = polling_mode
+        self.tq_config = None  # global config for TransferQueue system
 
         # Initialize ZMQ sockets for communication
         self._init_zmq_socket()
@@ -777,9 +905,11 @@ class TransferQueueController:
 
     def create_partition(self, partition_id: str) -> bool:
         """
-        Create a new data partition.
+        Create a new data partition with pre-allocated sample indexes.
 
-        Note: Partitions now dynamically expand as needed, so initial capacity is not required.
+        Partitions dynamically expand as needed. Additionally, TQ_PRE_ALLOC_SAMPLE_NUM
+        indexes are pre-allocated to allow consumers to determine consumption status
+        before all samples are produced.
 
         Args:
             partition_id: Unique identifier for the partition (e.g., "train@global_batch_0")
@@ -793,7 +923,11 @@ class TransferQueueController:
 
         self.partitions[partition_id] = DataPartitionStatus(partition_id=partition_id)
 
-        logger.info(f"Created partition {partition_id}")
+        # Pre-allocate global indexes for consumer consumption tracking
+        global_indexes = self.index_manager.allocate_indexes(partition_id, count=TQ_PRE_ALLOC_SAMPLE_NUM)
+        self.partitions[partition_id].register_pre_allocated_indexes(global_indexes)
+
+        logger.info(f"Created partition {partition_id} with {TQ_PRE_ALLOC_SAMPLE_NUM} pre-allocated indexes")
         return True
 
     def _get_partition(self, partition_id: str) -> Optional[DataPartitionStatus]:
@@ -837,7 +971,7 @@ class TransferQueueController:
 
     # ==================== Partition Index Management API ====================
 
-    def get_partition_index_range(self, partition: DataPartitionStatus) -> set:
+    def get_partition_index_range(self, partition: DataPartitionStatus) -> list[int]:
         """
         Get all indexes for a specific partition.
 
@@ -845,7 +979,7 @@ class TransferQueueController:
             partition: Partition identifier
 
         Returns:
-            Set of indexes allocated to the partition
+            List of indexes allocated to the partition
         """
         return self.index_manager.get_indexes_for_partition(partition)
 
@@ -859,7 +993,7 @@ class TransferQueueController:
         field_names: list[str],
         dtypes: Optional[dict[int, dict[str, Any]]],
         shapes: Optional[dict[int, dict[str, Any]]],
-        custom_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -871,6 +1005,7 @@ class TransferQueueController:
             field_names: List of field names to mark as produced
             dtypes: Optional per-sample field dtype information
             shapes: Optional per-sample field shape information
+            custom_backend_meta: Optional custom backend metadata
 
         Returns:
             True if update was successful, False otherwise
@@ -880,7 +1015,7 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_meta)
+        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_backend_meta)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -931,6 +1066,45 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
+    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
+        """
+        Set custom_meta for samples in partitions.
+
+        This method allows setting per-sample custom metadata (custom_meta) for samples
+        identified by their global indexes within specific partitions. Custom metadata
+        is stored per-sample and can be retrieved along with BatchMeta in subsequent
+        get_meta calls.
+
+        Args:
+            partition_custom_meta: Dictionary mapping partition_id to custom metadata dict.
+                                  Format: {partition_id: {global_index: {metadata_key: metadata_value}}}
+                                  - partition_id: ID of the partition
+                                  - global_index: Global index of the sample
+                                  - metadata_key/value: User-defined metadata key-value pairs
+
+        Example:
+            >>> # Set custom metadata for samples in different partitions
+            >>> controller.set_custom_meta({
+            ...     "train_0": {
+            ...         0: {"score": 0.9, "label": "positive"},
+            ...         1: {"score": 0.8, "label": "negative"}
+            ...     },
+            ...     "train_1": {
+            ...         10: {"score": 0.95, "label": "positive"}
+            ...     }
+            ... })
+        """
+
+        for partition_id, custom_meta in partition_custom_meta.items():
+            partition = self._get_partition(partition_id)
+            if partition:
+                partition.set_custom_meta(custom_meta)
+            else:
+                logger.warning(
+                    f"set_custom_meta: partition {partition_id}' not found; "
+                    f"custom_metadata for this partition will be ignored"
+                )
+
     def get_metadata(
         self,
         data_fields: list[str],
@@ -964,14 +1138,30 @@ class TransferQueueController:
         Raises:
             TimeoutError: If waiting for sufficient data times out in fetch mode
         """
-        if partition_id not in self.partitions:
-            self.create_partition(partition_id)
 
         if mode == "insert":
+            if partition_id not in self.partitions:
+                self.create_partition(partition_id)
+
+            partition = self._get_partition(partition_id)
             if data_fields:
-                # First put_data call, get_metadata in insert mode
-                batch_global_indexes = self.index_manager.allocate_indexes(partition_id, count=batch_size)
+                # This is called during put_data call without providing metadata.
+                # try to use pre-allocated global index first
+
+                if batch_size is None:
+                    raise ValueError("must provide batch_size for inserting new data")
+
+                assert partition is not None
+                batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+
+                if len(batch_global_indexes) < batch_size:
+                    new_global_indexes = self.index_manager.allocate_indexes(
+                        partition_id, count=(batch_size - len(batch_global_indexes))
+                    )
+                    batch_global_indexes.extend(new_global_indexes)
+
             else:
+                # TODO: separate this "clear" related logic into a separated mode
                 # clear metadata call passes empty data_fields
                 batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
@@ -979,6 +1169,9 @@ class TransferQueueController:
         assert task_name is not None
         if mode == "fetch":
             # Find ready samples within current data partition and package into BatchMeta when reading
+
+            if batch_size is None:
+                raise ValueError("must provide batch_size in fetch mode")
 
             start_time = time.time()
             while True:
@@ -1013,6 +1206,7 @@ class TransferQueueController:
                 ready_for_consume_indexes,
                 batch_size,
                 **(sampling_config or {}),
+                **kwargs,
             )
 
             # Check if we got valid results from the sampler
@@ -1024,10 +1218,7 @@ class TransferQueueController:
                 )
 
         elif mode == "force_fetch":
-            global_indexes_range = self.index_manager.get_indexes_for_partition(partition_id)
-            consumer_status = self.get_consumption_status(partition_id, task_name)
-            not_consumed_idx = [i for i in global_indexes_range if consumer_status[i] == 0]
-            batch_global_indexes = not_consumed_idx
+            batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
             consumed_indexes = []
 
         # Package into metadata
@@ -1145,10 +1336,12 @@ class TransferQueueController:
             )
             samples.append(sample)
 
-        custom_meta = partition.get_field_custom_meta(batch_global_indexes, data_fields)
+        custom_meta = partition.get_custom_meta(batch_global_indexes)
+        custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
 
         batch_meta = BatchMeta(samples=samples)
         batch_meta.update_custom_meta(custom_meta)
+        batch_meta._custom_backend_meta.update(custom_backend_meta)
         return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
@@ -1170,6 +1363,25 @@ class TransferQueueController:
         partition.clear_data(global_indexes_range, clear_consumption)
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
+        self.sampler.clear_cache(partition_id)
+
+    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a partition without clearing the actual data.
+
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
+        Args:
+            partition_id: ID of the partition to reset consumption for
+            task_name: Name of the task to reset. If None, resets all tasks.
+        Raises:
+            ValueError: If partition not found
+        """
+        logger.debug(f"[{self.controller_id}]: Resetting consumption for partition {partition_id}, task={task_name}")
+        partition = self._get_partition(partition_id)
+        if not partition:
+            raise ValueError(f"Partition {partition_id} not found")
+        partition.reset_consumption(task_name)
 
     def clear_meta(
         self,
@@ -1387,6 +1599,20 @@ class TransferQueueController:
                         receiver_id=request_msg.sender_id,
                         body={"metadata": metadata},
                     )
+            elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
+                with perf_monitor.measure(op_type="SET_CUSTOM_META"):
+                    params = request_msg.body
+                    partition_custom_meta = params["partition_custom_meta"]
+
+                    self.set_custom_meta(partition_custom_meta=partition_custom_meta)
+
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.SET_CUSTOM_META_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={"message": "Successfully set custom_meta"},
+                    )
+
             elif request_msg.request_type == ZMQRequestType.CLEAR_META:
                 with perf_monitor.measure(op_type="CLEAR_META"):
                     params = request_msg.body
@@ -1439,6 +1665,36 @@ class TransferQueueController:
                             "consumption_status": consumption_status,
                         },
                     )
+
+            elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
+                with perf_monitor.measure(op_type="RESET_CONSUMPTION"):
+                    # Handle reset consumption status request
+                    params = request_msg.body
+                    partition_id = params["partition_id"]
+                    task_name = params.get("task_name")  # Optional
+                    try:
+                        self.reset_consumption(partition_id, task_name)
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": True,
+                                "message": f"Consumption reset for partition {partition_id}",
+                            },
+                        )
+                    except Exception as e:
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": False,
+                                "message": str(e),
+                            },
+                        )
 
             elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
                 with perf_monitor.measure(op_type="GET_PRODUCTION"):
@@ -1497,7 +1753,7 @@ class TransferQueueController:
                         field_names=message_data.get("fields", []),
                         dtypes=message_data.get("dtypes", {}),
                         shapes=message_data.get("shapes", {}),
-                        custom_meta=message_data.get("custom_meta", {}),
+                        custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
 
                     if success:
@@ -1518,3 +1774,35 @@ class TransferQueueController:
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""
         return self.zmq_server_info
+
+    def store_config(self, conf: DictConfig) -> None:
+        """Store the global config of TransferQueue."""
+        self.tq_config = conf
+
+    def get_config(self) -> DictConfig:
+        """Retrieve the global config of TransferQueue."""
+        return self.tq_config
+
+    def register_sampler(
+        self,
+        sampler: BaseSampler | type[BaseSampler] = SequentialSampler,
+    ) -> None:
+        """
+        Register a sampler instance or subclass after the controller is initialized.
+
+        Args:
+            sampler: Sampler instance or sampler class to use for data sampling.
+                    - If a BaseSampler instance is provided, it will be used directly
+                    - If a BaseSampler subclass is provided, it will be instantiated
+                    - Defaults to SequentialSampler for simple sequential sampling
+                    - Example: sampler=GRPOGroupNSampler() (instance)
+                    - Example: sampler=SequentialSampler (class)
+        """
+        if isinstance(sampler, BaseSampler):
+            self.sampler = sampler
+        elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
+            self.sampler = sampler()
+        else:
+            raise TypeError(
+                f"sampler {getattr(sampler, '__name__', repr(sampler))} must be an instance or subclass of BaseSampler"
+            )

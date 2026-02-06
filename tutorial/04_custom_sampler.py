@@ -49,12 +49,7 @@ warnings.filterwarnings(
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-from transfer_queue import (  # noqa: E402
-    SimpleStorageUnit,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
-)
+import transfer_queue as tq  # noqa: E402
 from transfer_queue.sampler import BaseSampler  # noqa: E402
 
 
@@ -171,36 +166,14 @@ class PrioritySampler(BaseSampler):
 def setup_transfer_queue_with_sampler(sampler):
     """Setup TransferQueue with custom sampler."""
     if not ray.is_initialized():
-        ray.init()
+        ray.init(namespace="TransferQueueTutorial")
 
     config = OmegaConf.create(
-        {
-            "global_batch_size": 8,
-            "num_data_storage_units": 2,
-        }
+        {"controller": {"sampler": sampler}, "backend": {"SimpleStorage": {"num_data_storage_units": 2}}},
+        flags={"allow_objects": True},
     )
 
-    storage_units = {}
-    for i in range(2):
-        storage_units[i] = SimpleStorageUnit.remote(storage_unit_size=100)
-
-    controller = TransferQueueController.remote(sampler=sampler)
-    controller_info = process_zmq_server_info(controller)
-    storage_unit_infos = process_zmq_server_info(storage_units)
-
-    client = TransferQueueClient(
-        client_id="TutorialClient",
-        controller_info=controller_info,
-    )
-
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})
-    tq_config.controller_info = controller_info
-    tq_config.storage_unit_infos = storage_unit_infos
-    config = OmegaConf.merge(tq_config, config)
-
-    client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
-
-    return controller, storage_units, client
+    tq.init(config)
 
 
 def demonstrate_random_sampler_with_replacement():
@@ -211,7 +184,7 @@ def demonstrate_random_sampler_with_replacement():
     print("\nSetup TransferQueue with RandomSamplerWithReplacement...")
 
     sampler = RandomSamplerWithReplacement()
-    controller, storage_units, client = setup_transfer_queue_with_sampler(sampler)
+    setup_transfer_queue_with_sampler(sampler)
 
     # Add 5 samples
     print("\n[Step 1] Adding 5 samples...")
@@ -221,22 +194,22 @@ def demonstrate_random_sampler_with_replacement():
         },
         batch_size=5,
     )
-    client.put(data=data, partition_id="test")
+    tq.put(data=data, partition_id="test")
     print("  ✓ 5 samples added")
 
     # Get batch 1 (should get 2 random samples)
     print("\n[Step 2] Get batch 1 (2 samples)...")
-    meta1 = client.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
+    meta1 = tq.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta1.global_indexes}")
 
     # Get batch 2 (should get 1 random sample with replacement - may have duplicate with previous batch!)
     print("\n[Step 3] Get batch 2 (1 sample)...")
-    meta2 = client.get_meta(data_fields=["input"], batch_size=1, partition_id="test", task_name="demo_task")
+    meta2 = tq.get_meta(data_fields=["input"], batch_size=1, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta2.global_indexes}")
 
     # Get batch 3 (should get 2 random samples with replacement - may have duplicate with previous batches!)
     print("\n[Step 4] Get batch 3 (2 samples)...")
-    meta3 = client.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
+    meta3 = tq.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta3.global_indexes}")
 
     print("\n[Verification]")
@@ -246,8 +219,8 @@ def demonstrate_random_sampler_with_replacement():
     print(f"  ✓ All sampled: {all_sampled}")
 
     # Cleanup
-    client.clear_partition(partition_id="test")
-    client.close()
+    tq.clear_partition(partition_id="test")
+    tq.close()
     ray.shutdown()
 
 
@@ -259,7 +232,7 @@ def demonstrate_random_sampler_without_replacement():
     print("\nSetup TransferQueue with RandomSamplerWithoutReplacement...")
 
     sampler = RandomSamplerWithoutReplacement()
-    controller, storage_units, client = setup_transfer_queue_with_sampler(sampler)
+    setup_transfer_queue_with_sampler(sampler)
 
     # Add 6 samples
     print("\n[Step 1] Adding 6 samples...")
@@ -269,22 +242,22 @@ def demonstrate_random_sampler_without_replacement():
         },
         batch_size=6,
     )
-    client.put(data=data, partition_id="test")
+    tq.put(data=data, partition_id="test")
     print("  ✓ 6 samples added")
 
     # Get batch 1 (should get 3 random samples without replacement)
     print("\n[Step 2] Get batch 1 (3 samples)...")
-    meta1 = client.get_meta(data_fields=["input"], batch_size=3, partition_id="test", task_name="demo_task")
+    meta1 = tq.get_meta(data_fields=["input"], batch_size=3, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta1.global_indexes}")
 
     # Get batch 2 (should randomly get 1 sample that are different from previous batch)
     print("\n[Step 3] Get batch 2 (1 samples)...")
-    meta2 = client.get_meta(data_fields=["input"], batch_size=1, partition_id="test", task_name="demo_task")
+    meta2 = tq.get_meta(data_fields=["input"], batch_size=1, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta2.global_indexes}")
 
     # Get batch 3 (should randomly get 2 samples that are different from previous batch)
     print("\n[Step 4] Get batch 3 (2 samples)...")
-    meta3 = client.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
+    meta3 = tq.get_meta(data_fields=["input"], batch_size=2, partition_id="test", task_name="demo_task")
     print(f"  ✓ Got samples: {meta3.global_indexes}")
 
     print("\n[Verification]")
@@ -294,8 +267,8 @@ def demonstrate_random_sampler_without_replacement():
     print(f"  ✓ Batch 3: {meta3.global_indexes} (none left)")
 
     # Cleanup
-    client.clear_partition(partition_id="test")
-    client.close()
+    tq.clear_partition(partition_id="test")
+    tq.close()
     ray.shutdown()
 
 
@@ -307,7 +280,7 @@ def demonstrate_priority_sampler():
     print("\nSetup TransferQueue with PrioritySampler...")
 
     sampler = PrioritySampler()
-    controller, storage_units, client = setup_transfer_queue_with_sampler(sampler)
+    setup_transfer_queue_with_sampler(sampler)
 
     # Add 8 samples
     print("\n[Step 1] Adding 8 samples...")
@@ -317,7 +290,7 @@ def demonstrate_priority_sampler():
         },
         batch_size=8,
     )
-    client.put(data=data, partition_id="test")
+    tq.put(data=data, partition_id="test")
     print("  ✓ 8 samples added")
 
     time.sleep(1)
@@ -330,7 +303,7 @@ def demonstrate_priority_sampler():
     print(f"Priority scores: {priority_scores}")
 
     # Get batch using priority sampling
-    meta1 = client.get_meta(
+    meta1 = tq.get_meta(
         data_fields=["input"],
         batch_size=1,
         partition_id="test",
@@ -342,7 +315,7 @@ def demonstrate_priority_sampler():
 
     # Get another batch
     print("\n[Step 3] Get another batch (2 samples)...")
-    meta2 = client.get_meta(
+    meta2 = tq.get_meta(
         data_fields=["input"],
         batch_size=2,
         partition_id="test",
@@ -358,8 +331,8 @@ def demonstrate_priority_sampler():
     print(f"  ✓ Batch 2 high-priority indices: {[i for i in meta2.global_indexes if priority_scores[i] >= 0.1]}")
 
     # Cleanup
-    client.clear_partition(partition_id="test")
-    client.close()
+    tq.clear_partition(partition_id="test")
+    tq.close()
     ray.shutdown()
 
 

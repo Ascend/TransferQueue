@@ -32,12 +32,12 @@ sys.path.append(str(parent_dir))
 
 
 from transfer_queue import (  # noqa: E402
-    AsyncTransferQueueClient,
     SimpleStorageUnit,
+    TransferQueueClient,
     TransferQueueController,
     process_zmq_server_info,
 )
-from transfer_queue.utils.utils import get_placement_group  # noqa: E402
+from transfer_queue.utils.common import get_placement_group  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -247,7 +247,7 @@ class TQBandwidthTester:
         tq_config.storage_unit_infos = self.data_system_storage_unit_infos
         self.config = OmegaConf.merge(tq_config, self.config)
 
-        self.data_system_client = AsyncTransferQueueClient(
+        self.data_system_client = TransferQueueClient(
             client_id="Trainer", controller_info=self.data_system_controller_info
         )
         self.data_system_client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=self.config)

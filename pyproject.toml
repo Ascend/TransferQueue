@@ -87,10 +87,7 @@ filterwarnings = [
 
 [[tool.mypy.overrides]]
 module = [
-    "transfer_queue.data_system.*",
-    "transfer_queue.utils.utils.*",
-    "transfer_queue.utils.zmq_utils.*",
-    "transfer_queue.utils.serial_utils.*",
+    "transfer_queue.*",
 ]
 ignore_errors = false
 
@@ -108,9 +105,17 @@ version = {file = "transfer_queue/version/version"}
 dependencies = {file = "requirements.txt"}
 
 [project.optional-dependencies]
+build = [
+    "build"
+]
 test = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.20.0",
+    "flake8",
+    "pytest-mock",
+]
+yuanrong = [
+    "openyuanrong-datasystem"
 ]
 
 # If you need to mimic `package_dir={'': '.'}`:
@@ -121,5 +126,6 @@ test = [
 # This is the rough equivalent of package_data={'': ['version/*']}
 [tool.setuptools.package-data]
 transfer_queue = [
-  "version/*",
+    "version/*",
+    "*.yaml"
 ]

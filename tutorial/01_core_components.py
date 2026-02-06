@@ -37,87 +37,23 @@ warnings.filterwarnings(
 
 import ray  # noqa: E402
 import torch  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 # Add the parent directory to the path
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-from transfer_queue import (  # noqa: E402
-    SimpleStorageUnit,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
-)
+import transfer_queue as tq  # noqa: E402
 
 # Configure Ray
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"
 
-
-def demonstrate_basic_setup():
-    """
-    Demonstrate the basic setup of TransferQueue with three core components.
-    """
-
-    # Initialize Ray
-    if not ray.is_initialized():
-        ray.init()
-
-    # Configuration
-    config = OmegaConf.create(
-        {
-            "num_data_storage_units": 2,
-        }
-    )
-
-    print("[Step 1] Creating Storage Backend (using default SimpleStorageUnit)...")
-    storage_units = {}
-    for i in range(config["num_data_storage_units"]):
-        storage_units[i] = SimpleStorageUnit.remote(storage_unit_size=100)
-        print(f"  ✓ Created SimpleStorageUnit #{i}")
-
-    print("[Step 2] Creating TransferQueueController...")
-    controller = TransferQueueController.remote()
-    print("  ✓ Controller created - manages data state")
-
-    # Get server information
-    controller_info = process_zmq_server_info(controller)
-    storage_unit_infos = process_zmq_server_info(storage_units)
-
-    # Create Client (User-facing API)
-    print("[Step 3] Creating TransferQueueClient...")
-    client = TransferQueueClient(
-        client_id="TutorialClient",
-        controller_info=controller_info,
-    )
-    print("  ✓ Client created - this is what users interact with!")
-
-    # Initialize storage manager
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})
-    tq_config.controller_info = controller_info
-    tq_config.storage_unit_infos = storage_unit_infos
-    config = OmegaConf.merge(tq_config, config)
-
-    client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
-    print(
-        "  ✓ Storage manager initialized. It is a class variable inside the client, acting as an adapter to "
-        "suit for various storage backends."
-    )
-
-    print("[Architecture Summary]")
-    print(
-        "  - TransferQueueController: Tracking the production/consumption status as metadata (can define your own "
-        "data consumption logics)."
-    )
-    print("  - SimpleStorageUnit: Distributed data storage that holds actual data (easily swap out by other backends).")
-    print("  - TransferQueueClient: User interface that allows you to put/get/clear data or metadata)")
-
-    return controller, storage_units, client
+if not ray.is_initialized():
+    ray.init(namespace="TransferQueueTutorial")
 
 
-def demonstrate_data_workflow(client):
+def demonstrate_data_workflow():
     """
     Demonstrate basic data workflow: put → get → clear.
     """
@@ -148,12 +84,12 @@ def demonstrate_data_workflow(client):
 
     print(f"  Created {data_batch.batch_size[0]} samples")
     partition_id = "tutorial_partition_0"
-    client.put(data=data_batch, partition_id=partition_id)
+    tq.put(data=data_batch, partition_id=partition_id)
     print(f"  ✓ Data written to partition: {partition_id}")
 
     # Step 2: Get metadata
     print("[Step 2] Requesting data metadata...")
-    batch_meta = client.get_meta(
+    batch_meta = tq.get_meta(
         data_fields=["input_ids", "attention_mask"],
         batch_size=data_batch.batch_size[0],
         partition_id=partition_id,
@@ -164,7 +100,7 @@ def demonstrate_data_workflow(client):
 
     # Step 3: Get actual data
     print("[Step 3] Retrieving actual data...")
-    retrieved_data = client.get_data(batch_meta)
+    retrieved_data = tq.get_data(batch_meta)
     print("  ✓ Data retrieved successfully")
     print(f"    Keys: {list(retrieved_data.keys())}")
 
@@ -176,7 +112,7 @@ def demonstrate_data_workflow(client):
 
     # Step 5: Clear
     print("[Step 5] Clearing partition... (you may also use clear_samples() to clear specific samples)")
-    client.clear_partition(partition_id=partition_id)
+    tq.clear_partition(partition_id=partition_id)
     print("  ✓ Partition cleared")
 
 
@@ -189,16 +125,16 @@ def demonstrate_storage_backend_options():
     print("=" * 80)
 
     print("TransferQueue supports multiple storage backends:")
-    print("1. SimpleStorageUnit (default)")
+    print("1. SimpleStorage (default)")
     print("   - In-memory storage, fast and simple")
     print("   - Leveraging ZMQ for communication, with zero-copy serialization and transfer")
     print("   - No extra dependencies, good for development and testing")
 
-    print("2. YuanrongStorage")
+    print("2. Yuanrong")
     print("   - Ascend native distributed storage solution")
     print("   - Hierarchical storage interfaces including HBM/DRAM/SSD")
 
-    print("3. MoonCakeStore (on the way)")
+    print("3. MooncakeStore (on the way)")
     print("   - Support multiple transmission protocols")
     print("   - RDMA between DRAM and HBM")
 
@@ -234,10 +170,10 @@ def main():
 
     try:
         print("Setting up TransferQueue...")
-        controller, storage_units, client = demonstrate_basic_setup()
+        tq.init()
 
         print("Demonstrating the user workflow...")
-        demonstrate_data_workflow(client)
+        demonstrate_data_workflow()
 
         demonstrate_storage_backend_options()
 
@@ -253,7 +189,7 @@ def main():
         print("3. You can swap out different storage backends easily")
 
         # Cleanup
-        client.close()
+        tq.close()
         ray.shutdown()
         print("\n✓ Cleanup complete")
 

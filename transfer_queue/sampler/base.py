@@ -74,3 +74,16 @@ class BaseSampler(ABC):
 
     def __call__(self, *args: Any, **kwargs: Any) -> tuple[list[int], list[int]]:
         return self.sample(*args, **kwargs)
+
+    def clear_cache(self, partition_id: str):
+        """Clear cached states.
+
+        This method removes any cached sampling results that include the specified
+        global indexes, ensuring that future sampling operations do not reference
+        stale data.
+
+        Args:
+            partition_id: The partition ID associated with the task.
+        """
+        if partition_id in self._states.keys():
+            self._states.pop(partition_id)

@@ -630,3 +630,351 @@ def test_non_ascii_large_string():
     decoded = decoder.decode(serialized)
 
     assert decoded["unicode_text"] == large_unicode_string
+
+
+# ============================================================================
+# Thread Safety Tests (ContextVar-based isolation)
+# ============================================================================
+class TestSerialThreadSafety:
+    """Test thread safety of MsgpackEncoder/MsgpackDecoder with ContextVar.
+
+    These tests verify that the ContextVar-based fix properly isolates
+    aux_buffers across multiple threads, preventing buffer/metadata mismatch
+    errors that previously occurred when multiple threads used the global
+    _encoder/_decoder instances concurrently.
+
+    Historical issue: Before the fix, aux_buffers was stored as instance
+    variable, causing race conditions where int8 tensor buffers could be
+    associated with long tensor metadata, resulting in:
+    "self.size(-1) must be divisible by 8 to view Byte as Long"
+    """
+
+    @staticmethod
+    def _create_test_message(thread_id: int, iteration: int) -> dict:
+        """Create test message simulating GET_CONSUMPTION response structure.
+
+        Uses different dtypes and varying sizes to maximize the chance of
+        detecting buffer/metadata mismatches under concurrent access.
+        """
+        num_samples = 30 + (iteration % 10)
+        # torch.long: 8 bytes per element
+        global_index = torch.arange(num_samples, dtype=torch.long)
+        # torch.int8: 1 byte per element
+        consumption_status = torch.zeros(num_samples + iteration % 5, dtype=torch.int8)
+
+        return {
+            "request_type": "CONSUMPTION_RESPONSE",
+            "sender_id": f"controller_{thread_id}",
+            "receiver_id": f"client_{thread_id}",
+            "request_id": f"req_{thread_id}_{iteration}",
+            "body": {
+                "partition_id": f"partition_{thread_id}",
+                "global_index": global_index,
+                "consumption_status": consumption_status,
+            },
+        }
+
+    def test_global_encoder_thread_safety(self):
+        """Test that global _encoder/_decoder instances are thread-safe.
+
+        This test verifies the ContextVar-based fix by using the global
+        shared encoder/decoder instances across multiple threads with
+        concurrent serialize/deserialize operations.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from transfer_queue.utils.serial_utils import _decoder, _encoder
+
+        num_threads = 8
+        iterations_per_thread = 50
+        errors: list[str] = []
+        success_count = 0
+
+        def worker(thread_id: int) -> tuple[int, list[str]]:
+            """Worker function that uses global encoder/decoder."""
+            local_success = 0
+            local_errors: list[str] = []
+
+            for i in range(iterations_per_thread):
+                try:
+                    msg = self._create_test_message(thread_id, i)
+
+                    # Use global shared encoder (thread-safe with ContextVar)
+                    serialized = list(_encoder.encode(msg))
+
+                    # Use global shared decoder
+                    deserialized = _decoder.decode(serialized)
+
+                    # Verify data correctness
+                    original_global_index = msg["body"]["global_index"]
+                    decoded_global_index = deserialized["body"]["global_index"]
+
+                    if not torch.equal(original_global_index, decoded_global_index):
+                        raise ValueError(
+                            f"Data mismatch! Original shape: {original_global_index.shape}, "
+                            f"Decoded shape: {decoded_global_index.shape}"
+                        )
+
+                    original_status = msg["body"]["consumption_status"]
+                    decoded_status = deserialized["body"]["consumption_status"]
+                    if not torch.equal(original_status, decoded_status):
+                        raise ValueError(
+                            f"consumption_status mismatch! Original: {original_status.shape}, "
+                            f"Decoded: {decoded_status.shape}"
+                        )
+
+                    local_success += 1
+
+                except Exception as e:
+                    local_errors.append(f"Thread {thread_id}, Iter {i}: {type(e).__name__}: {e}")
+
+            return local_success, local_errors
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = {executor.submit(worker, tid): tid for tid in range(num_threads)}
+
+            for future in as_completed(futures):
+                s, e = future.result()
+                success_count += s
+                errors.extend(e)
+
+        # All operations should succeed with the ContextVar fix
+        total_ops = num_threads * iterations_per_thread
+        assert success_count == total_ops, (
+            f"Thread safety test failed: {len(errors)} errors out of {total_ops} operations.\n"
+            f"Sample errors: {errors[:5]}"
+        )
+
+    def test_mixed_dtype_concurrent_serialization(self):
+        """Test concurrent serialization of tensors with different dtypes.
+
+        This test specifically targets the historical bug where buffer index
+        mismatches occurred between int8 and int64 tensors, causing view errors.
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        from transfer_queue.utils.serial_utils import _decoder, _encoder
+
+        num_threads = 16
+        iterations = 30
+
+        # Use different dtypes with different byte sizes to maximize
+        # the chance of triggering buffer/metadata mismatches
+        dtype_configs = [
+            (torch.int8, (50,)),  # 1 byte per element
+            (torch.long, (50,)),  # 8 bytes per element
+            (torch.float16, (50, 10)),  # 2 bytes per element
+            (torch.float32, (50, 10)),  # 4 bytes per element
+            (torch.bfloat16, (50, 10)),  # 2 bytes per element
+        ]
+
+        def worker(thread_id: int) -> tuple[int, list[str]]:
+            local_success = 0
+            local_errors: list[str] = []
+
+            for i in range(iterations):
+                try:
+                    # Select dtype configuration based on thread_id and iteration
+                    dtype, shape = dtype_configs[(thread_id + i) % len(dtype_configs)]
+
+                    if dtype in (torch.int8, torch.long):
+                        tensor = torch.randint(-128, 127, shape, dtype=dtype)
+                    else:
+                        tensor = torch.randn(*shape, dtype=dtype)
+
+                    msg = {
+                        "thread_id": thread_id,
+                        "iteration": i,
+                        "tensor": tensor,
+                        "nested": {"inner_tensor": torch.randn(10, dtype=torch.float32)},
+                    }
+
+                    serialized = list(_encoder.encode(msg))
+                    deserialized = _decoder.decode(serialized)
+
+                    # Verify tensor correctness
+                    if not torch.equal(deserialized["tensor"], tensor):
+                        raise ValueError(f"Tensor mismatch for {dtype}")
+
+                    if not torch.allclose(deserialized["nested"]["inner_tensor"], msg["nested"]["inner_tensor"]):
+                        raise ValueError("Nested tensor mismatch")
+
+                    local_success += 1
+
+                except Exception as e:
+                    local_errors.append(f"Thread {thread_id}, Iter {i}: {type(e).__name__}: {e}")
+
+            return local_success, local_errors
+
+        errors: list[str] = []
+        success_count = 0
+
+        with ThreadPoolExecutor(max_workers=num_threads) as executor:
+            futures = {executor.submit(worker, tid): tid for tid in range(num_threads)}
+            for future in as_completed(futures):
+                s, e = future.result()
+                success_count += s
+                errors.extend(e)
+
+        total_ops = num_threads * iterations
+        assert success_count == total_ops, (
+            f"Mixed dtype test failed: {len(errors)} errors out of {total_ops}.\nSample errors: {errors[:5]}"
+        )
+
+
+# ============================================================================
+# Numpy Array Type Compatibility Tests
+# ============================================================================
+class TestNumpyArrayTypeCompatibility:
+    """Test numpy array serialization with various dtypes.
+
+    These tests verify the fix for the TypeError when using torch.from_numpy()
+    with unsupported numpy dtypes (e.g., object arrays). The fix uses pickle
+    fallback for incompatible types while maintaining zero-copy for numeric types.
+    """
+
+    def test_numpy_object_array_strings(self):
+        """Test numpy object array with string elements."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # String array (dtype=object or unicode)
+        str_arr = np.array(["hello", "world", "test"])
+
+        serialized = encoder.encode(str_arr)
+        deserialized = decoder.decode(serialized)
+
+        assert np.array_equal(deserialized, str_arr)
+        assert deserialized.dtype == str_arr.dtype
+
+    def test_numpy_object_array_mixed_types(self):
+        """Test numpy object array with mixed Python types."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # Mixed type array (explicitly object dtype)
+        mixed_arr = np.array([1, "two", 3.0, None], dtype=object)
+
+        serialized = encoder.encode(mixed_arr)
+        deserialized = decoder.decode(serialized)
+
+        assert np.array_equal(deserialized, mixed_arr)
+        assert deserialized.dtype == np.object_
+
+    def test_numpy_object_array_dicts(self):
+        """Test numpy object array containing Python dicts."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # Array of dicts
+        dict_arr = np.array([{"a": 1}, {"b": 2}, {"c": 3}], dtype=object)
+
+        serialized = encoder.encode(dict_arr)
+        deserialized = decoder.decode(serialized)
+
+        assert len(deserialized) == len(dict_arr)
+        for orig, decoded in zip(dict_arr, deserialized, strict=False):
+            assert orig == decoded
+
+    def test_numpy_numeric_arrays_zero_copy(self):
+        """Test that numeric numpy arrays use zero-copy path."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # These should use zero-copy (torch.from_numpy + tensor encoding)
+        numeric_dtypes = [
+            np.float32,
+            np.float64,
+            np.int32,
+            np.int64,
+            np.int8,
+            np.uint8,
+            np.bool_,
+        ]
+
+        for dtype in numeric_dtypes:
+            if dtype == np.bool_:
+                arr = np.array([True, False, True], dtype=dtype)
+            elif np.issubdtype(dtype, np.integer):
+                arr = np.array([1, 2, 3], dtype=dtype)
+            else:
+                arr = np.array([1.0, 2.0, 3.0], dtype=dtype)
+
+            serialized = encoder.encode(arr)
+
+            # Zero-copy should produce multiple buffers (metadata + tensor buffer)
+            assert len(serialized) > 1, f"Expected zero-copy for dtype {dtype}"
+
+            deserialized = decoder.decode(serialized)
+
+            # Deserialized as torch.Tensor (due to zero-copy path)
+            assert isinstance(deserialized, torch.Tensor)
+            assert torch.allclose(deserialized, torch.from_numpy(arr))
+
+    def test_numpy_object_array_in_zmq_message(self):
+        """Test numpy object array inside ZMQMessage."""
+        import numpy as np
+
+        from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+        # Create message with both object array and regular tensors
+        obj_arr = np.array(["prompt_1", "prompt_2", "prompt_3"], dtype=object)
+
+        msg = ZMQMessage(
+            request_type=ZMQRequestType.PUT_DATA,
+            sender_id="test",
+            receiver_id="test",
+            request_id="test",
+            timestamp=0.0,
+            body={
+                "prompts": obj_arr,
+                "tensor_data": torch.randn(3, 10),
+            },
+        )
+
+        encoded_msg = msg.serialize()
+        decoded_msg = ZMQMessage.deserialize(encoded_msg)
+
+        # Verify object array
+        assert np.array_equal(decoded_msg.body["prompts"], obj_arr)
+
+        # Verify tensor (should work with zero-copy)
+        assert torch.allclose(decoded_msg.body["tensor_data"], msg.body["tensor_data"])
+
+    def test_numpy_unicode_string_array(self):
+        """Test numpy unicode string array (dtype='<U...')."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # Unicode string array with Chinese characters
+        unicode_arr = np.array(["你好", "世界", "测试"])
+
+        serialized = encoder.encode(unicode_arr)
+        deserialized = decoder.decode(serialized)
+
+        assert np.array_equal(deserialized, unicode_arr)
+
+    def test_numpy_bytes_array(self):
+        """Test numpy bytes array (dtype='S...')."""
+        import numpy as np
+
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # Bytes array
+        bytes_arr = np.array([b"hello", b"world"], dtype="S10")
+
+        serialized = encoder.encode(bytes_arr)
+        deserialized = decoder.decode(serialized)
+
+        assert np.array_equal(deserialized, bytes_arr)

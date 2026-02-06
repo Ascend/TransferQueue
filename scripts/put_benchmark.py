@@ -39,7 +39,7 @@ from transfer_queue import (  # noqa: E402
     TransferQueueController,
     process_zmq_server_info,
 )
-from transfer_queue.utils.utils import get_placement_group  # noqa: E402
+from transfer_queue.utils.common import get_placement_group  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

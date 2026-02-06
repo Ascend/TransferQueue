@@ -36,7 +36,7 @@ from transfer_queue import (  # noqa: E402
     TransferQueueController,
     process_zmq_server_info,
 )
-from transfer_queue.utils.utils import get_placement_group  # noqa: E402
+from transfer_queue.utils.common import get_placement_group  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -226,7 +226,6 @@ class Trainer:
         # self.data_system_controller = TransferQueueController.remote(sampler=grpo_sampler)
 
         # Then use sampling_config in get_meta calls:
-        # sampling_config={"n_samples_per_prompt": 4}
         self.data_system_controller = TransferQueueController.remote()
         logger.info("TransferQueueController has been created.")
 

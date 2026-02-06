@@ -34,7 +34,7 @@ from transfer_queue.metadata import (  # noqa: E402
     FieldMeta,
     SampleMeta,
 )
-from transfer_queue.utils.utils import TransferQueueRole  # noqa: E402
+from transfer_queue.utils.enum_utils import TransferQueueRole  # noqa: E402
 from transfer_queue.utils.zmq_utils import (  # noqa: E402
     ZMQMessage,
     ZMQRequestType,
@@ -134,6 +134,16 @@ class MockController:
                             "partition_ids": ["partition_0", "partition_1", "test_partition"],
                         }
                         response_type = ZMQRequestType.LIST_PARTITIONS_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
+                        response_body = {"message": "success"}
+                        response_type = ZMQRequestType.SET_CUSTOM_META_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
+                        # Mock reset consumption - always succeed
+                        response_body = {
+                            "success": True,
+                            "message": "Consumption reset successfully",
+                        }
+                        response_type = ZMQRequestType.RESET_CONSUMPTION_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
@@ -308,9 +318,9 @@ def client_setup(mock_controller, mock_storage):
     ):
         config = {
             "controller_info": mock_controller.zmq_server_info,
-            "storage_unit_infos": {mock_storage.storage_id: mock_storage.zmq_server_info},
+            "zmq_info": {mock_storage.storage_id: mock_storage.zmq_server_info},
         }
-        client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
+        client.initialize_storage_manager(manager_type="SimpleStorage", config=config)
 
         # Mock all storage manager methods to avoid real ZMQ operations
         async def mock_put_data(data, metadata):
@@ -401,9 +411,9 @@ def test_single_controller_multiple_storages():
         ):
             config = {
                 "controller_info": controller.zmq_server_info,
-                "storage_unit_infos": {s.storage_id: s.zmq_server_info for s in storages},
+                "zmq_info": {s.storage_id: s.zmq_server_info for s in storages},
             }
-            client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
+            client.initialize_storage_manager(manager_type="SimpleStorage", config=config)
 
             # Mock all storage manager methods to avoid real ZMQ operations
             async def mock_put_data(data, metadata):
@@ -526,6 +536,52 @@ def test_get_partition_list(client_setup):
     assert "partition_0" in partition_list
     assert "partition_1" in partition_list
     assert "test_partition" in partition_list
+
+
+def test_reset_consumption(client_setup):
+    """Test synchronous reset_consumption - resets consumption status for a partition"""
+    client, _, _ = client_setup
+
+    # Test synchronous reset_consumption with task_name
+    success = client.reset_consumption(partition_id="train_0", task_name="generate_sequences")
+    assert success is True
+
+    print("✓ reset_consumption with task_name returns True")
+
+
+def test_reset_consumption_all_tasks(client_setup):
+    """Test synchronous reset_consumption without task_name (resets all tasks)"""
+    client, _, _ = client_setup
+
+    # Test synchronous reset_consumption without task_name (reset all tasks)
+    success = client.reset_consumption(partition_id="train_0")
+    assert success is True
+
+    print("✓ reset_consumption without task_name (all tasks) returns True")
+
+
+@pytest.mark.asyncio
+async def test_async_reset_consumption(client_setup):
+    """Test async reset_consumption - resets consumption status for a partition"""
+    client, _, _ = client_setup
+
+    # Test async_reset_consumption with task_name
+    success = await client.async_reset_consumption(partition_id="train_0", task_name="generate_sequences")
+    assert success is True
+
+    print("✓ async_reset_consumption with task_name returns True")
+
+
+@pytest.mark.asyncio
+async def test_async_reset_consumption_all_tasks(client_setup):
+    """Test async reset_consumption without task_name (resets all tasks)"""
+    client, _, _ = client_setup
+
+    # Test async_reset_consumption without task_name (reset all tasks)
+    success = await client.async_reset_consumption(partition_id="train_0")
+    assert success is True
+
+    print("✓ async_reset_consumption without task_name (all tasks) returns True")
 
 
 @pytest.mark.asyncio
@@ -679,3 +735,146 @@ async def test_async_clear_samples_with_empty_metadata(client_setup):
 
     # If no exception is raised, the test passes
     assert True
+
+
+@pytest.mark.asyncio
+async def test_sync_methods_work_in_async_event_loop(client_setup):
+    """Test all synchronous methods can be called from within an asyncio event loop.
+
+    This test verifies that the sync methods can be called directly from an async
+    function without causing "asyncio.run() cannot be called from a running loop" errors.
+    """
+    client, _, _ = client_setup
+
+    test_data = TensorDict({"tokens": torch.randint(0, 100, (3, 64))}, batch_size=3)
+
+    # Test sync put
+    metadata = client.put(data=test_data, partition_id="0")
+    assert metadata is not None
+
+    # Test sync get_meta - use fields that mock returns
+    metadata = client.get_meta(
+        data_fields=["log_probs", "variable_length_sequences", "prompt_text"], batch_size=2, partition_id="0"
+    )
+    assert metadata is not None
+    assert len(metadata.global_indexes) == 2
+
+    # Test sync get_data - verify we get the expected fields from mock
+    result = client.get_data(metadata)
+    assert result is not None
+    assert "log_probs" in result
+    assert "prompt_text" in result
+
+    # Test sync check_consumption_status
+    is_consumed = client.check_consumption_status(task_name="generate_sequences", partition_id="train_0")
+    assert isinstance(is_consumed, bool)
+
+    # Test sync get_consumption_status
+    global_index, consumption_status = client.get_consumption_status(
+        task_name="generate_sequences", partition_id="train_0"
+    )
+    assert global_index is not None
+    assert consumption_status is not None
+
+    # Test sync check_production_status
+    is_produced = client.check_production_status(data_fields=["log_probs", "prompt_text"], partition_id="train_0")
+    assert isinstance(is_produced, bool)
+
+    # Test sync get_production_status
+    global_index, production_status = client.get_production_status(
+        data_fields=["log_probs", "prompt_text"], partition_id="train_0"
+    )
+    assert global_index is not None
+    assert production_status is not None
+
+    # Test sync get_partition_list
+    partition_list = client.get_partition_list()
+    assert isinstance(partition_list, list)
+    assert len(partition_list) > 0
+
+    # Test sync clear_partition
+    client.clear_partition(partition_id="test_partition")
+
+    # Test sync clear_samples
+    metadata = client.get_meta(data_fields=["log_probs", "prompt_text"], batch_size=2, partition_id="0")
+    client.clear_samples(metadata=metadata)
+
+    print("✓ All sync methods work correctly when called from within asyncio event loop")
+
+
+@pytest.mark.asyncio
+async def test_sync_and_async_methods_mixed_usage(client_setup):
+    """Test mixing sync and async method calls within the same async context.
+
+    This test verifies that async methods and sync methods can be used interchangeably
+    without conflicts when called from an async function.
+    """
+    client, _, _ = client_setup
+
+    test_data = TensorDict({"tokens": torch.randint(0, 100, (2, 32))}, batch_size=2)
+
+    # Call sync method first
+    sync_put_result = client.put(data=test_data, partition_id="0")
+    assert sync_put_result is not None
+
+    # Call async method
+    async_metadata = await client.async_get_meta(data_fields=["tokens"], batch_size=2, partition_id="0")
+    assert async_metadata is not None
+
+    # Call sync method again
+    sync_get_meta_result = client.get_meta(data_fields=["tokens"], batch_size=2, partition_id="0")
+    assert sync_get_meta_result is not None
+
+    # Call async method
+    async_data = await client.async_get_data(sync_get_meta_result)
+    assert async_data is not None
+
+    print("✓ Mixed async and sync method calls work correctly")
+
+
+# =====================================================
+# Custom Meta Interface Tests
+# =====================================================
+
+
+class TestClientCustomMetaInterface:
+    """Tests for client custom_meta interface methods."""
+
+    def test_set_custom_meta_sync(self, client_setup):
+        """Test synchronous set_custom_meta method."""
+        client, _, _ = client_setup
+
+        # Test synchronous set_custom_meta
+
+        # First get metadata
+        metadata = client.get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
+        # Set custom_meta on the metadata
+        metadata.update_custom_meta(
+            {
+                0: {"input_ids": {"token_count": 100}},
+                1: {"input_ids": {"token_count": 120}},
+            }
+        )
+
+        # Call set_custom_meta with metadata (BatchMeta)
+        client.set_custom_meta(metadata)
+        print("✓ set_custom_meta sync method works")
+
+    @pytest.mark.asyncio
+    async def test_set_custom_meta_async(self, client_setup):
+        """Test asynchronous async_set_custom_meta method."""
+        client, _, _ = client_setup
+
+        # First get metadata
+        metadata = await client.async_get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
+        # Set custom_meta on the metadata
+        metadata.update_custom_meta(
+            {
+                0: {"input_ids": {"token_count": 100}},
+                1: {"input_ids": {"token_count": 120}},
+            }
+        )
+
+        # Call async_set_custom_meta with metadata (BatchMeta)
+        await client.async_set_custom_meta(metadata)
+        print("✓ async_set_custom_meta async method works")

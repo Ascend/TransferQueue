@@ -84,14 +84,14 @@ class RayStorageClient(TransferQueueStorageKVClient):
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
         return None
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
         """
         Retrieve objects from remote storage.
         Args:
             keys (list): List of string keys to fetch.
             shapes (list, optional): Ignored. For compatibility with KVStorageManager.
             dtypes (list, optional): Ignored. For compatibility with KVStorageManager.
-            custom_meta (list, optional): Ray object ref for each key
+            custom_backend_meta (list, optional): Ray object ref for each key
         Returns:
             list: List of retrieved objects
         """
@@ -106,10 +106,11 @@ class RayStorageClient(TransferQueueStorageKVClient):
             raise RuntimeError(f"Failed to retrieve value for key '{keys}': {e}") from e
         return values
 
-    def clear(self, keys: list[str]):
+    def clear(self, keys: list[str], custom_backend_meta=None):
         """
         Delete entries from storage by keys.
         Args:
             keys (list): List of keys to delete
+            custom_backend_meta (List[Any], optional): ...
         """
         ray.get(self.storage_actor.clear_obj_ref.remote(keys))

@@ -16,6 +16,7 @@
 import asyncio
 import logging
 import os
+import warnings
 from collections.abc import Mapping
 from functools import wraps
 from operator import itemgetter
@@ -24,12 +25,14 @@ from uuid import uuid4
 
 import torch
 import zmq
+from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.storage.simple_backend import StorageMetaGroup
+from transfer_queue.utils.common import get_env_bool
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -44,8 +47,10 @@ if not logger.hasHandlers():
 TQ_SIMPLE_STORAGE_MANAGER_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_MANAGER_RECV_TIMEOUT", 200))  # seconds
 TQ_SIMPLE_STORAGE_MANAGER_SEND_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_MANAGER_SEND_TIMEOUT", 200))  # seconds
 
+TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False)
 
-@TransferQueueStorageManagerFactory.register("AsyncSimpleStorageManager")
+
+@TransferQueueStorageManagerFactory.register("SimpleStorage")
 class AsyncSimpleStorageManager(TransferQueueStorageManager):
     """Asynchronous storage manager that handles multiple storage units.
 
@@ -53,14 +58,23 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     instances using ZMQ communication and dynamic socket management.
     """
 
-    def __init__(self, config: dict[str, Any]):
-        super().__init__(config)
+    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
+        super().__init__(controller_info, config)
 
         self.config = config
-        server_infos = config.get("storage_unit_infos", None)  # type: ZMQServerInfo | dict[str, ZMQServerInfo]
+        server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
 
         if server_infos is None:
-            raise ValueError("AsyncSimpleStorageManager requires non-empty 'storage_unit_infos' in config.")
+            server_infos = config.get("storage_unit_infos", None)
+            if server_infos is not None:
+                warnings.warn(
+                    "The config entry `storage_unit_infos` will be deprecated in 0.1.7, please use `zmq_info` instead.",
+                    category=DeprecationWarning,
+                    stacklevel=2,
+                )
+
+        if server_infos is None:
+            raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
         self._build_storage_mapping_functions()
@@ -198,8 +212,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         # Gather per-field dtype and shape information for each field
         # global_indexes, local_indexes, and field_data correspond one-to-one
-        per_field_dtypes = {}
-        per_field_shapes = {}
+        per_field_dtypes: dict[int, dict[str, Any]] = {}
+        per_field_shapes: dict[int, dict[str, Any]] = {}
 
         # Initialize the data structure for each global index
         for global_idx in metadata.global_indexes:
@@ -236,7 +250,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         """
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA,
+            request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
             body={"local_indexes": local_indexes, "data": storage_data},
@@ -274,7 +288,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             metadata, self.global_index_storage_unit_mapping, self.global_index_local_index_mapping
         )
 
-        # retrive data
+        # retrieve data
         tasks = [
             self._get_from_single_storage_unit(meta_group, target_storage_unit=storage_id)
             for storage_id, meta_group in storage_meta_groups.items()
@@ -331,7 +345,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         fields = storage_meta_group.get_field_names()
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_DATA,
+            request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
             body={"local_indexes": local_indexes, "fields": fields},
@@ -440,7 +454,7 @@ def _filter_storage_data(storage_meta_group: StorageMetaGroup, data: TensorDict)
     """
 
     # We use dict here instead of TensorDict to avoid unnecessary TensorDict overhead
-    results = {}
+    results: dict[str, Any] = {}
     batch_indexes = storage_meta_group.get_batch_indexes()
 
     if not batch_indexes:
@@ -452,6 +466,10 @@ def _filter_storage_data(storage_meta_group: StorageMetaGroup, data: TensorDict)
             result = (result,)
         results[fname] = list(result)
 
+        if not TQ_ZERO_COPY_SERIALIZATION:
+            # Explicitly copy tensor slices to prevent pickling the whole tensor for every storage unit.
+            # The tensors may still be contiguous, so we cannot use .contiguous() to trigger copy from parent tensors.
+            results[fname] = [item.clone() if isinstance(item, torch.Tensor) else item for item in results[fname]]
     return results
 
 

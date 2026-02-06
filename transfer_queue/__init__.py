@@ -15,24 +15,50 @@
 
 import os
 
-from .client import (
-    AsyncTransferQueueClient,
-    TransferQueueClient,
-    process_zmq_server_info,
-)
+from .client import TransferQueueClient
 from .controller import TransferQueueController
 from .dataloader import StreamingDataLoader, StreamingDataset
+from .interface import (
+    async_clear_partition,
+    async_clear_samples,
+    async_get_data,
+    async_get_meta,
+    async_put,
+    async_set_custom_meta,
+    clear_partition,
+    clear_samples,
+    close,
+    get_data,
+    get_meta,
+    init,
+    put,
+    set_custom_meta,
+)
 from .metadata import BatchMeta
 from .sampler import BaseSampler
 from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
 from .sampler.rank_aware_sampler import RankAwareSampler
 from .sampler.sequential_sampler import SequentialSampler
 from .storage import SimpleStorageUnit
-from .utils.utils import get_placement_group
-from .utils.zmq_utils import ZMQServerInfo
+from .utils.common import get_placement_group
+from .utils.zmq_utils import ZMQServerInfo, process_zmq_server_info
 
 __all__ = [
-    "AsyncTransferQueueClient",
+    "init",
+    "get_meta",
+    "get_data",
+    "put",
+    "set_custom_meta",
+    "clear_samples",
+    "clear_partition",
+    "async_get_meta",
+    "async_get_data",
+    "async_put",
+    "async_set_custom_meta",
+    "async_clear_samples",
+    "async_clear_partition",
+    "close",
+] + [
     "TransferQueueClient",
     "StreamingDataset",
     "StreamingDataLoader",

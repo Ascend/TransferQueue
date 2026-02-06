@@ -12,7 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import asyncio
+import copy
 import itertools
 import logging
 import os
@@ -20,12 +22,13 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any
+from typing import Any, Optional
 from uuid import uuid4
 
 import ray
 import torch
 import zmq
+from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 from torch import Tensor
 
@@ -57,15 +60,15 @@ class TransferQueueStorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
-        self.controller_info = config.get("controller_info", None)  # type: ZMQServerInfo
+        self.controller_info = controller_info
 
-        self.data_status_update_socket = None
-        self.controller_handshake_socket = None
+        self.data_status_update_socket: Optional[zmq.Socket[bytes]] = None
+        self.controller_handshake_socket: Optional[zmq.Socket[bytes]] = None
 
-        self.zmq_context = None
+        self.zmq_context: Optional[zmq.Context[Any]] = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -88,6 +91,7 @@ class TransferQueueStorageManager(ABC):
                 zmq.DEALER,
                 identity=f"{self.storage_manager_id}-data_status_update_socket-{uuid4().hex[:8]}".encode(),
             )
+            assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
             self.data_status_update_socket.connect(self.controller_info.to_addr("data_status_update_socket"))
 
             # do handshake with controller
@@ -106,6 +110,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for handshake confirmation between controller and storage manager
         poller = zmq.Poller()
 
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         self.controller_handshake_socket.connect(self.controller_info.to_addr("handshake_socket"))
         logger.debug(
             f"[{self.storage_manager_id}]: Handshake connection from storage manager id #{self.storage_manager_id} "
@@ -170,6 +175,7 @@ class TransferQueueStorageManager(ABC):
 
     def _send_handshake_requests(self) -> None:
         """Send handshake request to controller."""
+        assert self.controller_handshake_socket is not None, "controller_handshake_socket is not properly initialized"
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.HANDSHAKE,
             sender_id=self.storage_manager_id,
@@ -191,7 +197,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         dtypes: dict[int, dict[str, Any]],
         shapes: dict[int, dict[str, Any]],
-        custom_meta: dict[int, dict[str, Any]] = None,
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -202,7 +208,7 @@ class TransferQueueStorageManager(ABC):
             global_indexes: Data update related global_indexes.
             dtypes: Per-field dtypes for each field, in {global_index: {field: dtype}} format.
             shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
-            custom_meta: Per-field custom_meta for each field, in {global_index: {field: custom_meta}} format.
+            custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
         """
         # Create zmq poller for notifying data update information
 
@@ -213,6 +219,7 @@ class TransferQueueStorageManager(ABC):
         # Create zmq poller for notifying data update information
         poller = zmq.Poller()
         # Note: data_status_update_socket is already connected during initialization
+        assert self.data_status_update_socket is not None, "data_status_update_socket is not properly initialized"
 
         try:
             poller.register(self.data_status_update_socket, zmq.POLLIN)
@@ -226,7 +233,7 @@ class TransferQueueStorageManager(ABC):
                     "global_indexes": global_indexes,
                     "dtypes": dtypes,
                     "shapes": shapes,
-                    "custom_meta": custom_meta,
+                    "custom_backend_meta": custom_backend_meta,
                 },
             ).serialize()
 
@@ -343,16 +350,16 @@ class KVStorageManager(TransferQueueStorageManager):
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
     """
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
         """
         Initialize the KVStorageManager with configuration.
         """
         client_name = config.get("client_name", None)
         if client_name is None:
             raise ValueError("Missing client_name in config")
-        super().__init__(config)
+        super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
-        self._multi_threads_executor = None
+        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
         # Register a cleanup function: automatically invoke shutdown when the instance is garbage collected.
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
@@ -390,7 +397,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return [row_data for field in sorted(data.keys()) for row_data in data[field]]
 
     @staticmethod
-    def _shutdown_executor(thread_executor: ThreadPoolExecutor):
+    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
         """
         A static method to ensure no strong reference to 'self' is held within the
         finalizer's callback, enabling proper garbage collection.
@@ -421,6 +428,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 max_workers=self._num_threads, thread_name_prefix="KVStorageManager"
             )
 
+        assert self._multi_threads_executor is not None
         return self._multi_threads_executor
 
     def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Tensor]) -> TensorDict:
@@ -501,9 +509,9 @@ class KVStorageManager(TransferQueueStorageManager):
         return TensorDict(merged_data, batch_size=num_samples)
 
     @staticmethod
-    def _get_shape_type_custom_meta_list(metadata: BatchMeta):
+    def _get_shape_type_custom_backend_meta_list(metadata: BatchMeta):
         """
-        Extract the expected shape, dtype, and custom meta for each field-sample pair in metadata.
+        Extract the expected shape, dtype, and custom_backend_meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
 
         Args:
@@ -514,16 +522,17 @@ class KVStorageManager(TransferQueueStorageManager):
         """
         shapes = []
         dtypes = []
-        custom_meta_list = []
-        all_custom_meta = metadata.get_all_custom_meta()
+        custom_backend_meta_list = []
+        all_custom_backend_meta = copy.deepcopy(metadata._custom_backend_meta)
         for field_name in sorted(metadata.field_names):
             for index in range(len(metadata)):
                 field = metadata.samples[index].get_field_by_name(field_name)
+                assert field is not None, f"Field {field_name} not found in sample {index}"
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
                 global_index = metadata.global_indexes[index]
-                custom_meta_list.append(all_custom_meta.get(global_index, {}).get(field_name, None))
-        return shapes, dtypes, custom_meta_list
+                custom_backend_meta_list.append(all_custom_backend_meta.get(global_index, {}).get(field_name, None))
+        return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
@@ -545,10 +554,12 @@ class KVStorageManager(TransferQueueStorageManager):
         keys = self._generate_keys(data.keys(), metadata.global_indexes)
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
+
+        # put <keys, values> to storage backends
         custom_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        per_field_dtypes = {}
-        per_field_shapes = {}
+        per_field_dtypes: dict[int, dict[str, Any]] = {}
+        per_field_shapes: dict[int, dict[str, Any]] = {}
 
         # Initialize the data structure for each global index
         for global_idx in metadata.global_indexes:
@@ -567,7 +578,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 )
 
         # Prepare per-field custom_meta if available
-        per_field_custom_meta = {}
+        per_field_custom_meta: dict[int, dict[str, Any]] = {}
         if custom_meta:
             if len(custom_meta) != len(keys):
                 raise ValueError(f"Length of custom_meta ({len(custom_meta)}) does not match expected ({len(keys)})")
@@ -610,8 +621,10 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        shapes, dtypes, custom_meta = self._get_shape_type_custom_meta_list(metadata)
-        values = self.storage_client.get(keys=keys, shapes=shapes, dtypes=dtypes, custom_meta=custom_meta)
+        shapes, dtypes, custom_backend_meta = self._get_shape_type_custom_backend_meta_list(metadata)
+        values = self.storage_client.get(
+            keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
+        )
         return self._merge_tensors_to_tensordict(metadata, values)
 
     async def clear_data(self, metadata: BatchMeta) -> None:
@@ -620,4 +633,5 @@ class KVStorageManager(TransferQueueStorageManager):
             logger.warning("Attempted to clear data, but metadata contains no fields.")
             return
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        self.storage_client.clear(keys=keys)
+        _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
+        self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)

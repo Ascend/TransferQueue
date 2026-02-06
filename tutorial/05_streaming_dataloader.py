@@ -22,11 +22,11 @@ for efficient streaming data loading in distributed training scenarios.
 Key Components:
 - StreamingDataset: PyTorch IterableDataset that integrates with TransferQueue
 - StreamingDataLoader: DataLoader wrapper that yields (batch, batch_meta) tuples
-- RankAwareSampler: Enables data replica group coordination for consistent
+- RankAwareSampler: Enables DP group coordination for consistent
   sampling across multiple ranks
 
 Use Cases:
-- Distributed training with multiple data replica groups
+- Distributed training with multiple DP groups
 - Fine-grained micro-batch-level data retrieval
 """
 
@@ -57,70 +57,53 @@ warnings.filterwarnings(
 
 import ray  # noqa: E402
 import torch  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 # Add the parent directory to the path for imports
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-
+import transfer_queue as tq  # noqa: E402
 from transfer_queue import (  # noqa: E402
     RankAwareSampler,
-    SimpleStorageUnit,
     StreamingDataLoader,
     StreamingDataset,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
 )
 
 
 def setup_transfer_queue():
     """Setup TransferQueue components."""
     if not ray.is_initialized():
-        ray.init()
-
-    config = OmegaConf.create(
-        {
-            "num_data_storage_units": 2,
-        }
-    )
-
-    storage_units = {}
-    for i in range(config["num_data_storage_units"]):
-        storage_units[i] = SimpleStorageUnit.remote(storage_unit_size=100)
+        ray.init(namespace="TransferQueueTutorial")
 
     print("[Setup]: Setup TransferQueue components")
     print(
         "Note: Using RankAwareSampler when each rank retrieves data independently. It guarantees that "
-        "all ranks within the same data replica group receive the same sample indices."
+        "The same DP rank receives the same sample indices."
     )
     print(
         "Note: When using streaming data retrieval, please set polling_mode=True when initializing "
         "TransferQueueController. In polling_mode, the controller will return empty BatchMeta when "
         "available data cannot meet the consumption requirements. User side need to retry later."
     )
-    controller = TransferQueueController.remote(
-        sampler=RankAwareSampler,  # RankAwareSampler enables consistent sampling across ranks in same replica group
-        polling_mode=True,  # Enable polling mode for streaming data retrieval
+
+    config = OmegaConf.create(
+        {
+            "controller": {
+                "sampler": RankAwareSampler,  # RankAwareSampler enables consistent sampling for each DP rank
+                "polling_mode": True,  # Enable polling mode for streaming data retrieval
+            },
+            "backend": {"SimpleStorage": {"num_data_storage_units": 2}},
+        },
+        flags={"allow_objects": True},
     )
 
-    controller_info = process_zmq_server_info(controller)
-    storage_unit_infos = process_zmq_server_info(storage_units)
-
-    # Build the complete configuration
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})
-    tq_config.controller_info = controller_info
-    tq_config.storage_unit_infos = storage_unit_infos
-    config.storage_backend = "AsyncSimpleStorageManager"
-    config = OmegaConf.merge(tq_config, config)
-
-    return controller, storage_units, config
+    tq.init(config)
 
 
 @ray.remote(num_cpus=0.1)
-def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
+def generate_worker(rank_id: int, num_samples: int = 20):
     """
     Generate actor that produces training samples.
 
@@ -129,7 +112,6 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
 
     Args:
         rank_id: Unique identifier for this generator (used for sample indexing)
-        config: TransferQueue configuration
         num_samples: Number of samples to generate
 
     Note:
@@ -137,13 +119,9 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
         This ensures global uniqueness across all generator actors.
     """
     # Create a client for interacting with TransferQueue
-    client = TransferQueueClient(
-        client_id=f"gen_worker_{rank_id}",
-        controller_info=config.controller_info,
-    )
 
-    # Initialize the storage manager for this client
-    client.initialize_storage_manager(manager_type=config.storage_backend, config=config)
+    # Need to call tq.init() in each process
+    tq.init()
 
     # Generate and put samples into the queue
     for i in range(num_samples):
@@ -159,7 +137,7 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
         print(f"[Generate Worker@{rank_id}]: Putting sample {seq_id} into TransferQueue")
 
         # Put data into the specified partition
-        client.put(data, partition_id="train")
+        tq.put(data, partition_id="train")
 
     print(f"[Generate Worker@{rank_id}]: Complete putting samples into TransferQueue")
 
@@ -167,10 +145,7 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
 @ray.remote(num_cpus=0.1)
 def update_worker(
     rank_id: int,
-    data_replica_group: int,
-    data_replica_rank: int,
-    data_replica_world_size: int,
-    config: DictConfig,
+    dp_rank: int,
     max_steps: int = 5,
 ):
     """
@@ -182,22 +157,18 @@ def update_worker(
 
     Args:
         rank_id: Global rank identifier for logging and display purposes
-        data_replica_group: ID of the data parallel group this rank belongs to
-            Ranks in the same group receive the same data samples
-        data_replica_rank: Local rank index within the data replica group
-            Range: [0, data_replica_world_size - 1]
-        data_replica_world_size: Total number of ranks in this data replica group
-        config: TransferQueue configuration
+        dp_rank: Data parallel rank ID that this worker belongs to
+            The same Ranks receive the same data samples
         max_steps: Maximum number of batches to consume
 
     Returns:
-        dict: Contains data_replica_rank, data_replica_group, and consumed_ids
+        dict: Contains dp_rank and consumed_ids
 
     Example:
-        For a setup with 2 data replica groups (0 and 1), each with 2 ranks:
-        - Group 0: ranks [0, 1] receive identical samples
-        - Group 1: ranks [2, 3] receive identical samples
-        All ranks within the same group get the same global indexes.
+        For a setup with 2 data rank (0 and 1):
+        - Rank 0: receive identical samples
+        - Rank 1: receive identical samples
+        All ranks within the same rank index get the same global indexes.
 
     Note:
         The StreamingDataLoader yields tuples of (batch, batch_meta) where:
@@ -205,17 +176,23 @@ def update_worker(
         - batch_meta: Metadata for TransferQueue coordination (contains global_indexes)
     """
 
+    # Need to call tq.init() in each process
+    tq.init()
+
     # Step 1: Create StreamingDataset
     # This dataset integrates with TransferQueue and handles batch retrieval
+
+    controller = ray.get_actor("TransferQueueController")
+    config = ray.get(controller.get_config.remote())
+
     dataset = StreamingDataset(
         config=config,
-        micro_batch_size=2,  # Number of samples per batch
-        required_fields=["meta_idx"],  # Fields to retrieve from storage. We can retrieve partial fields!
+        batch_size=2,
+        micro_batch_size=2,  # Number of samples per micro-batch.
+        data_fields=["meta_idx"],  # Fields to retrieve from storage. We can retrieve partial fields!
         partition_id="train",  # Data partition to consume from
         task_name="update_task",  # Unique task identifier
-        data_replica_group=data_replica_group,
-        data_replica_rank=data_replica_rank,
-        data_replica_world_size=data_replica_world_size,
+        dp_rank=dp_rank,
     )
     print(f"[Update Worker@{rank_id}] StreamingDataset created successfully")
 
@@ -240,10 +217,7 @@ def update_worker(
         # Extract sample IDs from the batch
         ids = batch["meta_idx"].view(-1).tolist()
 
-        print(
-            f"[Update Worker@{rank_id}]: data_replica_rank {data_replica_rank} in "
-            f"data_replica_group {data_replica_group} retrieved samples: {ids}"
-        )
+        print(f"[Update Worker@{rank_id}]: dp_rank {dp_rank} retrieved samples: {ids}")
         consumed_ids.extend(ids)
 
         # Simulate processing time (remove in real training)
@@ -257,13 +231,12 @@ def update_worker(
     print(f"[Update Worker@{rank_id}] Completed {step} steps, consumed {len(consumed_ids)} samples")
 
     return {
-        "data_replica_rank": data_replica_rank,
-        "data_replica_group": data_replica_group,
+        "dp_rank": dp_rank,
         "consumed_ids": consumed_ids,
     }
 
 
-def start_all_generate_actors(config):
+def start_all_generate_actors():
     """
     Launch generate_actors for producing training samples.
     """
@@ -271,36 +244,30 @@ def start_all_generate_actors(config):
     handlers = []
 
     for i in range(num_workers):
-        handlers.append(generate_worker.remote(rank_id=i, config=config))
+        handlers.append(generate_worker.remote(rank_id=i, num_samples=20))
 
     return handlers
 
 
-def start_all_update_actors(config):
+def start_all_update_actors():
     """
     Launch update_actors for consuming training samples.
     """
 
     # Define the distributed training topology
     rank_ids = [0, 1, 2, 3]
-    data_replica_group = [0, 0, 1, 1]  # First two ranks in group 0, last two in group 1
-    data_replica_world_size = 2  # Each group has 2 ranks
+    dp_rank = [0, 0, 1, 1]  # First two ranks in group 0, last two in group 1
 
     print("Training topology configuration:")
     print(f"  - Total ranks: {len(rank_ids)}")
-    print(f"  - Data replica groups: {len(set(data_replica_group))}")
-    print(f"  - World size per group: {data_replica_world_size}")
-    print(f"  - Group assignments: {dict(zip(rank_ids, data_replica_group, strict=False))}")
+    print(f"  - Data parallel rank: {len(set(dp_rank))}")
 
     handlers = []
     for i in range(len(rank_ids)):
         handlers.append(
             update_worker.remote(
                 rank_id=rank_ids[i],
-                data_replica_group=data_replica_group[i],
-                data_replica_rank=rank_ids[i] % data_replica_world_size,
-                data_replica_world_size=data_replica_world_size,
-                config=config,
+                dp_rank=dp_rank[i],
             )
         )
 
@@ -332,9 +299,8 @@ def main():
         Key Concepts:
         - StreamingDataset: PyTorch IterableDataset that integrates with TransferQueue
         - StreamingDataLoader: DataLoader wrapper yielding (batch, batch_meta) tuples
-        - RankAwareSampler: Enables correct data consumption across data replica ranks
-        - Data Replica Group: Ranks that should receive identical data samples (TP, PP, ...)
-
+        - RankAwareSampler: Enables correct data consumption across DP ranks
+        - DP Rank: Ranks that should receive identical data samples
         """
         )
     )
@@ -342,15 +308,20 @@ def main():
 
     # Step 1: Setup TransferQueue infrastructure
     print("\n[Phase 1] Setting up TransferQueue infrastructure...")
-    controller, storage_units, config = setup_transfer_queue()
+    print(
+        "\nIn real-world usage, please export the environment variable of TQ_PRE_ALLOC_SAMPLE_NUM to "
+        "global_batch_size to make sure consumers can accurately determine consumption status even before "
+        "producers have generated the samples."
+    )
+    setup_transfer_queue()
 
     # Step 2: Launch data generation actors
     print("\n[Phase 2] Starting data generation...")
-    generate_worker_handlers = start_all_generate_actors(config)
+    generate_worker_handlers = start_all_generate_actors()
 
     # Step 3: Launch data consumption actors
     print("\n[Phase 3] Starting data consumption...")
-    update_worker_handlers = start_all_update_actors(config)
+    update_worker_handlers = start_all_update_actors()
 
     # Wait for completion
     print("\n[Phase 4] Waiting for actors to complete...")
@@ -369,10 +340,7 @@ def main():
     print("Results Summary")
     print("=" * 80)
     for result in update_results:
-        print(
-            f"  Rank {result['data_replica_rank']} (Group {result['data_replica_group']}): "
-            f"consumed {len(result['consumed_ids'])} samples"
-        )
+        print(f"  DP Rank {result['dp_rank']}: consumed {len(result['consumed_ids'])} samples")
 
     print("\n" + "=" * 80)
     print("Tutorial Complete!")
@@ -380,7 +348,7 @@ def main():
     print("Key Takeaways:")
     print("1. StreamingDataset provides PyTorch IterableDataset interface for TransferQueue")
     print("2. StreamingDataLoader wraps the dataset and yields (batch, batch_meta) tuples")
-    print("3. Ranks in the same data_replica_group receive identical samples")
+    print("3. Ranks with the same DP rank receive identical samples")
     print("4. The system enables efficient streaming capabilities")
 
 
