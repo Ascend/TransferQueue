@@ -34,6 +34,7 @@ from transfer_queue.storage import (
     TransferQueueStorageManagerFactory,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.enum_utils import ProductionStatus
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -1043,7 +1044,9 @@ class AsyncTransferQueueClient:
                         break
                 if field_meta is None:
                     # Construct a minimal field meta
-                    field_meta = FieldMeta(name=fname, dtype=None, shape=None, production_status=1)
+                    field_meta = FieldMeta(
+                        name=fname, dtype=None, shape=None, production_status=ProductionStatus.READY_FOR_CONSUME
+                    )
                 sample_fields[fname] = field_meta
             samples.append(SampleMeta(partition_id=partition_id, global_index=gidx, fields=sample_fields))
 
@@ -1139,7 +1142,10 @@ class AsyncTransferQueueClient:
                             SampleMeta(
                                 partition_id=partition_id,
                                 global_index=gidx,
-                                fields={fn: FieldMeta(fn, None, None, 1) for fn in partition_meta.field_names},
+                                fields={
+                                    fn: FieldMeta(fn, None, None, ProductionStatus.READY_FOR_CONSUME)
+                                    for fn in partition_meta.field_names
+                                },
                             )
                         )
 

@@ -158,7 +158,7 @@ class TestKVGet:
 
     def test_get_missing_key_raises(self):
         """kv_batch_get should raise KeyError for non-existent keys."""
-        with pytest.raises(KeyError, match="not found"):
+        with pytest.raises(KeyError, match="Keys not found in partition"):
             tq.kv_batch_get(keys=["nonexistent"], partition_id="test_kv")
 
 
