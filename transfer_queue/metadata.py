@@ -303,60 +303,43 @@ class BatchMeta:
         """
         self.extra_info.clear()
 
-    def set_custom_meta(self, global_index: int, meta_dict: dict[str, Any]) -> None:
+    def get_all_custom_meta(self) -> list[dict[str, Any]]:
         """
-        Set custom_meta for a specific sample by global_index.
-
-        Custom metadata is user-defined per-sample metadata that can be stored
-        and retrieved along with the BatchMeta.
-
-        Args:
-            global_index: The global_index of the sample to set custom meta for
-            meta_dict: Dictionary containing custom metadata for the sample
-
-        Raises:
-            ValueError: If the key is not in global_indexes
-        """
-
-        if global_index not in self.global_indexes:
-            raise ValueError(f"key {global_index} not found in global_indexes {self.global_indexes}.")
-
-        self.custom_meta[global_index] = copy.deepcopy(meta_dict)
-
-    def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
-        """
-        Get all custom_meta as a dictionary.
+        Get all custom_meta as a list of dictionary.
 
         Returns:
-            A deep copy of the custom_meta dictionary
+            A deep copy of the custom_meta list
         """
-        return copy.deepcopy(self.custom_meta)
+        custom_meta = [self.custom_meta.get(i, {}) for i in self.global_indexes]
+        return copy.deepcopy(custom_meta)
 
-    def update_custom_meta(self, new_meta: dict[int, dict[str, Any]]):
+    def update_custom_meta(self, custom_meta: list[dict[str, Any]]):
         """
-        Update custom_meta with a dictionary of new metadata.
+        Update custom_meta with a list of dictionary of custom metadata.
 
         This method updates the custom_meta dictionary with the provided metadata.
         Existing keys will be overwritten with new values.
 
         Args:
-            new_meta: Dictionary of new metadata
+            custom_meta: list of custom_meta dictionary
 
         Raises:
-            ValueError: If any key in new_meta is not in global_indexes
+            ValueError: If the length of custom_meta cannot match the batch size
         """
 
-        if new_meta is None:
+        if custom_meta is None:
             return
 
-        non_exist_global_indexes = set(new_meta.keys()) - set(self.global_indexes)
-        if non_exist_global_indexes:
+        if len(custom_meta) != self.size:
             raise ValueError(
-                f"Trying to update custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
-                f"do not exist in this batch."
+                f"The length of custom_meta list {len(custom_meta)} must match the batch size: {self.size}"
             )
 
-        self.custom_meta.update(new_meta)
+        custom_meta_dict: dict[int, dict[str, Any]] = {
+            self.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))
+        }
+
+        self.custom_meta.update(custom_meta_dict)
 
     def clear_custom_meta(self) -> None:
         """

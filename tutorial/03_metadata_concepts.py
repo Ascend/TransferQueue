@@ -205,10 +205,15 @@ def demonstrate_batch_meta():
     print(f"✓ Extra info: {batch.get_all_extra_info()}")
 
     print("[Example 3] Adding sample-level information through custom_meta...")
-    batch.set_custom_meta(
-        global_index=0, meta_dict={"uid": "prompt@0", "session_id": "session@0", "model_version": "epoch@0"}
+    batch.update_custom_meta(
+        [
+            {"uid": "prompt@0", "session_id": "session@0", "model_version": "epoch@0"},
+            {"uid": "prompt@1", "session_id": "session@0", "model_version": "epoch@0"},
+            {"uid": "prompt@2", "session_id": "session@0", "model_version": "epoch@0"},
+            {"uid": "prompt@3", "session_id": "session@0", "model_version": "epoch@0"},
+            {"uid": "prompt@4", "session_id": "session@0", "model_version": "epoch@0"},
+        ]
     )
-    batch.update_custom_meta({1: {"uid": "prompt@1", "session_id": "session@0", "model_version": "epoch@0"}})
     print(f"✓ Custom meta: {batch.get_all_custom_meta()}")
 
     # Example 4: Chunk a batch
@@ -300,7 +305,7 @@ def demonstrate_real_workflow():
 
     # Initialize Ray
     if not ray.is_initialized():
-        ray.init()
+        ray.init(namespace="TransferQueueTutorial")
 
     # Initialize TransferQueue
     tq.init()
@@ -323,10 +328,10 @@ def demonstrate_real_workflow():
 
     print("[Step 2] [Optional] Setting sample-level custom_meta...")
 
-    custom_meta = {
-        global_index: {"uid": uuid.uuid4().hex[:4], "session_id": uuid.uuid4().hex[:4], "model_version": 0}
-        for global_index in batch_meta.global_indexes
-    }
+    custom_meta = [
+        {"uid": uuid.uuid4().hex[:4], "session_id": uuid.uuid4().hex[:4], "model_version": 0}
+        for _ in range(batch_meta.size)
+    ]
     batch_meta.update_custom_meta(custom_meta)
     print(f"✓ Set custom_meta into BatchMeta: {batch_meta.get_all_custom_meta()}")
 
@@ -385,7 +390,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 2: Metadata System
+        TransferQueue Tutorial 3: Metadata System
 
         This script introduces the metadata system in TransferQueue, which tracks
         the structure and state of data:

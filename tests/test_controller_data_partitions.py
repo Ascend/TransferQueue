@@ -941,3 +941,62 @@ class TestDataPartitionStatusCustomMeta:
         result = partition.get_custom_meta([0, 1])
         assert 0 not in result
         assert 1 in result  # Sample 1 should still have custom_meta
+
+
+class TestDataPartitionStatusKvInterface:
+    """Unit tests for DataPartitionStatus KV interface functionality.
+
+    Tests for the keys_mapping and kv_retrieve_keys methods that support
+    key-value interface operations within a partition.
+    """
+
+    def test_kv_retrieve_keys_with_existing_keys(self):
+        """Test kv_retrieve_keys returns correct global_indexes for existing keys."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        # Simulate keys being registered (as would happen during kv_put)
+        partition.keys_mapping = {"key_a": 0, "key_b": 1, "key_c": 2}
+
+        # Retrieve keys
+        global_indexes = partition.kv_retrieve_keys(["key_a", "key_b", "key_c"])
+
+        assert global_indexes == [0, 1, 2]
+
+    def test_kv_retrieve_keys_with_nonexistent_keys(self):
+        """Test kv_retrieve_keys returns None for keys that don't exist."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        # Simulate some keys being registered
+        partition.keys_mapping = {"existing_key": 5}
+
+        # Retrieve mixed existing and non-existing keys
+        global_indexes = partition.kv_retrieve_keys(["existing_key", "nonexistent_key"])
+
+        assert global_indexes == [5, None]
+
+    def test_kv_retrieve_keys_empty_list(self):
+        """Test kv_retrieve_keys handles empty key list."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        global_indexes = partition.kv_retrieve_keys([])
+
+        assert global_indexes == []
+
+    def test_kv_retrieve_keys_partial_match(self):
+        """Test kv_retrieve_keys with partial key matches."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        partition.keys_mapping = {"key_1": 10, "key_2": 20, "key_3": 30}
+
+        # Request only some of the keys
+        global_indexes = partition.kv_retrieve_keys(["key_1", "key_3"])
+
+        assert global_indexes == [10, 30]

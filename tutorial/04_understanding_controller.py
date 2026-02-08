@@ -235,7 +235,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 3: Understanding TransferQueueController
+        TransferQueue Tutorial 4: Understanding TransferQueueController
 
         This script demonstrates TransferQueueController's key features:
 

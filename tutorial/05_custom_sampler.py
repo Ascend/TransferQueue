@@ -341,7 +341,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 4: Custom Sampler Development
+        TransferQueue Tutorial 5: Custom Sampler Development
 
         This script demonstrates how to develop custom samplers for TransferQueue.
         Samplers control HOW data is consumed from the queue.

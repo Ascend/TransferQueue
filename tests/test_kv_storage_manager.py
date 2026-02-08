@@ -27,6 +27,7 @@ sys.path.append(str(parent_dir))
 
 from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
 from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
+from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
 
 
 def get_meta(data, global_indexes=None):
@@ -41,7 +42,7 @@ def get_meta(data, global_indexes=None):
                 name=field_name,
                 dtype=tensor.dtype if isinstance(tensor, torch.Tensor) else None,
                 shape=tensor.shape if isinstance(tensor, torch.Tensor) else None,
-                production_status=1,
+                production_status=ProductionStatus.READY_FOR_CONSUME,
             )
             fields_dict[field_name] = field_meta
         sample = SampleMeta(
@@ -163,8 +164,8 @@ def test_merge_tensors_to_tensordict(mock_create, test_data):
             assert complex_tensordict[key] == complex_data[key]
 
 
-def test_get_shape_type_custom_backend_meta_list_without_custom_meta(test_data):
-    """Test _get_shape_type_custom_backend_meta_list returns correct shapes and dtypes without custom_meta."""
+def test_get_shape_type_custom_backend_meta_list_without_custom_backend_meta(test_data):
+    """Test _get_shape_type_custom_backend_meta_list returns correct shapes and dtypes without custom_backend_meta."""
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(
         test_data["metadata"]
     )
@@ -185,7 +186,7 @@ def test_get_shape_type_custom_backend_meta_list_without_custom_meta(test_data):
         torch.Size([2]),  # text[2]
     ]
     expected_dtypes = [torch.int64] * (len(test_data["field_names"]) * len(test_data["global_indexes"]))
-    # No custom_meta provided, so all should be None
+    # No custom_backend_meta provided, so all should be None
     expected_custom_backend_meta = [None] * (len(test_data["field_names"]) * len(test_data["global_indexes"]))
 
     assert shapes == expected_shapes
@@ -193,9 +194,9 @@ def test_get_shape_type_custom_backend_meta_list_without_custom_meta(test_data):
     assert custom_backend_meta_list == expected_custom_backend_meta
 
 
-def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
-    """Test _get_shape_type_custom_meta_list returns correct custom_meta when provided."""
-    # Add custom_meta to metadata
+def test_get_shape_type_custom_backend_meta_list_with_custom_backend_meta(test_data):
+    """Test _get_shape_type_custom_backend_meta_list returns correct custom_backend_meta when provided."""
+    # Add custom_backend_meta to metadata
     custom_backend_meta = {
         8: {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},
         9: {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},
@@ -206,8 +207,8 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
-    # Check custom_meta - order is label, mask, text (sorted alphabetically) by global_index
-    expected_custom_meta = [
+    # Check custom_backend_meta - order is label, mask, text (sorted alphabetically) by global_index
+    expected_custom_backend_meta = [
         {"key2": "value2"},  # label, global_index=8
         {"key5": "value5"},  # label, global_index=9
         {"key8": "value8"},  # label, global_index=10
@@ -218,15 +219,15 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
         {"key4": "value4"},  # text, global_index=9
         {"key7": "value7"},  # text, global_index=10
     ]
-    assert custom_backend_meta_list == expected_custom_meta
+    assert custom_backend_meta_list == expected_custom_backend_meta
 
 
-def test_get_shape_type_custom_backend_meta_list_with_partial_custom_meta(test_data):
-    """Test _get_shape_type_custom_backend_meta_list handles partial custom_meta correctly."""
-    # Add custom_meta only for some global_indexes and fields
+def test_get_shape_type_custom_backend_meta_list_with_partial_custom_backend_meta(test_data):
+    """Test _get_shape_type_custom_backend_meta_list handles partial custom_backend_meta correctly."""
+    # Add custom_backend_meta only for some global_indexes and fields
     custom_backend_meta = {
         8: {"text": {"key1": "value1"}},  # Only text field
-        # global_index 9 has no custom_meta
+        # global_index 9 has no custom_backend_meta
         10: {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # label and mask only
     }
     metadata = test_data["metadata"]
@@ -234,17 +235,17 @@ def test_get_shape_type_custom_backend_meta_list_with_partial_custom_meta(test_d
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
-    # Check custom_meta - order is label, mask, text (sorted alphabetically) by global_index
+    # Check custom_backend_meta - order is label, mask, text (sorted alphabetically) by global_index
     expected_custom_backend_meta = [
-        None,  # label, global_index=8 (not in custom_meta)
-        None,  # label, global_index=9 (not in custom_meta)
+        None,  # label, global_index=8 (not in custom_backend_meta)
+        None,  # label, global_index=9 (not in custom_backend_meta)
         {"key2": "value2"},  # label, global_index=10
-        None,  # mask, global_index=8 (not in custom_meta)
-        None,  # mask, global_index=9 (not in custom_meta)
+        None,  # mask, global_index=8 (not in custom_backend_meta)
+        None,  # mask, global_index=9 (not in custom_backend_meta)
         {"key3": "value3"},  # mask, global_index=10
         {"key1": "value1"},  # text, global_index=8
-        None,  # text, global_index=9 (not in custom_meta)
-        None,  # text, global_index=10 (not in custom_meta for text)
+        None,  # text, global_index=9 (not in custom_backend_meta)
+        None,  # text, global_index=10 (not in custom_backend_meta for text)
     ]
     assert custom_backend_meta_list == expected_custom_backend_meta
 
@@ -279,13 +280,13 @@ STORAGE_CLIENT_FACTORY_PATH = "transfer_queue.storage.managers.base.StorageClien
 
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
 @patch.object(KVStorageManager, "notify_data_update", new_callable=AsyncMock)
-def test_put_data_with_custom_meta_from_storage_client(mock_notify, test_data_for_put_data):
-    """Test that put_data correctly processes custom_meta returned by storage client."""
+def test_put_data_with_custom_backend_meta_from_storage_client(mock_notify, test_data_for_put_data):
+    """Test that put_data correctly processes custom_backend_meta returned by storage client."""
     # Create a mock storage client
     mock_storage_client = MagicMock()
-    # Simulate storage client returning custom_meta (one per key)
+    # Simulate storage client returning custom_backend_meta (one per key)
     # Keys order: label[0,1,2], text[0,1,2] (sorted by field name)
-    mock_custom_meta = [
+    mock_custom_backend_meta = [
         {"storage_key": "0@label"},
         {"storage_key": "1@label"},
         {"storage_key": "2@label"},
@@ -293,7 +294,7 @@ def test_put_data_with_custom_meta_from_storage_client(mock_notify, test_data_fo
         {"storage_key": "1@text"},
         {"storage_key": "2@text"},
     ]
-    mock_storage_client.put.return_value = mock_custom_meta
+    mock_storage_client.put.return_value = mock_custom_backend_meta
 
     # Create manager with mocked dependencies
     config = {"client_name": "MockClient"}
@@ -314,34 +315,35 @@ def test_put_data_with_custom_meta_from_storage_client(mock_notify, test_data_fo
     assert keys == expected_keys
     assert len(values) == 6
 
-    # Verify notify_data_update was called with correct custom_meta structure
+    # Verify notify_data_update was called with correct custom_backend_meta structure
     mock_notify.assert_called_once()
     notify_call_args = mock_notify.call_args
-    per_field_custom_meta = notify_call_args[0][5]  # 6th positional argument
+    per_field_custom_backend_meta = notify_call_args[0][5]  # 6th positional argument
 
-    # Verify custom_meta is structured correctly: {global_index: {field: meta}}
-    assert 0 in per_field_custom_meta
-    assert 1 in per_field_custom_meta
-    assert 2 in per_field_custom_meta
+    # Verify custom_backend_meta is structured correctly: {global_index: {field: meta}}
+    assert 0 in per_field_custom_backend_meta
+    assert 1 in per_field_custom_backend_meta
+    assert 2 in per_field_custom_backend_meta
 
-    assert per_field_custom_meta[0]["label"] == {"storage_key": "0@label"}
-    assert per_field_custom_meta[0]["text"] == {"storage_key": "0@text"}
-    assert per_field_custom_meta[1]["label"] == {"storage_key": "1@label"}
-    assert per_field_custom_meta[1]["text"] == {"storage_key": "1@text"}
-    assert per_field_custom_meta[2]["label"] == {"storage_key": "2@label"}
-    assert per_field_custom_meta[2]["text"] == {"storage_key": "2@text"}
+    assert per_field_custom_backend_meta[0]["label"] == {"storage_key": "0@label"}
+    assert per_field_custom_backend_meta[0]["text"] == {"storage_key": "0@text"}
+    assert per_field_custom_backend_meta[1]["label"] == {"storage_key": "1@label"}
+    assert per_field_custom_backend_meta[1]["text"] == {"storage_key": "1@text"}
+    assert per_field_custom_backend_meta[2]["label"] == {"storage_key": "2@label"}
+    assert per_field_custom_backend_meta[2]["text"] == {"storage_key": "2@text"}
 
-    # Verify metadata was updated with custom_meta
-    all_custom_meta = test_data_for_put_data["metadata"].get_all_custom_meta()
-    assert all_custom_meta[0]["label"] == {"storage_key": "0@label"}
-    assert all_custom_meta[2]["text"] == {"storage_key": "2@text"}
+    # Verify metadata was updated with custom_backend_meta
+    all_custom_backend_meta = test_data_for_put_data["metadata"]._custom_backend_meta
+    assert len(all_custom_backend_meta) == 3
+    assert all_custom_backend_meta[0]["label"] == {"storage_key": "0@label"}
+    assert all_custom_backend_meta[2]["text"] == {"storage_key": "2@text"}
 
 
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
 @patch.object(KVStorageManager, "notify_data_update", new_callable=AsyncMock)
-def test_put_data_without_custom_meta(mock_notify, test_data_for_put_data):
-    """Test that put_data works correctly when storage client returns no custom_meta."""
-    # Create a mock storage client that returns None for custom_meta
+def test_put_data_without_custom_backend_meta(mock_notify, test_data_for_put_data):
+    """Test that put_data works correctly when storage client returns no custom_backend_meta."""
+    # Create a mock storage client that returns None for custom_backend_meta
     mock_storage_client = MagicMock()
     mock_storage_client.put.return_value = None
 
@@ -353,19 +355,19 @@ def test_put_data_without_custom_meta(mock_notify, test_data_for_put_data):
     # Run put_data
     asyncio.run(manager.put_data(test_data_for_put_data["data"], test_data_for_put_data["metadata"]))
 
-    # Verify notify_data_update was called with empty dict for custom_meta
+    # Verify notify_data_update was called with empty dict for custom_backend_meta
     mock_notify.assert_called_once()
     notify_call_args = mock_notify.call_args
-    per_field_custom_meta = notify_call_args[0][5]  # 6th positional argument
-    assert per_field_custom_meta == {}
+    per_field_custom_backend_meta = notify_call_args[0][5]  # 6th positional argument
+    assert per_field_custom_backend_meta == {}
 
 
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
-def test_put_data_custom_meta_length_mismatch_raises_error(test_data_for_put_data):
-    """Test that put_data raises ValueError when custom_meta length doesn't match keys."""
-    # Create a mock storage client that returns mismatched custom_meta length
+def test_put_data_custom_backend_meta_length_mismatch_raises_error(test_data_for_put_data):
+    """Test that put_data raises ValueError when custom_backend_meta length doesn't match keys."""
+    # Create a mock storage client that returns mismatched custom_backend_meta length
     mock_storage_client = MagicMock()
-    # Return only 3 custom_meta entries when 6 are expected
+    # Return only 3 custom_backend_meta entries when 6 are expected
     mock_storage_client.put.return_value = [{"key": "1"}, {"key": "2"}, {"key": "3"}]
 
     # Create manager with mocked dependencies

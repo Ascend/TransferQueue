@@ -760,3 +760,205 @@ class TestTransferQueueControllerCustomMeta:
 
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))
+
+
+class TestTransferQueueControllerKvInterface:
+    """End-to-end tests for TransferQueueController KV interface functionality.
+
+    Tests for kv_retrieve_keys method that supports key-value interface operations
+    across the controller and partition layers.
+    """
+
+    def test_controller_kv_retrieve_keys_create_mode(self, ray_setup):
+        """Test kv_retrieve_keys with create=True creates new keys in partition."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_test_partition"
+
+        # Retrieve keys with create=True - should create partition and keys
+        keys = ["key_a", "key_b", "key_c"]
+        metadata = ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=True))
+
+        # Verify partition was created
+        partitions = ray.get(tq_controller.list_partitions.remote())
+        assert partition_id in partitions
+
+        # Verify metadata contains correct number of global_indexes
+        assert len(metadata.global_indexes) == len(keys)
+
+        # Verify partition has keys_mapping
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert "key_a" in partition.keys_mapping
+        assert "key_b" in partition.keys_mapping
+        assert "key_c" in partition.keys_mapping
+        assert metadata.global_indexes[0] == partition.keys_mapping["key_a"]
+        assert metadata.global_indexes[1] == partition.keys_mapping["key_b"]
+        assert metadata.global_indexes[2] == partition.keys_mapping["key_c"]
+        assert partition.revert_keys_mapping[metadata.global_indexes[0]] == "key_a"
+        assert partition.revert_keys_mapping[metadata.global_indexes[1]] == "key_b"
+        assert partition.revert_keys_mapping[metadata.global_indexes[2]] == "key_c"
+
+        print("✓ kv_retrieve_keys with create=True creates keys correctly")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+    def test_controller_kv_retrieve_keys_existing_keys(self, ray_setup):
+        """Test kv_retrieve_keys retrieves existing keys correctly."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_existing_test"
+
+        # First, create some keys
+        keys = ["existing_key_1", "existing_key_2"]
+        ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=True))
+
+        # Retrieve the same keys again (should return existing)
+        retrieved_metadata = ray.get(
+            tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=False)
+        )
+
+        # Verify the same global_indexes are returned
+        assert len(retrieved_metadata.global_indexes) == len(keys)
+
+        print("✓ kv_retrieve_keys retrieves existing keys correctly")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+    def test_controller_kv_retrieve_keys_non_existent_without_create(self, ray_setup):
+        """Test kv_retrieve_keys raises error for non-existent keys without create."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_nonexistent_test"
+
+        # Create partition first
+        ray.get(tq_controller.kv_retrieve_keys.remote(keys=["initial_key"], partition_id=partition_id, create=True))
+
+        # Try to retrieve non-existent key without create
+        batch_meta = ray.get(
+            tq_controller.kv_retrieve_keys.remote(keys=["nonexistent_key"], partition_id=partition_id, create=False)
+        )
+        assert batch_meta.size == 0
+
+        print("✓ kv_retrieve_keys return an empty BatchMeta for non-existent keys without create")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+    def test_controller_kv_retrieve_keys_empty_partition_without_create(self, ray_setup):
+        """Test kv_retrieve_keys raises error for non-existent partition without create."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "nonexistent_partition"
+
+        batch_meta = ray.get(
+            tq_controller.kv_retrieve_keys.remote(keys=["key_1"], partition_id=partition_id, create=False)
+        )
+        assert batch_meta.size == 0
+
+        print("✓ kv_retrieve_keys return an empty BatchMeta for non-existent partition_id without create")
+
+    def test_controller_kv_retrieve_keys_with_production_status(self, ray_setup):
+        """Test kv_retrieve_keys works with production status update."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_production_test"
+
+        # Create keys
+        keys = ["sample_1", "sample_2", "sample_3"]
+        metadata = ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=True))
+        global_indexes = metadata.global_indexes
+
+        # Update production status
+        dtypes = {idx: {"data": "torch.float32"} for idx in global_indexes}
+        shapes = {idx: {"data": (64,)} for idx in global_indexes}
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=global_indexes,
+                field_names=["data"],
+                dtypes=dtypes,
+                shapes=shapes,
+            )
+        )
+        assert success
+
+        # Retrieve keys again (should include production info)
+        retrieved_metadata = ray.get(
+            tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=False)
+        )
+
+        # Verify production status is available
+        assert len(retrieved_metadata.samples) == len(keys)
+        for sample in retrieved_metadata.samples:
+            assert "data" in sample.fields
+            assert sample.fields["data"].dtype == "torch.float32"
+            assert sample.fields["data"].shape == (64,)
+
+        print("✓ kv_retrieve_keys works with production status")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+    def test_controller_kv_retrieve_keys_with_custom_meta(self, ray_setup):
+        """Test kv_retrieve_keys preserves custom_meta through retrieve."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_custom_meta_test"
+
+        # Create keys
+        keys = ["key_1", "key_2"]
+        metadata = ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=True))
+
+        # Set custom_meta
+        custom_meta = {
+            partition_id: {
+                metadata.global_indexes[0]: {"score": 0.9, "tag": "A"},
+                metadata.global_indexes[1]: {"score": 0.8, "tag": "B"},
+            }
+        }
+        ray.get(tq_controller.set_custom_meta.remote(partition_custom_meta=custom_meta))
+
+        # Retrieve keys and verify custom_meta
+        retrieved_metadata = ray.get(
+            tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=False)
+        )
+
+        # Verify custom_meta is preserved
+        all_custom_meta = retrieved_metadata.get_all_custom_meta()
+        assert len(all_custom_meta) == 2
+        assert all_custom_meta[0]["score"] == 0.9
+        assert all_custom_meta[1]["tag"] == "B"
+
+        print("✓ kv_retrieve_keys preserves custom_meta")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
+    def test_controller_kv_interface_multiple_partitions(self, ray_setup):
+        """Test KV interface works correctly across multiple partitions."""
+        tq_controller = TransferQueueController.remote()
+
+        # Create keys in partition 1
+        partition_1 = "partition_kv_1"
+        keys_1 = ["p1_key_a", "p1_key_b"]
+        ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys_1, partition_id=partition_1, create=True))
+
+        # Create keys in partition 2
+        partition_2 = "partition_kv_2"
+        keys_2 = ["p2_key_x", "p2_key_y", "p2_key_z"]
+        ray.get(tq_controller.kv_retrieve_keys.remote(keys=keys_2, partition_id=partition_2, create=True))
+
+        # Verify partitions are isolated
+        partition_1_snapshot = ray.get(tq_controller.get_partition_snapshot.remote(partition_1))
+        partition_2_snapshot = ray.get(tq_controller.get_partition_snapshot.remote(partition_2))
+
+        assert "p1_key_a" in partition_1_snapshot.keys_mapping
+        assert "p1_key_b" in partition_1_snapshot.keys_mapping
+        assert "p2_key_x" in partition_2_snapshot.keys_mapping
+        assert "p2_key_z" in partition_2_snapshot.keys_mapping
+
+        # Verify cross-partition access is isolated
+        assert "p2_key_x" not in partition_1_snapshot.keys_mapping
+        assert "p1_key_a" not in partition_2_snapshot.keys_mapping
+
+        print("✓ KV interface maintains partition isolation")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_1))
+        ray.get(tq_controller.clear_partition.remote(partition_2))

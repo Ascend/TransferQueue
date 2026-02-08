@@ -289,7 +289,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 5: StreamingDataLoader for Distributed Training
+        TransferQueue Tutorial 6: StreamingDataLoader for Distributed Training
 
         This tutorial demonstrates the StreamingDataLoader interface for distributed
         training scenarios. It showcases how to use StreamingDataset and StreamingDataLoader

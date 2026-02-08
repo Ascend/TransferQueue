@@ -788,64 +788,6 @@ class TestBatchMeta:
     # =====================================================
     # Custom Meta Tests
     # =====================================================
-
-    def test_batch_meta_set_custom_meta_basic(self):
-        """Test set_custom_meta sets metadata for a sample by global_index."""
-        fields = {
-            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
-            "field_b": FieldMeta(name="field_b", dtype=torch.int64, shape=(3,)),
-        }
-        samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-            SampleMeta(partition_id="partition_0", global_index=1, fields=fields),
-        ]
-        batch = BatchMeta(samples=samples)
-
-        # Set custom_meta for sample 0
-        batch.set_custom_meta(0, {"sample_score": 0.9, "quality": "high"})
-
-        result = batch.get_all_custom_meta()
-        assert 0 in result
-        assert result[0]["sample_score"] == 0.9
-        assert result[0]["quality"] == "high"
-        # Sample 1 should not have custom_meta
-        assert 1 not in result
-
-    def test_batch_meta_set_custom_meta_overwrites(self):
-        """Test set_custom_meta overwrites existing metadata."""
-        fields = {
-            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
-        }
-        samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-        ]
-        batch = BatchMeta(samples=samples)
-
-        # Set initial custom_meta
-        batch.set_custom_meta(0, {"sample_score": 0.9, "quality": "high"})
-
-        # Overwrite with new custom_meta
-        batch.set_custom_meta(0, {"sample_score": 0.1, "quality": "low"})
-
-        result = batch.get_all_custom_meta()
-        assert result[0]["sample_score"] == 0.1
-        assert result[0]["quality"] == "low"
-
-    def test_batch_meta_set_custom_meta_invalid_global_index(self):
-        """Test set_custom_meta raises error for invalid global_index."""
-        fields = {
-            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
-        }
-        samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-        ]
-        batch = BatchMeta(samples=samples)
-
-        # Try to set with non-existent global index
-        with pytest.raises(ValueError) as exc_info:
-            batch.set_custom_meta(999, {"sample_score": 0.9})
-        assert "not found in global_indexes" in str(exc_info.value)
-
     def test_batch_meta_update_custom_meta(self):
         """Test update_custom_meta adds metadata for different global indices."""
         fields = {
@@ -859,10 +801,7 @@ class TestBatchMeta:
         batch = BatchMeta(samples=samples)
 
         # Initial custom_meta for sample 0
-        batch.update_custom_meta({0: {"sample_score": 0.9}})
-
-        # Update with metadata for sample 1
-        batch.update_custom_meta({1: {"sample_score": 0.1}})
+        batch.update_custom_meta([{"sample_score": 0.9}, {"sample_score": 0.1}])
 
         result = batch.get_all_custom_meta()
         assert result[0]["sample_score"] == 0.9
@@ -879,10 +818,10 @@ class TestBatchMeta:
         batch = BatchMeta(samples=samples)
 
         # Initial custom_meta
-        batch.update_custom_meta({0: {"sample_score": 0.9, "quality": "high"}})
+        batch.update_custom_meta([{"sample_score": 0.9, "quality": "high"}])
 
         # Update with new value for same field - dict.update replaces
-        batch.update_custom_meta({0: {"sample_score": 0.1, "quality": "low"}})
+        batch.update_custom_meta([{"sample_score": 0.1, "quality": "low"}])
 
         result = batch.get_all_custom_meta()
         assert result[0]["sample_score"] == 0.1
@@ -899,47 +838,13 @@ class TestBatchMeta:
         batch = BatchMeta(samples=samples)
 
         # Set initial value
-        batch.update_custom_meta({0: {"sample_score": 0.9}})
+        batch.update_custom_meta([{"sample_score": 0.9}])
 
         # Update with None should not change anything
         batch.update_custom_meta(None)
 
         result = batch.get_all_custom_meta()
         assert result[0]["sample_score"] == 0.9
-
-    def test_batch_meta_update_custom_meta_with_empty_dict(self):
-        """Test update_custom_meta with empty dict does nothing."""
-        fields = {
-            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
-        }
-        samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-        ]
-        batch = BatchMeta(samples=samples)
-
-        # Set initial value
-        batch.update_custom_meta({0: {"sample_score": 0.9}})
-
-        # Update with empty dict should not change anything
-        batch.update_custom_meta({})
-
-        result = batch.get_all_custom_meta()
-        assert result[0]["sample_score"] == 0.9
-
-    def test_batch_meta_update_custom_meta_invalid_global_index(self):
-        """Test update_custom_meta raises error for invalid global_index."""
-        fields = {
-            "field_a": FieldMeta(name="field_a", dtype=torch.float32, shape=(2,)),
-        }
-        samples = [
-            SampleMeta(partition_id="partition_0", global_index=0, fields=fields),
-        ]
-        batch = BatchMeta(samples=samples)
-
-        # Try to update with non-existent global index
-        with pytest.raises(ValueError) as exc_info:
-            batch.update_custom_meta({999: {"sample_score": 0.9}})
-        assert "non-exist global_indexes" in str(exc_info.value)
 
     def test_batch_meta_clear_custom_meta(self):
         """Test clear_custom_meta removes all custom metadata."""
@@ -953,14 +858,13 @@ class TestBatchMeta:
         batch = BatchMeta(samples=samples)
 
         # Set custom_meta
-        batch.set_custom_meta(0, {"sample_score": 0.9})
-        batch.set_custom_meta(1, {"sample_score": 0.1})
+        batch.update_custom_meta([{"sample_score": 0.9}, {"sample_score": 0.1}])
 
         # Clear all
         batch.clear_custom_meta()
 
         result = batch.get_all_custom_meta()
-        assert result == {}
+        assert result == [{}, {}]
 
     def test_batch_meta_get_all_custom_meta_returns_deep_copy(self):
         """Test get_all_custom_meta returns a deep copy."""
@@ -972,7 +876,7 @@ class TestBatchMeta:
         ]
         batch = BatchMeta(samples=samples)
 
-        custom_meta = {0: {"sample_score": 0.9, "nested": {"value": 1}}}
+        custom_meta = [{"sample_score": 0.9, "nested": {"value": 1}}]
         batch.update_custom_meta(custom_meta)
 
         # Get all custom_meta
@@ -997,7 +901,7 @@ class TestBatchMeta:
         batch = BatchMeta(samples=samples)
 
         result = batch.get_all_custom_meta()
-        assert result == {}
+        assert result == [{}]
 
     def test_batch_meta_custom_meta_with_nested_data(self):
         """Test custom_meta supports nested dictionary data."""
@@ -1013,7 +917,7 @@ class TestBatchMeta:
             "model_info": {"name": "llama", "version": "7b", "config": {"hidden_size": 4096, "num_layers": 32}},
             "tags": ["training", "inference"],
         }
-        batch.set_custom_meta(0, nested_meta)
+        batch.update_custom_meta([nested_meta])
 
         result = batch.get_all_custom_meta()
         assert result[0]["model_info"]["name"] == "llama"
