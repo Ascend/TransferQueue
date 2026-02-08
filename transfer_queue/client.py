@@ -898,6 +898,260 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_partition_list: {str(e)}") from e
 
+    # ── High-level KV Interface ──────────────────────────────────────────
+    # Redis-style Put/Get/List/Clear that wraps the low-level metadata APIs.
+    # String keys are mapped to global_indexes internally.
+
+    def _ensure_kv_index(self):
+        """Lazily create the per-partition kv index."""
+        if not hasattr(self, "_kv_key_to_index"):
+            self._kv_key_to_index: dict[str, dict[str, int]] = {}  # partition_id -> {key -> global_index}
+            self._kv_index_to_key: dict[str, dict[int, str]] = {}  # partition_id -> {global_index -> key}
+
+    async def async_kv_put(
+        self,
+        key: str,
+        fields: dict,
+        partition_id: str = "default",
+        tag: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Insert or update a multi-column sample by key.
+
+        Args:
+            key: Unique string key identifying the sample within the partition.
+            fields: Dictionary mapping field names to tensor values (without batch dim).
+            partition_id: Logical partition namespace.
+            tag: Optional metadata dictionary for status tracking.
+        """
+        await self.async_kv_batch_put(
+            kv_pairs={key: fields},
+            partition_id=partition_id,
+            tags={key: tag} if tag else None,
+        )
+
+    async def async_kv_batch_put(
+        self,
+        kv_pairs: dict[str, dict],
+        partition_id: str = "default",
+        tags: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> None:
+        """Put multiple key-value pairs efficiently in batch.
+
+        Args:
+            kv_pairs: Dictionary mapping keys to field dictionaries.
+            partition_id: Logical partition namespace.
+            tags: Optional dictionary mapping keys to metadata tag dictionaries.
+        """
+        self._ensure_kv_index()
+        if partition_id not in self._kv_key_to_index:
+            self._kv_key_to_index[partition_id] = {}
+            self._kv_index_to_key[partition_id] = {}
+
+        keys = list(kv_pairs.keys())
+        fields_list = list(kv_pairs.values())
+
+        # Stack tensors into a batched TensorDict
+        # All samples must have the same set of field names
+        field_names = sorted(fields_list[0].keys())
+        stacked = {}
+        for fname in field_names:
+            tensors = [f[fname] if isinstance(f[fname], Tensor) else torch.tensor(f[fname]) for f in fields_list]
+            stacked[fname] = torch.stack(tensors, dim=0)
+        data = TensorDict(stacked, batch_size=[len(keys)])
+
+        # Insert via low-level API (allocates global_indexes)
+        metadata = await self.async_put(data, partition_id=partition_id)
+
+        # Record key <-> global_index mapping
+        for i, k in enumerate(keys):
+            gidx = metadata.global_indexes[i]
+            self._kv_key_to_index[partition_id][k] = gidx
+            self._kv_index_to_key[partition_id][gidx] = k
+
+        # Store tags via custom_meta
+        if tags:
+            custom = {}
+            for k, t in tags.items():
+                if t and k in self._kv_key_to_index[partition_id]:
+                    gidx = self._kv_key_to_index[partition_id][k]
+                    custom[gidx] = {**t, "_kv_key": k}
+            if custom:
+                metadata.update_custom_meta(custom)
+                await self.async_set_custom_meta(metadata)
+        else:
+            # Still store key mapping in custom_meta for kv_list
+            custom = {}
+            for k in keys:
+                gidx = self._kv_key_to_index[partition_id][k]
+                custom[gidx] = {"_kv_key": k}
+            metadata.update_custom_meta(custom)
+            await self.async_set_custom_meta(metadata)
+
+    async def async_kv_batch_get(
+        self,
+        keys: list[str],
+        fields: Optional[list[str]] = None,
+        partition_id: str = "default",
+    ) -> dict[str, TensorDict]:
+        """Retrieve samples by keys, supporting column selection by fields.
+
+        Args:
+            keys: List of string keys to retrieve.
+            fields: Optional list of field names. If None, retrieves all fields.
+            partition_id: Logical partition namespace.
+
+        Returns:
+            Dictionary mapping keys to TensorDict of field values.
+        """
+        self._ensure_kv_index()
+        if partition_id not in self._kv_key_to_index:
+            raise ValueError(f"Partition '{partition_id}' has no KV data.")
+
+        key_map = self._kv_key_to_index[partition_id]
+        missing = [k for k in keys if k not in key_map]
+        if missing:
+            raise KeyError(f"Keys not found in partition '{partition_id}': {missing}")
+
+        global_indexes = [key_map[k] for k in keys]
+
+        # Construct a force_fetch to get specific global_indexes
+        # First get meta to know the field schema
+        all_fields = fields if fields else []
+        metadata = await self.async_get_meta(
+            data_fields=all_fields,
+            batch_size=len(keys),
+            partition_id=partition_id,
+            mode="force_fetch",
+        )
+
+        # Build targeted metadata with only the requested global_indexes
+        from transfer_queue.metadata import FieldMeta, SampleMeta
+
+        if fields is None:
+            # Use field names from the fetched metadata
+            fields = metadata.field_names
+
+        samples = []
+        for gidx in global_indexes:
+            sample_fields = {}
+            for fname in fields:
+                # Find the field meta from the full metadata if available
+                field_meta = None
+                for s in metadata.samples:
+                    if s.global_index == gidx:
+                        field_meta = s.fields.get(fname)
+                        break
+                if field_meta is None:
+                    # Construct a minimal field meta
+                    field_meta = FieldMeta(name=fname, dtype=None, shape=None, production_status=1)
+                sample_fields[fname] = field_meta
+            samples.append(SampleMeta(partition_id=partition_id, global_index=gidx, fields=sample_fields))
+
+        target_meta = BatchMeta(samples=samples)
+
+        # Fetch data
+        data = await self.async_get_data(target_meta)
+
+        # Split into per-key results
+        result = {}
+        for i, k in enumerate(keys):
+            per_sample = {}
+            for fname in fields:
+                per_sample[fname] = data[fname][i : i + 1]
+            result[k] = TensorDict(per_sample, batch_size=[1])
+
+        return result
+
+    async def async_kv_list(
+        self,
+        partition_id: str = "default",
+    ) -> list[dict[str, Any]]:
+        """List keys and tags (metadata) in a partition.
+
+        Args:
+            partition_id: Logical partition namespace.
+
+        Returns:
+            List of dictionaries with "key" and optional "tag" entries.
+        """
+        self._ensure_kv_index()
+        if partition_id not in self._kv_key_to_index:
+            return []
+
+        # Get partition metadata including custom_meta
+        metadata = await self._get_partition_meta(partition_id)
+
+        result = []
+        index_to_key = self._kv_index_to_key.get(partition_id, {})
+        for gidx in metadata.global_indexes:
+            entry: dict[str, Any] = {}
+            key = index_to_key.get(gidx)
+            if key is None:
+                # Try to recover from custom_meta
+                cm = metadata.custom_meta.get(gidx, {})
+                key = cm.get("_kv_key", str(gidx))
+            entry["key"] = key
+            cm = metadata.custom_meta.get(gidx, {})
+            tag = {k: v for k, v in cm.items() if k != "_kv_key"}
+            if tag:
+                entry["tag"] = tag
+            result.append(entry)
+        return result
+
+    async def async_kv_clear(
+        self,
+        keys: Optional[list[str]] = None,
+        partition_id: str = "default",
+    ) -> None:
+        """Remove key-value pairs from storage.
+
+        Args:
+            keys: Optional list of string keys to remove. If None, clears entire partition.
+            partition_id: Logical partition namespace.
+        """
+        self._ensure_kv_index()
+
+        if keys is None:
+            await self.async_clear_partition(partition_id)
+            self._kv_key_to_index.pop(partition_id, None)
+            self._kv_index_to_key.pop(partition_id, None)
+        else:
+            key_map = self._kv_key_to_index.get(partition_id, {})
+            from transfer_queue.metadata import FieldMeta, SampleMeta
+
+            global_indexes = []
+            for k in keys:
+                if k in key_map:
+                    global_indexes.append(key_map[k])
+
+            if global_indexes:
+                # Get partition meta to know the field schema
+                partition_meta = await self._get_partition_meta(partition_id)
+                samples = []
+                for gidx in global_indexes:
+                    for s in partition_meta.samples:
+                        if s.global_index == gidx:
+                            samples.append(s)
+                            break
+                    else:
+                        # Construct minimal sample
+                        samples.append(
+                            SampleMeta(
+                                partition_id=partition_id,
+                                global_index=gidx,
+                                fields={fn: FieldMeta(fn, None, None, 1) for fn in partition_meta.field_names},
+                            )
+                        )
+
+                target_meta = BatchMeta(samples=samples)
+                await self.async_clear_samples(target_meta)
+
+            # Clean up local index
+            for k in keys:
+                gidx = key_map.pop(k, None)
+                if gidx is not None and partition_id in self._kv_index_to_key:
+                    self._kv_index_to_key[partition_id].pop(gidx, None)
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager."""
         try:
@@ -972,6 +1226,11 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._get_partition_list = _make_sync(self.async_get_partition_list)
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
         self._reset_consumption = _make_sync(self.async_reset_consumption)
+        self._kv_put = _make_sync(self.async_kv_put)
+        self._kv_batch_put = _make_sync(self.async_kv_batch_put)
+        self._kv_batch_get = _make_sync(self.async_kv_batch_get)
+        self._kv_list = _make_sync(self.async_kv_list)
+        self._kv_clear = _make_sync(self.async_kv_clear)
 
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
@@ -1285,6 +1544,85 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._set_custom_meta(metadata=metadata)
+
+    # ── High-level KV Interface (Sync) ────────────────────────────────────
+
+    def kv_put(
+        self,
+        key: str,
+        fields: dict,
+        partition_id: str = "default",
+        tag: Optional[dict[str, Any]] = None,
+    ) -> None:
+        """Insert or update a multi-column sample by key.
+
+        Args:
+            key: Unique string key identifying the sample within the partition.
+            fields: Dictionary mapping field names to tensor values (without batch dim).
+            partition_id: Logical partition namespace.
+            tag: Optional metadata dictionary for status tracking.
+        """
+        return self._kv_put(key=key, fields=fields, partition_id=partition_id, tag=tag)
+
+    def kv_batch_put(
+        self,
+        kv_pairs: dict[str, dict],
+        partition_id: str = "default",
+        tags: Optional[dict[str, dict[str, Any]]] = None,
+    ) -> None:
+        """Put multiple key-value pairs efficiently in batch.
+
+        Args:
+            kv_pairs: Dictionary mapping keys to field dictionaries.
+            partition_id: Logical partition namespace.
+            tags: Optional dictionary mapping keys to metadata tag dictionaries.
+        """
+        return self._kv_batch_put(kv_pairs=kv_pairs, partition_id=partition_id, tags=tags)
+
+    def kv_batch_get(
+        self,
+        keys: list[str],
+        fields: Optional[list[str]] = None,
+        partition_id: str = "default",
+    ) -> dict[str, TensorDict]:
+        """Retrieve samples by keys, supporting column selection by fields.
+
+        Args:
+            keys: List of string keys to retrieve.
+            fields: Optional list of field names. If None, retrieves all fields.
+            partition_id: Logical partition namespace.
+
+        Returns:
+            Dictionary mapping keys to TensorDict of field values.
+        """
+        return self._kv_batch_get(keys=keys, fields=fields, partition_id=partition_id)
+
+    def kv_list(
+        self,
+        partition_id: str = "default",
+    ) -> list[dict[str, Any]]:
+        """List keys and tags (metadata) in a partition.
+
+        Args:
+            partition_id: Logical partition namespace.
+
+        Returns:
+            List of dictionaries with "key" and optional "tag" entries.
+        """
+        return self._kv_list(partition_id=partition_id)
+
+    def kv_clear(
+        self,
+        keys: Optional[list[str]] = None,
+        partition_id: str = "default",
+    ) -> None:
+        """Remove key-value pairs from storage.
+
+        Args:
+            keys: Optional list of string keys to remove. If None, clears entire partition.
+            partition_id: Logical partition namespace.
+        """
+        return self._kv_clear(keys=keys, partition_id=partition_id)
 
     def close(self) -> None:
         """Close the client and cleanup resources including event loop and thread."""

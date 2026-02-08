@@ -625,6 +625,222 @@ async def async_clear_partition(partition_id: str):
     return await tq_client.async_clear_partition(partition_id)
 
 
+def kv_put(
+    key: str,
+    fields: dict,
+    partition_id: str = "default",
+    tag: Optional[dict[str, Any]] = None,
+) -> None:
+    """Insert or update a multi-column sample by key, with optional metadata tag.
+
+    This is a high-level KV-style API that provides Redis-like Put/Get/List semantics
+    on top of TransferQueue's storage backends.
+
+    Args:
+        key: Unique string key identifying the sample within the partition.
+        fields: Dictionary mapping field names to tensor values.
+                Each value should be a torch.Tensor (without batch dimension).
+        partition_id: Logical partition namespace. Defaults to "default".
+        tag: Optional lightweight metadata dictionary for status tracking.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> tq.kv_put(
+        ...     key="sample_0",
+        ...     fields={"input_ids": torch.tensor([1, 2, 3]), "score": torch.tensor([0.95])},
+        ...     partition_id="rollout_v1",
+        ...     tag={"status": "completed"},
+        ... )
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return tq_client.kv_put(key, fields, partition_id, tag)
+
+
+async def async_kv_put(
+    key: str,
+    fields: dict,
+    partition_id: str = "default",
+    tag: Optional[dict[str, Any]] = None,
+) -> None:
+    """Asynchronously insert or update a multi-column sample by key, with optional metadata tag.
+
+    Args:
+        key: Unique string key identifying the sample within the partition.
+        fields: Dictionary mapping field names to tensor values.
+        partition_id: Logical partition namespace. Defaults to "default".
+        tag: Optional lightweight metadata dictionary for status tracking.
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return await tq_client.async_kv_put(key, fields, partition_id, tag)
+
+
+def kv_batch_put(
+    kv_pairs: dict[str, dict],
+    partition_id: str = "default",
+    tags: Optional[dict[str, dict[str, Any]]] = None,
+) -> None:
+    """Put multiple key-value pairs efficiently in batch.
+
+    Args:
+        kv_pairs: Dictionary mapping keys to field dictionaries.
+                  Each field dictionary maps field names to tensor values.
+        partition_id: Logical partition namespace. Defaults to "default".
+        tags: Optional dictionary mapping keys to metadata tag dictionaries.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> tq.kv_batch_put(
+        ...     kv_pairs={
+        ...         "s0": {"input_ids": torch.tensor([1, 2]), "reward": torch.tensor([0.5])},
+        ...         "s1": {"input_ids": torch.tensor([3, 4]), "reward": torch.tensor([0.8])},
+        ...     },
+        ...     partition_id="rollout_v1",
+        ...     tags={"s0": {"status": "done"}, "s1": {"status": "done"}},
+        ... )
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return tq_client.kv_batch_put(kv_pairs, partition_id, tags)
+
+
+async def async_kv_batch_put(
+    kv_pairs: dict[str, dict],
+    partition_id: str = "default",
+    tags: Optional[dict[str, dict[str, Any]]] = None,
+) -> None:
+    """Asynchronously put multiple key-value pairs efficiently in batch.
+
+    Args:
+        kv_pairs: Dictionary mapping keys to field dictionaries.
+        partition_id: Logical partition namespace. Defaults to "default".
+        tags: Optional dictionary mapping keys to metadata tag dictionaries.
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return await tq_client.async_kv_batch_put(kv_pairs, partition_id, tags)
+
+
+def kv_batch_get(
+    keys: list[str],
+    fields: Optional[list[str]] = None,
+    partition_id: str = "default",
+) -> dict[str, TensorDict]:
+    """Retrieve samples by keys, supporting column selection by fields.
+
+    Args:
+        keys: List of string keys to retrieve.
+        fields: Optional list of field names to retrieve. If None, retrieves all fields.
+        partition_id: Logical partition namespace. Defaults to "default".
+
+    Returns:
+        Dictionary mapping keys to TensorDict of field values.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> results = tq.kv_batch_get(
+        ...     keys=["s0", "s1"],
+        ...     fields=["input_ids"],
+        ...     partition_id="rollout_v1",
+        ... )
+        >>> print(results["s0"]["input_ids"])
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return tq_client.kv_batch_get(keys, fields, partition_id)
+
+
+async def async_kv_batch_get(
+    keys: list[str],
+    fields: Optional[list[str]] = None,
+    partition_id: str = "default",
+) -> dict[str, TensorDict]:
+    """Asynchronously retrieve samples by keys, supporting column selection by fields.
+
+    Args:
+        keys: List of string keys to retrieve.
+        fields: Optional list of field names to retrieve. If None, retrieves all fields.
+        partition_id: Logical partition namespace. Defaults to "default".
+
+    Returns:
+        Dictionary mapping keys to TensorDict of field values.
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return await tq_client.async_kv_batch_get(keys, fields, partition_id)
+
+
+def kv_list(
+    partition_id: str = "default",
+) -> list[dict[str, Any]]:
+    """List keys and tags (metadata) in a partition.
+
+    Args:
+        partition_id: Logical partition namespace. Defaults to "default".
+
+    Returns:
+        List of dictionaries, each containing "key" and optional "tag" entries.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> entries = tq.kv_list(partition_id="rollout_v1")
+        >>> for entry in entries:
+        ...     print(f"Key: {entry['key']}, Tag: {entry.get('tag', {})}")
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return tq_client.kv_list(partition_id)
+
+
+async def async_kv_list(
+    partition_id: str = "default",
+) -> list[dict[str, Any]]:
+    """Asynchronously list keys and tags (metadata) in a partition.
+
+    Args:
+        partition_id: Logical partition namespace. Defaults to "default".
+
+    Returns:
+        List of dictionaries, each containing "key" and optional "tag" entries.
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return await tq_client.async_kv_list(partition_id)
+
+
+def kv_clear(
+    keys: Optional[list[str]] = None,
+    partition_id: str = "default",
+) -> None:
+    """Remove key-value pairs from storage.
+
+    If keys is None, clears the entire partition.
+
+    Args:
+        keys: Optional list of string keys to remove. If None, clears all keys in the partition.
+        partition_id: Logical partition namespace. Defaults to "default".
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> tq.kv_clear(keys=["s0", "s1"], partition_id="rollout_v1")
+        >>> tq.kv_clear(partition_id="rollout_v1")  # Clear entire partition
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return tq_client.kv_clear(keys, partition_id)
+
+
+async def async_kv_clear(
+    keys: Optional[list[str]] = None,
+    partition_id: str = "default",
+) -> None:
+    """Asynchronously remove key-value pairs from storage.
+
+    Args:
+        keys: Optional list of string keys to remove. If None, clears all keys in the partition.
+        partition_id: Logical partition namespace. Defaults to "default".
+    """
+    tq_client = _maybe_create_transferqueue_client()
+    return await tq_client.async_kv_clear(keys, partition_id)
+
+
 def close():
     """Close the TransferQueue system."""
     global _TRANSFER_QUEUE_CLIENT
