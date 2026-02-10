@@ -202,7 +202,18 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
         10: {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},
     }
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+
+    for global_idx, field_metas in custom_backend_meta.items():
+        template = SampleMeta(
+            partition_id="",
+            global_index=global_idx,
+            fields={
+                fname: FieldMeta(name=fname, dtype=None, shape=None, _custom_backend_meta=meta)
+                for fname, meta in field_metas.items()
+            },
+            custom_meta={}
+        )
+        next((s for s in metadata.samples if s.global_index == global_idx), None).union(template, validate=False)
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
@@ -230,7 +241,18 @@ def test_get_shape_type_custom_backend_meta_list_with_partial_custom_meta(test_d
         10: {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # label and mask only
     }
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+
+    for global_idx, field_metas in custom_backend_meta.items():
+        template = SampleMeta(
+            partition_id="",
+            global_index=global_idx,
+            fields={
+                fname: FieldMeta(name=fname, dtype=None, shape=None, _custom_backend_meta=meta)
+                for fname, meta in field_metas.items()
+            },
+            custom_meta={}
+        )
+        next((s for s in metadata.samples if s.global_index == global_idx), None).union(template, validate=False)
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 

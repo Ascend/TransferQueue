@@ -25,7 +25,7 @@ from tensordict.tensorclass import NonTensorStack
 
 # Setup path
 parent_dir = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(parent_dir))
+sys.path.append(str(parent_dir))
 
 from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
 from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
