@@ -30,11 +30,16 @@ class RayStorageManager(KVStorageManager):
     """Storage manager for Ray-RDT backend."""
 
     def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
-        client_name = config.get("client_name", None)
-
-        if client_name is None:
-            logger.info("Missing 'client_name' in config, using default value('RayStorageClient')")
-            config["client_name"] = "RayStorageClient"
-        elif client_name != "RayStorageClient":
-            raise ValueError(f"Invalid 'client_name': {client_name} in config. Expecting 'RayStorageClient'")
-        super().__init__(controller_info, config)
+        client_name = config.get("client_name")
+        if client_name is not None and client_name != "RayStorageClient":
+            raise ValueError(
+                f"Invalid 'client_name': {client_name} in config. "
+                f"RayStorageManager only supports 'RayStorageClient'"
+            )
+        
+        ray_storage_client_name = "RayStorageClient"
+        
+        super().__init__(
+            controller_info,
+            {**config, "client_name": ray_storage_client_name}  
+        )
