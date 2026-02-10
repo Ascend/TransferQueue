@@ -48,6 +48,7 @@ class FieldMeta:
     dtype: Optional[Any]  # Data type (e.g., torch.float32, numpy.float32)
     shape: Optional[Any]  # Data shape (e.g., torch.Size([3, 224, 224]), (3, 224, 224))
     production_status: ProductionStatus = ProductionStatus.NOT_PRODUCED
+    _custom_backend_meta: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         return (
@@ -70,6 +71,7 @@ class FieldMeta:
             production_status=ProductionStatus(str(data["production_status"]))
             if isinstance(data["production_status"], int | str)
             else data["production_status"],
+            _custom_backend_meta=data.get("_custom_backend_meta", {}),
         )
 
 
@@ -80,6 +82,7 @@ class SampleMeta:
     partition_id: str  # Partition id, used for data versioning
     global_index: int  # Global row index, uniquely identifies a data sample
     fields: dict[str, FieldMeta]  # Fields of interest for this sample
+    custom_meta: dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize is_ready property based on field readiness"""
@@ -137,11 +140,11 @@ class SampleMeta:
         selected_fields = {name: self.fields[name] for name in field_names if name in self.fields}
 
         # construct new SampleMeta instance
-        # TODO(tianyi): (maybe) move _custom_backend_meta and custom_meta to FieldMeta level?
         selected_sample_meta = SampleMeta(
             fields=selected_fields,
             partition_id=self.partition_id,
             global_index=self.global_index,
+            custom_meta=copy.deepcopy(self.custom_meta),
         )
 
         return selected_sample_meta
@@ -168,6 +171,9 @@ class SampleMeta:
         # Merge fields
         self.fields = _union_fields(self.fields, other.fields)
 
+        # Merge custom meta
+        self.custom_meta = {**self.custom_meta, **other.custom_meta}
+
         # Update is_ready property
         object.__setattr__(self, "_is_ready", all(field.is_ready for field in self.fields.values()))
         return self
@@ -193,6 +199,7 @@ class SampleMeta:
             partition_id=data["partition_id"],
             global_index=data["global_index"],
             fields=fields,
+            custom_meta=data.get("custom_meta", {}),
         )
 
 
@@ -204,12 +211,6 @@ class BatchMeta:
 
     # external meta for non-sample level information
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
-
-    # user-defined meta for each sample
-    custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
-
-    # internal meta for different storage backends in per-sample per-field level
-    _custom_backend_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
@@ -235,16 +236,7 @@ class BatchMeta:
 
             object.__setattr__(self, "_partition_ids", [sample.partition_id for sample in self.samples])
 
-            # filter custom_meta and _custom_backend_meta
-            self.custom_meta = copy.deepcopy(
-                {k: self.custom_meta[k] for k in self.global_indexes if k in self.custom_meta}
-            )
-            self._custom_backend_meta = copy.deepcopy(
-                {k: self._custom_backend_meta[k] for k in self.global_indexes if k in self._custom_backend_meta}
-            )
         else:
-            self.custom_meta = {}
-            self._custom_backend_meta = {}
             object.__setattr__(self, "_global_indexes", [])
             object.__setattr__(self, "_field_names", [])
             object.__setattr__(self, "_partition_ids", [])
@@ -321,7 +313,10 @@ class BatchMeta:
         if global_index not in self.global_indexes:
             raise ValueError(f"key {global_index} not found in global_indexes {self.global_indexes}.")
 
-        self.custom_meta[global_index] = copy.deepcopy(meta_dict)
+        for sample in self.samples:
+            if sample.global_index == global_index:
+                sample.custom_meta = copy.deepcopy(meta_dict)
+                break
 
     def get_all_custom_meta(self) -> dict[int, dict[str, Any]]:
         """
@@ -330,7 +325,7 @@ class BatchMeta:
         Returns:
             A deep copy of the custom_meta dictionary
         """
-        return copy.deepcopy(self.custom_meta)
+        return {s.global_index: copy.deepcopy(s.custom_meta) for s in self.samples if s.custom_meta}
 
     def update_custom_meta(self, new_meta: dict[int, dict[str, Any]]):
         """
@@ -356,7 +351,11 @@ class BatchMeta:
                 f"do not exist in this batch."
             )
 
-        self.custom_meta.update(new_meta)
+        for global_index, meta_dict in new_meta.items():
+            for sample in self.samples:
+                if sample.global_index == global_index:
+                    sample.custom_meta.update(copy.deepcopy(meta_dict))
+                    break
 
     def clear_custom_meta(self) -> None:
         """
@@ -364,7 +363,8 @@ class BatchMeta:
 
         This method removes all entries from the custom_meta dictionary.
         """
-        self.custom_meta.clear()
+        for sample in self.samples:
+            sample.custom_meta.clear()
 
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """
@@ -407,18 +407,10 @@ class BatchMeta:
 
         selected_samples = [self.samples[i] for i in indexes]
 
-        global_indexes = [self.global_indexes[i] for i in indexes]
-        selected_custom_meta = {i: self.custom_meta[i] for i in global_indexes if i in self.custom_meta}
-        selected_custom_backend_meta = {
-            i: self._custom_backend_meta[i] for i in global_indexes if i in self._custom_backend_meta
-        }
-
         # construct new BatchMeta instance
         selected_batch_meta = BatchMeta(
             samples=selected_samples,
             extra_info=self.extra_info,
-            custom_meta=selected_custom_meta,
-            _custom_backend_meta=selected_custom_backend_meta,
         )
 
         return selected_batch_meta
@@ -437,22 +429,10 @@ class BatchMeta:
         # select fields for each SampleMeta
         new_samples = [sample.select_fields(field_names=field_names) for sample in self.samples]
 
-        # select fields in _custom_backend_meta
-        selected_custom_backend_meta = {}
-        for idx in self.global_indexes:
-            if idx in self._custom_backend_meta:
-                custom_backend_meta_idx = self._custom_backend_meta[idx]
-
-                selected_custom_backend_meta[idx] = {
-                    field: custom_backend_meta_idx[field] for field in field_names if field in custom_backend_meta_idx
-                }
-
         # construct new BatchMeta instance
         new_batch_meta = BatchMeta(
             samples=new_samples,
             extra_info=self.extra_info,
-            custom_meta=self.custom_meta,
-            _custom_backend_meta=selected_custom_backend_meta,
         )
 
         return new_batch_meta
@@ -464,23 +444,10 @@ class BatchMeta:
     def __getitem__(self, item):
         if isinstance(item, int | np.integer):
             sample_meta = self.samples[item] if self.samples else []
-            global_idx = self.global_indexes[item]
-
-            if global_idx in self.custom_meta:
-                custom_meta = {global_idx: self.custom_meta[global_idx]}
-            else:
-                custom_meta = {}
-
-            if global_idx in self._custom_backend_meta:
-                custom_backend_meta = {global_idx: self._custom_backend_meta[global_idx]}
-            else:
-                custom_backend_meta = {}
 
             return BatchMeta(
                 samples=[sample_meta],
                 extra_info=self.extra_info,
-                custom_meta=custom_meta,
-                _custom_backend_meta=custom_backend_meta,
             )
         else:
             raise TypeError(f"Indexing with {type(item)} is not supported now!")
@@ -514,16 +481,9 @@ class BatchMeta:
             current_chunk_size = base_size + 1 if i < remainder else base_size
             end = start + current_chunk_size
             chunk_samples = self.samples[start:end]
-            global_indexes = self.global_indexes[start:end]
-            chunk_custom_meta = {i: self.custom_meta[i] for i in global_indexes if i in self.custom_meta}
-            chunk_custom_backend_meta = {
-                i: self._custom_backend_meta[i] for i in global_indexes if i in self._custom_backend_meta
-            }
             chunk = BatchMeta(
                 samples=chunk_samples,
                 extra_info=self.extra_info,
-                custom_meta=chunk_custom_meta,
-                _custom_backend_meta=chunk_custom_backend_meta,
             )
             chunk_list.append(chunk)
             start = end
@@ -564,14 +524,14 @@ class BatchMeta:
         """
         if not data:
             logger.warning("Try to concat empty BatchMeta chunks. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
+            return BatchMeta(samples=[], extra_info={})
 
         # skip empty chunks
         data = [chunk for chunk in data if chunk and len(chunk.samples) > 0]
 
         if len(data) == 0:
             logger.warning("No valid BatchMeta chunks to concatenate. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
+            return BatchMeta(samples=[], extra_info={})
 
         if validate:
             base_fields = data[0].field_names
@@ -585,15 +545,9 @@ class BatchMeta:
 
         # Merge all extra_info dictionaries from the chunks
         merged_extra_info = dict()
-        merged_custom_meta = dict()
-        merged_custom_backend_meta = dict()
 
         values_by_key = defaultdict(list)
         for chunk in data:
-            # For the sample-level custom_meta and field-level _custom_backend_meta, we directly update the dict.
-            merged_custom_meta.update(chunk.custom_meta)
-            merged_custom_backend_meta.update(chunk._custom_backend_meta)
-
             for key, value in chunk.extra_info.items():
                 values_by_key[key].append(value)
 
@@ -622,8 +576,6 @@ class BatchMeta:
         return BatchMeta(
             samples=all_samples,
             extra_info=merged_extra_info,
-            custom_meta=merged_custom_meta,
-            _custom_backend_meta=merged_custom_backend_meta,
         )
 
     def union(self, other: "BatchMeta", validate: bool = True) -> Optional["BatchMeta"]:
@@ -670,24 +622,9 @@ class BatchMeta:
         # Merge extra info dictionaries
         merged_extra_info = {**self.extra_info, **other.extra_info}
 
-        # Merge custom_meta dictionaries
-        merged_custom_meta = {**self.custom_meta, **other.custom_meta}
-
-        # Merge custom_backend_meta dictionaries
-        merged_custom_backend_meta = {}
-        for idx in self.global_indexes:
-            if idx in self._custom_backend_meta and idx in other._custom_backend_meta:
-                merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx], **other._custom_backend_meta[idx]}
-            elif idx in self._custom_backend_meta:
-                merged_custom_backend_meta[idx] = {**self._custom_backend_meta[idx]}
-            elif idx in other._custom_backend_meta:
-                merged_custom_backend_meta[idx] = {**other._custom_backend_meta[idx]}
-
         return BatchMeta(
             samples=merged_samples,
             extra_info=merged_extra_info,
-            custom_meta=merged_custom_meta,
-            _custom_backend_meta=merged_custom_backend_meta,
         )
 
     def reorder(self, indexes: list[int]):
@@ -784,7 +721,7 @@ class BatchMeta:
         """
         if extra_info is None:
             extra_info = {}
-        return cls(samples=[], extra_info=extra_info, custom_meta={}, _custom_backend_meta={})
+        return cls(samples=[], extra_info=extra_info)
 
     def __str__(self):
         sample_strs = ", ".join(str(sample) for sample in self.samples)
@@ -803,8 +740,6 @@ class BatchMeta:
         return cls(
             samples=samples,
             extra_info=data.get("extra_info", {}),
-            custom_meta=data.get("custom_meta", {}),
-            _custom_backend_meta=data.get("_custom_backend_meta", {}),
         )
 
 

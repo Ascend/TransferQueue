@@ -1293,6 +1293,9 @@ class TransferQueueController:
         if mode not in ["fetch", "insert", "force_fetch"]:
             raise ValueError(f"Invalid mode: {mode}")
 
+        custom_meta = partition.get_custom_meta(batch_global_indexes)
+        custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
+
         # Generate sample metadata
         samples = []
         for global_index in batch_global_indexes:
@@ -1322,11 +1325,16 @@ class TransferQueueController:
                         dtype = None
                         shape = None
 
+                backend_meta = {}
+                if global_index in custom_backend_meta and field_name in custom_backend_meta[global_index]:
+                    backend_meta = copy.deepcopy(custom_backend_meta[global_index][field_name])
+
                 fields[field_name] = FieldMeta(
                     name=field_name,
                     dtype=dtype,
                     shape=shape,
                     production_status=production_status,
+                    _custom_backend_meta=backend_meta,
                 )
 
             sample = SampleMeta(
@@ -1336,12 +1344,8 @@ class TransferQueueController:
             )
             samples.append(sample)
 
-        custom_meta = partition.get_custom_meta(batch_global_indexes)
-        custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
-
         batch_meta = BatchMeta(samples=samples)
         batch_meta.update_custom_meta(custom_meta)
-        batch_meta._custom_backend_meta.update(custom_backend_meta)
         return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
