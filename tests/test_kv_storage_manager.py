@@ -211,7 +211,7 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_meta(test_data):
                 fname: FieldMeta(name=fname, dtype=None, shape=None, _custom_backend_meta=meta)
                 for fname, meta in field_metas.items()
             },
-            custom_meta={}
+            custom_meta={},
         )
         next((s for s in metadata.samples if s.global_index == global_idx), None).union(template, validate=False)
 
@@ -250,7 +250,7 @@ def test_get_shape_type_custom_backend_meta_list_with_partial_custom_meta(test_d
                 fname: FieldMeta(name=fname, dtype=None, shape=None, _custom_backend_meta=meta)
                 for fname, meta in field_metas.items()
             },
-            custom_meta={}
+            custom_meta={},
         )
         next((s for s in metadata.samples if s.global_index == global_idx), None).union(template, validate=False)
 
