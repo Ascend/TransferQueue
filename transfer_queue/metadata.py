@@ -144,7 +144,7 @@ class SampleMeta:
             fields=selected_fields,
             partition_id=self.partition_id,
             global_index=self.global_index,
-            custom_meta=copy.deepcopy(self.custom_meta)
+            custom_meta=copy.deepcopy(self.custom_meta),
         )
 
         return selected_sample_meta
@@ -350,7 +350,7 @@ class BatchMeta:
                 f"Trying to update custom_meta with non-exist global_indexes! {non_exist_global_indexes} "
                 f"do not exist in this batch."
             )
-        
+
         for global_index, meta_dict in new_meta.items():
             for sample in self.samples:
                 if sample.global_index == global_index:
@@ -444,7 +444,6 @@ class BatchMeta:
     def __getitem__(self, item):
         if isinstance(item, int | np.integer):
             sample_meta = self.samples[item] if self.samples else []
-            global_idx = self.global_indexes[item]
 
             return BatchMeta(
                 samples=[sample_meta],
@@ -525,14 +524,14 @@ class BatchMeta:
         """
         if not data:
             logger.warning("Try to concat empty BatchMeta chunks. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
+            return BatchMeta(samples=[], extra_info={})
 
         # skip empty chunks
         data = [chunk for chunk in data if chunk and len(chunk.samples) > 0]
 
         if len(data) == 0:
             logger.warning("No valid BatchMeta chunks to concatenate. Returning empty BatchMeta.")
-            return BatchMeta(samples=[], extra_info={}, custom_meta={}, _custom_backend_meta={})
+            return BatchMeta(samples=[], extra_info={})
 
         if validate:
             base_fields = data[0].field_names

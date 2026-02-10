@@ -37,26 +37,36 @@ class TestFieldMeta:
     def test_field_meta_is_ready(self):
         """Test the is_ready property based on production status."""
         field_ready = FieldMeta(
-            name="test_field", dtype=torch.float32, shape=(2, 3), production_status=ProductionStatus.READY_FOR_CONSUME,
-            _custom_backend_meta={"test_field": {"dtype": torch.float32}}
+            name="test_field",
+            dtype=torch.float32,
+            shape=(2, 3),
+            production_status=ProductionStatus.READY_FOR_CONSUME,
+            _custom_backend_meta={"test_field": {"dtype": torch.float32}},
         )
         assert field_ready.is_ready is True
 
         field_not_ready = FieldMeta(
-            name="test_field", dtype=torch.float32, shape=(2, 3), production_status=ProductionStatus.NOT_PRODUCED,
-            _custom_backend_meta={"test_field": {"dtype": torch.float32}}
+            name="test_field",
+            dtype=torch.float32,
+            shape=(2, 3),
+            production_status=ProductionStatus.NOT_PRODUCED,
+            _custom_backend_meta={"test_field": {"dtype": torch.float32}},
         )
         assert field_not_ready.is_ready is False
 
     def test_filed_meta_complete_integrity(self):
         """Test the complete_integrity property based on production status."""
         field_complete = FieldMeta(
-            name="test_field", dtype=torch.float32, shape=(2, 3), production_status=ProductionStatus.READY_FOR_CONSUME,
-            _custom_backend_meta={"test_field": {"dtype": torch.float32}}
+            name="test_field",
+            dtype=torch.float32,
+            shape=(2, 3),
+            production_status=ProductionStatus.READY_FOR_CONSUME,
+            _custom_backend_meta={"test_field": {"dtype": torch.float32}},
         )
 
         assert field_complete.name == "test_field"
         assert field_complete._custom_backend_meta["test_field"]["dtype"] == torch.float32
+
 
 class TestSampleMeta:
     """SampleMeta learning examples."""
@@ -68,16 +78,24 @@ class TestSampleMeta:
             "field1": FieldMeta(name="field1", dtype=torch.float32, shape=(2,)),
             "field2": FieldMeta(name="field2", dtype=torch.int64, shape=(3,)),
         }
-        sample1 = SampleMeta(partition_id="partition_0", global_index=0, fields=fields1, 
-                             custom_meta={"fields": "fields1", "global_index": 0})
+        sample1 = SampleMeta(
+            partition_id="partition_0",
+            global_index=0,
+            fields=fields1,
+            custom_meta={"fields": "fields1", "global_index": 0},
+        )
 
         # Create second sample with additional fields
         fields2 = {
             "field2": FieldMeta(name="field2", dtype=torch.int64, shape=(3,)),
             "field3": FieldMeta(name="field3", dtype=torch.bool, shape=(4,)),
         }
-        sample2 = SampleMeta(partition_id="partition_0", global_index=0, fields=fields2,
-                             custom_meta={"fields": "fields2", "global_index": 0})
+        sample2 = SampleMeta(
+            partition_id="partition_0",
+            global_index=0,
+            fields=fields2,
+            custom_meta={"fields": "fields2", "global_index": 0},
+        )
 
         # Union samples
         result = sample1.union(sample2)
@@ -95,16 +113,25 @@ class TestSampleMeta:
         sample1 = SampleMeta(
             partition_id="partition_0",
             global_index=0,
-            fields={"field1": FieldMeta(name="field1", dtype=torch.float32, shape=(2,),
-                                        _custom_backend_meta={"backend_type": "float32_tensor"})},
+            fields={
+                "field1": FieldMeta(
+                    name="field1",
+                    dtype=torch.float32,
+                    shape=(2,),
+                    _custom_backend_meta={"backend_type": "float32_tensor"},
+                )
+            },
             custom_meta={"source": "dataset_A"},
         )
 
         sample2 = SampleMeta(
             partition_id="partition_0",
             global_index=1,  # Different global index
-            fields={"field2": FieldMeta(name="field2", dtype=torch.int64, shape=(3,),
-                                        _custom_backend_meta={"backend_type": "int64_tensor"})},
+            fields={
+                "field2": FieldMeta(
+                    name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend_type": "int64_tensor"}
+                )
+            },
             custom_meta={"source": "dataset_B"},
         )
 
@@ -116,17 +143,27 @@ class TestSampleMeta:
         """Example: Add new fields to a sample."""
         initial_fields = {
             "field1": FieldMeta(
-                name="field1", dtype=torch.float32, shape=(2,), production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"field1": {"dtype": torch.float32}}
+                name="field1",
+                dtype=torch.float32,
+                shape=(2,),
+                production_status=ProductionStatus.READY_FOR_CONSUME,
+                _custom_backend_meta={"field1": {"dtype": torch.float32}},
             )
         }
-        sample = SampleMeta(partition_id="partition_0", global_index=0, fields=initial_fields,
-                            custom_meta={"fields": "fields1", "global_index": 0})
+        sample = SampleMeta(
+            partition_id="partition_0",
+            global_index=0,
+            fields=initial_fields,
+            custom_meta={"fields": "fields1", "global_index": 0},
+        )
 
         new_fields = {
             "field2": FieldMeta(
-                name="field2", dtype=torch.int64, shape=(3,), production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"field2": {"dtype": torch.int64}}
+                name="field2",
+                dtype=torch.int64,
+                shape=(3,),
+                production_status=ProductionStatus.READY_FOR_CONSUME,
+                _custom_backend_meta={"field2": {"dtype": torch.int64}},
             )
         }
         sample.add_fields(new_fields)
@@ -141,29 +178,20 @@ class TestSampleMeta:
         """Example: Select specific fields from a sample."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,), 
-                _custom_backend_meta={"backend_type": "float32_tensor"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"backend_type": "float32_tensor"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,), 
-                _custom_backend_meta={"backend_type": "int64_tensor"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend_type": "int64_tensor"}
             ),
             "field3": FieldMeta(
-                name="field3", 
-                dtype=torch.bool, 
-                shape=(4,), 
-                _custom_backend_meta={"backend_type": "bool_tensor"}
+                name="field3", dtype=torch.bool, shape=(4,), _custom_backend_meta={"backend_type": "bool_tensor"}
             ),
         }
         sample = SampleMeta(
-            partition_id="partition_0", 
-            global_index=0, 
+            partition_id="partition_0",
+            global_index=0,
             fields=fields,
-            custom_meta={"source": "dataset_X", "priority": "high"}
+            custom_meta={"source": "dataset_X", "priority": "high"},
         )
 
         # Select only field1 and field3
@@ -190,24 +218,13 @@ class TestSampleMeta:
         """Example: Select fields ignores non-existent field names."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,), 
-                _custom_backend_meta={"backend_type": "float32_tensor"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"backend_type": "float32_tensor"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,), 
-                _custom_backend_meta={"backend_type": "int64_tensor"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend_type": "int64_tensor"}
             ),
         }
-        sample = SampleMeta(
-            partition_id="partition_0", 
-            global_index=0, 
-            fields=fields,
-            custom_meta={"valid": True}
-        )
+        sample = SampleMeta(partition_id="partition_0", global_index=0, fields=fields, custom_meta={"valid": True})
 
         # Try to select a field that doesn't exist
         selected_sample = sample.select_fields(["field1", "nonexistent_field"])
@@ -225,23 +242,14 @@ class TestSampleMeta:
         """Example: Select with empty field list returns sample with no fields."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,), 
-                _custom_backend_meta={"backend_type": "float32_tensor"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"backend_type": "float32_tensor"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,), 
-                _custom_backend_meta={"backend_type": "int64_tensor"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend_type": "int64_tensor"}
             ),
         }
         sample = SampleMeta(
-            partition_id="partition_0", 
-            global_index=0, 
-            fields=fields,
-            custom_meta={"metadata_version": 2}
+            partition_id="partition_0", global_index=0, fields=fields, custom_meta={"metadata_version": 2}
         )
 
         # Select with empty list
@@ -253,6 +261,7 @@ class TestSampleMeta:
         # Verify custom_meta is preserved even with no fields
         assert selected_sample.custom_meta == {"metadata_version": 2}
 
+
 class TestBatchMeta:
     """BatchMeta learning examples - Core Operations."""
 
@@ -263,21 +272,21 @@ class TestBatchMeta:
         for i in range(10):
             fields = {
                 "test_field": FieldMeta(
-                    name="test_field", 
-                    dtype=torch.float32, 
-                    shape=(2,), 
+                    name="test_field",
+                    dtype=torch.float32,
+                    shape=(2,),
                     production_status=ProductionStatus.READY_FOR_CONSUME,
-                    _custom_backend_meta={"dtype": torch.float32}  # Moved to FieldMeta
+                    _custom_backend_meta={"dtype": torch.float32},  # Moved to FieldMeta
                 )
             }
             sample = SampleMeta(
-                partition_id="partition_0", 
-                global_index=i, 
+                partition_id="partition_0",
+                global_index=i,
                 fields=fields,
-                custom_meta={"uid": i}  # Moved to SampleMeta
+                custom_meta={"uid": i},  # Moved to SampleMeta
             )
             samples.append(sample)
-        
+
         batch = BatchMeta(samples=samples)  # Removed custom_meta/_custom_backend_meta params
 
         # Chunk into 3 parts
@@ -311,21 +320,18 @@ class TestBatchMeta:
         for i in range(10):
             fields = {
                 "test_field": FieldMeta(
-                    name="test_field", 
-                    dtype=torch.float32, 
-                    shape=(2,), 
+                    name="test_field",
+                    dtype=torch.float32,
+                    shape=(2,),
                     production_status=ProductionStatus.READY_FOR_CONSUME,
-                    _custom_backend_meta={"dtype": torch.float32}
+                    _custom_backend_meta={"dtype": torch.float32},
                 )
             }
             sample = SampleMeta(
-                partition_id=f"partition_{i % 4}", 
-                global_index=i + 10, 
-                fields=fields,
-                custom_meta={"uid": i + 10}
+                partition_id=f"partition_{i % 4}", global_index=i + 10, fields=fields, custom_meta={"uid": i + 10}
             )
             samples.append(sample)
-        
+
         batch = BatchMeta(samples=samples)  # Removed custom_meta/_custom_backend_meta params
 
         # Chunk according to partition_id
@@ -374,11 +380,11 @@ class TestBatchMeta:
         """Example: Concatenate multiple batches."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
 
@@ -504,31 +510,20 @@ class TestBatchMeta:
         """Example: Union two batches with matching global indexes."""
         fields1 = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,),
-                _custom_backend_meta={"backend": "float32"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"backend": "float32"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,),
-                _custom_backend_meta={"backend": "int64"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend": "int64"}
             ),
         }
         fields2 = {
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
+                name="field2",
+                dtype=torch.int64,
                 shape=(3,),
-                _custom_backend_meta={"backend": "int64", "compression": "lz4"}
+                _custom_backend_meta={"backend": "int64", "compression": "lz4"},
             ),
-            "field3": FieldMeta(
-                name="field3", 
-                dtype=torch.bool, 
-                shape=(4,),
-                _custom_backend_meta={"backend": "bool"}
-            ),
+            "field3": FieldMeta(name="field3", dtype=torch.bool, shape=(4,), _custom_backend_meta={"backend": "bool"}),
         }
 
         batch1 = BatchMeta(
@@ -639,23 +634,12 @@ class TestBatchMeta:
         """Example: Select specific fields from all samples in a batch."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,),
-                _custom_backend_meta={"precision": "fp32"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"precision": "fp32"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,),
-                _custom_backend_meta={"encoding": "varint"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"encoding": "varint"}
             ),
-            "field3": FieldMeta(
-                name="field3", 
-                dtype=torch.bool, 
-                shape=(4,),
-                _custom_backend_meta={"packing": "bit"}
-            ),
+            "field3": FieldMeta(name="field3", dtype=torch.bool, shape=(4,), _custom_backend_meta={"packing": "bit"}),
         }
         samples = [
             SampleMeta(partition_id="partition_0", global_index=0, fields=fields, custom_meta={"version": 1}),
@@ -682,6 +666,7 @@ class TestBatchMeta:
         # Global indexes and custom_meta preserved
         assert selected_batch.global_indexes == [0, 1]
         assert selected_batch.samples[0].custom_meta == {"version": 1}
+
     def test_batch_meta_select_fields_with_nonexistent_fields(self):
         """Example: Select fields ignores non-existent field names in batch."""
         fields = {
@@ -744,18 +729,18 @@ class TestBatchMeta:
         """Example: Selected fields preserve their original metadata."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2, 3), 
+                name="field1",
+                dtype=torch.float32,
+                shape=(2, 3),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"source": "sensor_a"}
+                _custom_backend_meta={"source": "sensor_a"},
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(5,), 
+                name="field2",
+                dtype=torch.int64,
+                shape=(5,),
                 production_status=ProductionStatus.NOT_PRODUCED,
-                _custom_backend_meta={"source": "sensor_b"}
+                _custom_backend_meta={"source": "sensor_b"},
             ),
         }
         samples = [
@@ -777,16 +762,10 @@ class TestBatchMeta:
         """Example: Select specific samples from a batch."""
         fields = {
             "field1": FieldMeta(
-                name="field1", 
-                dtype=torch.float32, 
-                shape=(2,),
-                _custom_backend_meta={"backend": "float32"}
+                name="field1", dtype=torch.float32, shape=(2,), _custom_backend_meta={"backend": "float32"}
             ),
             "field2": FieldMeta(
-                name="field2", 
-                dtype=torch.int64, 
-                shape=(3,),
-                _custom_backend_meta={"backend": "int64"}
+                name="field2", dtype=torch.int64, shape=(3,), _custom_backend_meta={"backend": "int64"}
             ),
         }
         samples = [
@@ -819,11 +798,11 @@ class TestBatchMeta:
         """Example: Select all samples using complete index list."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -850,11 +829,11 @@ class TestBatchMeta:
         """Example: Select a single sample from batch."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -877,11 +856,11 @@ class TestBatchMeta:
         """Example: Select with empty list returns empty batch."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -904,11 +883,11 @@ class TestBatchMeta:
         """Example: Select samples in reverse order."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -936,11 +915,11 @@ class TestBatchMeta:
         """Example: Select samples preserves all extra info types."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -1272,11 +1251,11 @@ class TestEdgeCases:
         """Example: Chunking when chunks > samples produces empty chunks."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
         samples = [
@@ -1306,16 +1285,20 @@ class TestEdgeCases:
         """Example: Concat handles empty batches gracefully."""
         fields = {
             "test_field": FieldMeta(
-                name="test_field", 
-                dtype=torch.float32, 
-                shape=(2,), 
+                name="test_field",
+                dtype=torch.float32,
+                shape=(2,),
                 production_status=ProductionStatus.READY_FOR_CONSUME,
-                _custom_backend_meta={"dtype": torch.float32}
+                _custom_backend_meta={"dtype": torch.float32},
             )
         }
 
         batch1 = BatchMeta(samples=[])
-        batch2 = BatchMeta(samples=[SampleMeta(partition_id="partition_0", global_index=0, fields=fields, custom_meta={"sample_id": 0})])
+        batch2 = BatchMeta(
+            samples=[
+                SampleMeta(partition_id="partition_0", global_index=0, fields=fields, custom_meta={"sample_id": 0})
+            ]
+        )
         batch3 = BatchMeta(samples=[])
 
         # Empty batches are filtered out

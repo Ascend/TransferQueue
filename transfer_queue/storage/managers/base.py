@@ -523,15 +523,14 @@ class KVStorageManager(TransferQueueStorageManager):
         shapes = []
         dtypes = []
         custom_backend_meta_list = []
-        all_custom_backend_meta = copy.deepcopy(metadata._custom_backend_meta)
         for field_name in sorted(metadata.field_names):
             for index in range(len(metadata)):
                 field = metadata.samples[index].get_field_by_name(field_name)
                 assert field is not None, f"Field {field_name} not found in sample {index}"
                 shapes.append(field.shape)
                 dtypes.append(field.dtype)
-                global_index = metadata.global_indexes[index]
-                custom_backend_meta_list.append(all_custom_backend_meta.get(global_index, {}).get(field_name, None))
+                backend_meta = field._custom_backend_meta
+                custom_backend_meta_list.append(copy.deepcopy(backend_meta) if backend_meta else None)
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
