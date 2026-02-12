@@ -47,7 +47,8 @@ def _maybe_create_transferqueue_client(
     global _TRANSFER_QUEUE_CLIENT
     if _TRANSFER_QUEUE_CLIENT is None:
         if conf is None:
-            return _init_from_existing()
+            _init_from_existing()
+            return _TRANSFER_QUEUE_CLIENT
         pid = os.getpid()
         _TRANSFER_QUEUE_CLIENT = TransferQueueClient(
             client_id=f"TransferQueueClient_{pid}", controller_info=conf.controller.zmq_info
