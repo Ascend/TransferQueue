@@ -102,6 +102,8 @@ def _init_from_existing() -> bool:
     try:
         controller = ray.get_actor("TransferQueueController")
     except ValueError:
+        logger.warning("Called _init_from_existing() but TransferQueue Controller has not been initialized yet."
+                       "Please call tq.init() first.")
         return False
 
     logger.info("Found existing TransferQueueController instance. Connecting...")
