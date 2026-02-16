@@ -13,16 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-E2E Lifecycle Consistency Tests for TransferQueue.
-
-Implements all 5 scenarios from consistency_validation_plan.md:
-- Scenario One: Core Read/Write Consistency
-- Scenario Two: Cross-Partition & Complex Update
-- Scenario Three: Production Status Lifecycle
-- Scenario Four: Custom Metadata Persistence
-- Scenario Five: Reset & Clear
-"""
+"""E2E lifecycle consistency tests for TransferQueue."""
 
 import sys
 import time
@@ -35,24 +26,20 @@ import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
 
-# Setup paths
+# Setup paths (transfer_queue is not pip-installed)
 parent_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(parent_dir))
-
-from transfer_queue import (  # noqa: E402
-    SimpleStorageUnit,
-    TransferQueueClient,
-    TransferQueueController,
-)
 
 # Module-level default fields to avoid repeated generation
 DEFAULT_FIELDS = [
     "tensor_f32",
     "tensor_i64",
+    "tensor_bf16",
     "nested_jagged",
     "nested_strided",
     "list_int",
     "list_str",
+    "list_obj",
     "np_array",
     "np_obj",
     "special_val",
@@ -71,50 +58,31 @@ def ray_cluster():
 
 @pytest.fixture(scope="module")
 def e2e_client(ray_cluster):
-    """Create a client with 2 storage units for lifecycle testing."""
-    controller_actor = TransferQueueController.options(
-        name="lifecycle_controller",
-        get_if_exists=True,
-    ).remote(polling_mode=True)
-    controller_info = ray.get(controller_actor.get_zmq_server_info.remote())
+    """Create a client using transfer_queue.init() for lifecycle testing."""
+    from omegaconf import OmegaConf
 
-    # Two storage units to ensure sharding
-    storage_actor_1 = SimpleStorageUnit.options(
-        name="lifecycle_storage_1",
-        get_if_exists=True,
-    ).remote(storage_unit_size=10000)
-    storage_info_1 = ray.get(storage_actor_1.get_zmq_server_info.remote())
-
-    storage_actor_2 = SimpleStorageUnit.options(
-        name="lifecycle_storage_2",
-        get_if_exists=True,
-    ).remote(storage_unit_size=10000)
-    storage_info_2 = ray.get(storage_actor_2.get_zmq_server_info.remote())
-
-    client = TransferQueueClient(
-        client_id="lifecycle_test_client",
-        controller_info=controller_info,
-    )
+    import transfer_queue
 
     config = {
-        "controller_info": controller_info,
-        "storage_unit_infos": {
-            storage_info_1.id: storage_info_1,
-            storage_info_2.id: storage_info_2,
+        "controller": {
+            "polling_mode": True,
         },
-        "storage_backend_config": {"storage_unit_size": 10000},
+        "backend": {
+            "storage_backend": "SimpleStorage",
+            "SimpleStorage": {
+                "total_storage_size": 200,
+                "num_data_storage_units": 2,
+            },
+        },
     }
-
-    client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
-
+    transfer_queue.init(OmegaConf.create(config))
+    client = transfer_queue.get_client()
     yield client
+    transfer_queue.close()
 
 
 def generate_complex_data(indices: list[int]) -> TensorDict:
-    """
-    Generates complex TensorDict with all required field types.
-    Based on consistency_validation_plan.md Section 3.2.
-    """
+    """Generate complex TensorDict with all supported field types."""
     n = len(indices)
 
     # Standard Tensor (Float32)
@@ -128,15 +96,15 @@ def generate_complex_data(indices: list[int]) -> TensorDict:
     for i in indices:
         length = 2 + (i % 4)  # Variable length: 2-5
         nested_list.append(torch.arange(i, i + length, dtype=torch.float32))
+    # Inject special values into jagged tensor components
+    nested_list[0][0] = float("inf")
+    if len(nested_list) > 1:
+        nested_list[1][0] = float("nan")
     nested_jagged = torch.nested.as_nested_tensor(nested_list, layout=torch.jagged)
 
-    # Nested Tensor (Strided) - fallback to jagged if not supported
-    try:
-        strided_tensors = [torch.full((3, 4), float(i)) for i in indices]
-        nested_strided = torch.nested.nested_tensor(strided_tensors, layout=torch.strided)
-    except (TypeError, RuntimeError):
-        strided_tensors = [torch.full((3, 4), float(i)) for i in indices]
-        nested_strided = torch.nested.as_nested_tensor(strided_tensors, layout=torch.jagged)
+    # Nested Tensor (Strided)
+    strided_tensors = [torch.full((3, 4), float(i)) for i in indices]
+    nested_strided = torch.nested.nested_tensor(strided_tensors, layout=torch.strided)
 
     # Python Lists
     list_int = [i * 10 for i in indices]
@@ -156,19 +124,36 @@ def generate_complex_data(indices: list[int]) -> TensorDict:
     non_tensor_data = [{"idx": i, "text": f"non_tensor_{i}"} for i in indices]
     non_tensor_stack = NonTensorData(data=non_tensor_data, batch_size=(n,), device=None)
 
+    # BFloat16 Tensor
+    tensor_bf16 = torch.stack([torch.arange(i, i + 5, dtype=torch.bfloat16) for i in indices])
+
+    # List of objects (dicts)
+    list_obj = [{"key": f"value_{i}", "num": i} for i in indices]
+
+    field_values = {
+        "tensor_f32": tensor_f32,
+        "tensor_i64": tensor_i64,
+        "tensor_bf16": tensor_bf16,
+        "nested_jagged": nested_jagged,
+        "nested_strided": nested_strided,
+        "list_int": list_int,
+        "list_str": list_str,
+        "list_obj": list_obj,
+        "np_array": np_array,
+        "np_obj": np_obj,
+        "special_val": special_val,
+        "non_tensor_stack": non_tensor_stack,
+    }
+
+    # Validate: field_values must exactly match DEFAULT_FIELDS
+    assert set(field_values.keys()) == set(DEFAULT_FIELDS), (
+        f"generate_complex_data fields mismatch with DEFAULT_FIELDS: "
+        f"extra={set(field_values.keys()) - set(DEFAULT_FIELDS)}, "
+        f"missing={set(DEFAULT_FIELDS) - set(field_values.keys())}"
+    )
+
     return TensorDict(
-        {
-            "tensor_f32": tensor_f32,
-            "tensor_i64": tensor_i64,
-            "nested_jagged": nested_jagged,
-            "nested_strided": nested_strided,
-            "list_int": list_int,
-            "list_str": list_str,
-            "np_array": np_array,
-            "np_obj": np_obj,
-            "special_val": special_val,
-            "non_tensor_stack": non_tensor_stack,
-        },
+        {field: field_values[field] for field in DEFAULT_FIELDS},
         batch_size=n,
     )
 
@@ -189,9 +174,7 @@ def poll_for_meta(client, partition_id, data_fields, batch_size, task_name, mode
     return None
 
 
-# =============================================================================
 # Helper Functions for Data Verification
-# =============================================================================
 def verify_special_values(retrieved: torch.Tensor, expected: torch.Tensor) -> bool:
     """Verify special values (NaN, Inf) are preserved."""
     # Check Inf column
@@ -207,27 +190,47 @@ def verify_special_values(retrieved: torch.Tensor, expected: torch.Tensor) -> bo
 
 
 def verify_nested_tensor_equal(retrieved, expected) -> bool:
-    """Verify nested tensors element by element."""
-    if len(retrieved.unbind()) != len(expected.unbind()):
+    """Verify nested tensors element by element, handling NaN/Inf."""
+    r_list = retrieved.unbind()
+    e_list = expected.unbind()
+    if len(r_list) != len(e_list):
         return False
-    for r, e in zip(retrieved.unbind(), expected.unbind(), strict=False):
-        if not torch.allclose(r, e):
+    for r, e in zip(r_list, e_list, strict=True):
+        # Handle NaN: positions must match
+        r_nan = torch.isnan(r)
+        e_nan = torch.isnan(e)
+        if not torch.equal(r_nan, e_nan):
+            return False
+        # Compare non-NaN values (allclose handles Inf correctly)
+        mask = ~r_nan
+        if mask.any() and not torch.allclose(r[mask], e[mask]):
             return False
     return True
 
 
 def verify_non_tensor_data(retrieved, expected) -> bool:
-    """Verify NonTensorData content."""
-    if hasattr(retrieved, "data"):
+    """Verify NonTensorData content element by element."""
+    if hasattr(retrieved, "tolist"):
+        retrieved = retrieved.tolist()
+    elif hasattr(retrieved, "data"):
         retrieved = retrieved.data
-    if hasattr(expected, "data"):
+    if hasattr(expected, "tolist"):
+        expected = expected.tolist()
+    elif hasattr(expected, "data"):
         expected = expected.data
+    if isinstance(retrieved, list) and isinstance(expected, list):
+        if len(retrieved) != len(expected):
+            return False
+        return all(r == e for r, e in zip(retrieved, expected, strict=True))
     return retrieved == expected
 
 
 def verify_list_equal(retrieved, expected) -> bool:
-    """Verify list content, handling possible Tensor conversion."""
-    # Convert Tensor to list if needed
+    """Verify list content.
+
+    Note: TensorDict automatically converts Python lists to Tensors during storage,
+    so we convert back to native Python types before comparison.
+    """
     if isinstance(retrieved, torch.Tensor):
         retrieved = retrieved.tolist()
     if isinstance(expected, torch.Tensor):
@@ -235,19 +238,31 @@ def verify_list_equal(retrieved, expected) -> bool:
     return retrieved == expected
 
 
-# =============================================================================
-# Scenario One: Core Read/Write Consistency
-# =============================================================================
-def test_core_consistency(e2e_client):
-    """
-    Test Case: Core Read/Write Consistency (Scenario 1)
+def _reorder_tensordict(td: TensorDict, order: list[int]) -> TensorDict:
+    """Reorder a TensorDict by the given index order.
 
-    Validates:
-    1. Put full complex data -> Get retrieves identical data
-    2. NaN remains NaN, Inf remains Inf
-    3. NonTensorData unpacks without loss
-    4. All field types are correctly round-tripped
+    Handles regular tensors, nested/jagged tensors, lists, and other indexable types.
     """
+    reordered = {}
+    for key in td.keys():
+        field = td[key]
+        if hasattr(field, "unbind"):
+            items = field.unbind(0)
+            reordered_items = [items[i] for i in order]
+            try:
+                reordered[key] = torch.stack(reordered_items)
+            except RuntimeError:
+                reordered[key] = torch.nested.as_nested_tensor(reordered_items, layout=field.layout)
+        elif isinstance(field, list):
+            reordered[key] = [field[i] for i in order]
+        else:
+            reordered[key] = field[torch.tensor(order)]
+    return TensorDict(reordered, batch_size=td.batch_size)
+
+
+# Scenario One: Core Read/Write Consistency
+def test_core_consistency(e2e_client):
+    """Put full complex data then get — verify all field types are correctly round-tripped."""
     client = e2e_client
     partition_id = "test_core_consistency"
     batch_size = 20
@@ -269,6 +284,7 @@ def test_core_consistency(e2e_client):
         # 3. Verify Standard Tensors
         assert torch.allclose(retrieved_data["tensor_f32"], original_data["tensor_f32"]), "tensor_f32 mismatch"
         assert torch.equal(retrieved_data["tensor_i64"], original_data["tensor_i64"]), "tensor_i64 mismatch"
+        assert torch.equal(retrieved_data["tensor_bf16"], original_data["tensor_bf16"]), "tensor_bf16 mismatch"
 
         # 4. Verify Nested Tensors (Jagged)
         assert verify_nested_tensor_equal(retrieved_data["nested_jagged"], original_data["nested_jagged"]), (
@@ -283,6 +299,7 @@ def test_core_consistency(e2e_client):
         # 6. Verify Python Lists
         assert verify_list_equal(retrieved_data["list_int"], original_data["list_int"]), "list_int mismatch"
         assert verify_list_equal(retrieved_data["list_str"], original_data["list_str"]), "list_str mismatch"
+        assert verify_list_equal(retrieved_data["list_obj"], original_data["list_obj"]), "list_obj mismatch"
 
         # 7. Verify NumPy Arrays
         assert np.allclose(retrieved_data["np_array"], original_data["np_array"]), "np_array mismatch"
@@ -301,25 +318,12 @@ def test_core_consistency(e2e_client):
         client.clear_partition(partition_id)
 
 
-# =============================================================================
-# Scenario Two: Cross-Partition & Complex Update
-# =============================================================================
-def test_cross_partition_complex_update(e2e_client):
-    """
-    Test Case: Cross-Partition & Complex Update (Scenario 2)
-
-    Validates:
-    1. Put A (indices 0-19) with full complex fields
-    2. Put B (indices 20-39) with full complex fields
-    3. Update indices 10-29 (cross-shard): modify existing fields + add new fields
-    4. Get Full (0-39) and verify:
-       - 0-9: original Put A values
-       - 10-29: updated values with new fields
-       - 30-39: original Put B values
-    """
+# Scenario Two: Cross-Shard Update
+def test_cross_shard_complex_update(e2e_client):
+    """Cross-shard update: put A + put B, update overlapping region, verify all regions."""
     client = e2e_client
-    partition_id = "test_cross_partition_update"
-    task_name = "cross_partition_task"
+    partition_id = "test_cross_shard_update"
+    task_name = "cross_shard_task"
 
     # Define index ranges
     idx_a = list(range(0, 20))  # Put A
@@ -371,6 +375,11 @@ def test_cross_partition_complex_update(e2e_client):
         assert full_meta is not None and full_meta.size == 40, "Failed to retrieve full metadata"
         full_data = client.get_data(full_meta)
 
+        # Reorder by global_indexes for deterministic positional assertions
+        sorted_order = sorted(range(full_meta.size), key=lambda i: full_meta.global_indexes[i])
+        if sorted_order != list(range(full_meta.size)):
+            full_data = _reorder_tensordict(full_data, sorted_order)
+
         # 6. Verify region 0-9: original Put A values
         original_data_0_9 = generate_complex_data(list(range(0, 10)))
         assert torch.allclose(full_data["tensor_f32"][:10], original_data_0_9["tensor_f32"]), (
@@ -402,20 +411,9 @@ def test_cross_partition_complex_update(e2e_client):
         client.clear_partition(partition_id)
 
 
-# =============================================================================
 # Scenario Three: Production Status Lifecycle
-# =============================================================================
 def test_production_status_lifecycle(e2e_client):
-    """
-    Test Case: Production Status Lifecycle (Scenario 3)
-
-    Validates multi-round partial field put and production status transitions.
-
-    Steps:
-    1. Round 1 Put: Indices 0-9, only Set_A fields -> Check production(Set_A)=True, production(Set_B)=False
-    2. Round 2 Put: Indices 0-9, complete Set_B fields -> Check production(Set_A+Set_B)=True
-    3. Verify consumption status transitions
-    """
+    """Multi-round partial put: verify production & consumption status transitions."""
     client = e2e_client
     partition_id = "test_production_lifecycle"
     batch_size = 10
@@ -465,30 +463,26 @@ def test_production_status_lifecycle(e2e_client):
         is_consumed = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
         assert not is_consumed, "Data should not be consumed initially"
 
-        # 7. Consume Data
+        # 7. Consume Data (consumption is marked during get_meta(fetch))
         meta = poll_for_meta(client, partition_id, all_fields, batch_size, task_name, mode="fetch")
         assert meta is not None, "Failed to poll metadata"
+
+        # Consumption is marked during get_meta(fetch), verify before get_data
+        is_consumed_mid = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
+        assert is_consumed_mid, "Data should already be consumed after get_meta in fetch mode"
+
         client.get_data(meta)
 
         # 8. Post-Consumption Check - should be True
         is_consumed_after = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
-        assert is_consumed_after, "Data should be consumed after get_data"
+        assert is_consumed_after, "Data should be consumed after get_meta in fetch mode"
     finally:
         client.clear_partition(partition_id)
 
 
-# =============================================================================
 # Scenario Four: Custom Metadata Persistence
-# =============================================================================
 def test_custom_metadata_persistence(e2e_client):
-    """
-
-    Test Case: Custom Metadata Persistence (Scenario 4)
-
-    Validates:
-    1. put data -> set_custom_meta -> get_meta retrieves correct custom_meta
-    2. Custom metadata is per-sample and survives roundtrip
-    """
+    """Set per-sample custom metadata, retrieve it, and verify persistence."""
     client = e2e_client
     partition_id = "test_custom_meta"
     batch_size = 8
@@ -504,14 +498,15 @@ def test_custom_metadata_persistence(e2e_client):
 
     try:
         # 2. Create Custom Metadata for each sample
-        custom_metadata = {}
-        for i in range(batch_size):
-            custom_metadata[meta.global_indexes[i]] = {
+        custom_metadata_list = [
+            {
                 "score": float(i) / 10.0,
                 "label": f"label_{i}",
                 "tags": [f"tag_{i}_a", f"tag_{i}_b"],
             }
-        meta.update_custom_meta(custom_metadata)
+            for i in range(batch_size)
+        ]
+        meta.update_custom_meta(custom_metadata_list)
 
         # 3. Upload Custom Metadata
         client.set_custom_meta(meta)
@@ -522,28 +517,20 @@ def test_custom_metadata_persistence(e2e_client):
 
         # Verify custom metadata content
         retrieved_custom = retrieved_meta.get_all_custom_meta()
-        for global_idx, expected_meta in custom_metadata.items():
-            assert global_idx in retrieved_custom, f"Missing custom_meta for index {global_idx}"
-            actual = retrieved_custom[global_idx]
-            assert actual["score"] == expected_meta["score"], f"Score mismatch at index {global_idx}"
-            assert actual["label"] == expected_meta["label"], f"Label mismatch at index {global_idx}"
-            assert actual["tags"] == expected_meta["tags"], f"Tags mismatch at index {global_idx}"
+        assert len(retrieved_custom) == batch_size, (
+            f"Expected {batch_size} custom_meta entries, got {len(retrieved_custom)}"
+        )
+        for i, (actual, expected) in enumerate(zip(retrieved_custom, custom_metadata_list, strict=True)):
+            assert actual["score"] == expected["score"], f"Score mismatch at sample {i}"
+            assert actual["label"] == expected["label"], f"Label mismatch at sample {i}"
+            assert actual["tags"] == expected["tags"], f"Tags mismatch at sample {i}"
     finally:
         client.clear_partition(partition_id)
 
 
-# =============================================================================
 # Scenario Five: Reset & Clear
-# =============================================================================
 def test_reset_consumption(e2e_client):
-    """
-    Test Case: Reset Consumption Status (Scenario 5a)
-
-    Validates:
-    1. After consuming data, consumption status is True
-    2. After reset_consumption, status reverts to False
-    3. Data can be re-consumed after reset
-    """
+    """Consume data, reset consumption status, verify re-consumability."""
     client = e2e_client
     partition_id = "test_reset_consumption"
     batch_size = 10
@@ -559,15 +546,20 @@ def test_reset_consumption(e2e_client):
         is_consumed_initial = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
         assert not is_consumed_initial, "Data should not be consumed initially"
 
-        # 3. Consume Data (get_meta + get_data)
+        # 3. Consume Data (consumption is marked during get_meta(fetch))
         meta = poll_for_meta(client, partition_id, fields, batch_size, task_name, mode="fetch")
         assert meta is not None and meta.size == batch_size, "Failed to poll metadata"
+
+        # Consumption is marked during get_meta(fetch), verify before get_data
+        is_consumed_mid = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
+        assert is_consumed_mid, "Data should already be consumed after get_meta in fetch mode"
+
         retrieved_data = client.get_data(meta)
         assert retrieved_data.batch_size[0] == batch_size, "Retrieved data batch_size mismatch"
 
         # 4. Post-Consumption Status Check - should be True
         is_consumed_after = client.check_consumption_status(task_name=task_name, partition_id=partition_id)
-        assert is_consumed_after, "Data should be consumed after get_data"
+        assert is_consumed_after, "Data should be consumed after get_meta in fetch mode"
 
         # 5. Reset Consumption
         success = client.reset_consumption(partition_id=partition_id, task_name=task_name)
@@ -585,15 +577,7 @@ def test_reset_consumption(e2e_client):
 
 
 def test_clear_partition(e2e_client):
-    """
-    Test Case: Clear Partition (Scenario 5b)
-
-    Validates:
-    1. Put data -> data is accessible
-    2. clear_partition -> data is physically deleted
-    3. After clear, check_production_status returns False
-    4. After clear, partition is removed from partition list
-    """
+    """Clear partition: verify data removal and production status reset."""
     client = e2e_client
     partition_id = "test_clear_partition"
     batch_size = 15
@@ -604,28 +588,35 @@ def test_clear_partition(e2e_client):
     data = generate_complex_data(list(range(batch_size)))
     client.put(data=data, partition_id=partition_id)
 
-    # 2. Verify Data Exists - production status should be True
-    is_ready = client.check_production_status(data_fields=fields, partition_id=partition_id)
-    assert is_ready, "Data should be ready after put"
+    try:
+        # 2. Verify Data Exists - production status should be True
+        is_ready = client.check_production_status(data_fields=fields, partition_id=partition_id)
+        assert is_ready, "Data should be ready after put"
 
-    # 3. Get Data to confirm accessibility
-    meta = poll_for_meta(client, partition_id, fields, batch_size, task_name, mode="force_fetch")
-    assert meta is not None and meta.size == batch_size, "Failed to poll metadata"
+        # 3. Get Data to confirm accessibility
+        meta = poll_for_meta(client, partition_id, fields, batch_size, task_name, mode="force_fetch")
+        assert meta is not None and meta.size == batch_size, "Failed to poll metadata"
 
-    # 4. Verify partition exists before clear
-    partition_list_before = client.get_partition_list()
-    assert partition_id in partition_list_before, "Partition should exist before clear"
+        # 4. Verify partition exists before clear
+        partition_list_before = client.get_partition_list()
+        assert partition_id in partition_list_before, "Partition should exist before clear"
 
-    # 5. Clear Partition
-    client.clear_partition(partition_id)
+        # 5. Clear Partition
+        client.clear_partition(partition_id)
 
-    # 6. Verify partition is removed from list
-    partition_list_after = client.get_partition_list()
-    assert partition_id not in partition_list_after, "Partition should be removed after clear"
+        # 6. Verify partition is removed from list
+        partition_list_after = client.get_partition_list()
+        assert partition_id not in partition_list_after, "Partition should be removed after clear"
 
-    # 7. Verify Production Status returns False for cleared partition
-    is_ready_after_clear = client.check_production_status(data_fields=fields, partition_id=partition_id)
-    assert not is_ready_after_clear, "Production status should be False after clear"
+        # 7. Verify Production Status returns False for cleared partition
+        is_ready_after_clear = client.check_production_status(data_fields=fields, partition_id=partition_id)
+        assert not is_ready_after_clear, "Production status should be False after clear"
+    finally:
+        # Ensure cleanup even if assertions fail
+        try:
+            client.clear_partition(partition_id)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
