@@ -25,6 +25,7 @@ from threading import Lock, Thread
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import ray
 import torch
 import zmq
@@ -34,11 +35,9 @@ from torch import Tensor
 
 from transfer_queue.metadata import (
     BatchMeta,
-    FieldMeta,
-    SampleMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
-from transfer_queue.utils.enum_utils import ProductionStatus, TransferQueueRole
+from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -669,13 +668,33 @@ class DataPartitionStatus:
 
     # ==================== Metadata Methods ====================
 
-    def get_field_dtype(self, global_index: int, field_name: str) -> Optional[Any]:
-        """Get dtype for a specific sample and field."""
-        return self.field_dtypes.get(global_index, {}).get(field_name)
+    def get_field_schema(self, field_names: list[str]) -> dict[str, dict[str, Any]]:
+        """Build O(F) field_schema from per-sample dtypes/shapes for specified fields.
 
-    def get_field_shape(self, global_index: int, field_name: str) -> Optional[Any]:
-        """Get shape for a specific sample and field."""
-        return self.field_shapes.get(global_index, {}).get(field_name)
+        Assembles the columnar field_schema used by BatchMeta from the per-sample
+        field_dtypes and field_shapes stored in the Partition.
+        """
+        schema = {}
+        for fname in field_names:
+            # Find first sample that has metadata for this field
+            dtype = None
+            shape = None
+            for idx_dtypes in self.field_dtypes.values():
+                if fname in idx_dtypes:
+                    dtype = idx_dtypes[fname]
+                    break
+            for idx_shapes in self.field_shapes.values():
+                if fname in idx_shapes:
+                    shape = idx_shapes[fname]
+                    break
+            if dtype is not None or shape is not None:
+                schema[fname] = {
+                    "dtype": dtype,
+                    "shape": shape,
+                    "is_nested": False,
+                    "is_non_tensor": False,
+                }
+        return schema
 
     def get_field_custom_backend_meta(
         self, global_indices: list[int], field_names: list[str]
@@ -700,10 +719,22 @@ class DataPartitionStatus:
             {0: {'field_a': {'meta1': 'xxx'}, 'field_b': {'meta1': 'xxx'}}, 1: {...}}
         """
         return {
-            idx: {f: v for f, v in self.field_custom_backend_meta[idx].items() if f in field_names}
+            idx: {
+                f: v
+                for f, v in self.field_custom_backend_meta[idx].items()
+                if f.startswith("_") or f in field_names  # keep special keys like _su_id
+            }
             for idx in global_indices
             if idx in self.field_custom_backend_meta
         }
+
+    def get_field_dtype(self, global_index: int, field_name: str) -> Optional[Any]:
+        """Get the dtype for a specific (global_index, field_name) pair."""
+        return self.field_dtypes.get(global_index, {}).get(field_name, None)
+
+    def get_field_shape(self, global_index: int, field_name: str) -> Optional[Any]:
+        """Get the shape for a specific (global_index, field_name) pair."""
+        return self.field_shapes.get(global_index, {}).get(field_name, None)
 
     def get_custom_meta(self, global_indices: list[int]) -> dict[int, dict]:
         """
@@ -1292,6 +1323,8 @@ class TransferQueueController:
         """
         Generate BatchMeta for specific samples in a partition.
 
+        O(F) optimized version that uses field_schema instead of per-sample metadata.
+
         This function is responsible only for metadata generation and does not
         modify consumption state. State management is handled by the calling function.
 
@@ -1314,55 +1347,52 @@ class TransferQueueController:
         if mode not in ["fetch", "insert", "force_fetch"]:
             raise ValueError(f"Invalid mode: {mode}")
 
-        # Generate sample metadata
-        samples = []
-        for global_index in batch_global_indexes:
-            fields = {}
-            for field_name in data_fields:
-                # Determine production status
-                if mode == "fetch":
-                    production_status = ProductionStatus.READY_FOR_CONSUME
-                    dtype = partition.get_field_dtype(global_index, field_name)
-                    shape = partition.get_field_shape(global_index, field_name)
-                elif mode == "insert":
-                    production_status = ProductionStatus.NOT_PRODUCED
-                    dtype = None
-                    shape = None
-                elif mode == "force_fetch":
-                    field_index = partition.field_name_mapping.get(field_name)
-                    if (
-                        field_index is not None
-                        and partition.production_status is not None
-                        and partition.production_status[global_index, field_index] == 1
-                    ):
-                        production_status = ProductionStatus.READY_FOR_CONSUME
-                        dtype = partition.get_field_dtype(global_index, field_name)
-                        shape = partition.get_field_shape(global_index, field_name)
-                    else:
-                        production_status = ProductionStatus.NOT_PRODUCED
-                        dtype = None
-                        shape = None
+        batch_size = len(batch_global_indexes)
 
-                fields[field_name] = FieldMeta(
-                    name=field_name,
-                    dtype=dtype,
-                    shape=shape,
-                    production_status=production_status,
-                )
+        field_schema = partition.get_field_schema(data_fields)
 
-            sample = SampleMeta(
-                partition_id=partition_id,
-                global_index=global_index,
-                fields=fields,
-            )
-            samples.append(sample)
+        # In insert mode, create placeholder schema for unregistered fields so that
+        # metadata.field_names is complete and update_production_status() can recognize them.
+        if mode == "insert":
+            for fname in data_fields:
+                if fname not in field_schema:
+                    field_schema[fname] = {
+                        "dtype": None,
+                        "shape": None,
+                        "is_nested": False,
+                        "is_non_tensor": False,
+                    }
 
-        custom_meta = partition.get_custom_meta(batch_global_indexes)
+        if mode == "fetch":
+            production_status = np.ones(batch_size, dtype=np.int8)
+        elif mode == "insert":
+            production_status = np.zeros(batch_size, dtype=np.int8)
+        else:  # force_fetch
+            production_status = np.zeros(batch_size, dtype=np.int8)
+            if partition.production_status is not None and data_fields:
+                field_indices = [
+                    partition.field_name_mapping.get(fname)
+                    for fname in data_fields
+                    if fname in partition.field_name_mapping
+                ]
+                if field_indices:
+                    for i, global_idx in enumerate(batch_global_indexes):
+                        if global_idx < partition.production_status.shape[0]:
+                            sample_status = partition.production_status[global_idx, field_indices]
+                            if torch.all(sample_status == 1):
+                                production_status[i] = 1
+
+        custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
 
-        batch_meta = BatchMeta(samples=samples)
-        batch_meta.update_custom_meta([custom_meta.get(idx, {}) for idx in batch_meta.global_indexes])
-        batch_meta._custom_backend_meta.update(custom_backend_meta)
+        batch_meta = BatchMeta(
+            global_indexes=batch_global_indexes,
+            partition_ids=[partition_id] * batch_size,
+            field_schema=field_schema,
+            production_status=production_status,
+            custom_meta=custom_meta_dict,
+            _custom_backend_meta=custom_backend_meta,
+        )
         return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):

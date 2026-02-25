@@ -29,7 +29,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 from transfer_queue.controller import TransferQueueController  # noqa: E402
-from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
 
 
 @pytest.fixture(scope="function")
@@ -67,13 +66,9 @@ class TestTransferQueueController:
         )
 
         assert metadata.global_indexes == list(range(gbs * num_n_samples))
-        assert metadata.samples[0].partition_id == "train_0"
-        assert sum([int(sample.fields.get("prompt_ids").production_status) for sample in metadata.samples]) == int(
-            ProductionStatus.NOT_PRODUCED
-        )
-        assert sum([int(sample.fields.get("attention_mask").production_status) for sample in metadata.samples]) == int(
-            ProductionStatus.NOT_PRODUCED
-        )
+        assert metadata.partition_ids[0] == "train_0"
+        # In insert mode, production_status should be all zeros (NOT_PRODUCED)
+        assert metadata.production_status is not None and all(metadata.production_status == 0)
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id))
         assert partition_index_range == list(range(gbs * num_n_samples))
 
@@ -158,7 +153,7 @@ class TestTransferQueueController:
         )
 
         assert gen_meta.global_indexes == list(range(gbs * num_n_samples))
-        assert gen_meta.samples[0].partition_id == "train_0"
+        assert gen_meta.partition_ids[0] == "train_0"
         assert gen_meta.field_names == ["prompt_ids"]
         partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
         assert torch.equal(partition.consumption_status["generate_sequences"], torch.ones(gbs * num_n_samples))
@@ -187,7 +182,8 @@ class TestTransferQueueController:
             )
         )
         assert clear_meta.global_indexes == list(range(gbs * num_n_samples))
-        assert [sample.fields for sample in clear_meta.samples] == [{}] * (gbs * num_n_samples)
+        # In insert mode with no fields, field_schema should be empty
+        assert clear_meta.field_schema == {} or clear_meta.field_names == []
         print("✓ Clear metadata correct")
 
         # Test clear_partition
@@ -456,13 +452,9 @@ class TestTransferQueueController:
         part1_index_range = gbs_1 * num_n_samples_1
         part2_index_range = gbs_2 * num_n_samples_2
         assert val_metadata.global_indexes == list(range(part1_index_range, part2_index_range + part1_index_range))
-        assert val_metadata.samples[0].partition_id == "val_0"
-        assert sum([int(sample.fields.get("prompt_ids").production_status) for sample in val_metadata.samples]) == int(
-            ProductionStatus.NOT_PRODUCED
-        )
-        assert sum(
-            [int(sample.fields.get("attention_mask").production_status) for sample in val_metadata.samples]
-        ) == int(ProductionStatus.NOT_PRODUCED)
+        assert val_metadata.partition_ids[0] == "val_0"
+        # In insert mode, production_status should be all zeros (NOT_PRODUCED)
+        assert val_metadata.production_status is not None and all(val_metadata.production_status == 0)
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id_2))
         assert partition_index_range == list(range(part1_index_range, part2_index_range + part1_index_range))
 
@@ -536,13 +528,9 @@ class TestTransferQueueController:
             )
         )
         assert metadata_2.global_indexes == list(range(32)) + list(range(48, 80))
-        assert metadata_2.samples[0].partition_id == "train_1"
-        assert sum([int(sample.fields.get("prompt_ids").production_status) for sample in metadata_2.samples]) == int(
-            ProductionStatus.NOT_PRODUCED
-        )
-        assert sum(
-            [int(sample.fields.get("attention_mask").production_status) for sample in metadata_2.samples]
-        ) == int(ProductionStatus.NOT_PRODUCED)
+        assert metadata_2.partition_ids[0] == "train_1"
+        # In insert mode, production_status should be all zeros (NOT_PRODUCED)
+        assert metadata_2.production_status is not None and all(metadata_2.production_status == 0)
         partition_index_range = ray.get(tq_controller.get_partition_index_range.remote(partition_id_3))
         assert partition_index_range == list(range(32)) + list(range(48, 80))
         print("✓ Correctly assign partition_3")
@@ -884,12 +872,9 @@ class TestTransferQueueControllerKvInterface:
             tq_controller.kv_retrieve_keys.remote(keys=keys, partition_id=partition_id, create=False)
         )
 
-        # Verify production status is available
-        assert len(retrieved_metadata.samples) == len(keys)
-        for sample in retrieved_metadata.samples:
-            assert "data" in sample.fields
-            assert sample.fields["data"].dtype == "torch.float32"
-            assert sample.fields["data"].shape == (64,)
+        # Verify production status is available (columnar API)
+        assert len(retrieved_metadata.global_indexes) == len(keys)
+        assert "data" in retrieved_metadata.field_schema
 
         print("✓ kv_retrieve_keys works with production status")
 

@@ -26,9 +26,6 @@ import psutil
 import ray
 import zmq
 
-from transfer_queue.utils.common import (
-    get_env_bool,
-)
 from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
 from transfer_queue.utils.serial_utils import _decoder, _encoder
 
@@ -42,9 +39,10 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 
-bytestr: TypeAlias = bytes | bytearray | memoryview
+# 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
+_PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
 
-TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False)
+bytestr: TypeAlias = bytes | bytearray | memoryview
 
 
 class ZMQRequestType(ExplicitEnum):
@@ -168,43 +166,44 @@ class ZMQMessage:
         )
 
     def serialize(self) -> list:
-        """
-        Serialize message using unified MsgpackEncoder or pickle.
-        Returns: list[bytestr] - [msgpack_header, *tensor_buffers] or [bytes]
-        """
-        if TQ_ZERO_COPY_SERIALIZATION:
-            msg_dict = {
-                "request_type": self.request_type.value,  # Enum -> str for msgpack
-                "sender_id": self.sender_id,
-                "receiver_id": self.receiver_id,
-                "request_id": self.request_id,
-                "timestamp": self.timestamp,
-                "body": self.body,
-            }
+        """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
+        msg_dict = {
+            "request_type": self.request_type.value,  # Enum -> str for msgpack
+            "sender_id": self.sender_id,
+            "receiver_id": self.receiver_id,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp,
+            "body": self.body,
+        }
+        try:
             return list(_encoder.encode(msg_dict))
-        else:
-            return [pickle.dumps(self)]
+        except (TypeError, ValueError) as e:
+            logger.warning(
+                "ZMQMessage.serialize: zero-copy encoding failed (%s: %s), falling back to pickle.",
+                type(e).__name__,
+                e,
+            )
+            return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(self)]
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
-        """
-        Deserialize message using unified MsgpackDecoder or pickle.
-        """
+        """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
         if not frames:
             raise ValueError("Empty frames received")
 
-        if TQ_ZERO_COPY_SERIALIZATION:
-            msg_dict = _decoder.decode(frames)
-            return cls(
-                request_type=ZMQRequestType(msg_dict["request_type"]),
-                sender_id=msg_dict["sender_id"],
-                receiver_id=msg_dict["receiver_id"],
-                body=msg_dict["body"],
-                request_id=msg_dict["request_id"],
-                timestamp=msg_dict["timestamp"],
-            )
-        else:
-            return pickle.loads(frames[0])
+        # pickle fallback path: serialize() sets frame[0] to _PICKLE_FALLBACK_SENTINEL on failure.
+        if len(frames) >= 2 and frames[0] == _PICKLE_FALLBACK_SENTINEL:
+            return pickle.loads(frames[1])
+
+        msg_dict = _decoder.decode(frames)
+        return cls(
+            request_type=ZMQRequestType(msg_dict["request_type"]),
+            sender_id=msg_dict["sender_id"],
+            receiver_id=msg_dict["receiver_id"],
+            body=msg_dict["body"],
+            request_id=msg_dict["request_id"],
+            timestamp=msg_dict["timestamp"],
+        )
 
 
 def get_free_port() -> str:

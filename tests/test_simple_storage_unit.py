@@ -399,25 +399,71 @@ def test_storage_unit_data_direct():
 
     storage_data = StorageUnitData(storage_size=10)
 
-    # Test put_data
     field_data = {
         "log_probs": [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0])],
     }
+    # local_keys = gi values (e.g., 0 and 1)
     storage_data.put_data(field_data, [0, 1])
 
-    # Test get_data
     result = storage_data.get_data(["log_probs", "rewards"], [0, 1])
     assert "log_probs" in result
     assert "rewards" in result
     assert len(result["log_probs"]) == 2
     assert len(result["rewards"]) == 2
 
-    # Test single index get
     result_single = storage_data.get_data(["log_probs"], [0])
-    assert torch.allclose(result_single["log_probs"][0], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(result_single["log_probs"][0], torch.tensor([1.0, 2.0]))
 
-    # Test clear
+    # clear: key is removed (not set to None)
     storage_data.clear([0])
-    result_after_clear = storage_data.get_data(["log_probs"], [0])
-    assert result_after_clear["log_probs"][0] is None
+    assert 0 not in storage_data.field_data["log_probs"]  # key gone
+    assert 1 in storage_data.field_data["log_probs"]  # other key intact
+
+
+def test_storage_unit_data_dict_key():
+    """StorageUnitData dict-key: gi 直接作为 key，clear 真正释放内存."""
+    from transfer_queue.storage.simple_backend import StorageUnitData
+
+    storage = StorageUnitData(storage_size=4)
+
+    # put_data: 用 gi 列表 [10, 11] 作为 local_keys
+    storage.put_data(
+        {"f": [torch.tensor([1.0]), torch.tensor([2.0])]},
+        local_keys=[10, 11],
+    )
+    assert len(storage.field_data["f"]) == 2
+
+    # get_data: 通过 gi 读取
+    result = storage.get_data(["f"], local_keys=[10, 11])
+    torch.testing.assert_close(result["f"][0], torch.tensor([1.0]))
+    torch.testing.assert_close(result["f"][1], torch.tensor([2.0]))
+
+    # clear: 真正删除 key，不是置 None
+    storage.clear(keys=[10])
+    assert 10 not in storage.field_data["f"]
+    assert 11 in storage.field_data["f"]
+
+    # capacity check: storage_size=4，已有 1 条，再放 4 条应失败
+    with pytest.raises(ValueError, match="Storage capacity exceeded"):
+        storage.put_data(
+            {"f": [torch.tensor([i * 1.0]) for i in range(4)]},
+            local_keys=[20, 21, 22, 23],
+        )
+
+
+def test_storage_unit_data_partial_consume_safety():
+    """部分消费后写入复用 gi，不应覆盖未消费数据."""
+    from transfer_queue.storage.simple_backend import StorageUnitData
+
+    storage = StorageUnitData(storage_size=4)
+    storage.put_data({"f": [torch.tensor([0.0]), torch.tensor([1.0])]}, local_keys=[0, 1])
+
+    storage.clear(keys=[1])  # 只清除 gi=1
+    assert 0 in storage.field_data["f"]
+    assert 1 not in storage.field_data["f"]
+
+    # 复用 gi=1 写入新数据，不影响 gi=0
+    storage.put_data({"f": [torch.tensor([9.0])]}, local_keys=[1])
+    torch.testing.assert_close(storage.field_data["f"][0], torch.tensor([0.0]))
+    torch.testing.assert_close(storage.field_data["f"][1], torch.tensor([9.0]))

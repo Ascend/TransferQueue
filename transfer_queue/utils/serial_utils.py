@@ -35,6 +35,7 @@ CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
+CUSTOM_TYPE_BATCHMETA = 5  # For BatchMeta serialization
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
 
@@ -69,6 +70,9 @@ class MsgpackEncoder:
 
     def encode(self, obj: Any) -> Sequence[bytestr]:
         """Encode a given object to a byte array."""
+        # Pre-process to convert BatchMeta to Ext; msgspec auto-serializes dataclasses and won't call enc_hook for them.
+        obj = self._preprocess_for_batchmeta(obj)
+
         bufs: list[bytestr] = [b""]
         token = _encoder_aux_buffers.set(bufs)
         try:
@@ -81,6 +85,24 @@ class MsgpackEncoder:
         finally:
             _encoder_aux_buffers.reset(token)
 
+    def _preprocess_for_batchmeta(self, obj: Any) -> Any:
+        """Recursively preprocess object to convert BatchMeta to Ext.
+
+        This is necessary because msgspec auto-serializes dataclasses and
+        won't call enc_hook for them.
+        """
+        from transfer_queue.metadata import BatchMeta
+
+        if isinstance(obj, BatchMeta):
+            return self._encode_batchmeta(obj)
+        elif isinstance(obj, dict):
+            return {k: self._preprocess_for_batchmeta(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._preprocess_for_batchmeta(item) for item in obj]
+        elif isinstance(obj, tuple):
+            return tuple(self._preprocess_for_batchmeta(item) for item in obj)
+        return obj
+
     def enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for types msgspec doesn't natively support.
 
@@ -88,6 +110,9 @@ class MsgpackEncoder:
         - torch.Tensor: Extract buffer, store metadata
         - TensorDict: Convert to dict structure for recursive processing
         - numpy.ndarray: Convert to tensor for unified handling
+
+        Note: BatchMeta is handled by _preprocess_for_batchmeta() before encode() is called,
+        so it will never reach this hook.
         """
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
@@ -115,6 +140,14 @@ class MsgpackEncoder:
 
         # Fallback to pickle for unknown types
         return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def _encode_batchmeta(self, obj: Any) -> msgpack.Ext:
+        """Encode BatchMeta for serialization.
+
+        BatchMeta is small, so we serialize it via pickle (which handles torch.dtype natively).
+        """
+        meta_dict = obj.to_dict()
+        return msgpack.Ext(CUSTOM_TYPE_BATCHMETA, pickle.dumps(meta_dict, protocol=pickle.HIGHEST_PROTOCOL))
 
     def _encode_tensordict(self, obj: Any) -> dict:
         """Convert TensorDict to a dict structure for recursive msgpack processing.
@@ -314,6 +347,7 @@ class MsgpackDecoder:
         - torch.Tensor: Extract buffer, store metadata
         - TensorDict: Convert to dict structure for recursive processing
         - numpy.ndarray: Convert to tensor for unified handling
+        - BatchMeta: Reconstruct from pickle
         """
         if code == CUSTOM_TYPE_PICKLE:
             return pickle.loads(data)
@@ -325,6 +359,11 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NESTED_TENSOR:
             nested_meta = pickle.loads(data)
             return self._decode_nested_tensor(nested_meta)
+        if code == CUSTOM_TYPE_BATCHMETA:
+            from transfer_queue.metadata import BatchMeta
+
+            meta_dict = pickle.loads(data)
+            return BatchMeta.from_dict(meta_dict)
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
 

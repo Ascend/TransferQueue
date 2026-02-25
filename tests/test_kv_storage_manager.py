@@ -25,33 +25,35 @@ from tensordict import TensorDict
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
+from transfer_queue.metadata import BatchMeta  # noqa: E402
 from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
-from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
 
 
 def get_meta(data, global_indexes=None):
     if not global_indexes:
-        global_indexes = range(data.batch_size[0])
-    samples = []
-    for sample_id in range(data.batch_size[0]):
-        fields_dict = {}
-        for field_name in data.keys():
-            tensor = data[field_name][sample_id]
-            field_meta = FieldMeta(
-                name=field_name,
-                dtype=tensor.dtype if isinstance(tensor, torch.Tensor) else None,
-                shape=tensor.shape if isinstance(tensor, torch.Tensor) else None,
-                production_status=ProductionStatus.READY_FOR_CONSUME,
-            )
-            fields_dict[field_name] = field_meta
-        sample = SampleMeta(
-            partition_id=0,
-            global_index=global_indexes[sample_id],
-            fields=fields_dict,
-        )
-        samples.append(sample)
-    metadata = BatchMeta(samples=samples)
+        global_indexes = list(range(data.batch_size[0]))
+
+    # Build columnar field_schema from the data
+    field_schema = {}
+    for field_name in data.keys():
+        tensor = data[field_name][0]
+        field_schema[field_name] = {
+            "dtype": tensor.dtype if isinstance(tensor, torch.Tensor) else type(tensor),
+            "shape": tensor.shape if isinstance(tensor, torch.Tensor) else None,
+            "is_nested": False,
+            "is_non_tensor": not isinstance(tensor, torch.Tensor),
+        }
+
+    import numpy as np
+
+    production_status = np.ones(len(global_indexes), dtype=np.int8)
+
+    metadata = BatchMeta(
+        global_indexes=list(global_indexes),
+        partition_ids=["0"] * len(global_indexes),
+        field_schema=field_schema,
+        production_status=production_status,
+    )
     return metadata
 
 
