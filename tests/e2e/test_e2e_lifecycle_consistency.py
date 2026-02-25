@@ -228,12 +228,18 @@ def verify_non_tensor_data(retrieved, expected) -> bool:
 def verify_list_equal(retrieved, expected) -> bool:
     """Verify list content.
 
-    Note: TensorDict automatically converts Python lists to Tensors during storage,
-    so we convert back to native Python types before comparison.
+    Note: TensorDict may materialize Python lists as Tensors or NonTensorStack during
+    storage/retrieval, so we normalize both sides to native Python types before comparison.
     """
-    if isinstance(retrieved, torch.Tensor):
+    from tensordict.tensorclass import NonTensorStack  # local import to avoid circular deps
+
+    if isinstance(retrieved, NonTensorStack):
         retrieved = retrieved.tolist()
-    if isinstance(expected, torch.Tensor):
+    elif isinstance(retrieved, torch.Tensor):
+        retrieved = retrieved.tolist()
+    if isinstance(expected, NonTensorStack):
+        expected = expected.tolist()
+    elif isinstance(expected, torch.Tensor):
         expected = expected.tolist()
     return retrieved == expected
 
@@ -241,17 +247,26 @@ def verify_list_equal(retrieved, expected) -> bool:
 def _reorder_tensordict(td: TensorDict, order: list[int]) -> TensorDict:
     """Reorder a TensorDict by the given index order.
 
-    Handles regular tensors, nested/jagged tensors, lists, and other indexable types.
+    Handles regular tensors, nested/jagged tensors, NonTensorStack, lists, and other
+    indexable types.
     """
+    from tensordict.tensorclass import NonTensorStack  # local import to avoid circular deps
+
     reordered = {}
     for key in td.keys():
         field = td[key]
-        if hasattr(field, "unbind"):
+        if isinstance(field, NonTensorStack):
+            # NonTensorStack: reorder by converting to list and re-wrapping
+            items = field.tolist()
+            reordered_items = [items[i] for i in order]
+            reordered[key] = NonTensorStack(*reordered_items, batch_size=[len(order)])
+        elif hasattr(field, "unbind"):
             items = field.unbind(0)
             reordered_items = [items[i] for i in order]
             try:
                 reordered[key] = torch.stack(reordered_items)
-            except RuntimeError:
+            except (RuntimeError, TypeError):
+                # RuntimeError: shape mismatch (jagged); TypeError: non-Tensor items
                 reordered[key] = torch.nested.as_nested_tensor(reordered_items, layout=field.layout)
         elif isinstance(field, list):
             reordered[key] = [field[i] for i in order]
@@ -303,7 +318,14 @@ def test_core_consistency(e2e_client):
 
         # 7. Verify NumPy Arrays
         assert np.allclose(retrieved_data["np_array"], original_data["np_array"]), "np_array mismatch"
-        assert np.array_equal(retrieved_data["np_obj"], original_data["np_obj"]), "np_obj mismatch"
+        # np_obj may be returned as NonTensorStack; normalize to list before comparing
+        retrieved_np_obj = retrieved_data["np_obj"]
+        if hasattr(retrieved_np_obj, "tolist"):
+            retrieved_np_obj = retrieved_np_obj.tolist()
+        expected_np_obj = original_data["np_obj"]
+        if hasattr(expected_np_obj, "tolist") and not isinstance(expected_np_obj, np.ndarray):
+            expected_np_obj = expected_np_obj.tolist()
+        assert list(retrieved_np_obj) == list(expected_np_obj), "np_obj mismatch"
 
         # 8. Verify Special Values (NaN and Inf)
         assert verify_special_values(retrieved_data["special_val"], original_data["special_val"]), (
