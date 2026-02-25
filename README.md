@@ -96,14 +96,14 @@ This data structure design is motivated by the computational characteristics of 
 
 | Level | Tier | Style | Fine-Grained Access | Streaming | Sampler | Multiple-Backends | 
 |---|---|---|---|------------------|---|---|
-| High | **KV Interface** (this PR) | Put/Get/List/Clear | ✓ | ○                | ✗ | ✓ | 
-| High |  **StreamingDataLoader** (#23) | PyTorch DataLoader | ✓ | ✓                | ✓ | ✓ | 
+| High | **KV Interface** ([PR#28](https://github.com/Ascend/TransferQueue/pull/28))| Put/Get/List/Clear | ✓ | ○                | ✗ | ✓ | 
+| High |  **StreamingDataLoader** ([PR#23](https://github.com/Ascend/TransferQueue/pull/23)) | PyTorch DataLoader | ✓ | ✓                | ✓ | ✓ | 
 | Low |  **TransferQueueClient** | Metadata-based | ✓ | ✓                | ✓ | ✓ | 
 
 
 #### Key-Value based API
 
-To simplify the usage of TransferQueue, we have provided a Redis-style high-level API that can enjoy most of the advanced features provided by TransferQueue ([#PR28](https://github.com/Ascend/TransferQueue/pull/28)).
+To simplify the usage of TransferQueue, we have provided a Redis-style high-level API that can enjoy most of the advanced features provided by TransferQueue ([PR#28](https://github.com/Ascend/TransferQueue/pull/28)).
 
 **Methods**
 
