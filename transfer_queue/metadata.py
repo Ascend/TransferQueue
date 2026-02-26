@@ -26,7 +26,6 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData, NonTensorStack
-from torch import Tensor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -87,8 +86,8 @@ class BatchMeta:
         field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}.
         production_status: Vectorized production status, shape (B,) where B is batch size.
         extra_info: Additional batch-level information.
-        custom_meta: Per-sample user-defined metadata {global_index: {key: value}}.
-        _custom_backend_meta: Per-sample per-field storage backend metadata {global_index: {field: meta}}.
+        custom_meta: Per-sample user-defined metadata, list aligned with global_indexes.
+        _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
     """
 
     global_indexes: list[int]
@@ -98,10 +97,10 @@ class BatchMeta:
     # O(B) vectorized production status; always np.ndarray after __post_init__ (never None)
     production_status: np.ndarray = dataclasses.field(default=None, repr=False)  # type: ignore[assignment]
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # user-defined meta for each sample (sample-level)
-    custom_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
-    # internal meta for different storage backends (per-sample per-field level)
-    _custom_backend_meta: dict[int, dict[str, Any]] = dataclasses.field(default_factory=dict)
+    # user-defined meta for each sample (sample-level), list aligned with global_indexes
+    custom_meta: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # internal meta for different storage backends (per-sample per-field level), list aligned with global_indexes
+    _custom_backend_meta: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     def __post_init__(self):
         """Initialize all computed properties during initialization"""
@@ -147,17 +146,21 @@ class BatchMeta:
         is_ready = batch_size > 0 and bool(np.all(self.production_status == 1))
         self._is_ready = is_ready
 
-        # Filter custom_meta and _custom_backend_meta to only include valid global indexes
-        if self.global_indexes:
-            self.custom_meta = copy.deepcopy(
-                {k: self.custom_meta[k] for k in self.global_indexes if k in self.custom_meta}
-            )
-            self._custom_backend_meta = copy.deepcopy(
-                {k: self._custom_backend_meta[k] for k in self.global_indexes if k in self._custom_backend_meta}
-            )
+        # Validate or initialize columnar custom_meta / _custom_backend_meta
+        if not self.custom_meta:
+            self.custom_meta = [{} for _ in range(batch_size)]
         else:
-            self.custom_meta = {}
-            self._custom_backend_meta = {}
+            self.custom_meta = copy.deepcopy(self.custom_meta)
+            if len(self.custom_meta) != batch_size:
+                raise ValueError(f"custom_meta length {len(self.custom_meta)} != batch_size {batch_size}")
+        if not self._custom_backend_meta:
+            self._custom_backend_meta = [{} for _ in range(batch_size)]
+        else:
+            self._custom_backend_meta = copy.deepcopy(self._custom_backend_meta)
+            if len(self._custom_backend_meta) != batch_size:
+                raise ValueError(
+                    f"_custom_backend_meta length {len(self._custom_backend_meta)} != batch_size {batch_size}"
+                )
 
     @property
     def size(self) -> int:
@@ -225,8 +228,7 @@ class BatchMeta:
         Returns:
             A deep copy of the custom_meta list
         """
-        custom_meta = [self.custom_meta.get(i, {}) for i in self.global_indexes]
-        return copy.deepcopy(custom_meta)
+        return copy.deepcopy(self.custom_meta)
 
     def update_custom_meta(self, custom_meta: list[dict[str, Any]]):
         """Update custom_meta with a list of dictionary of custom metadata.
@@ -245,14 +247,12 @@ class BatchMeta:
                 f"The length of custom_meta list {len(custom_meta)} must match the batch size: {self.size}"
             )
 
-        custom_meta_dict: dict[int, dict[str, Any]] = {
-            self.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))
-        }
-        self.custom_meta.update(custom_meta_dict)
+        for i, meta in enumerate(custom_meta):
+            self.custom_meta[i].update(meta)
 
     def clear_custom_meta(self) -> None:
         """Clear all custom_meta."""
-        self.custom_meta.clear()
+        self.custom_meta = [{} for _ in range(self.size)]
 
     # ==================== Core BatchMeta Operations ====================
 
@@ -331,15 +331,9 @@ class BatchMeta:
                 new_meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in sample_indices]
             new_field_schema[fname] = new_meta
 
-        new_custom_meta = {
-            idx: copy.deepcopy(self.custom_meta[idx]) for idx in new_global_indexes if idx in self.custom_meta
-        }
+        new_custom_meta = [copy.deepcopy(self.custom_meta[i]) for i in sample_indices]
 
-        new_custom_backend_meta = {
-            idx: copy.deepcopy(self._custom_backend_meta[idx])
-            for idx in new_global_indexes
-            if idx in self._custom_backend_meta
-        }
+        new_custom_backend_meta = [copy.deepcopy(self._custom_backend_meta[i]) for i in sample_indices]
 
         return BatchMeta(
             global_indexes=new_global_indexes,
@@ -366,15 +360,9 @@ class BatchMeta:
             if fname in self.field_schema:
                 new_field_schema[fname] = copy.deepcopy(self.field_schema[fname])
 
-        selected_custom_backend_meta = {}
-        for idx in self.global_indexes:
-            if idx in self._custom_backend_meta:
-                custom_backend_meta_idx = self._custom_backend_meta[idx]
-                selected_custom_backend_meta[idx] = {
-                    field: custom_backend_meta_idx[field]
-                    for field in custom_backend_meta_idx
-                    if field.startswith("_") or field in field_names  # keep special keys like _su_id
-                }
+        selected_custom_backend_meta = [
+            {f: v for f, v in m.items() if f.startswith("_") or f in field_names} for m in self._custom_backend_meta
+        ]
 
         return BatchMeta(
             global_indexes=self.global_indexes,
@@ -551,11 +539,11 @@ class BatchMeta:
                         all_shapes.extend([None] * chunk.size)
                 all_field_schema[fname]["per_sample_shapes"] = all_shapes
 
-        all_custom_meta: dict[int, dict[str, Any]] = {}
-        all_custom_backend_meta: dict[int, dict[str, Any]] = {}
+        all_custom_meta: list[dict[str, Any]] = []
+        all_custom_backend_meta: list[dict[str, Any]] = []
         for chunk in data:
-            all_custom_meta.update(chunk.custom_meta)
-            all_custom_backend_meta.update(chunk._custom_backend_meta)
+            all_custom_meta.extend(chunk.custom_meta)
+            all_custom_backend_meta.extend(chunk._custom_backend_meta)
 
         # Merge all extra_info dictionaries from the chunks
         merged_extra_info = dict()
@@ -622,6 +610,9 @@ class BatchMeta:
             if meta.get("per_sample_shapes") is not None:
                 meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in indices]
 
+        self.custom_meta = [self.custom_meta[i] for i in indices]
+        self._custom_backend_meta = [self._custom_backend_meta[i] for i in indices]
+
     @classmethod
     def empty(cls, extra_info: Optional[dict[str, Any]] = None) -> "BatchMeta":
         """Create an empty BatchMeta with no samples.
@@ -643,8 +634,8 @@ class BatchMeta:
             field_schema={},
             production_status=None,
             extra_info=extra_info,
-            custom_meta={},
-            _custom_backend_meta={},
+            custom_meta=[],
+            _custom_backend_meta=[],
         )
 
     def __str__(self):
@@ -709,10 +700,9 @@ class BatchMeta:
             field_schema=field_schema,
             production_status=production_status,
             extra_info=data.get("extra_info", {}),
-            custom_meta=data.get("custom_meta", {}),
-            _custom_backend_meta=data.get("_custom_backend_meta", {}),
+            custom_meta=data.get("custom_meta", []),
+            _custom_backend_meta=data.get("_custom_backend_meta", []),
         )
-
 
 
 # ==================== KV Interface Metadata ====================

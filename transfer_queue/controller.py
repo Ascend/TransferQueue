@@ -1385,13 +1385,17 @@ class TransferQueueController:
         custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
 
+        # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
+        custom_meta_list = [custom_meta_dict.get(gi, {}) for gi in batch_global_indexes]
+        custom_backend_meta_list = [custom_backend_meta.get(gi, {}) for gi in batch_global_indexes]
+
         batch_meta = BatchMeta(
             global_indexes=batch_global_indexes,
             partition_ids=[partition_id] * batch_size,
             field_schema=field_schema,
             production_status=production_status,
-            custom_meta=custom_meta_dict,
-            _custom_backend_meta=custom_backend_meta,
+            custom_meta=custom_meta_list,
+            _custom_backend_meta=custom_backend_meta_list,
         )
         return batch_meta
 

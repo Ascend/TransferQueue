@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import itertools
 import logging
 import os
@@ -523,7 +522,6 @@ class KVStorageManager(TransferQueueStorageManager):
         shapes = []
         dtypes = []
         custom_backend_meta_list = []
-        all_custom_backend_meta = copy.deepcopy(metadata._custom_backend_meta)
         num_samples = len(metadata)
 
         for field_name in sorted(metadata.field_names):
@@ -538,8 +536,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 else:
                     shapes.append(field_shape)
                 dtypes.append(field_dtype)
-                global_index = metadata.global_indexes[index]
-                custom_backend_meta_list.append(all_custom_backend_meta.get(global_index, {}).get(field_name, None))
+                custom_backend_meta_list.append(metadata._custom_backend_meta[index].get(field_name, None))
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
@@ -591,8 +588,9 @@ class KVStorageManager(TransferQueueStorageManager):
                 raise ValueError(
                     f"Length of custom_backend_meta ({len(custom_backend_meta)}) does not match expected ({len(keys)})"
                 )
-            # custom meta is a flat list aligned with keys/values
-            # Use itertools.product to eliminate nested loops
+            # Build gi→position index for O(1) lookup
+            gi_to_pos = {gi: i for i, gi in enumerate(metadata.global_indexes)}
+
             for global_idx in metadata.global_indexes:
                 per_field_custom_backend_meta[global_idx] = {}
 
@@ -605,7 +603,8 @@ class KVStorageManager(TransferQueueStorageManager):
                 strict=True,
             ):
                 per_field_custom_backend_meta[global_idx][field_name] = meta_value
-            metadata._custom_backend_meta.update(per_field_custom_backend_meta)
+                # Also update columnar _custom_backend_meta
+                metadata._custom_backend_meta[gi_to_pos[global_idx]][field_name] = meta_value
 
         # Get current data partition id
         partition_id = metadata.partition_ids[0]

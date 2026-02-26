@@ -364,9 +364,9 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         from collections import defaultdict  # noqa: F811 (shadowed by top-level import, kept for clarity)
 
         groups: dict[str, list[int]] = defaultdict(list)
-        for gi in metadata.global_indexes:
-            backend_meta = metadata._custom_backend_meta.get(gi)
-            if backend_meta is None or "_su_id" not in backend_meta:
+        for i, gi in enumerate(metadata.global_indexes):
+            backend_meta = metadata._custom_backend_meta[i]
+            if not backend_meta or "_su_id" not in backend_meta:
                 raise RuntimeError(
                     f"get_data: missing _su_id for global_index {gi} in _custom_backend_meta. "
                     f"Make sure put_data was called before get_data."
@@ -469,9 +469,9 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         from collections import defaultdict  # noqa: F811 (shadowed by top-level import, kept for clarity)
 
         groups: dict[str, list[int]] = defaultdict(list)
-        for gi in metadata.global_indexes:
-            backend_meta = metadata._custom_backend_meta.get(gi)
-            if backend_meta is None or "_su_id" not in backend_meta:
+        for i, gi in enumerate(metadata.global_indexes):
+            backend_meta = metadata._custom_backend_meta[i]
+            if not backend_meta or "_su_id" not in backend_meta:
                 raise RuntimeError(
                     f"clear_data: missing _su_id for global_index {gi} in _custom_backend_meta. "
                     f"Make sure put_data was called before clear_data."

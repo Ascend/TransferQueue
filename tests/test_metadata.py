@@ -76,8 +76,8 @@ class TestBatchMetaColumnar:
             partition_ids=["partition_0"] * 10,
             field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
             production_status=np.ones(10, dtype=np.int8),
-            custom_meta={i: {"uid": i} for i in range(10)},
-            _custom_backend_meta={i: {"f": {"key": i}} for i in range(10)},
+            custom_meta=[{"uid": i} for i in range(10)],
+            _custom_backend_meta=[{"f": {"key": i}} for i in range(10)],
         )
         chunks = batch.chunk(3)
         assert len(chunks) == 3
@@ -85,11 +85,11 @@ class TestBatchMetaColumnar:
         assert len(chunks[0]) == 4
         assert len(chunks[1]) == 3
         assert len(chunks[2]) == 3
-        # custom_meta is chunked correctly
-        assert 0 in chunks[0].custom_meta
-        assert 3 in chunks[0].custom_meta
-        assert 4 not in chunks[0].custom_meta
-        assert 4 in chunks[1].custom_meta
+        # custom_meta is chunked correctly (positional)
+        assert chunks[0].custom_meta[0] == {"uid": 0}
+        assert chunks[0].custom_meta[3] == {"uid": 3}
+        assert len(chunks[0].custom_meta) == 4
+        assert chunks[1].custom_meta[0] == {"uid": 4}
 
     def test_chunk_by_partition(self):
         """Test splitting by partition_id."""
@@ -120,14 +120,14 @@ class TestBatchMetaColumnar:
     def test_custom_meta_update(self):
         """Test update_custom_meta method."""
         batch = self._make_batch(batch_size=2)
-        batch.update_custom_meta({0: {"tag": "alpha"}, 1: {"tag": "beta"}})
+        batch.update_custom_meta([{"tag": "alpha"}, {"tag": "beta"}])
         assert batch.custom_meta[0]["tag"] == "alpha"
         assert batch.custom_meta[1]["tag"] == "beta"
 
     def test_custom_backend_meta(self):
         """Test _custom_backend_meta attribute."""
         batch = self._make_batch(batch_size=2)
-        batch._custom_backend_meta[0] = {"field_a": {"storage_key": "abc"}}
+        batch._custom_backend_meta[0]["field_a"] = {"storage_key": "abc"}
         assert batch._custom_backend_meta[0]["field_a"]["storage_key"] == "abc"
 
     def test_size_property(self):

@@ -198,14 +198,13 @@ def test_get_shape_type_custom_backend_meta_list_without_custom_backend_meta(tes
 
 def test_get_shape_type_custom_backend_meta_list_with_custom_backend_meta(test_data):
     """Test _get_shape_type_custom_backend_meta_list returns correct custom_backend_meta when provided."""
-    # Add custom_backend_meta to metadata
-    custom_backend_meta = {
-        8: {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},
-        9: {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},
-        10: {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},
-    }
+    # Add custom_backend_meta to metadata (columnar: list aligned with global_indexes [8, 9, 10])
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+    metadata._custom_backend_meta = [
+        {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # global_index=8
+        {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},  # global_index=9
+        {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},  # global_index=10
+    ]
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
@@ -226,14 +225,13 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_backend_meta(test_d
 
 def test_get_shape_type_custom_backend_meta_list_with_partial_custom_backend_meta(test_data):
     """Test _get_shape_type_custom_backend_meta_list handles partial custom_backend_meta correctly."""
-    # Add custom_backend_meta only for some global_indexes and fields
-    custom_backend_meta = {
-        8: {"text": {"key1": "value1"}},  # Only text field
-        # global_index 9 has no custom_backend_meta
-        10: {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # label and mask only
-    }
+    # Add custom_backend_meta only for some fields (columnar: list aligned with global_indexes [8, 9, 10])
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+    metadata._custom_backend_meta = [
+        {"text": {"key1": "value1"}},  # global_index=8: only text field
+        {},  # global_index=9: no custom_backend_meta
+        {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # global_index=10: label and mask only
+    ]
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
