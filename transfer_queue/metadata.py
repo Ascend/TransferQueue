@@ -374,6 +374,45 @@ class BatchMeta:
             _custom_backend_meta=selected_custom_backend_meta,
         )
 
+    def with_data_fields(self, field_names: list[str]) -> "BatchMeta":
+        """Return a new BatchMeta with the given data fields, replacing the current field_schema.
+
+        Unlike ``select_fields``, this method allows specifying field names that are not
+        yet present in the current ``field_schema`` (e.g. fields added by a subsequent
+        ``put`` call on a subset of samples).  Unknown fields are included in the new
+        ``field_schema`` with an empty metadata dict so that ``get_data`` can retrieve
+        them from the storage backend.
+
+        Args:
+            field_names (list[str]): List of field names to request. May include fields
+                not present in the current ``field_schema``.
+
+        Returns:
+            BatchMeta: A new BatchMeta instance whose ``field_schema`` contains exactly
+            the requested fields (existing metadata is preserved where available).
+        """
+        new_field_schema = {}
+        for fname in field_names:
+            if fname in self.field_schema:
+                new_field_schema[fname] = copy.deepcopy(self.field_schema[fname])
+            else:
+                # Unknown field — include with empty schema so get_data can fetch it.
+                new_field_schema[fname] = {}
+
+        selected_custom_backend_meta = [
+            {f: v for f, v in m.items() if f.startswith("_") or f in field_names} for m in self._custom_backend_meta
+        ]
+
+        return BatchMeta(
+            global_indexes=self.global_indexes,
+            partition_ids=self.partition_ids,
+            field_schema=new_field_schema,
+            production_status=self.production_status.copy(),
+            extra_info=self.extra_info,
+            custom_meta=self.custom_meta,
+            _custom_backend_meta=selected_custom_backend_meta,
+        )
+
     def __len__(self) -> int:
         """Return the number of samples in this batch."""
         return self.size

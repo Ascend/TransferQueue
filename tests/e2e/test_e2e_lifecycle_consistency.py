@@ -420,15 +420,20 @@ def test_cross_shard_complex_update(e2e_client):
             "Region 30-39 tensor_f32 should match original Put B"
         )
 
-        # 9. Verify new fields exist in update region
-        extended_fields = base_fields + ["new_extra_tensor", "new_extra_non_tensor"]
-        update_region_meta = poll_for_meta(
-            client, partition_id, extended_fields, 20, "update_region_task", mode="force_fetch"
+        # 9. Verify new fields exist in update region (indices 10-29 only have new fields).
+        # Build extended_meta from full_meta (which has valid _custom_backend_meta/_su_id)
+        # by selecting the subset of samples whose global_indexes match meta_update.
+        # Using meta_update directly would fail because it was derived from alloc_meta
+        # before put(), so its _custom_backend_meta lacks _su_id.
+        update_gis = set(meta_update.global_indexes)
+        update_positions_in_full = [i for i, gi in enumerate(full_meta.global_indexes) if gi in update_gis]
+        update_meta_with_backend = full_meta.select_samples(update_positions_in_full)
+        extended_meta = update_meta_with_backend.with_data_fields(
+            base_fields + ["new_extra_tensor", "new_extra_non_tensor"]
         )
-        if update_region_meta is not None and update_region_meta.size > 0:
-            update_region_data = client.get_data(update_region_meta)
-            assert "new_extra_tensor" in update_region_data.keys(), "new_extra_tensor should exist"
-            assert "new_extra_non_tensor" in update_region_data.keys(), "new_extra_non_tensor should exist"
+        update_region_data = client.get_data(extended_meta)
+        assert "new_extra_tensor" in update_region_data.keys(), "new_extra_tensor should exist"
+        assert "new_extra_non_tensor" in update_region_data.keys(), "new_extra_non_tensor should exist"
     finally:
         client.clear_partition(partition_id)
 
