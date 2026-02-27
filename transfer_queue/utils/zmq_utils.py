@@ -178,10 +178,11 @@ class ZMQMessage:
         try:
             return list(_encoder.encode(msg_dict))
         except (TypeError, ValueError) as e:
-            logger.warning(
-                "ZMQMessage.serialize: zero-copy encoding failed (%s: %s), falling back to pickle.",
+            # Pickle fallback is a normal degradation path (e.g. body contains torch.dtype objects).
+            # Log at INFO so operators are aware but not alarmed; use WARNING only for unexpected errors.
+            logger.info(
+                "ZMQMessage.serialize: msgpack encoding unsupported type (%s), using pickle fallback.",
                 type(e).__name__,
-                e,
             )
             return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(self)]
 

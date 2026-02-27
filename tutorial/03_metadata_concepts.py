@@ -36,6 +36,7 @@ warnings.filterwarnings(
 )
 
 
+import numpy as np  # noqa: E402
 import ray  # noqa: E402
 import torch  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
@@ -45,129 +46,161 @@ parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
 import transfer_queue as tq  # noqa: E402
-from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
-from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
+from transfer_queue.metadata import BatchMeta  # noqa: E402
 
 # Configure Ray
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"
 
 
-def demonstrate_field_meta():
+def demonstrate_batch_meta_schema():
     """
-    Demonstrate FieldMeta - specific data fields of each training sample.
+    Demonstrate BatchMeta field_schema - field-level metadata for the batch.
+    After the columnar refactoring, field metadata is stored once at the batch level
+    (not per-sample). This is the O(F) optimized representation.
     """
     print("=" * 80)
-    print("FieldMeta - Specific data fields of each training sample")
+    print("BatchMeta field_schema - Field-Level Metadata (O(F) columnar storage)")
     print("=" * 80)
 
-    print("FieldMeta represents a single field in ONE sample:")
-    print("- name: Field identifier ('Prompt', 'Response', etc.)")
+    print("field_schema stores metadata for each field ONCE per batch (not per sample):")
     print("- dtype: Data type (torch.float32, torch.int64, etc.)")
     print("- shape: Shape of ONE sample's data (NO batch dimension)")
-    print("- production_status: Whether data is ready (has been produced and written to the TQ backend)")
+    print("- is_nested: Whether the field uses nested/ragged tensors")
+    print("- is_non_tensor: Whether the field is non-tensor data")
 
-    # Example 1: Create a field for input_ids
-    print("[Example 1] Manually creating FieldMeta for input_ids...")
-    input_ids_field = FieldMeta(
-        name="input_ids",
-        dtype=torch.int64,
-        shape=(512,),  # Sequence length for ONE sample
-        production_status=ProductionStatus.READY_FOR_CONSUME,
+    # Example 1: Create a field schema entry for input_ids (analogous to old FieldMeta)
+    print("[Example 1] Creating field schema entry for input_ids...")
+    batch = BatchMeta(
+        global_indexes=[0, 1, 2],
+        partition_ids=["train_0"] * 3,
+        field_schema={
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+        },
     )
-    print(f"✓ Created: {input_ids_field}")
-    print(f"  Is ready: {input_ids_field.is_ready}")
+    print("✓ Created: BatchMeta with field 'input_ids'")
+    print(f"  input_ids schema: {batch.field_schema['input_ids']}")
+    print(f"  Is ready: {batch.is_ready}")
     print("  Note: Shape (512,) means ONE sample has 512 tokens (no batch dimension)")
 
-    # Example 2: Create a field for attention_mask
-    print("[Example 2] Creating FieldMeta for attention_mask...")
-    attention_mask_field = FieldMeta(
-        name="attention_mask",
-        dtype=torch.int64,
-        shape=(512,),  # Sequence length for ONE sample
-        production_status=ProductionStatus.NOT_PRODUCED,
+    # Example 2: Create a field schema entry for attention_mask
+    print("[Example 2] Creating field schema entry for attention_mask...")
+    batch2 = BatchMeta(
+        global_indexes=[0, 1, 2],
+        partition_ids=["train_0"] * 3,
+        field_schema={
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+        },
     )
-    print(f"✓ Created: {attention_mask_field}")
-    print(f"  Is ready: {attention_mask_field.is_ready}")
+    print("✓ Created: BatchMeta with field 'attention_mask'")
+    print(f"  attention_mask schema: {batch2.field_schema['attention_mask']}")
+    print(f"  Is ready: {batch2.is_ready}")
 
-    # Example 3: Check field readiness
+    # Example 3: Check field readiness via is_ready and production_status
     print("[Example 3] Checking field readiness...")
-    print(f"  input_ids ready: {input_ids_field.is_ready}")
-    print(f"  attention_mask ready: {attention_mask_field.is_ready}")
+    ready_batch = BatchMeta(
+        global_indexes=[0, 1, 2],
+        partition_ids=["train_0"] * 3,
+        field_schema={
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+        },
+        production_status=np.array([1, 1, 1], dtype="int8"),  # 1 = READY_FOR_CONSUME
+    )
+    print(f"  input_ids field exists: {'input_ids' in ready_batch.field_schema}")
+    print(f"  attention_mask field exists: {'attention_mask' in ready_batch.field_schema}")
+    print(f"  not-ready batch is_ready: {batch.is_ready}")
+    print(f"  ready batch is_ready:     {ready_batch.is_ready}")
+
+    # Example 4: Access per-sample view and individual field schema by key
+    print("[Example 4] Accessing sample view and individual field by key...")
+    view = ready_batch.samples[0]
+    print(f"  batch.samples[0].fields -> {view.fields}")
+    print(f"  batch.samples[0].fields['input_ids'] -> {view.fields['input_ids']}")
+    print(f"  batch.samples[0].fields['input_ids']['dtype'] -> {view.fields['input_ids']['dtype']}")
+    print("  Note: view.fields returns the shared field_schema dict (same for all samples)")
+    print(f"  For partition_id: use batch.partition_ids[0] = '{ready_batch.partition_ids[0]}'")
+    print(f"  For global_index: use batch.global_indexes[0] = {ready_batch.global_indexes[0]}")
 
 
-def demonstrate_sample_meta():
+def demonstrate_batch_meta_construction():
     """
-    Demonstrate SampleMeta - describes a single data sample.
+    Demonstrate how to construct BatchMeta directly and operate on it
+    (analogous to old SampleMeta operations: add_fields, select_fields, union).
     """
     print("=" * 80)
-    print("SampleMeta - Describing a Single Data Sample")
+    print("BatchMeta Construction & Operations")
     print("=" * 80)
 
-    print("SampleMeta represents ONE data sample:")
-    print("- partition_id: Which partition the sample belongs to")
-    print("- global_index: Unique identifier across ALL partitions")
-    print("- fields: Dict of FieldMeta objects (describing each field of THIS sample)")
+    print("BatchMeta now uses a columnar layout:")
+    print("- global_indexes: list[int] - unique IDs across ALL partitions")
+    print("- partition_ids: list[str] - which partition each sample belongs to")
+    print("- field_schema: dict[str, dict] - field metadata (stored ONCE, not per-sample)")
 
-    # Example 1: Manually create a sample
-    print("[Example 1] Creating a SampleMeta...")
-    fields = {
-        "input_ids": FieldMeta("input_ids", torch.int64, (512,)),
-        "attention_mask": FieldMeta("attention_mask", torch.int64, (512,)),
-    }
-    sample = SampleMeta(partition_id="train_0", global_index=0, fields=fields)
-    print(f"✓ Created: {sample}")
-    print(f"  Partition: {sample.partition_id}")
-    print(f"  Global index: {sample.global_index}")
-    print(f"  Fields: {sample.field_names}")
-    print(f"  Is ready: {sample.is_ready}")
+    # Example 1: Manually create a BatchMeta (analogous to old SampleMeta construction)
+    print("[Example 1] Creating a BatchMeta with input_ids and attention_mask...")
+    batch = BatchMeta(
+        global_indexes=[0, 1, 2, 3, 4],
+        partition_ids=["train_0"] * 5,
+        field_schema={
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+        },
+    )
+    print(f"✓ Created: {len(batch)} samples")
+    print(f"  Partition IDs: {batch.partition_ids}")
+    print(f"  Global indexes: {batch.global_indexes}")
+    print(f"  Fields: {batch.field_names}")
+    print(f"  Is ready: {batch.is_ready}")
 
-    # Example 2: Manually add fields to a sample
-    print("[Example 2] Adding fields to a sample...")
-    new_fields = {
-        "responses": FieldMeta("responses", torch.int64, (128,)),
-        "log_probs": FieldMeta("log_probs", torch.float32, (128,)),
-    }
-    sample.add_fields(new_fields)
-    print(f"✓ Added fields: {list(new_fields.keys())}")
-    print(f"  Now has fields: {sample.field_names}")
-    print(f"  Is ready: {sample.is_ready}")
+    # Example 2: add_fields - add new fields from real tensor data (analogous to sample.add_fields)
+    print("[Example 2] Adding new fields via add_fields(TensorDict)...")
+    new_data = TensorDict(
+        {
+            "responses": torch.randint(0, 1000, (5, 128)),
+            "log_probs": torch.randn(5, 128),
+        },
+        batch_size=5,
+    )
+    batch.add_fields(new_data)  # infers dtype/shape from actual tensors, sets all ready
+    print("✓ Added fields: ['responses', 'log_probs']")
+    print(f"  Now has fields: {batch.field_names}")
+    print(f"  Is ready: {batch.is_ready}  (add_fields sets all to READY_FOR_CONSUME by default)")
 
-    # Example 3: Select specific fields
+    # Example 3: select_fields - select specific fields (analogous to sample.select_fields)
     print("[Example 3] Selecting specific fields...")
-    selected_sample = sample.select_fields(["input_ids", "responses"])
-    print(f"✓ Selected fields: {selected_sample.field_names}")
-    print(f"  Original fields: {sample.field_names}")
+    selected = batch.select_fields(["input_ids", "responses"])
+    print(f"✓ Selected fields: {selected.field_names}")
+    print(f"  Original fields: {batch.field_names}")
 
-    # Example 4: Union two samples
-    print("[Example 4] Unioning two samples...")
-    print("  IMPORTANT: Union requires samples to have IDENTICAL partition_id and global_index!")
-    sample1 = SampleMeta(
-        partition_id="train_0",
-        global_index=5,
-        fields={
-            "input_ids": FieldMeta("input_ids", torch.int64, (512,)),
-            "attention_mask": FieldMeta("attention_mask", torch.int64, (512,)),
+    # Example 4: union - merge two batches with different global_indexes (new columnar semantics)
+    print("[Example 4] Unioning two batches with different global_indexes...")
+    print("  IMPORTANT: new union semantics = concat unique samples (by global_index)")
+    batch_a = BatchMeta(
+        global_indexes=[0, 1, 2],
+        partition_ids=["train_0"] * 3,
+        field_schema={
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
         },
     )
-    sample2 = SampleMeta(
-        partition_id="train_0",
-        global_index=5,  # Same global index!
-        fields={
-            "responses": FieldMeta("responses", torch.int64, (128,)),
-            "log_probs": FieldMeta("log_probs", torch.float32, (128,)),
+    batch_b = BatchMeta(
+        global_indexes=[2, 3, 4],  # global_index=2 overlaps with batch_a
+        partition_ids=["train_0"] * 3,
+        field_schema={
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
         },
     )
-    print(f"  Sample1: partition={sample1.partition_id}, global_index={sample1.global_index}")
-    print(f"  Sample2: partition={sample2.partition_id}, global_index={sample2.global_index}")
+    print(f"  BatchA indexes: {batch_a.global_indexes}")
+    print(f"  BatchB indexes: {batch_b.global_indexes}")
+    unioned = batch_a.union(batch_b)
+    print(f"✓ Union result indexes: {unioned.global_indexes}  (global_index=2 deduplicated)")
 
-    try:
-        unioned = sample1.union(sample2)
-        print("✓ Union successful!")
-        print(f"  Unioned fields: {unioned.field_names}")
-        print(f"  Global index preserved: {unioned.global_index}")
-    except ValueError as e:
-        print(f"✗ Union failed: {e}")
+    # Example 5: Empty BatchMeta
+    print("[Example 5] Creating an empty BatchMeta (for initializing before data arrives)...")
+    empty = BatchMeta.empty()
+    print(f"✓ Empty BatchMeta: size={empty.size}, is_ready={empty.is_ready}")
 
 
 def demonstrate_batch_meta():
@@ -175,35 +208,45 @@ def demonstrate_batch_meta():
     Demonstrate BatchMeta - describes a batch of samples with operations.
     """
     print("=" * 80)
-    print("BatchMeta - Describing a Batch of Samples")
+    print("BatchMeta - Operations on Batch")
     print("=" * 80)
 
-    print("BatchMeta represents a collection of samples:")
-    print("- samples: List of SampleMeta objects")
-    print("- extra_info: Additional batch-level information")
-    print("- Provides operations: chunk, concat, union, select, reorder")
+    print("BatchMeta represents a collection of data samples with operations:")
+    print("- global_indexes: list of global sample indices")
+    print("- partition_ids: list of partition IDs per sample")
+    print("- field_schema: field-level metadata (stored once at batch level)")
+    print("- Operations: chunk, concat, union, select_samples, select_fields, reorder")
 
-    # Example 1: Manually create a batch
+    # Helper to create a BatchMeta
+    def make_batch(global_indexes, fields=None):
+        if fields is None:
+            fields = ["input_ids", "attention_mask", "responses"]
+        schema = {
+            "input_ids": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "attention_mask": {"dtype": torch.int64, "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            "responses": {"dtype": torch.int64, "shape": (128,), "is_nested": False, "is_non_tensor": False},
+        }
+        return BatchMeta(
+            global_indexes=global_indexes,
+            partition_ids=["train_0"] * len(global_indexes),
+            field_schema={k: v for k, v in schema.items() if k in fields},
+        )
+
+    # Example 1: Create a batch
     print("[Example 1] Creating a BatchMeta...")
-    fields = {
-        "input_ids": FieldMeta("input_ids", torch.int64, (512,)),
-        "attention_mask": FieldMeta("attention_mask", torch.int64, (512,)),
-        "responses": FieldMeta("responses", torch.int64, (128,)),
-    }
-    samples = [SampleMeta(partition_id="train_0", global_index=i, fields=fields) for i in range(5)]
-    batch = BatchMeta(samples=samples)
+    batch = make_batch(list(range(5)))
     print(f"✓ Created batch with {len(batch)} samples")
     print(f"  Global indexes: {batch.global_indexes}")
     print(f"  Field names: {batch.field_names}")
     print(f"  Size: {batch.size}")
 
-    # Example 2: Add extra_info
+    # Example 2: Add extra_info (batch-level)
     print("[Example 2] Adding batch-level information through extra_info...")
-    print("Note: The extra info will not be stored into TransferQueueController.")
     batch.extra_info["epoch"] = 1
     batch.extra_info["batch_idx"] = 0
     print(f"✓ Extra info: {batch.get_all_extra_info()}")
 
+    # Example 3: update_custom_meta (list aligned with global_indexes)
     print("[Example 3] Adding sample-level information through custom_meta...")
     batch.update_custom_meta(
         [
@@ -216,82 +259,55 @@ def demonstrate_batch_meta():
     )
     print(f"✓ Custom meta: {batch.get_all_custom_meta()}")
 
-    # Example 4: Chunk a batch
+    # Example 4: Chunk
     print("[Example 4] Chunking a batch into parts...")
     chunks = batch.chunk(3)
     print(f"✓ Split into {len(chunks)} chunks:")
     for i, chunk in enumerate(chunks):
         print(f"  Chunk {i}: {len(chunk)} samples, indexes={chunk.global_indexes}")
 
-    # Example 5: Select specific fields
+    # Example 5: select_fields
     print("[Example 5] Selecting specific fields...")
     selected_batch = batch.select_fields(["input_ids", "responses"])
     print(f"✓ Selected fields: {selected_batch.field_names}")
     print(f"  Original fields: {batch.field_names}")
 
-    # Example 6: Select specific samples
+    # Example 6: select_samples
     print("[Example 6] Selecting specific samples...")
     selected_samples = batch.select_samples([0, 2, 4])
-    print(f"✓ Selected samples at indexes: {selected_samples.global_indexes}")
+    print(f"✓ Selected samples at batch indices [0,2,4]: global_indexes={selected_samples.global_indexes}")
 
-    # Example 7: Reorder samples
+    # Example 7: reorder
     print("[Example 7] Reordering samples...")
     print(f"  Original order: {batch.global_indexes}")
     batch.reorder([4, 3, 2, 1, 0])
     print(f"  After reorder: {batch.global_indexes}")
 
-    # Example 8: Concat batches
+    # Example 8: concat
     print("[Example 8] Concatenating batches...")
-    batch1 = BatchMeta(samples=[SampleMeta(partition_id="train_0", global_index=i, fields=fields) for i in range(3)])
-    batch2 = BatchMeta(samples=[SampleMeta(partition_id="train_0", global_index=i, fields=fields) for i in range(3, 6)])
+    batch1 = make_batch(list(range(3)))
+    batch2 = make_batch(list(range(3, 6)))
     concatenated = BatchMeta.concat([batch1, batch2])
     print(f"✓ Concatenated {len(batch1)} + {len(batch2)} = {len(concatenated)} samples")
     print(f"  Global indexes: {concatenated.global_indexes}")
-    print("  Note: concat combines multiple batches into one (same structure)")
+    print("  Note: concat combines multiple batches with SAME field structure into one larger batch")
 
-    # Example 9: Union batches
-    print("[Example 9] Unioning batches (different fields, same samples)...")
-    batch_with_input = BatchMeta(
-        samples=[
-            SampleMeta(
-                partition_id="train_0",
-                global_index=i,
-                fields={
-                    "input_ids": FieldMeta("input_ids", torch.int64, (512,)),
-                    "attention_mask": FieldMeta("attention_mask", torch.int64, (512,)),
-                },
-            )
-            for i in range(3)
-        ]
-    )
-    batch_with_output = BatchMeta(
-        samples=[
-            SampleMeta(
-                partition_id="train_0",
-                global_index=i,
-                fields={
-                    "responses": FieldMeta("responses", torch.int64, (128,)),
-                    "log_probs": FieldMeta("log_probs", torch.float32, (128,)),
-                },
-            )
-            for i in range(3)
-        ]
-    )
-    print(f"  Batch1 has fields: {batch_with_input.field_names}")
-    print(f"  Batch2 has fields: {batch_with_output.field_names}")
-    print(f"  Both have same samples (global_indexes: {batch_with_input.global_indexes})")
-
-    unioned_batch = batch_with_input.union(batch_with_output)
-    print("✓ Union successful!")
-    print(f"  Unioned fields: {unioned_batch.field_names}")
-    print("  Note: union merges fields from two batches with SAME samples (same global_indexes)")
+    # Example 9: union (new semantics: concat unique samples, dedup by global_index)
+    print("[Example 9] Unioning batches with overlapping global_indexes...")
+    batch_a = make_batch(list(range(3)), fields=["input_ids", "attention_mask"])  # indexes [0,1,2]
+    batch_b = make_batch(list(range(2, 5)), fields=["input_ids", "attention_mask"])  # indexes [2,3,4] — 2 overlaps!
+    print(f"  BatchA fields: {batch_a.field_names}, indexes: {batch_a.global_indexes}")
+    print(f"  BatchB fields: {batch_b.field_names}, indexes: {batch_b.global_indexes}")
+    unioned = batch_a.union(batch_b)
+    print(f"✓ Unioned: {unioned.global_indexes}  (global_index=2 deduplicated, result: [0,1,2,3,4])")
+    print("  Note: union keeps self's copy when global_index overlaps")
 
     print("=" * 80)
     print("concat vs union:")
-    print("  - concat: Combines multiple batches with SAME structure into one larger batch")
-    print("    Example: batch1[0,1,2] + batch2[3,4,5] = batch[0,1,2,3,4,5]")
-    print("  - union: Merges fields from two batches with IDENTICAL samples")
-    print("    Example: batch1[0,1] with fields A + batch2[0,1] with fields B = batch[0,1] with fields A+B")
+    print("  - concat: Combines multiple batches with SAME field structure into one larger batch")
+    print("    Example: batch[0,1,2] concat batch[3,4,5] = batch[0,1,2,3,4,5]")
+    print("  - union:  Merges two batches, deduplicating by global_index (keeps self's copy)")
+    print("    Example: batch[0,1,2] union batch[2,3,4] = batch[0,1,2,3,4]")
     print("=" * 80)
 
 
@@ -351,8 +367,8 @@ def demonstrate_real_workflow():
     print(f"  Number of samples: {len(batch_meta)}")
     print(f"  Global indexes: {batch_meta.global_indexes}")
     print(f"  Field names: {batch_meta.field_names}")
-    print(f"  Partition ID: {batch_meta.samples[0].partition_id}")
-    print(f"  Sample structure: {batch_meta.samples[0]}")
+    print(f"  Partition IDs: {batch_meta.partition_ids}")
+    print(f"  Sample view: fields={batch_meta.samples[0].fields}")
     print(f"  Custom Meta: {batch_meta.get_all_custom_meta()}")
 
     print("[Step 4] Retrieve samples with specific fields..")
@@ -397,24 +413,24 @@ def main():
         This script introduces the metadata system in TransferQueue, which tracks
         the structure and state of data:
 
-        1. FieldMeta - Describes a single field (name, dtype, shape, production status)
-        2. SampleMeta - Describes a single data sample (partition_id, global_index, fields)
-        3. BatchMeta - Describes a batch of samples (collection of SampleMeta with operations)
+        1. BatchMeta - The central metadata object for a collection of data samples.
+           Uses a columnar layout: field metadata is stored ONCE at the batch level (O(F)),
+           not per-sample (was O(B×F) in the old design).
 
         Key Concepts:
-        - Metadata tracks data structure without storing actual data
-        - User can set their own custom metadata into BatchMeta, and use TQ controller to store them.
-        - BatchMeta provides operations: chunk, concat, union, select, reorder...
-        - Metadata is lightweight and can be passed around efficiently
-        - Union requires samples to have identical partition_id and global_index
-        """
+        - BatchMeta stores global_indexes, partition_ids, and field_schema directly
+        - field_schema: dict[field_name, {dtype, shape, is_nested, is_non_tensor}]
+        - custom_meta: list[dict] aligned with global_indexes (one dict per sample)
+        - Metadata operations: chunk, concat, union, select_fields, select_samples, reorder
+        - batch.samples[i] returns a lazy view with .fields -> field_schema (read-only)
+    """
         )
     )
     print("=" * 80)
 
     try:
-        demonstrate_field_meta()
-        demonstrate_sample_meta()
+        demonstrate_batch_meta_schema()
+        demonstrate_batch_meta_construction()
         demonstrate_batch_meta()
         demonstrate_real_workflow()
 
@@ -422,12 +438,11 @@ def main():
         print("Tutorial Complete!")
         print("=" * 80)
         print("Key Takeaways:")
-        print("1. FieldMeta describes individual data fields (NO batch dimension in shape)")
-        print("2. SampleMeta describes a single data sample")
-        print("3. BatchMeta manages collections of samples with operations")
-        print("4. Metadata operations: chunk, concat, union, select, reorder... You can retrieve subsets easily!")
-        print("5. extra_info is in batch-level, and custom_meta is in sample-level.")
-        print("6. You can put custom_meta into TQ controller, so you can retrieve them from anywhere!")
+        print("1. BatchMeta uses columnar storage: field metadata stored once, not per-sample")
+        print("2. Construct BatchMeta with: BatchMeta(global_indexes=[...], partition_ids=[...], field_schema={...})")
+        print("3. BatchMeta operations: chunk, concat, union, select_fields, select_samples, reorder")
+        print("4. extra_info is batch-level; custom_meta is sample-level (list[dict])")
+        print("5. Store custom_meta via TQ controller: tq_client.set_custom_meta(batch_meta)")
 
         # Cleanup
         ray.shutdown()

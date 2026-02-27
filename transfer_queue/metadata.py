@@ -37,6 +37,35 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_dtype(dtype_str: str) -> Any:
+    """Parse a dtype string produced by to_dict() back to a dtype object.
+
+    Supports torch.dtype strings (e.g. "torch.float32") and numpy dtype
+    strings (e.g. "float64", "int8").  Falls back to returning the raw
+    string if parsing fails so that unknown types are not silently dropped.
+    """
+    if dtype_str is None:
+        return None
+    # torch.dtype: repr is "torch.<name>"
+    if dtype_str.startswith("torch."):
+        name = dtype_str[len("torch.") :]
+        dtype = getattr(torch, name, None)
+        if isinstance(dtype, torch.dtype):
+            return dtype
+    # numpy dtype
+    try:
+        return np.dtype(dtype_str)
+    except TypeError:
+        pass
+    # Fallback: return as-is (e.g. plain Python type repr like "<class 'int'>")
+    return dtype_str
+
+
 class _SampleView:
     """Lazy read-only view of a single sample row in a columnar BatchMeta."""
 
@@ -686,12 +715,15 @@ class BatchMeta:
     def to_dict(self) -> dict:
         """Convert BatchMeta to dict for serialization.
 
-        Note: Actual serialization (including dtype encoding) is handled by serial_utils.
+        dtype is explicitly serialized as a string (e.g. "torch.float32", "float64") so
+        that from_dict() can reconstruct it without relying on pickle to transparently
+        round-trip torch.dtype / numpy.dtype objects.
         """
         serialized_schema = {}
         for fname, meta in self.field_schema.items():
+            dtype = meta.get("dtype")
             serialized_schema[fname] = {
-                "dtype": meta.get("dtype"),  # Will be handled by serial_utils
+                "dtype": str(dtype) if dtype is not None else None,
                 "shape": list(meta["shape"]) if meta.get("shape") else None,
                 "is_nested": meta.get("is_nested", False),
                 "is_non_tensor": meta.get("is_non_tensor", False),
@@ -703,7 +735,7 @@ class BatchMeta:
             "global_indexes": self.global_indexes,
             "partition_ids": self.partition_ids,
             "field_schema": serialized_schema,
-            "production_status": self.production_status.tolist(),
+            "production_status": self.production_status.tolist() if self.production_status is not None else [],
             "extra_info": self.extra_info,
             "custom_meta": self.custom_meta,
             "_custom_backend_meta": self._custom_backend_meta,
@@ -713,12 +745,14 @@ class BatchMeta:
     def from_dict(cls, data: dict) -> "BatchMeta":
         """Create BatchMeta from dictionary.
 
-        Note: Actual deserialization (including dtype decoding) is handled by serial_utils.
+        dtype is stored as a string and decoded back to torch.dtype / numpy.dtype here.
         """
         field_schema = {}
         for fname, meta in data.get("field_schema", {}).items():
+            dtype_str = meta.get("dtype")
+            dtype = _parse_dtype(dtype_str) if dtype_str is not None else None
             field_schema[fname] = {
-                "dtype": meta.get("dtype"),  # Already decoded by serial_utils
+                "dtype": dtype,
                 "shape": tuple(meta["shape"]) if meta.get("shape") else None,
                 "is_nested": meta.get("is_nested", False),
                 "is_non_tensor": meta.get("is_non_tensor", False),

@@ -226,6 +226,9 @@ class DataPartitionStatus:
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     field_dtypes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: dtype}
     field_shapes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: shape}
+    # O(F) schema cache: field_name -> {dtype, shape, is_nested, is_non_tensor}
+    # Updated eagerly in _update_field_metadata; used by get_field_schema() for O(1) per-field lookup.
+    field_schema_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     field_custom_backend_meta: dict[int, dict[str, Any]] = field(
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
@@ -482,12 +485,34 @@ class DataPartitionStatus:
                 if global_idx not in self.field_dtypes:
                     self.field_dtypes[global_idx] = {}
                 self.field_dtypes[global_idx].update(dtype_value[i])
+                # Update field_schema_cache with new dtype info
+                for fname, dtype in dtype_value[i].items():
+                    if fname not in self.field_schema_cache:
+                        self.field_schema_cache[fname] = {
+                            "dtype": dtype,
+                            "shape": None,
+                            "is_nested": False,
+                            "is_non_tensor": False,
+                        }
+                    elif self.field_schema_cache[fname].get("dtype") is None:
+                        self.field_schema_cache[fname]["dtype"] = dtype
 
             # Only create and update shape mapping if a shape value was provided
             if shape_value[i] is not None:
                 if global_idx not in self.field_shapes:
                     self.field_shapes[global_idx] = {}
                 self.field_shapes[global_idx].update(shape_value[i])
+                # Update field_schema_cache with new shape info
+                for fname, shape in shape_value[i].items():
+                    if fname not in self.field_schema_cache:
+                        self.field_schema_cache[fname] = {
+                            "dtype": None,
+                            "shape": shape,
+                            "is_nested": False,
+                            "is_non_tensor": False,
+                        }
+                    elif self.field_schema_cache[fname].get("shape") is None:
+                        self.field_schema_cache[fname]["shape"] = shape
 
             # Only create and update custom_backend_meta mapping if a custom_backend_meta value was provided
             if custom_backend_meta_value[i] is not None:
@@ -669,30 +694,20 @@ class DataPartitionStatus:
     # ==================== Metadata Methods ====================
 
     def get_field_schema(self, field_names: list[str]) -> dict[str, dict[str, Any]]:
-        """Build O(F) field_schema from per-sample dtypes/shapes for specified fields.
+        """Return field_schema for the requested fields from the O(F) cache.
 
-        Assembles the columnar field_schema used by BatchMeta from the per-sample
-        field_dtypes and field_shapes stored in the Partition.
+        Complexity: O(F) — one dict-lookup per field, no full scan of per-sample maps.
+        The cache is populated eagerly in _update_field_metadata() at put time.
         """
         schema = {}
         for fname in field_names:
-            # Find first sample that has metadata for this field
-            dtype = None
-            shape = None
-            for idx_dtypes in self.field_dtypes.values():
-                if fname in idx_dtypes:
-                    dtype = idx_dtypes[fname]
-                    break
-            for idx_shapes in self.field_shapes.values():
-                if fname in idx_shapes:
-                    shape = idx_shapes[fname]
-                    break
-            if dtype is not None or shape is not None:
+            cached = self.field_schema_cache.get(fname)
+            if cached is not None:
                 schema[fname] = {
-                    "dtype": dtype,
-                    "shape": shape,
-                    "is_nested": False,
-                    "is_non_tensor": False,
+                    "dtype": cached.get("dtype"),
+                    "shape": cached.get("shape"),
+                    "is_nested": cached.get("is_nested", False),
+                    "is_non_tensor": cached.get("is_non_tensor", False),
                 }
         return schema
 

@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import warnings
+from collections import defaultdict
 from collections.abc import Mapping
 from functools import wraps
 from operator import itemgetter
@@ -361,8 +362,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        from collections import defaultdict  # noqa: F811 (shadowed by top-level import, kept for clarity)
-
         groups: dict[str, list[int]] = defaultdict(list)
         for i, gi in enumerate(metadata.global_indexes):
             backend_meta = metadata._custom_backend_meta[i]
@@ -465,8 +464,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         if metadata.size == 0:
             return
-
-        from collections import defaultdict  # noqa: F811 (shadowed by top-level import, kept for clarity)
 
         groups: dict[str, list[int]] = defaultdict(list)
         for i, gi in enumerate(metadata.global_indexes):
