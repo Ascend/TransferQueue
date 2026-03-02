@@ -40,29 +40,29 @@ class MockStorageClient:
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
         self.socket.connect(storage_put_get_address)
 
-    def send_put(self, client_id, local_indexes, field_data):
+    def send_put(self, client_id, global_indexes, field_data):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes, "data": field_data},
+            body={"global_indexes": global_indexes, "data": field_data},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())
 
-    def send_get(self, client_id, local_indexes, fields):
+    def send_get(self, client_id, global_indexes, fields):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes, "fields": fields},
+            body={"global_indexes": global_indexes, "fields": fields},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())
 
-    def send_clear(self, client_id, local_indexes):
+    def send_clear(self, client_id, global_indexes):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.CLEAR_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes},
+            body={"global_indexes": global_indexes},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())
@@ -107,13 +107,13 @@ def test_put_get_single_client(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "log_probs": [torch.tensor([1.0, 2.0, 3.0]), torch.tensor([4.0, 5.0, 6.0]), torch.tensor([7.0, 8.0, 9.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0]), torch.tensor([30.0])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -142,9 +142,9 @@ def test_put_get_multiple_clients(storage_setup):
     num_clients = 3
     clients = [MockStorageClient(put_get_address) for _ in range(num_clients)]
 
-    # Each client puts unique data using different local_indexes
+    # Each client puts unique data using different global_indexes
     for i, client in enumerate(clients):
-        local_indexes = [i * 10 + 0, i * 10 + 1, i * 10 + 2]
+        global_indexes = [i * 10 + 0, i * 10 + 1, i * 10 + 2]
         field_data = {
             "log_probs": [
                 torch.tensor([i, i + 1, i + 2]),
@@ -154,14 +154,14 @@ def test_put_get_multiple_clients(storage_setup):
             "rewards": [torch.tensor([i * 10]), torch.tensor([i * 10 + 10]), torch.tensor([i * 10 + 20])],
         }
 
-        response = client.send_put(i, local_indexes, field_data)
+        response = client.send_put(i, global_indexes, field_data)
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
-    # Test overlapping local indexes
+    # Test overlapping global indexes
     overlapping_client = MockStorageClient(put_get_address)
-    overlap_local_indexes = [0]  # Overlaps with first client's index 0
+    overlap_global_indexes = [0]  # Overlaps with first client's index 0
     overlap_field_data = {"log_probs": [torch.tensor([999, 999, 999])], "rewards": [torch.tensor([999])]}
-    response = overlapping_client.send_put(99, overlap_local_indexes, overlap_field_data)
+    response = overlapping_client.send_put(99, overlap_global_indexes, overlap_field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # Each original client gets its own data (except for index 0 which was overwritten)
@@ -209,7 +209,7 @@ def test_performance_basic(storage_setup):
         start = time.time()
 
         # Use batch size and index mapping
-        local_indexes = list(range(i * batch_size, (i + 1) * batch_size))
+        global_indexes = list(range(i * batch_size, (i + 1) * batch_size))
 
         # Create tensor data
         log_probs_data = []
@@ -224,7 +224,7 @@ def test_performance_basic(storage_setup):
 
         field_data = {"log_probs": log_probs_data, "rewards": rewards_data}
 
-        response = client.send_put(0, local_indexes, field_data)
+        response = client.send_put(0, global_indexes, field_data)
         latency = time.time() - start
         put_latencies.append(latency)
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
@@ -236,8 +236,8 @@ def test_performance_basic(storage_setup):
     for i in range(num_gets):
         start = time.time()
         # Retrieve batch of data
-        local_indexes = list(range(i * batch_size, (i + 1) * batch_size))
-        response = client.send_get(0, local_indexes, ["log_probs", "rewards"])
+        global_indexes = list(range(i * batch_size, (i + 1) * batch_size))
+        response = client.send_get(0, global_indexes, ["log_probs", "rewards"])
         latency = time.time() - start
         get_latencies.append(latency)
         assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
@@ -259,7 +259,7 @@ def test_put_get_nested_tensor(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data with nested tensors
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "variable_length_sequences": [
             torch.tensor([-0.5, -1.2, -0.8]),
@@ -269,7 +269,7 @@ def test_put_get_nested_tensor(storage_setup):
         "attention_mask": [torch.tensor([1, 1, 1]), torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -298,13 +298,13 @@ def test_put_get_non_tensor_data(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data with non-tensor data
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "prompt_text": ["Hello world!", "This is a longer sentence for testing", "Test case"],
         "response_text": ["Hi there!", "This is the response to the longer sentence", "Test response"],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -366,13 +366,13 @@ def test_clear_data(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data first
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "log_probs": [torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0]), torch.tensor([30.0])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # Verify data exists
@@ -399,25 +399,71 @@ def test_storage_unit_data_direct():
 
     storage_data = StorageUnitData(storage_size=10)
 
-    # Test put_data
     field_data = {
         "log_probs": [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0])],
     }
+    # global_indexes = gi values (e.g., 0 and 1)
     storage_data.put_data(field_data, [0, 1])
 
-    # Test get_data
     result = storage_data.get_data(["log_probs", "rewards"], [0, 1])
     assert "log_probs" in result
     assert "rewards" in result
     assert len(result["log_probs"]) == 2
     assert len(result["rewards"]) == 2
 
-    # Test single index get
     result_single = storage_data.get_data(["log_probs"], [0])
-    assert torch.allclose(result_single["log_probs"][0], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(result_single["log_probs"][0], torch.tensor([1.0, 2.0]))
 
-    # Test clear
+    # clear: key is removed (not set to None)
     storage_data.clear([0])
-    result_after_clear = storage_data.get_data(["log_probs"], [0])
-    assert result_after_clear["log_probs"][0] is None
+    assert 0 not in storage_data.field_data["log_probs"]  # key gone
+    assert 1 in storage_data.field_data["log_probs"]  # other key intact
+
+
+def test_storage_unit_data_dict_key():
+    """StorageUnitData dict-key: gi 直接作为 key，clear 真正释放内存."""
+    from transfer_queue.storage.simple_backend import StorageUnitData
+
+    storage = StorageUnitData(storage_size=4)
+
+    # put_data: 用 gi 列表 [10, 11] 作为 global_indexes
+    storage.put_data(
+        {"f": [torch.tensor([1.0]), torch.tensor([2.0])]},
+        global_indexes=[10, 11],
+    )
+    assert len(storage.field_data["f"]) == 2
+
+    # get_data: 通过 gi 读取
+    result = storage.get_data(["f"], global_indexes=[10, 11])
+    torch.testing.assert_close(result["f"][0], torch.tensor([1.0]))
+    torch.testing.assert_close(result["f"][1], torch.tensor([2.0]))
+
+    # clear: 真正删除 key，不是置 None
+    storage.clear(keys=[10])
+    assert 10 not in storage.field_data["f"]
+    assert 11 in storage.field_data["f"]
+
+    # capacity check: storage_size=4，已有 1 条，再放 4 条应失败
+    with pytest.raises(ValueError, match="Storage capacity exceeded"):
+        storage.put_data(
+            {"f": [torch.tensor([i * 1.0]) for i in range(4)]},
+            global_indexes=[20, 21, 22, 23],
+        )
+
+
+def test_storage_unit_data_partial_consume_safety():
+    """部分消费后写入复用 gi，不应覆盖未消费数据."""
+    from transfer_queue.storage.simple_backend import StorageUnitData
+
+    storage = StorageUnitData(storage_size=4)
+    storage.put_data({"f": [torch.tensor([0.0]), torch.tensor([1.0])]}, global_indexes=[0, 1])
+
+    storage.clear(keys=[1])  # 只清除 gi=1
+    assert 0 in storage.field_data["f"]
+    assert 1 not in storage.field_data["f"]
+
+    # 复用 gi=1 写入新数据，不影响 gi=0
+    storage.put_data({"f": [torch.tensor([9.0])]}, global_indexes=[1])
+    torch.testing.assert_close(storage.field_data["f"][0], torch.tensor([0.0]))
+    torch.testing.assert_close(storage.field_data["f"][1], torch.tensor([9.0]))

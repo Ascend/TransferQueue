@@ -13,13 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import logging
 import os
 import time
 import weakref
-from dataclasses import dataclass
-from operator import itemgetter
 from threading import Event, Thread
 from typing import Any, Optional
 from uuid import uuid4
@@ -28,7 +25,6 @@ import ray
 import zmq
 from ray.util import get_node_ip_address
 
-from transfer_queue.metadata import SampleMeta
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -50,100 +46,76 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
 
-    This class provides efficient storage and retrieval of data in a 2D matrix format
-    where rows represent samples (indexed by local_index) and columns represent fields.
-    Each field contains a list of data items indexed by their local position.
+    Uses dict-based storage keyed by global_index (gi) instead of pre-allocated list.
+    This allows O(1) insert/delete without index translation and avoids capacity bloat.
 
     Data Structure Example:
-        ┌─────────────┬─────────────┬─────────────┬─────────┐
-        │ local_index │ field_name1 │ field_name2 │  ...    │
-        ├─────────────┼─────────────┼─────────────┼─────────┤
-        │ 0           │ item1       │ item2       │  ...    │
-        │ 1           │ item3       │ item4       │  ...    │
-        │ 2           │ item5       │ item6       │  ...    │
-        └─────────────┴─────────────┴─────────────┴─────────┘
+        field_data = {
+            "field_name1": {gi0: item1, gi3: item2, ...},
+            "field_name2": {gi0: item3, gi3: item4, ...},
+        }
     """
 
     def __init__(self, storage_size: int):
-        # Dict containing field names and corresponding data in the field
-        # Format: {"field_name": [data_at_index_0, data_at_index_1, ...]}
-        self.field_data: dict[str, list] = {}
-
-        # Maximum number of elements stored in storage unit
+        # field_name -> {gi: data} nested dict
+        self.field_data: dict[str, dict] = {}
+        # Capacity upper bound (not pre-allocated list length)
         self.storage_size = storage_size
 
-    def get_data(self, fields: list[str], local_indexes: list[int]) -> dict[str, list]:
-        """
-        Get data from storage unit according to given fields and local_indexes.
+    def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
+        """Get data by global index keys.
 
         Args:
             fields: Field names used for getting data.
-            local_indexes: Local indexes used for getting data.
+            global_indexes: Global indexes used as dict keys.
 
         Returns:
             dict with field names as keys, corresponding data list as values.
         """
         result: dict[str, list] = {}
-
         for field in fields:
-            # Validate field name
             if field not in self.field_data:
                 raise ValueError(
-                    f"StorageUnitData get_data operation receive invalid field: {field} beyond {self.field_data.keys()}"
+                    f"StorageUnitData get_data: field '{field}' not found. Available: {list(self.field_data.keys())}"
                 )
-
-            if len(local_indexes) == 1:
-                gathered_item = self.field_data[field][local_indexes[0]]
-                result[field] = [gathered_item]
-
-            else:
-                gathered_items = list(itemgetter(*local_indexes)(self.field_data[field]))
-
-                result[field] = gathered_items
-
+            try:
+                result[field] = [self.field_data[field][k] for k in global_indexes]
+            except KeyError as e:
+                raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
 
-    def put_data(self, field_data: dict[str, Any], local_indexes: list[int]) -> None:
-        """
-        Put or update data into storage unit according to given field_data and local_indexes.
+    def put_data(self, field_data: dict[str, Any], global_indexes: list) -> None:
+        """Put data into storage.
 
         Args:
-            field_data: Dict with field names as keys, corresponding data in the field as values.
-            local_indexes: Local indexes used for putting data.
+            field_data: Dict with field names as keys, data list as values.
+            global_indexes: Global indexes to use as dict keys.
         """
-
+        # Capacity is enforced per unique sample key, not counted per-field
+        existing_keys: set = set()
+        for fd in self.field_data.values():
+            existing_keys.update(fd.keys())
+        new_global_keys = [k for k in global_indexes if k not in existing_keys]
+        if len(existing_keys) + len(new_global_keys) > self.storage_size:
+            raise ValueError(
+                f"Storage capacity exceeded: {len(existing_keys)} existing + "
+                f"{len(new_global_keys)} new > {self.storage_size}"
+            )
         for f, values in field_data.items():
             if f not in self.field_data:
-                self.field_data[f] = [None] * self.storage_size
+                self.field_data[f] = {}
+            for key, val in zip(global_indexes, values, strict=False):
+                self.field_data[f][key] = val
 
-            for i, idx in enumerate(local_indexes):
-                if idx < 0 or idx >= self.storage_size:
-                    raise ValueError(
-                        f"StorageUnitData put_data operation receive invalid local_index: {idx} beyond "
-                        f"storage_size: {self.storage_size}"
-                    )
-
-                self.field_data[f][idx] = values[i]
-
-    def clear(self, local_indexes: list[int]) -> None:
-        """
-        Clear data at specified local_indexes by setting all related fields to None.
+    def clear(self, keys: list[int]) -> None:
+        """Remove data at given global index keys, immediately freeing memory.
 
         Args:
-            local_indexes: local_indexes to clear.
+            keys: Global indexes to remove.
         """
-        # Validate local_indexes
-        for idx in local_indexes:
-            if idx < 0 or idx >= self.storage_size:
-                raise ValueError(
-                    f"StorageUnitData clear operation receive invalid local_index: {idx} beyond "
-                    f"storage_size: {self.storage_size}"
-                )
-
-        # Clear data at specified local_indexes
         for f in self.field_data:
-            for idx in local_indexes:
-                self.field_data[f][idx] = None
+            for key in keys:
+                self.field_data[f].pop(key, None)
 
 
 @ray.remote(num_cpus=1)
@@ -317,7 +289,7 @@ class SimpleStorageUnit:
                             response_msg = self._handle_clear(request_msg)
                     else:
                         response_msg = ZMQMessage.create(
-                            request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,
+                            request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
                             sender_id=self.storage_unit_id,
                             body={
                                 "message": f"Storage unit id #{self.storage_unit_id} "
@@ -326,7 +298,7 @@ class SimpleStorageUnit:
                         )
                 except Exception as e:
                     response_msg = ZMQMessage.create(
-                        request_type=ZMQRequestType.PUT_GET_ERROR,
+                        request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
                         sender_id=self.storage_unit_id,
                         body={
                             "message": f"{self.storage_unit_id}, worker encountered error "
@@ -352,22 +324,24 @@ class SimpleStorageUnit:
             Put data success response ZMQMessage.
         """
         try:
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
             field_data = data_parts.body["data"]  # field_data should be a TensorDict.
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
-                self.storage_data.put_data(field_data, local_indexes)
+                self.storage_data.put_data(field_data, global_indexes)
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_RESPONSE, sender_id=self.storage_unit_id, body={}
+                request_type=ZMQRequestType.PUT_DATA_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={},
             )
 
             return response_msg
         except Exception as e:
             return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_ERROR,
+                request_type=ZMQRequestType.PUT_ERROR,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
                     "message": f"Failed to put data into storage unit id "
@@ -387,15 +361,15 @@ class SimpleStorageUnit:
         """
         try:
             fields = data_parts.body["fields"]
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
-                result_data = self.storage_data.get_data(fields, local_indexes)
+                result_data = self.storage_data.get_data(fields, global_indexes)
 
             response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_DATA_RESPONSE,
+                request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
                     "data": result_data,
@@ -403,7 +377,7 @@ class SimpleStorageUnit:
             )
         except Exception as e:
             response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_ERROR,
+                request_type=ZMQRequestType.GET_ERROR,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
                     "message": f"Failed to get data from storage unit id #{self.storage_unit_id}, "
@@ -414,30 +388,30 @@ class SimpleStorageUnit:
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
-        Handle clear request, clear data in storage unit according to given local_indexes.
+        Handle clear request, clear data in storage unit according to given global_indexes.
 
         Args:
-            data_parts: ZMQMessage from client, including target local_indexes.
+            data_parts: ZMQMessage from client, including target global_indexes.
 
         Returns:
             Clear data success response ZMQMessage.
         """
         try:
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
-                self.storage_data.clear(local_indexes)
+                self.storage_data.clear(global_indexes)
 
             response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,
+                request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={"message": f"Clear data in storage unit id #{self.storage_unit_id} successfully."},
             )
         except Exception as e:
             response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA_ERROR,
+                request_type=ZMQRequestType.CLEAR_DATA_ERROR,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
                     "message": f"Failed to clear data in storage unit id #{self.storage_unit_id}, "
@@ -483,60 +457,3 @@ class SimpleStorageUnit:
             ZMQServerInfo containing connection details for this storage unit.
         """
         return self.zmq_server_info
-
-
-@dataclass
-class StorageMetaGroup:
-    """
-    Represents a group of samples stored in the same storage unit.
-    Used to organize samples by their storage_id for efficient client operations.
-    """
-
-    storage_id: str
-    sample_metas: list[SampleMeta] = dataclasses.field(default_factory=list)
-    local_indexes: list[int] = dataclasses.field(default_factory=list)
-
-    def add_sample_meta(self, sample_meta: SampleMeta, local_index: int) -> None:
-        """Add a SampleMeta object to this storage group"""
-        self.sample_metas.append(sample_meta)
-        self.local_indexes.append(local_index)
-
-    def get_batch_indexes(self) -> list[int]:
-        """Get all internal indexes from stored SampleMeta objects"""
-        return [meta.batch_index for meta in self.sample_metas]
-
-    def get_global_indexes(self) -> list[int]:
-        """Get all global indexes from stored SampleMeta objects"""
-        return [meta.global_index for meta in self.sample_metas]
-
-    def get_local_indexes(self) -> list[int]:
-        """Get all local indexes from stored SampleMeta objects"""
-        return self.local_indexes
-
-    def get_field_names(self) -> list[str]:
-        """Get all unique field names from stored SampleMeta objects"""
-        all_fields: set[str] = set()
-        for meta in self.sample_metas:
-            all_fields.update(meta.fields.keys())
-        return list(all_fields)
-
-    @property
-    def size(self) -> int:
-        """Number of samples in this storage meta group"""
-        return len(self.sample_metas)
-
-    @property
-    def is_empty(self) -> bool:
-        """Check if this storage meta group is empty"""
-        return len(self.sample_metas) == 0
-
-    def __len__(self) -> int:
-        """Number of samples in this storage meta group"""
-        return self.size
-
-    def __bool__(self) -> bool:
-        """Truthiness based on whether group has samples"""
-        return not self.is_empty
-
-    def __str__(self) -> str:
-        return f"StorageMetaGroup(storage_id='{self.storage_id}', size={self.size})"

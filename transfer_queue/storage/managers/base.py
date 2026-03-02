@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import itertools
 import logging
 import os
@@ -121,7 +120,6 @@ class TransferQueueStorageManager(ABC):
         )
         poller.register(self.controller_handshake_socket, zmq.POLLIN)
 
-        # Initial handshake request send
         self._send_handshake_requests()
 
         start_time = time.time()
@@ -131,7 +129,6 @@ class TransferQueueStorageManager(ABC):
             not is_connected  # Only one controller to connect to
             and time.time() - start_time < TQ_STORAGE_HANDSHAKE_TIMEOUT
         ):
-            # Check for timeout and retransmission
             current_time = time.time()
             if pending_connection:
                 if (
@@ -213,6 +210,7 @@ class TransferQueueStorageManager(ABC):
             shapes: Per-field shapes for each field, in {global_index: {field: shape}} format.
             custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
         """
+
         if not self.controller_info:
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
             return
@@ -225,7 +223,7 @@ class TransferQueueStorageManager(ABC):
             sock.connect(self.controller_info.to_addr("data_status_update_socket"))
 
             request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,
+                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 body={
                     "partition_id": partition_id,
@@ -272,7 +270,7 @@ class TransferQueueStorageManager(ABC):
             logger.error(f"[{self.storage_manager_id}]: Error during notify_data_update: {e}")
             try:
                 error_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ERROR,
+                    request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ERROR,  # type: ignore[arg-type]
                     sender_id=self.storage_manager_id,
                     body={"message": f"Failed to notify: {str(e)}"},
                 ).serialize()
@@ -320,6 +318,41 @@ class TransferQueueStorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
+    @staticmethod
+    def _extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
+        """Extract field-level schema from TensorDict. O(F) complexity."""
+        field_schema: dict[str, dict[str, Any]] = {}
+
+        for field_name in data.keys():
+            field_data = data[field_name]
+
+            is_tensor = isinstance(field_data, torch.Tensor)
+            is_nested = is_tensor and field_data.is_nested
+
+            if is_nested:
+                unbound = field_data.unbind()
+                first_item = unbound[0] if unbound else None
+            elif is_tensor:
+                first_item = field_data[0] if field_data.shape[0] > 0 else None
+            else:
+                first_item = field_data[0] if len(field_data) > 0 else None
+
+            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
+
+            field_meta = {
+                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+                "shape": getattr(first_item, "shape", None) if is_tensor and not is_nested else None,
+                "is_nested": is_nested,
+                "is_non_tensor": is_non_tensor,
+            }
+
+            if is_nested:
+                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in unbound]
+
+            field_schema[field_name] = field_meta
+
+        return field_schema
+
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
         # Close handshake socket if it exists
@@ -361,7 +394,6 @@ class KVStorageManager(TransferQueueStorageManager):
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
         self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
-        # Register a cleanup function: automatically invoke shutdown when the instance is garbage collected.
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
@@ -501,7 +533,6 @@ class KVStorageManager(TransferQueueStorageManager):
             # Prioritize processing fields with larger tensor sizes to improve parallel efficiency
             field_sizes = []
             for i in range(num_fields):
-                # Estimate size based on the first value
                 _first_value = values[i * num_samples]
                 if isinstance(_first_value, torch.Tensor):
                     size = _first_value.nelement() * _first_value.element_size()
@@ -531,30 +562,31 @@ class KVStorageManager(TransferQueueStorageManager):
         shapes = []
         dtypes = []
         custom_backend_meta_list = []
-        all_custom_backend_meta = copy.deepcopy(metadata._custom_backend_meta)
+        num_samples = len(metadata)
+
         for field_name in sorted(metadata.field_names):
-            for index in range(len(metadata)):
-                field = metadata.samples[index].get_field_by_name(field_name)
-                assert field is not None, f"Field {field_name} not found in sample {index}"
-                shapes.append(field.shape)
-                dtypes.append(field.dtype)
-                global_index = metadata.global_indexes[index]
-                custom_backend_meta_list.append(all_custom_backend_meta.get(global_index, {}).get(field_name, None))
+            field_meta = metadata.field_schema.get(field_name, {})
+            field_shape = field_meta.get("shape")
+            field_dtype = field_meta.get("dtype")
+            per_sample_shapes = field_meta.get("per_sample_shapes")
+
+            for index in range(num_samples):
+                if per_sample_shapes is not None:
+                    shapes.append(per_sample_shapes[index])
+                else:
+                    shapes.append(field_shape)
+                dtypes.append(field_dtype)
+                custom_backend_meta_list.append(metadata._custom_backend_meta[index].get(field_name, None))
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
         Store tensor data in the backend storage and notify the controller.
-
-        Serializes the input tensors, stores them using the storage client,
-        extracts per-sample dtype and shape information, and sends a notification
-        to the controller that new data is available.
         """
         if not metadata.field_names:
             logger.warning("Attempted to put data, but metadata contains no fields.")
             return
 
-        # For each field, extract dtype and shape for each sample
         num_samples = len(metadata.global_indexes)
         if num_samples == 0:
             return
@@ -563,37 +595,18 @@ class KVStorageManager(TransferQueueStorageManager):
         values = self._generate_values(data)
         loop = asyncio.get_event_loop()
 
-        # put <keys, values> to storage backends
         custom_backend_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        per_field_dtypes: dict[int, dict[str, Any]] = {}
-        per_field_shapes: dict[int, dict[str, Any]] = {}
+        field_schema = self._extract_field_schema(data)
 
-        # Initialize the data structure for each global index
-        for global_idx in metadata.global_indexes:
-            per_field_dtypes[global_idx] = {}
-            per_field_shapes[global_idx] = {}
-
-        for field_name, field_data in data.items():
-            for i in range(num_samples):
-                data_item = field_data[i]
-                global_idx = metadata.global_indexes[i]
-                per_field_dtypes[global_idx][field_name] = (
-                    getattr(data_item, "dtype", None) if isinstance(data_item, Tensor) else None
-                )
-                per_field_shapes[global_idx][field_name] = (
-                    getattr(data_item, "shape", None) if isinstance(data_item, Tensor) else None
-                )
-
-        # Prepare per-field custom_backend_meta if available
         per_field_custom_backend_meta: dict[int, dict[str, Any]] = {}
         if custom_backend_meta:
             if len(custom_backend_meta) != len(keys):
                 raise ValueError(
                     f"Length of custom_backend_meta ({len(custom_backend_meta)}) does not match expected ({len(keys)})"
                 )
-            # custom meta is a flat list aligned with keys/values
-            # Use itertools.product to eliminate nested loops
+            global_index_to_position = {gi: i for i, gi in enumerate(metadata.global_indexes)}
+
             for global_idx in metadata.global_indexes:
                 per_field_custom_backend_meta[global_idx] = {}
 
@@ -606,13 +619,34 @@ class KVStorageManager(TransferQueueStorageManager):
                 strict=True,
             ):
                 per_field_custom_backend_meta[global_idx][field_name] = meta_value
-            metadata._custom_backend_meta.update(per_field_custom_backend_meta)
+                metadata._custom_backend_meta[global_index_to_position[global_idx]][field_name] = meta_value
 
         # Get current data partition id
-        # Note: Currently we only support putting to & getting data from a single data partition simultaneously,
-        # but in the future we may support putting to & getting data from multiple data partitions concurrently.
-        partition_id = metadata.samples[0].partition_id
-        # notify controller that new data is ready
+        partition_id = metadata.partition_ids[0]
+
+        per_field_dtypes: dict[int, dict[str, Any]] = {}
+        per_field_shapes: dict[int, dict[str, Any]] = {}
+        for field_name, field_meta in field_schema.items():
+            is_nested = field_meta.get("is_nested", False)
+
+            if is_nested:
+                per_sample_shapes = field_meta.get("per_sample_shapes", [])
+                for i, global_idx in enumerate(metadata.global_indexes):
+                    if global_idx not in per_field_dtypes:
+                        per_field_dtypes[global_idx] = {}
+                        per_field_shapes[global_idx] = {}
+                    per_field_dtypes[global_idx][field_name] = field_meta.get("dtype")
+                    per_field_shapes[global_idx][field_name] = (
+                        per_sample_shapes[i] if i < len(per_sample_shapes) else None
+                    )
+            else:
+                for global_idx in metadata.global_indexes:
+                    if global_idx not in per_field_dtypes:
+                        per_field_dtypes[global_idx] = {}
+                        per_field_shapes[global_idx] = {}
+                    per_field_dtypes[global_idx][field_name] = field_meta.get("dtype")
+                    per_field_shapes[global_idx][field_name] = field_meta.get("shape")
+
         await self.notify_data_update(
             partition_id,
             list(data.keys()),

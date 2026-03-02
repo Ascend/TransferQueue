@@ -25,33 +25,35 @@ from tensordict import TensorDict
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
+from transfer_queue.metadata import BatchMeta  # noqa: E402
 from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
-from transfer_queue.utils.enum_utils import ProductionStatus  # noqa: E402
 
 
 def get_meta(data, global_indexes=None):
     if not global_indexes:
-        global_indexes = range(data.batch_size[0])
-    samples = []
-    for sample_id in range(data.batch_size[0]):
-        fields_dict = {}
-        for field_name in data.keys():
-            tensor = data[field_name][sample_id]
-            field_meta = FieldMeta(
-                name=field_name,
-                dtype=tensor.dtype if isinstance(tensor, torch.Tensor) else None,
-                shape=tensor.shape if isinstance(tensor, torch.Tensor) else None,
-                production_status=ProductionStatus.READY_FOR_CONSUME,
-            )
-            fields_dict[field_name] = field_meta
-        sample = SampleMeta(
-            partition_id=0,
-            global_index=global_indexes[sample_id],
-            fields=fields_dict,
-        )
-        samples.append(sample)
-    metadata = BatchMeta(samples=samples)
+        global_indexes = list(range(data.batch_size[0]))
+
+    # Build columnar field_schema from the data
+    field_schema = {}
+    for field_name in data.keys():
+        tensor = data[field_name][0]
+        field_schema[field_name] = {
+            "dtype": tensor.dtype if isinstance(tensor, torch.Tensor) else type(tensor),
+            "shape": tensor.shape if isinstance(tensor, torch.Tensor) else None,
+            "is_nested": False,
+            "is_non_tensor": not isinstance(tensor, torch.Tensor),
+        }
+
+    import numpy as np
+
+    production_status = np.ones(len(global_indexes), dtype=np.int8)
+
+    metadata = BatchMeta(
+        global_indexes=list(global_indexes),
+        partition_ids=["0"] * len(global_indexes),
+        field_schema=field_schema,
+        production_status=production_status,
+    )
     return metadata
 
 
@@ -196,14 +198,13 @@ def test_get_shape_type_custom_backend_meta_list_without_custom_backend_meta(tes
 
 def test_get_shape_type_custom_backend_meta_list_with_custom_backend_meta(test_data):
     """Test _get_shape_type_custom_backend_meta_list returns correct custom_backend_meta when provided."""
-    # Add custom_backend_meta to metadata
-    custom_backend_meta = {
-        8: {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},
-        9: {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},
-        10: {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},
-    }
+    # Add custom_backend_meta to metadata (columnar: list aligned with global_indexes [8, 9, 10])
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+    metadata._custom_backend_meta = [
+        {"text": {"key1": "value1"}, "label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # global_index=8
+        {"text": {"key4": "value4"}, "label": {"key5": "value5"}, "mask": {"key6": "value6"}},  # global_index=9
+        {"text": {"key7": "value7"}, "label": {"key8": "value8"}, "mask": {"key9": "value9"}},  # global_index=10
+    ]
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
@@ -224,14 +225,13 @@ def test_get_shape_type_custom_backend_meta_list_with_custom_backend_meta(test_d
 
 def test_get_shape_type_custom_backend_meta_list_with_partial_custom_backend_meta(test_data):
     """Test _get_shape_type_custom_backend_meta_list handles partial custom_backend_meta correctly."""
-    # Add custom_backend_meta only for some global_indexes and fields
-    custom_backend_meta = {
-        8: {"text": {"key1": "value1"}},  # Only text field
-        # global_index 9 has no custom_backend_meta
-        10: {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # label and mask only
-    }
+    # Add custom_backend_meta only for some fields (columnar: list aligned with global_indexes [8, 9, 10])
     metadata = test_data["metadata"]
-    metadata._custom_backend_meta.update(custom_backend_meta)
+    metadata._custom_backend_meta = [
+        {"text": {"key1": "value1"}},  # global_index=8: only text field
+        {},  # global_index=9: no custom_backend_meta
+        {"label": {"key2": "value2"}, "mask": {"key3": "value3"}},  # global_index=10: label and mask only
+    ]
 
     shapes, dtypes, custom_backend_meta_list = KVStorageManager._get_shape_type_custom_backend_meta_list(metadata)
 
