@@ -511,8 +511,6 @@ class KVStorageManager(TransferQueueStorageManager):
         Extract the expected shape, dtype, and custom_backend_meta for each field-sample pair in metadata.
         The order matches the key/value order: sorted by field name, then by global index.
 
-        O(F) optimized version that uses field_schema instead of per-sample metadata.
-
         Args:
             metadata (BatchMeta): Metadata containing sample and field information.
         Returns:
@@ -542,8 +540,6 @@ class KVStorageManager(TransferQueueStorageManager):
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
         Store tensor data in the backend storage and notify the controller.
-
-        O(F) optimized version that extracts field-level schema instead of per-sample metadata.
         """
         if not metadata.field_names:
             logger.warning("Attempted to put data, but metadata contains no fields.")
@@ -613,24 +609,27 @@ class KVStorageManager(TransferQueueStorageManager):
         per_field_dtypes: dict[int, dict[str, Any]] = {}
         per_field_shapes: dict[int, dict[str, Any]] = {}
         for field_name, field_data in data.items():
-            first_item = field_data[0] if len(field_data) > 0 else None
             is_nested = isinstance(field_data, torch.Tensor) and field_data.is_nested
-            field_dtype = getattr(first_item, "dtype", type(first_item) if first_item is not None else None)
-            field_shape = (
-                getattr(first_item, "shape", None) if not is_nested and isinstance(first_item, Tensor) else None
-            )
-            # Pre-compute unbind once to avoid O(B²) repeated calls inside the loop
-            unbound = field_data.unbind() if is_nested else None
 
-            for i, global_idx in enumerate(metadata.global_indexes):
-                if global_idx not in per_field_dtypes:
-                    per_field_dtypes[global_idx] = {}
-                    per_field_shapes[global_idx] = {}
-                per_field_dtypes[global_idx][field_name] = field_dtype
-                if is_nested:
-                    assert unbound is not None  # is_nested=True implies unbind() was called
+            if is_nested:
+                # Nested tensor: each sample may have a different shape and dtype, iterate per-sample
+                unbound = field_data.unbind()
+                for i, global_idx in enumerate(metadata.global_indexes):
+                    if global_idx not in per_field_dtypes:
+                        per_field_dtypes[global_idx] = {}
+                        per_field_shapes[global_idx] = {}
+                    per_field_dtypes[global_idx][field_name] = unbound[i].dtype
                     per_field_shapes[global_idx][field_name] = tuple(unbound[i].shape)
-                else:
+            else:
+                # Non-nested tensor: all samples share the same dtype and shape, bulk-fill
+                first_item = field_data[0] if len(field_data) > 0 else None
+                field_dtype = getattr(first_item, "dtype", type(first_item) if first_item is not None else None)
+                field_shape = getattr(first_item, "shape", None) if isinstance(first_item, Tensor) else None
+                for global_idx in metadata.global_indexes:
+                    if global_idx not in per_field_dtypes:
+                        per_field_dtypes[global_idx] = {}
+                        per_field_shapes[global_idx] = {}
+                    per_field_dtypes[global_idx][field_name] = field_dtype
                     per_field_shapes[global_idx][field_name] = field_shape
 
         await self.notify_data_update(

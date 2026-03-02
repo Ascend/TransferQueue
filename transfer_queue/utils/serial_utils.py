@@ -17,6 +17,8 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
+import logging
+import os
 import pickle
 import warnings
 from collections.abc import Sequence
@@ -38,7 +40,13 @@ CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_BATCHMETA = 5  # For BatchMeta serialization
 CUSTOM_TYPE_NUMPY = 6  # For numpy ndarray with buffer reference
 
+# 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
+_PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
+
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
 # Ignore warnings about non-writable buffers from torch.frombuffer. Upper codes will ensure
 # the tensors are writable to users.
@@ -141,9 +149,11 @@ class MsgpackEncoder:
         return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
     def _encode_batchmeta(self, obj: Any) -> msgpack.Ext:
-        """Encode BatchMeta for serialization.
+        """Encode BatchMeta as a pickle-based Ext payload.
 
-        BatchMeta is small, so we serialize it via pickle (which handles torch.dtype natively).
+        BatchMeta must be preprocessed before encode() because msgspec auto-serializes
+        dataclasses (bypassing enc_hook), and BatchMeta fields contain torch.dtype which
+        msgpack cannot handle natively.
         """
         meta_dict = obj.to_dict()
         return msgpack.Ext(CUSTOM_TYPE_BATCHMETA, pickle.dumps(meta_dict, protocol=pickle.HIGHEST_PROTOCOL))
@@ -390,3 +400,30 @@ class MsgpackDecoder:
 
 _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder()
+
+
+def encode_with_fallback(obj: Any) -> list[bytestr]:
+    """Encode an object via msgpack zero-copy; falls back to pickle on failure.
+
+    The pickle path is a normal degradation path (e.g. body contains torch.dtype
+    objects). Use this as the single entry point for all ZMQ message serialization.
+    """
+    try:
+        return list(_encoder.encode(obj))
+    except (TypeError, ValueError) as e:
+        logger.info(
+            "encode_with_fallback: msgpack failed (%s), falling back to pickle.",
+            type(e).__name__,
+        )
+        return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
+
+
+def decode_with_fallback(frames: list) -> Any:
+    """Decode frames produced by encode_with_fallback.
+
+    Transparently handles both the msgpack zero-copy path and the pickle
+    fallback path based on the leading sentinel frame.
+    """
+    if len(frames) >= 2 and frames[0] == _PICKLE_FALLBACK_SENTINEL:
+        return pickle.loads(frames[1])
+    return _decoder.decode(frames)

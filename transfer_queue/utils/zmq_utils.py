@@ -15,7 +15,6 @@
 
 import logging
 import os
-import pickle
 import socket
 import time
 from dataclasses import dataclass
@@ -27,7 +26,7 @@ import ray
 import zmq
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
-from transfer_queue.utils.serial_utils import _decoder, _encoder
+from transfer_queue.utils.serial_utils import decode_with_fallback, encode_with_fallback
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -38,9 +37,6 @@ if not logger.hasHandlers():
     handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
     logger.addHandler(handler)
 
-
-# 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
-_PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 
@@ -175,16 +171,7 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        try:
-            return list(_encoder.encode(msg_dict))
-        except (TypeError, ValueError) as e:
-            # Pickle fallback is a normal degradation path (e.g. body contains torch.dtype objects).
-            # Log at INFO so operators are aware but not alarmed; use WARNING only for unexpected errors.
-            logger.info(
-                "ZMQMessage.serialize: msgpack encoding unsupported type (%s), using pickle fallback.",
-                type(e).__name__,
-            )
-            return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(self)]
+        return encode_with_fallback(msg_dict)
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
@@ -192,18 +179,17 @@ class ZMQMessage:
         if not frames:
             raise ValueError("Empty frames received")
 
-        # pickle fallback path: serialize() sets frame[0] to _PICKLE_FALLBACK_SENTINEL on failure.
-        if len(frames) >= 2 and frames[0] == _PICKLE_FALLBACK_SENTINEL:
-            return pickle.loads(frames[1])
-
-        msg_dict = _decoder.decode(frames)
+        result = decode_with_fallback(frames)
+        # Pickle fallback path: serialize() pickled the ZMQMessage directly.
+        if isinstance(result, cls):
+            return result
         return cls(
-            request_type=ZMQRequestType(msg_dict["request_type"]),
-            sender_id=msg_dict["sender_id"],
-            receiver_id=msg_dict["receiver_id"],
-            body=msg_dict["body"],
-            request_id=msg_dict["request_id"],
-            timestamp=msg_dict["timestamp"],
+            request_type=ZMQRequestType(result["request_type"]),
+            sender_id=result["sender_id"],
+            receiver_id=result["receiver_id"],
+            body=result["body"],
+            request_id=result["request_id"],
+            timestamp=result["timestamp"],
         )
 
 

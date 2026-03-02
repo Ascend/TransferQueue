@@ -107,13 +107,13 @@ def test_put_get_single_client(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "log_probs": [torch.tensor([1.0, 2.0, 3.0]), torch.tensor([4.0, 5.0, 6.0]), torch.tensor([7.0, 8.0, 9.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0]), torch.tensor([30.0])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -142,9 +142,9 @@ def test_put_get_multiple_clients(storage_setup):
     num_clients = 3
     clients = [MockStorageClient(put_get_address) for _ in range(num_clients)]
 
-    # Each client puts unique data using different local_indexes
+    # Each client puts unique data using different global_indexes
     for i, client in enumerate(clients):
-        local_indexes = [i * 10 + 0, i * 10 + 1, i * 10 + 2]
+        global_indexes = [i * 10 + 0, i * 10 + 1, i * 10 + 2]
         field_data = {
             "log_probs": [
                 torch.tensor([i, i + 1, i + 2]),
@@ -154,14 +154,14 @@ def test_put_get_multiple_clients(storage_setup):
             "rewards": [torch.tensor([i * 10]), torch.tensor([i * 10 + 10]), torch.tensor([i * 10 + 20])],
         }
 
-        response = client.send_put(i, local_indexes, field_data)
+        response = client.send_put(i, global_indexes, field_data)
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
-    # Test overlapping local indexes
+    # Test overlapping global indexes
     overlapping_client = MockStorageClient(put_get_address)
-    overlap_local_indexes = [0]  # Overlaps with first client's index 0
+    overlap_global_indexes = [0]  # Overlaps with first client's index 0
     overlap_field_data = {"log_probs": [torch.tensor([999, 999, 999])], "rewards": [torch.tensor([999])]}
-    response = overlapping_client.send_put(99, overlap_local_indexes, overlap_field_data)
+    response = overlapping_client.send_put(99, overlap_global_indexes, overlap_field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # Each original client gets its own data (except for index 0 which was overwritten)
@@ -209,7 +209,7 @@ def test_performance_basic(storage_setup):
         start = time.time()
 
         # Use batch size and index mapping
-        local_indexes = list(range(i * batch_size, (i + 1) * batch_size))
+        global_indexes = list(range(i * batch_size, (i + 1) * batch_size))
 
         # Create tensor data
         log_probs_data = []
@@ -224,7 +224,7 @@ def test_performance_basic(storage_setup):
 
         field_data = {"log_probs": log_probs_data, "rewards": rewards_data}
 
-        response = client.send_put(0, local_indexes, field_data)
+        response = client.send_put(0, global_indexes, field_data)
         latency = time.time() - start
         put_latencies.append(latency)
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
@@ -236,8 +236,8 @@ def test_performance_basic(storage_setup):
     for i in range(num_gets):
         start = time.time()
         # Retrieve batch of data
-        local_indexes = list(range(i * batch_size, (i + 1) * batch_size))
-        response = client.send_get(0, local_indexes, ["log_probs", "rewards"])
+        global_indexes = list(range(i * batch_size, (i + 1) * batch_size))
+        response = client.send_get(0, global_indexes, ["log_probs", "rewards"])
         latency = time.time() - start
         get_latencies.append(latency)
         assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
@@ -259,7 +259,7 @@ def test_put_get_nested_tensor(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data with nested tensors
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "variable_length_sequences": [
             torch.tensor([-0.5, -1.2, -0.8]),
@@ -269,7 +269,7 @@ def test_put_get_nested_tensor(storage_setup):
         "attention_mask": [torch.tensor([1, 1, 1]), torch.tensor([1, 1, 1, 1]), torch.tensor([1, 1])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -298,13 +298,13 @@ def test_put_get_non_tensor_data(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data with non-tensor data
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "prompt_text": ["Hello world!", "This is a longer sentence for testing", "Test case"],
         "response_text": ["Hi there!", "This is the response to the longer sentence", "Test response"],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # GET data
@@ -366,13 +366,13 @@ def test_clear_data(storage_setup):
     client = MockStorageClient(put_get_address)
 
     # PUT data first
-    local_indexes = [0, 1, 2]
+    global_indexes = [0, 1, 2]
     field_data = {
         "log_probs": [torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0]), torch.tensor([30.0])],
     }
 
-    response = client.send_put(0, local_indexes, field_data)
+    response = client.send_put(0, global_indexes, field_data)
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # Verify data exists
