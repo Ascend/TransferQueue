@@ -196,15 +196,15 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         field_schema = self._extract_field_schema(data)
 
-        su_to_global_indexes: dict[str, list[int]] = {}
+        storage_unit_to_global_indexes: dict[str, list[int]] = {}
         tasks = []
         for unit_idx, storage_id in enumerate(storage_unit_keys):
             start = unit_idx * chunk_size
             end = min((unit_idx + 1) * chunk_size, batch_size)
             if start >= batch_size or start >= end:
                 continue
-            gi_slice = metadata.global_indexes[start:end]
-            su_to_global_indexes[storage_id] = list(gi_slice)
+            chunk_global_indexes = metadata.global_indexes[start:end]
+            storage_unit_to_global_indexes[storage_id] = list(chunk_global_indexes)
             tasks.append(
                 self._prepare_and_send_to_unit(
                     storage_id=storage_id,
@@ -219,13 +219,17 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         partition_id = metadata.partition_ids[0]
         dtypes_for_notify = {
-            gi: {fname: fmeta.get("dtype") for fname, fmeta in field_schema.items()} for gi in metadata.global_indexes
+            gi: {field_name: field_meta.get("dtype") for field_name, field_meta in field_schema.items()}
+            for gi in metadata.global_indexes
         }
         shapes_for_notify = {
-            gi: {fname: fmeta.get("shape") for fname, fmeta in field_schema.items()} for gi in metadata.global_indexes
+            gi: {field_name: field_meta.get("shape") for field_name, field_meta in field_schema.items()}
+            for gi in metadata.global_indexes
         }
         backend_meta = {
-            gi: {"_su_id": storage_id} for storage_id, gi_list in su_to_global_indexes.items() for gi in gi_list
+            gi: {"_su_id": storage_id}
+            for storage_id, global_index_list in storage_unit_to_global_indexes.items()
+            for gi in global_index_list
         }
         await self.notify_data_update(
             partition_id,
@@ -251,14 +255,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         global_indexes = list(metadata.global_indexes[start:end])
 
         storage_data = {}
-        for fname in data.keys():
-            field_data = data[fname]
+        for field_name in data.keys():
+            field_data = data[field_name]
             if isinstance(field_data, torch.Tensor) and field_data.is_nested:
                 # CPU NestedTensor does not support slicing; unbind first then index
                 unbound = field_data.unbind()
-                storage_data[fname] = unbound[start:end]
+                storage_data[field_name] = unbound[start:end]
             else:
-                storage_data[fname] = field_data[start:end]
+                storage_data[field_name] = field_data[start:end]
 
         await self._put_to_single_storage_unit(global_indexes, storage_data, target_storage_unit=storage_id)
 
@@ -272,7 +276,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         Returns:
             Dictionary mapping storage unit IDs to lists of global indexes.
         """
-        groups: dict[str, list[int]] = defaultdict(list)
+        storage_unit_groups: dict[str, list[int]] = defaultdict(list)
         for i, gi in enumerate(metadata.global_indexes):
             backend_meta = metadata._custom_backend_meta[i]
             if not backend_meta or "_su_id" not in backend_meta:
@@ -280,8 +284,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                     f"{caller}: missing _su_id for global_index {gi} in _custom_backend_meta. "
                     f"Make sure put_data was called before {caller}."
                 )
-            groups[backend_meta["_su_id"]].append(gi)
-        return groups
+            storage_unit_groups[backend_meta["_su_id"]].append(gi)
+        return storage_unit_groups
 
     @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)
     async def _put_to_single_storage_unit(
@@ -335,11 +339,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        groups = self._group_by_storage_unit(metadata, "get_data")
+        storage_unit_groups = self._group_by_storage_unit(metadata, "get_data")
 
         tasks = [
             self._get_from_single_storage_unit(global_indexes, metadata.field_names, target_storage_unit=su_id)
-            for su_id, global_indexes in groups.items()
+            for su_id, global_indexes in storage_unit_groups.items()
         ]
         results = await asyncio.gather(*tasks)
 
@@ -427,11 +431,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return
 
-        groups = self._group_by_storage_unit(metadata, "clear_data")
+        storage_unit_groups = self._group_by_storage_unit(metadata, "clear_data")
 
         tasks = [
             self._clear_single_storage_unit(global_indexes, target_storage_unit=su_id)
-            for su_id, global_indexes in groups.items()
+            for su_id, global_indexes in storage_unit_groups.items()
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)

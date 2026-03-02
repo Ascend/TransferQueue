@@ -354,11 +354,11 @@ class BatchMeta:
         new_production_status = self.production_status[sample_indices]
 
         new_field_schema = {}
-        for fname, meta in self.field_schema.items():
+        for field_name, meta in self.field_schema.items():
             new_meta = copy.deepcopy(meta)
             if meta.get("per_sample_shapes") is not None:
                 new_meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in sample_indices]
-            new_field_schema[fname] = new_meta
+            new_field_schema[field_name] = new_meta
 
         new_custom_meta = [copy.deepcopy(self.custom_meta[i]) for i in sample_indices]
 
@@ -385,9 +385,9 @@ class BatchMeta:
             BatchMeta: A new BatchMeta instance containing only the specified fields.
         """
         new_field_schema = {}
-        for fname in field_names:
-            if fname in self.field_schema:
-                new_field_schema[fname] = copy.deepcopy(self.field_schema[fname])
+        for field_name in field_names:
+            if field_name in self.field_schema:
+                new_field_schema[field_name] = copy.deepcopy(self.field_schema[field_name])
 
         selected_custom_backend_meta = [
             {f: v for f, v in m.items() if f.startswith("_") or f in field_names} for m in self._custom_backend_meta
@@ -421,12 +421,12 @@ class BatchMeta:
             the requested fields (existing metadata is preserved where available).
         """
         new_field_schema = {}
-        for fname in field_names:
-            if fname in self.field_schema:
-                new_field_schema[fname] = copy.deepcopy(self.field_schema[fname])
+        for field_name in field_names:
+            if field_name in self.field_schema:
+                new_field_schema[field_name] = copy.deepcopy(self.field_schema[field_name])
             else:
                 # Unknown field — include with empty schema so get_data can fetch it.
-                new_field_schema[fname] = {}
+                new_field_schema[field_name] = {}
 
         selected_custom_backend_meta = [
             {f: v for f, v in m.items() if f.startswith("_") or f in field_names} for m in self._custom_backend_meta
@@ -565,20 +565,20 @@ class BatchMeta:
                     raise ValueError("Error: Field names do not match for concatenation.")
 
             # Validate field_schema dtype and is_nested consistency across chunks
-            for fname in base_fields:
-                base_meta = data[0].field_schema.get(fname, {})
+            for field_name in base_fields:
+                base_meta = data[0].field_schema.get(field_name, {})
                 base_dtype = base_meta.get("dtype")
                 base_is_nested = base_meta.get("is_nested", False)
                 for i, chunk in enumerate(data[1:], start=1):
-                    chunk_meta = chunk.field_schema.get(fname, {})
+                    chunk_meta = chunk.field_schema.get(field_name, {})
                     if chunk_meta.get("dtype") != base_dtype:
                         raise ValueError(
-                            f"Field '{fname}' dtype mismatch in concat: "
+                            f"Field '{field_name}' dtype mismatch in concat: "
                             f"chunk[0]={base_dtype}, chunk[{i}]={chunk_meta.get('dtype')}"
                         )
                     if chunk_meta.get("is_nested", False) != base_is_nested:
                         raise ValueError(
-                            f"Field '{fname}' is_nested mismatch in concat: "
+                            f"Field '{field_name}' is_nested mismatch in concat: "
                             f"chunk[0]={base_is_nested}, chunk[{i}]={chunk_meta.get('is_nested', False)}"
                         )
 
@@ -589,23 +589,23 @@ class BatchMeta:
 
         all_field_schema: dict[str, dict[str, Any]] = {}
         first_chunk = data[0]
-        for fname, meta in first_chunk.field_schema.items():
-            all_field_schema[fname] = {
+        for field_name, meta in first_chunk.field_schema.items():
+            all_field_schema[field_name] = {
                 "dtype": meta.get("dtype"),
                 "shape": meta.get("shape"),
                 "is_nested": meta.get("is_nested", False),
                 "is_non_tensor": meta.get("is_non_tensor", False),
             }
-            if any(chunk.field_schema.get(fname, {}).get("per_sample_shapes") for chunk in data):
+            if any(chunk.field_schema.get(field_name, {}).get("per_sample_shapes") for chunk in data):
                 all_shapes = []
                 for chunk in data:
-                    chunk_meta = chunk.field_schema.get(fname, {})
+                    chunk_meta = chunk.field_schema.get(field_name, {})
                     chunk_shapes = chunk_meta.get("per_sample_shapes")
                     if chunk_shapes:
                         all_shapes.extend(chunk_shapes)
                     else:
                         all_shapes.extend([None] * chunk.size)
-                all_field_schema[fname]["per_sample_shapes"] = all_shapes
+                all_field_schema[field_name]["per_sample_shapes"] = all_shapes
 
         all_custom_meta: list[dict[str, Any]] = []
         all_custom_backend_meta: list[dict[str, Any]] = []
@@ -674,7 +674,7 @@ class BatchMeta:
 
         self.production_status = self.production_status[indices]
 
-        for fname, meta in self.field_schema.items():
+        for field_name, meta in self.field_schema.items():
             if meta.get("per_sample_shapes") is not None:
                 meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in indices]
 
@@ -720,16 +720,16 @@ class BatchMeta:
         round-trip torch.dtype / numpy.dtype objects.
         """
         serialized_schema = {}
-        for fname, meta in self.field_schema.items():
+        for field_name, meta in self.field_schema.items():
             dtype = meta.get("dtype")
-            serialized_schema[fname] = {
+            serialized_schema[field_name] = {
                 "dtype": str(dtype) if dtype is not None else None,
                 "shape": list(meta["shape"]) if meta.get("shape") else None,
                 "is_nested": meta.get("is_nested", False),
                 "is_non_tensor": meta.get("is_non_tensor", False),
             }
             if meta.get("per_sample_shapes") is not None:
-                serialized_schema[fname]["per_sample_shapes"] = [list(s) for s in meta["per_sample_shapes"]]
+                serialized_schema[field_name]["per_sample_shapes"] = [list(s) for s in meta["per_sample_shapes"]]
 
         return {
             "global_indexes": self.global_indexes,
@@ -748,22 +748,22 @@ class BatchMeta:
         dtype is stored as a string and decoded back to torch.dtype / numpy.dtype here.
         """
         field_schema = {}
-        for fname, meta in data.get("field_schema", {}).items():
+        for field_name, meta in data.get("field_schema", {}).items():
             dtype_str = meta.get("dtype")
             dtype = _parse_dtype(dtype_str) if dtype_str is not None else None
-            field_schema[fname] = {
+            field_schema[field_name] = {
                 "dtype": dtype,
                 "shape": tuple(meta["shape"]) if meta.get("shape") else None,
                 "is_nested": meta.get("is_nested", False),
                 "is_non_tensor": meta.get("is_non_tensor", False),
             }
             if meta.get("per_sample_shapes") is not None:
-                field_schema[fname]["per_sample_shapes"] = [tuple(s) for s in meta["per_sample_shapes"]]
+                field_schema[field_name]["per_sample_shapes"] = [tuple(s) for s in meta["per_sample_shapes"]]
 
-        ps_data = data.get("production_status")
+        production_status_data = data.get("production_status")
         production_status: np.ndarray = (
-            np.array(ps_data, dtype=np.int8)
-            if ps_data is not None
+            np.array(production_status_data, dtype=np.int8)
+            if production_status_data is not None
             else np.zeros(len(data["global_indexes"]), dtype=np.int8)
         )
 

@@ -486,16 +486,16 @@ class DataPartitionStatus:
                     self.field_dtypes[global_idx] = {}
                 self.field_dtypes[global_idx].update(dtype_value[i])
                 # Update field_schema_cache with new dtype info
-                for fname, dtype in dtype_value[i].items():
-                    if fname not in self.field_schema_cache:
-                        self.field_schema_cache[fname] = {
+                for field_name, dtype in dtype_value[i].items():
+                    if field_name not in self.field_schema_cache:
+                        self.field_schema_cache[field_name] = {
                             "dtype": dtype,
                             "shape": None,
                             "is_nested": False,
                             "is_non_tensor": False,
                         }
-                    elif self.field_schema_cache[fname].get("dtype") is None:
-                        self.field_schema_cache[fname]["dtype"] = dtype
+                    elif self.field_schema_cache[field_name].get("dtype") is None:
+                        self.field_schema_cache[field_name]["dtype"] = dtype
 
             # Only create and update shape mapping if a shape value was provided
             if shape_value[i] is not None:
@@ -503,16 +503,16 @@ class DataPartitionStatus:
                     self.field_shapes[global_idx] = {}
                 self.field_shapes[global_idx].update(shape_value[i])
                 # Update field_schema_cache with new shape info
-                for fname, shape in shape_value[i].items():
-                    if fname not in self.field_schema_cache:
-                        self.field_schema_cache[fname] = {
+                for field_name, shape in shape_value[i].items():
+                    if field_name not in self.field_schema_cache:
+                        self.field_schema_cache[field_name] = {
                             "dtype": None,
                             "shape": shape,
                             "is_nested": False,
                             "is_non_tensor": False,
                         }
-                    elif self.field_schema_cache[fname].get("shape") is None:
-                        self.field_schema_cache[fname]["shape"] = shape
+                    elif self.field_schema_cache[field_name].get("shape") is None:
+                        self.field_schema_cache[field_name]["shape"] = shape
 
             # Only create and update custom_backend_meta mapping if a custom_backend_meta value was provided
             if custom_backend_meta_value[i] is not None:
@@ -700,10 +700,10 @@ class DataPartitionStatus:
         The cache is populated eagerly in _update_field_metadata() at put time.
         """
         schema = {}
-        for fname in field_names:
-            cached = self.field_schema_cache.get(fname)
+        for field_name in field_names:
+            cached = self.field_schema_cache.get(field_name)
             if cached is not None:
-                schema[fname] = {
+                schema[field_name] = {
                     "dtype": cached.get("dtype"),
                     "shape": cached.get("shape"),
                     "is_nested": cached.get("is_nested", False),
@@ -1374,9 +1374,9 @@ class TransferQueueController:
         # In insert mode, create placeholder schema for unregistered fields so that
         # metadata.field_names is complete and update_production_status() can recognize them.
         if mode == "insert":
-            for fname in data_fields:
-                if fname not in field_schema:
-                    field_schema[fname] = {
+            for field_name in data_fields:
+                if field_name not in field_schema:
+                    field_schema[field_name] = {
                         "dtype": None,
                         "shape": None,
                         "is_nested": False,
@@ -1391,9 +1391,9 @@ class TransferQueueController:
             production_status = np.zeros(batch_size, dtype=np.int8)
             if partition.production_status is not None and data_fields:
                 field_indices = [
-                    partition.field_name_mapping.get(fname)
-                    for fname in data_fields
-                    if fname in partition.field_name_mapping
+                    partition.field_name_mapping.get(field_name)
+                    for field_name in data_fields
+                    if field_name in partition.field_name_mapping
                 ]
                 if field_indices:
                     for i, global_idx in enumerate(batch_global_indexes):
@@ -1576,9 +1576,9 @@ class TransferQueueController:
             verified_global_indexes
         )
         data_fields = []
-        for fname, col_idx in partition.field_name_mapping.items():
+        for field_name, col_idx in partition.field_name_mapping.items():
             if col_idx < len(col_mask) and col_mask[col_idx]:
-                data_fields.append(fname)
+                data_fields.append(field_name)
 
         metadata = self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 

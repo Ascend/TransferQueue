@@ -41,8 +41,8 @@ class TestBatchMetaColumnar:
         if field_names is None:
             field_names = ["field_a", "field_b"]
         field_schema = {
-            fname: {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}
-            for fname in field_names
+            field_name: {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}
+            for field_name in field_names
         }
         production_status = np.ones(batch_size, dtype=np.int8)
         return BatchMeta(

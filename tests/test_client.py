@@ -175,7 +175,8 @@ class MockController:
 
         # Build columnar field_schema
         field_schema = {
-            fname: {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": False} for fname in data_fields
+            field_name: {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": False}
+            for field_name in data_fields
         }
 
         metadata = BatchMeta(

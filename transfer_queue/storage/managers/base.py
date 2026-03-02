@@ -605,7 +605,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 raise ValueError(
                     f"Length of custom_backend_meta ({len(custom_backend_meta)}) does not match expected ({len(keys)})"
                 )
-            gi_to_pos = {gi: i for i, gi in enumerate(metadata.global_indexes)}
+            global_index_to_position = {gi: i for i, gi in enumerate(metadata.global_indexes)}
 
             for global_idx in metadata.global_indexes:
                 per_field_custom_backend_meta[global_idx] = {}
@@ -619,7 +619,7 @@ class KVStorageManager(TransferQueueStorageManager):
                 strict=True,
             ):
                 per_field_custom_backend_meta[global_idx][field_name] = meta_value
-                metadata._custom_backend_meta[gi_to_pos[global_idx]][field_name] = meta_value
+                metadata._custom_backend_meta[global_index_to_position[global_idx]][field_name] = meta_value
 
         # Get current data partition id
         partition_id = metadata.partition_ids[0]
