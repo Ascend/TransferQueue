@@ -297,6 +297,27 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         return field_schema
 
+    def _group_by_storage_unit(self, metadata: BatchMeta, caller: str) -> dict[str, list[int]]:
+        """Group global_indexes by their storage unit ID from _custom_backend_meta.
+
+        Args:
+            metadata: BatchMeta containing _custom_backend_meta with _su_id routing info.
+            caller: Name of the calling method, used in error messages.
+
+        Returns:
+            Dictionary mapping storage unit IDs to lists of global indexes.
+        """
+        groups: dict[str, list[int]] = defaultdict(list)
+        for i, gi in enumerate(metadata.global_indexes):
+            backend_meta = metadata._custom_backend_meta[i]
+            if not backend_meta or "_su_id" not in backend_meta:
+                raise RuntimeError(
+                    f"{caller}: missing _su_id for global_index {gi} in _custom_backend_meta. "
+                    f"Make sure put_data was called before {caller}."
+                )
+            groups[backend_meta["_su_id"]].append(gi)
+        return groups
+
     @dynamic_storage_manager_socket(socket_name="put_get_socket")
     async def _put_to_single_storage_unit(
         self,
@@ -349,19 +370,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        groups: dict[str, list[int]] = defaultdict(list)
-        for i, gi in enumerate(metadata.global_indexes):
-            backend_meta = metadata._custom_backend_meta[i]
-            if not backend_meta or "_su_id" not in backend_meta:
-                raise RuntimeError(
-                    f"get_data: missing _su_id for global_index {gi} in _custom_backend_meta. "
-                    f"Make sure put_data was called before get_data."
-                )
-            groups[backend_meta["_su_id"]].append(gi)
+        groups = self._group_by_storage_unit(metadata, "get_data")
 
         tasks = [
-            self._get_from_single_storage_unit(gi_list, metadata.field_names, target_storage_unit=su_id)
-            for su_id, gi_list in groups.items()
+            self._get_from_single_storage_unit(global_indexes, metadata.field_names, target_storage_unit=su_id)
+            for su_id, global_indexes in groups.items()
         ]
         results = await asyncio.gather(*tasks)
 
@@ -452,18 +465,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if metadata.size == 0:
             return
 
-        groups: dict[str, list[int]] = defaultdict(list)
-        for i, gi in enumerate(metadata.global_indexes):
-            backend_meta = metadata._custom_backend_meta[i]
-            if not backend_meta or "_su_id" not in backend_meta:
-                raise RuntimeError(
-                    f"clear_data: missing _su_id for global_index {gi} in _custom_backend_meta. "
-                    f"Make sure put_data was called before clear_data."
-                )
-            groups[backend_meta["_su_id"]].append(gi)
+        groups = self._group_by_storage_unit(metadata, "clear_data")
 
         tasks = [
-            self._clear_single_storage_unit(gi_list, target_storage_unit=su_id) for su_id, gi_list in groups.items()
+            self._clear_single_storage_unit(global_indexes, target_storage_unit=su_id)
+            for su_id, global_indexes in groups.items()
         ]
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
