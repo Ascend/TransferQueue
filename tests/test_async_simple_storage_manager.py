@@ -371,11 +371,11 @@ async def test_get_data_routes_from_custom_backend_meta():
     # Mock _get_from_single_storage_unit to record which su_id and gi were requested
     called_with: dict[str, list] = {}
 
-    async def fake_get(gi_list, fields, target_storage_unit=None, **kwargs):
+    async def fake_get(global_indexes, fields, target_storage_unit=None, **kwargs):
         su = target_storage_unit
-        called_with[su] = list(gi_list)
-        tensors = [torch.zeros(2) for _ in gi_list]
-        return gi_list, fields, {"f": tensors}, b""
+        called_with[su] = list(global_indexes)
+        tensors = [torch.zeros(2) for _ in global_indexes]
+        return global_indexes, fields, {"f": tensors}, b""
 
     manager._get_from_single_storage_unit = fake_get
 
@@ -428,8 +428,8 @@ async def test_clear_data_routes_from_custom_backend_meta():
 
     called_with: dict[str, list] = {}
 
-    async def fake_clear(gi_list, target_storage_unit=None, **kwargs):
-        called_with[target_storage_unit] = list(gi_list)
+    async def fake_clear(global_indexes, target_storage_unit=None, **kwargs):
+        called_with[target_storage_unit] = list(global_indexes)
 
     manager._clear_single_storage_unit = fake_clear
 

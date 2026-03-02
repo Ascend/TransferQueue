@@ -420,17 +420,17 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     @dynamic_storage_manager_socket(socket_name="put_get_socket")
     async def _get_from_single_storage_unit(
         self,
-        gi_list: list[int],
+        global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
         socket: zmq.Socket = None,
     ):
-        """Get data from a single SU by gi keys."""
+        """Get data from a single SU by global index keys."""
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"local_indexes": gi_list, "fields": fields},
+            body={"local_indexes": global_indexes, "fields": fields},
         )
         try:
             await socket.send_multipart(request_msg.serialize())
@@ -438,11 +438,8 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
-                # Return data and index information from this storage unit
-                # We need to return messages to get_data() since the zero-copy deserialization directly points to the
-                # memory of messages object.
                 storage_unit_data = response_msg.body["data"]
-                return gi_list, fields, storage_unit_data, messages
+                return global_indexes, fields, storage_unit_data, messages
             else:
                 raise RuntimeError(
                     f"Failed to get data from storage unit {target_storage_unit}: "
@@ -479,13 +476,13 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                 logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
 
     @dynamic_storage_manager_socket(socket_name="put_get_socket")
-    async def _clear_single_storage_unit(self, local_indexes, target_storage_unit=None, socket=None):
+    async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
         try:
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA,
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"local_indexes": local_indexes},
+                body={"local_indexes": global_indexes},
             )
 
             await socket.send_multipart(request_msg.serialize())
