@@ -946,12 +946,12 @@ class TestDataPartitionStatusCustomMeta:
 class TestDataPartitionStatusKvInterface:
     """Unit tests for DataPartitionStatus KV interface functionality.
 
-    Tests for the keys_mapping and kv_retrieve_keys methods that support
+    Tests for the keys_mapping and kv_retrieve_meta methods that support
     key-value interface operations within a partition.
     """
 
-    def test_kv_retrieve_keys_with_existing_keys(self):
-        """Test kv_retrieve_keys returns correct global_indexes for existing keys."""
+    def test_kv_retrieve_meta_with_existing_keys(self):
+        """Test kv_retrieve_meta returns correct global_indexes for existing keys."""
         from transfer_queue.controller import DataPartitionStatus
 
         partition = DataPartitionStatus(partition_id="kv_test_partition")
@@ -960,12 +960,12 @@ class TestDataPartitionStatusKvInterface:
         partition.keys_mapping = {"key_a": 0, "key_b": 1, "key_c": 2}
 
         # Retrieve keys
-        global_indexes = partition.kv_retrieve_keys(["key_a", "key_b", "key_c"])
+        global_indexes = partition.kv_retrieve_indexes(["key_a", "key_b", "key_c"])
 
         assert global_indexes == [0, 1, 2]
 
-    def test_kv_retrieve_keys_with_nonexistent_keys(self):
-        """Test kv_retrieve_keys returns None for keys that don't exist."""
+    def test_kv_retrieve_meta_with_nonexistent_keys(self):
+        """Test kv_retrieve_meta returns None for keys that don't exist."""
         from transfer_queue.controller import DataPartitionStatus
 
         partition = DataPartitionStatus(partition_id="kv_test_partition")
@@ -974,22 +974,22 @@ class TestDataPartitionStatusKvInterface:
         partition.keys_mapping = {"existing_key": 5}
 
         # Retrieve mixed existing and non-existing keys
-        global_indexes = partition.kv_retrieve_keys(["existing_key", "nonexistent_key"])
+        global_indexes = partition.kv_retrieve_indexes(["existing_key", "nonexistent_key"])
 
         assert global_indexes == [5, None]
 
-    def test_kv_retrieve_keys_empty_list(self):
-        """Test kv_retrieve_keys handles empty key list."""
+    def test_kv_retrieve_meta_empty_list(self):
+        """Test kv_retrieve_meta handles empty key list."""
         from transfer_queue.controller import DataPartitionStatus
 
         partition = DataPartitionStatus(partition_id="kv_test_partition")
 
-        global_indexes = partition.kv_retrieve_keys([])
+        global_indexes = partition.kv_retrieve_indexes([])
 
         assert global_indexes == []
 
-    def test_kv_retrieve_keys_partial_match(self):
-        """Test kv_retrieve_keys with partial key matches."""
+    def test_kv_retrieve_meta_partial_match(self):
+        """Test kv_retrieve_meta with partial key matches."""
         from transfer_queue.controller import DataPartitionStatus
 
         partition = DataPartitionStatus(partition_id="kv_test_partition")
@@ -997,6 +997,61 @@ class TestDataPartitionStatusKvInterface:
         partition.keys_mapping = {"key_1": 10, "key_2": 20, "key_3": 30}
 
         # Request only some of the keys
-        global_indexes = partition.kv_retrieve_keys(["key_1", "key_3"])
+        global_indexes = partition.kv_retrieve_indexes(["key_1", "key_3"])
 
         assert global_indexes == [10, 30]
+
+    def test_kv_retrieve_keys_with_existing_indexes(self):
+        """Test kv_retrieve_keys returns correct keys for existing global_indexes."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        # Simulate reverse mapping (key -> global_index)
+        partition.keys_mapping = {"key_a": 0, "key_b": 1, "key_c": 2}
+        # Build reverse mapping
+        partition.revert_keys_mapping = {0: "key_a", 1: "key_b", 2: "key_c"}
+
+        # Retrieve keys using global_indexes
+        keys = partition.kv_retrieve_keys([0, 1, 2])
+
+        assert keys == ["key_a", "key_b", "key_c"]
+
+    def test_kv_retrieve_keys_with_nonexistent_indexes(self):
+        """Test kv_retrieve_keys returns None for global_indexes that don't exist."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        # Simulate some indexes being registered
+        partition.keys_mapping = {"existing_key": 5}
+        partition.revert_keys_mapping = {5: "existing_key"}
+
+        # Retrieve mixed existing and non-existing global_indexes
+        keys = partition.kv_retrieve_keys([5, 99])
+
+        assert keys == ["existing_key", None]
+
+    def test_kv_retrieve_keys_empty_list(self):
+        """Test kv_retrieve_keys handles empty global_index list."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        keys = partition.kv_retrieve_keys([])
+
+        assert keys == []
+
+    def test_kv_retrieve_keys_partial_match(self):
+        """Test kv_retrieve_keys with partial global_index matches."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="kv_test_partition")
+
+        partition.keys_mapping = {"key_1": 10, "key_2": 20, "key_3": 30}
+        partition.revert_keys_mapping = {10: "key_1", 20: "key_2", 30: "key_3"}
+
+        # Request only some of the global_indexes
+        keys = partition.kv_retrieve_keys([10, 30])
+
+        assert keys == ["key_1", "key_3"]
