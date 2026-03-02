@@ -62,12 +62,12 @@ class StorageUnitData:
         # Capacity upper bound (not pre-allocated list length)
         self.storage_size = storage_size
 
-    def get_data(self, fields: list[str], local_keys: list) -> dict[str, list]:
-        """Get data by gi keys.
+    def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
+        """Get data by global index keys.
 
         Args:
             fields: Field names used for getting data.
-            local_keys: Global indexes used as dict keys.
+            global_indexes: Global indexes used as dict keys.
 
         Returns:
             dict with field names as keys, corresponding data list as values.
@@ -79,23 +79,23 @@ class StorageUnitData:
                     f"StorageUnitData get_data: field '{field}' not found. Available: {list(self.field_data.keys())}"
                 )
             try:
-                result[field] = [self.field_data[field][k] for k in local_keys]
+                result[field] = [self.field_data[field][k] for k in global_indexes]
             except KeyError as e:
                 raise KeyError(f"StorageUnitData get_data: key {e} not found in field '{field}'") from e
         return result
 
-    def put_data(self, field_data: dict[str, Any], local_keys: list) -> None:
-        """Put data into storage. local_keys are global_indexes used as dict keys.
+    def put_data(self, field_data: dict[str, Any], global_indexes: list) -> None:
+        """Put data into storage.
 
         Args:
             field_data: Dict with field names as keys, data list as values.
-            local_keys: Global indexes to use as dict keys.
+            global_indexes: Global indexes to use as dict keys.
         """
         # Capacity is enforced per unique sample key, not counted per-field
         existing_keys: set = set()
         for fd in self.field_data.values():
             existing_keys.update(fd.keys())
-        new_global_keys = [k for k in local_keys if k not in existing_keys]
+        new_global_keys = [k for k in global_indexes if k not in existing_keys]
         if len(existing_keys) + len(new_global_keys) > self.storage_size:
             raise ValueError(
                 f"Storage capacity exceeded: {len(existing_keys)} existing + "
@@ -104,7 +104,7 @@ class StorageUnitData:
         for f, values in field_data.items():
             if f not in self.field_data:
                 self.field_data[f] = {}
-            for key, val in zip(local_keys, values, strict=False):
+            for key, val in zip(global_indexes, values, strict=False):
                 self.field_data[f][key] = val
 
     def clear(self, keys: list[int]) -> None:

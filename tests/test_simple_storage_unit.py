@@ -403,7 +403,7 @@ def test_storage_unit_data_direct():
         "log_probs": [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
         "rewards": [torch.tensor([10.0]), torch.tensor([20.0])],
     }
-    # local_keys = gi values (e.g., 0 and 1)
+    # global_indexes = gi values (e.g., 0 and 1)
     storage_data.put_data(field_data, [0, 1])
 
     result = storage_data.get_data(["log_probs", "rewards"], [0, 1])
@@ -427,15 +427,15 @@ def test_storage_unit_data_dict_key():
 
     storage = StorageUnitData(storage_size=4)
 
-    # put_data: 用 gi 列表 [10, 11] 作为 local_keys
+    # put_data: 用 gi 列表 [10, 11] 作为 global_indexes
     storage.put_data(
         {"f": [torch.tensor([1.0]), torch.tensor([2.0])]},
-        local_keys=[10, 11],
+        global_indexes=[10, 11],
     )
     assert len(storage.field_data["f"]) == 2
 
     # get_data: 通过 gi 读取
-    result = storage.get_data(["f"], local_keys=[10, 11])
+    result = storage.get_data(["f"], global_indexes=[10, 11])
     torch.testing.assert_close(result["f"][0], torch.tensor([1.0]))
     torch.testing.assert_close(result["f"][1], torch.tensor([2.0]))
 
@@ -448,7 +448,7 @@ def test_storage_unit_data_dict_key():
     with pytest.raises(ValueError, match="Storage capacity exceeded"):
         storage.put_data(
             {"f": [torch.tensor([i * 1.0]) for i in range(4)]},
-            local_keys=[20, 21, 22, 23],
+            global_indexes=[20, 21, 22, 23],
         )
 
 
@@ -457,13 +457,13 @@ def test_storage_unit_data_partial_consume_safety():
     from transfer_queue.storage.simple_backend import StorageUnitData
 
     storage = StorageUnitData(storage_size=4)
-    storage.put_data({"f": [torch.tensor([0.0]), torch.tensor([1.0])]}, local_keys=[0, 1])
+    storage.put_data({"f": [torch.tensor([0.0]), torch.tensor([1.0])]}, global_indexes=[0, 1])
 
     storage.clear(keys=[1])  # 只清除 gi=1
     assert 0 in storage.field_data["f"]
     assert 1 not in storage.field_data["f"]
 
     # 复用 gi=1 写入新数据，不影响 gi=0
-    storage.put_data({"f": [torch.tensor([9.0])]}, local_keys=[1])
+    storage.put_data({"f": [torch.tensor([9.0])]}, global_indexes=[1])
     torch.testing.assert_close(storage.field_data["f"][0], torch.tensor([0.0]))
     torch.testing.assert_close(storage.field_data["f"][1], torch.tensor([9.0]))
