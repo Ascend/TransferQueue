@@ -318,6 +318,41 @@ class TransferQueueStorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
+    @staticmethod
+    def _extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
+        """Extract field-level schema from TensorDict. O(F) complexity."""
+        field_schema: dict[str, dict[str, Any]] = {}
+
+        for field_name in data.keys():
+            field_data = data[field_name]
+
+            is_tensor = isinstance(field_data, torch.Tensor)
+            is_nested = is_tensor and field_data.is_nested
+
+            if is_nested:
+                unbound = field_data.unbind()
+                first_item = unbound[0] if unbound else None
+            elif is_tensor:
+                first_item = field_data[0] if field_data.shape[0] > 0 else None
+            else:
+                first_item = field_data[0] if len(field_data) > 0 else None
+
+            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
+
+            field_meta = {
+                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+                "shape": getattr(first_item, "shape", None) if is_tensor and not is_nested else None,
+                "is_nested": is_nested,
+                "is_non_tensor": is_non_tensor,
+            }
+
+            if is_nested:
+                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in unbound]
+
+            field_schema[field_name] = field_meta
+
+        return field_schema
+
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
         # Close handshake socket if it exists
@@ -562,28 +597,7 @@ class KVStorageManager(TransferQueueStorageManager):
 
         custom_backend_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        # O(F): Extract field-level schema by sampling the first item
-        field_schema: dict[str, dict[str, Any]] = {}
-        for field_name, field_data in data.items():
-            first_item = field_data[0] if len(field_data) > 0 else None
-
-            is_nested = isinstance(field_data, torch.Tensor) and field_data.is_nested
-
-            is_non_tensor = not isinstance(first_item, Tensor) if first_item is not None else False
-
-            field_meta = {
-                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
-                "shape": getattr(first_item, "shape", None)
-                if not is_nested and isinstance(first_item, Tensor)
-                else None,
-                "is_nested": is_nested,
-                "is_non_tensor": is_non_tensor,
-            }
-
-            if is_nested:
-                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in field_data.unbind()]
-
-            field_schema[field_name] = field_meta
+        field_schema = self._extract_field_schema(data)
 
         per_field_custom_backend_meta: dict[int, dict[str, Any]] = {}
         if custom_backend_meta:
@@ -591,7 +605,6 @@ class KVStorageManager(TransferQueueStorageManager):
                 raise ValueError(
                     f"Length of custom_backend_meta ({len(custom_backend_meta)}) does not match expected ({len(keys)})"
                 )
-            # Build gi→position index for O(1) lookup
             gi_to_pos = {gi: i for i, gi in enumerate(metadata.global_indexes)}
 
             for global_idx in metadata.global_indexes:
@@ -606,38 +619,33 @@ class KVStorageManager(TransferQueueStorageManager):
                 strict=True,
             ):
                 per_field_custom_backend_meta[global_idx][field_name] = meta_value
-                # Also update columnar _custom_backend_meta
                 metadata._custom_backend_meta[gi_to_pos[global_idx]][field_name] = meta_value
 
         # Get current data partition id
         partition_id = metadata.partition_ids[0]
 
-        # Build per-sample per-field dtypes and shapes for controller notification
         per_field_dtypes: dict[int, dict[str, Any]] = {}
         per_field_shapes: dict[int, dict[str, Any]] = {}
-        for field_name, field_data in data.items():
-            is_nested = isinstance(field_data, torch.Tensor) and field_data.is_nested
+        for field_name, field_meta in field_schema.items():
+            is_nested = field_meta.get("is_nested", False)
 
             if is_nested:
-                # Nested tensor: each sample may have a different shape and dtype, iterate per-sample
-                unbound = field_data.unbind()
+                per_sample_shapes = field_meta.get("per_sample_shapes", [])
                 for i, global_idx in enumerate(metadata.global_indexes):
                     if global_idx not in per_field_dtypes:
                         per_field_dtypes[global_idx] = {}
                         per_field_shapes[global_idx] = {}
-                    per_field_dtypes[global_idx][field_name] = unbound[i].dtype
-                    per_field_shapes[global_idx][field_name] = tuple(unbound[i].shape)
+                    per_field_dtypes[global_idx][field_name] = field_meta.get("dtype")
+                    per_field_shapes[global_idx][field_name] = (
+                        per_sample_shapes[i] if i < len(per_sample_shapes) else None
+                    )
             else:
-                # Non-nested tensor: all samples share the same dtype and shape, bulk-fill
-                first_item = field_data[0] if len(field_data) > 0 else None
-                field_dtype = getattr(first_item, "dtype", type(first_item) if first_item is not None else None)
-                field_shape = getattr(first_item, "shape", None) if isinstance(first_item, Tensor) else None
                 for global_idx in metadata.global_indexes:
                     if global_idx not in per_field_dtypes:
                         per_field_dtypes[global_idx] = {}
                         per_field_shapes[global_idx] = {}
-                    per_field_dtypes[global_idx][field_name] = field_dtype
-                    per_field_shapes[global_idx][field_name] = field_shape
+                    per_field_dtypes[global_idx][field_name] = field_meta.get("dtype")
+                    per_field_shapes[global_idx][field_name] = field_meta.get("shape")
 
         await self.notify_data_update(
             partition_id,

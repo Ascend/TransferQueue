@@ -262,41 +262,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         await self._put_to_single_storage_unit(global_indexes, storage_data, target_storage_unit=storage_id)
 
-    def _extract_field_schema(self, data: TensorDict) -> dict[str, dict[str, Any]]:
-        """Extract field-level schema from TensorDict. O(F) complexity."""
-        field_schema: dict[str, dict[str, Any]] = {}
-
-        for field_name in data.keys():
-            field_data = data[field_name]
-
-            # NestedTensor does not support len()/indexing; check is_nested then unbind
-            is_tensor = isinstance(field_data, torch.Tensor)
-            is_nested = is_tensor and field_data.is_nested
-
-            if is_nested:
-                unbound = field_data.unbind()
-                first_item = unbound[0] if unbound else None
-            elif is_tensor:
-                first_item = field_data[0] if field_data.shape[0] > 0 else None
-            else:
-                first_item = field_data[0] if len(field_data) > 0 else None
-
-            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
-
-            field_meta = {
-                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
-                "shape": getattr(first_item, "shape", None) if is_tensor and not is_nested else None,
-                "is_nested": is_nested,
-                "is_non_tensor": is_non_tensor,
-            }
-
-            if is_nested:
-                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in unbound]
-
-            field_schema[field_name] = field_meta
-
-        return field_schema
-
     def _group_by_storage_unit(self, metadata: BatchMeta, caller: str) -> dict[str, list[int]]:
         """Group global_indexes by their storage unit ID from _custom_backend_meta.
 
