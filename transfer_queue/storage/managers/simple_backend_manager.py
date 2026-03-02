@@ -196,7 +196,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         field_schema = self._extract_field_schema(data)
 
-        su_to_gis: dict[str, list[int]] = {}
+        su_to_global_indexes: dict[str, list[int]] = {}
         tasks = []
         for unit_idx, storage_id in enumerate(storage_unit_keys):
             start = unit_idx * chunk_size
@@ -204,15 +204,12 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             if start >= batch_size or start >= end:
                 continue
             gi_slice = metadata.global_indexes[start:end]
-            su_to_gis[storage_id] = list(gi_slice)
+            su_to_global_indexes[storage_id] = list(gi_slice)
             tasks.append(
                 self._prepare_and_send_to_unit(
-                    unit_idx=unit_idx,
                     storage_id=storage_id,
-                    chunk_size=chunk_size,
-                    batch_size=batch_size,
-                    start_offset=0,  # fixed; no cross-batch rotation
-                    num_units=num_units,
+                    start=start,
+                    end=end,
                     data=data,
                     metadata=metadata,
                 )
@@ -227,7 +224,9 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         shapes_for_notify = {
             gi: {fname: fmeta.get("shape") for fname, fmeta in field_schema.items()} for gi in metadata.global_indexes
         }
-        backend_meta = {gi: {"_su_id": storage_id} for storage_id, gi_list in su_to_gis.items() for gi in gi_list}
+        backend_meta = {
+            gi: {"_su_id": storage_id} for storage_id, gi_list in su_to_global_indexes.items() for gi in gi_list
+        }
         await self.notify_data_update(
             partition_id,
             list(data.keys()),
@@ -239,29 +238,17 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
     async def _prepare_and_send_to_unit(
         self,
-        unit_idx: int,
         storage_id: str,
-        chunk_size: int,
-        batch_size: int,
-        start_offset: int,
-        num_units: int,
+        start: int,
+        end: int,
         data: TensorDict,
         metadata: BatchMeta,
     ) -> None:
         """Prepare data slice and send to a single storage unit.
 
-        All operations use O(1) slicing. Returns early if this unit has no data assigned.
+        All operations use O(1) slicing.
         """
-        rotated_idx = (unit_idx - start_offset) % num_units
-        start = rotated_idx * chunk_size
-        end = min((rotated_idx + 1) * chunk_size, batch_size)
-
-        if start >= batch_size or start >= end:
-            return
-
-        # global_index is used directly as dict key in storage, no local_index conversion needed
-        global_indexes_slice = metadata.global_indexes[start:end]
-        local_indexes = list(global_indexes_slice)
+        global_indexes = list(metadata.global_indexes[start:end])
 
         storage_data = {}
         for fname in data.keys():
@@ -273,7 +260,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             else:
                 storage_data[fname] = field_data[start:end]
 
-        await self._put_to_single_storage_unit(local_indexes, storage_data, target_storage_unit=storage_id)
+        await self._put_to_single_storage_unit(global_indexes, storage_data, target_storage_unit=storage_id)
 
     def _extract_field_schema(self, data: TensorDict) -> dict[str, dict[str, Any]]:
         """Extract field-level schema from TensorDict. O(F) complexity."""
