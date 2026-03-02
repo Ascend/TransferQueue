@@ -321,7 +321,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     @dynamic_storage_manager_socket(socket_name="put_get_socket")
     async def _put_to_single_storage_unit(
         self,
-        local_indexes: list[int],
+        global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
         socket: zmq.Socket = None,
@@ -334,7 +334,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"local_indexes": local_indexes, "data": storage_data},
+            body={"global_indexes": global_indexes, "data": storage_data},
         )
 
         try:
@@ -430,7 +430,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"local_indexes": global_indexes, "fields": fields},
+            body={"global_indexes": global_indexes, "fields": fields},
         )
         try:
             await socket.send_multipart(request_msg.serialize())
@@ -482,7 +482,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                 request_type=ZMQRequestType.CLEAR_DATA,
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"local_indexes": global_indexes},
+                body={"global_indexes": global_indexes},
             )
 
             await socket.send_multipart(request_msg.serialize())

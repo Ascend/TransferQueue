@@ -245,12 +245,12 @@ class SimpleStorageUnit:
             Put data success response ZMQMessage.
         """
         try:
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
             field_data = data_parts.body["data"]  # field_data should be a TensorDict.
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
-                self.storage_data.put_data(field_data, local_indexes)
+                self.storage_data.put_data(field_data, global_indexes)
 
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
@@ -282,12 +282,12 @@ class SimpleStorageUnit:
         """
         try:
             fields = data_parts.body["fields"]
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
-                result_data = self.storage_data.get_data(fields, local_indexes)
+                result_data = self.storage_data.get_data(fields, global_indexes)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -309,21 +309,21 @@ class SimpleStorageUnit:
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
-        Handle clear request, clear data in storage unit according to given local_indexes.
+        Handle clear request, clear data in storage unit according to given global_indexes.
 
         Args:
-            data_parts: ZMQMessage from client, including target local_indexes.
+            data_parts: ZMQMessage from client, including target global_indexes.
 
         Returns:
             Clear data success response ZMQMessage.
         """
         try:
-            local_indexes = data_parts.body["local_indexes"]
+            global_indexes = data_parts.body["global_indexes"]
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
-                self.storage_data.clear(local_indexes)
+                self.storage_data.clear(global_indexes)
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]

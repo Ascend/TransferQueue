@@ -40,29 +40,29 @@ class MockStorageClient:
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
         self.socket.connect(storage_put_get_address)
 
-    def send_put(self, client_id, local_indexes, field_data):
+    def send_put(self, client_id, global_indexes, field_data):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes, "data": field_data},
+            body={"global_indexes": global_indexes, "data": field_data},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())
 
-    def send_get(self, client_id, local_indexes, fields):
+    def send_get(self, client_id, global_indexes, fields):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes, "fields": fields},
+            body={"global_indexes": global_indexes, "fields": fields},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())
 
-    def send_clear(self, client_id, local_indexes):
+    def send_clear(self, client_id, global_indexes):
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.CLEAR_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"local_indexes": local_indexes},
+            body={"global_indexes": global_indexes},
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart())

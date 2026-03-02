@@ -327,12 +327,12 @@ class MockStorage:
 
     def _handle_get_data(self, request_body):
         """Handle GET_DATA request by retrieving stored data"""
-        local_indexes = request_body.get("local_indexes", [])
+        global_indexes = request_body.get("global_indexes", [])
         fields = request_body.get("fields", [])
 
         result: dict[str, list] = {}
         for field in fields:
-            gathered_items = [TEST_DATA[field][i] for i in local_indexes]
+            gathered_items = [TEST_DATA[field][i] for i in global_indexes]
 
             if gathered_items:
                 all_tensors = all(isinstance(x, torch.Tensor) for x in gathered_items)
