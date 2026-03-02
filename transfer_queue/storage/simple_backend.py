@@ -13,10 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import dataclasses
 import logging
 import os
-from dataclasses import dataclass
 from threading import Thread
 from typing import Any
 from uuid import uuid4
@@ -348,64 +346,3 @@ class SimpleStorageUnit:
             ZMQServerInfo containing connection details for this storage unit.
         """
         return self.zmq_server_info
-
-
-@dataclass
-class StorageMetaGroup:
-    """Group of metadata for a specific storage unit."""
-
-    storage_id: str
-    global_indexes: list[int] = dataclasses.field(default_factory=list)
-    partition_ids: list[str] = dataclasses.field(default_factory=list)
-    batch_indexes: list[int] = dataclasses.field(default_factory=list)  # Original TensorDict positions
-    field_names: list[str] = dataclasses.field(default_factory=list)  # Field names from BatchMeta
-
-    def add_meta(self, global_index: int, partition_id: str, batch_index: int | None = None):
-        """Add metadata to the group.
-
-        Args:
-            global_index: Global unique index across all storage
-            partition_id: Partition identifier
-            batch_index: Original position in input TensorDict (optional)
-        """
-        self.global_indexes.append(global_index)
-        self.partition_ids.append(partition_id)
-        if batch_index is not None:
-            self.batch_indexes.append(batch_index)
-
-    def get_global_indexes(self) -> list[int]:
-        """Get all global indexes from stored samples"""
-        return self.global_indexes
-
-    def get_storage_keys(self) -> list[int]:
-        """Return global indexes used as storage dict keys."""
-        return self.global_indexes
-
-    def get_batch_indexes(self) -> list[int]:
-        """Get original TensorDict position indexes for _filter_storage_data."""
-        return self.batch_indexes
-
-    def get_field_names(self) -> list[str]:
-        """Get all field names for this storage group."""
-        return self.field_names
-
-    @property
-    def size(self) -> int:
-        """Number of samples in this storage meta group"""
-        return len(self.global_indexes)
-
-    @property
-    def is_empty(self) -> bool:
-        """Check if this storage meta group is empty"""
-        return len(self.global_indexes) == 0
-
-    def __len__(self) -> int:
-        """Number of samples in this storage meta group"""
-        return self.size
-
-    def __bool__(self) -> bool:
-        """Truthiness based on whether group has samples"""
-        return not self.is_empty
-
-    def __str__(self) -> str:
-        return f"StorageMetaGroup(storage_id='{self.storage_id}', size={self.size})"
