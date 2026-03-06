@@ -21,12 +21,11 @@ from .managers import (
     TransferQueueStorageManagerFactory,
     YuanrongStorageManager,
 )
-from .simple_backend import SimpleStorageUnit, StorageMetaGroup, StorageUnitData
+from .simple_backend import SimpleStorageUnit, StorageUnitData
 
 __all__ = [
     "SimpleStorageUnit",
     "StorageUnitData",
-    "StorageMetaGroup",
     "TransferQueueStorageManager",
     "TransferQueueStorageManagerFactory",
     "AsyncSimpleStorageManager",

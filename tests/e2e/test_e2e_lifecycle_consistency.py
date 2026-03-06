@@ -420,15 +420,22 @@ def test_cross_shard_complex_update(e2e_client):
             "Region 30-39 tensor_f32 should match original Put B"
         )
 
-        # 9. Verify new fields exist in update region
-        extended_fields = base_fields + ["new_extra_tensor", "new_extra_non_tensor"]
-        update_region_meta = poll_for_meta(
-            client, partition_id, extended_fields, 20, "update_region_task", mode="force_fetch"
+        # 9. Verify new fields exist in update region (indices 10-29 only have new fields).
+        # Build extended_meta from full_meta (which has valid _custom_backend_meta)
+        # by selecting the subset of samples whose global_indexes match meta_update.
+        # Using meta_update directly would fail because it was derived from alloc_meta
+        # before put(), so its _custom_backend_meta may be incomplete.
+        update_gis = set(meta_update.global_indexes)
+        update_positions_in_full = [
+            i for i, global_index in enumerate(full_meta.global_indexes) if global_index in update_gis
+        ]
+        update_meta_with_backend = full_meta.select_samples(update_positions_in_full)
+        extended_meta = update_meta_with_backend.with_data_fields(
+            base_fields + ["new_extra_tensor", "new_extra_non_tensor"]
         )
-        if update_region_meta is not None and update_region_meta.size > 0:
-            update_region_data = client.get_data(update_region_meta)
-            assert "new_extra_tensor" in update_region_data.keys(), "new_extra_tensor should exist"
-            assert "new_extra_non_tensor" in update_region_data.keys(), "new_extra_non_tensor should exist"
+        update_region_data = client.get_data(extended_meta)
+        assert "new_extra_tensor" in update_region_data.keys(), "new_extra_tensor should exist"
+        assert "new_extra_non_tensor" in update_region_data.keys(), "new_extra_non_tensor should exist"
     finally:
         client.clear_partition(partition_id)
 
@@ -639,6 +646,60 @@ def test_clear_partition(e2e_client):
             client.clear_partition(partition_id)
         except Exception:
             pass
+
+
+# Scenario Six: Dynamic Tensor Shape → Nested Tensor Transition
+def test_dynamic_tensor_shape_nested_transition(e2e_client):
+    """
+    Test transition from regular tensor to nested tensor.
+    First put tensors of identical shape, then put tensors of a different shape.
+    Verify that the field schema marks is_nested=True, and getting all samples returns a nested tensor.
+    """
+    client = e2e_client
+    partition_id = "test_nested_transition_partition"
+    task_name = "test_task"
+
+    try:
+        # 1. Put same-shape tensor (shape: (2, 4)) — initial insert
+        data1 = TensorDict({"dynamic_feature": torch.ones(2, 4)}, batch_size=2)
+        meta1_put = client.put(data=data1, partition_id=partition_id)
+        assert meta1_put.size == 2
+
+        # Poll and verify first batch is regular tensor
+        meta1 = poll_for_meta(client, partition_id, ["dynamic_feature"], 2, task_name, mode="force_fetch")
+        assert not meta1.field_schema["dynamic_feature"]["is_nested"]
+        retrieved_1 = client.get_data(meta1)
+        assert not retrieved_1["dynamic_feature"].is_nested
+        assert retrieved_1["dynamic_feature"].shape == (2, 4)
+
+        # 2. Allocate 2 more slots via insert mode, put different-shape tensor (shape: (2, 6))
+        alloc_meta2 = client.get_meta(
+            partition_id=partition_id,
+            data_fields=["dynamic_feature"],
+            batch_size=2,
+            mode="insert",
+            task_name="allocator",
+        )
+        assert alloc_meta2.size == 2
+        data2 = TensorDict({"dynamic_feature": torch.ones(2, 6)}, batch_size=2)
+        client.put(data=data2, metadata=alloc_meta2)
+
+        # Poll and verify metadata now indicates nested tensor
+        meta2 = poll_for_meta(client, partition_id, ["dynamic_feature"], 2, task_name, mode="force_fetch")
+
+        # After second put with different shape, is_nested should be True
+        assert meta2.field_schema["dynamic_feature"]["is_nested"] is True
+
+        # 3. Retrieve all 4 samples together
+        meta_all = poll_for_meta(client, partition_id, ["dynamic_feature"], 4, task_name, mode="force_fetch")
+        assert meta_all.field_schema["dynamic_feature"]["is_nested"] is True
+
+        retrieved_all = client.get_data(meta_all)
+        # The merged result should be a nested tensor since the shapes vary
+        assert retrieved_all["dynamic_feature"].is_nested is True
+        assert len(retrieved_all["dynamic_feature"]) == 4
+    finally:
+        client.clear_partition(partition_id)
 
 
 if __name__ == "__main__":

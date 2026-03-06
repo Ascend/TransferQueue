@@ -31,10 +31,8 @@ sys.path.append(str(parent_dir))
 from transfer_queue import TransferQueueClient  # noqa: E402
 from transfer_queue.metadata import (  # noqa: E402
     BatchMeta,
-    FieldMeta,
-    SampleMeta,
 )
-from transfer_queue.utils.enum_utils import ProductionStatus, TransferQueueRole  # noqa: E402
+from transfer_queue.utils.enum_utils import TransferQueueRole  # noqa: E402
 from transfer_queue.utils.zmq_utils import (  # noqa: E402
     ZMQMessage,
     ZMQRequestType,
@@ -175,24 +173,17 @@ class MockController:
         batch_size = request_body.get("batch_size", 1)
         data_fields = request_body.get("data_fields", [])
 
-        samples = []
-        for i in range(batch_size):
-            fields = []
-            for field_name in data_fields:
-                field_meta = FieldMeta(
-                    name=field_name,
-                    dtype=None,
-                    shape=None,
-                    production_status=ProductionStatus.NOT_PRODUCED,
-                )
-                fields.append(field_meta)
-            sample = SampleMeta(
-                partition_id="0",
-                global_index=i,
-                fields={field.name: field for field in fields},
-            )
-            samples.append(sample)
-        metadata = BatchMeta(samples=samples)
+        # Build columnar field_schema
+        field_schema = {
+            field_name: {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": False}
+            for field_name in data_fields
+        }
+
+        metadata = BatchMeta(
+            global_indexes=list(range(batch_size)),
+            partition_ids=["0"] * batch_size,
+            field_schema=field_schema,
+        )
 
         return {"metadata": metadata}
 
@@ -202,39 +193,31 @@ class MockController:
         create = request_body.get("create", False)
         partition_id = request_body.get("partition_id", "")
 
-        # Initialize key tracking if not exists
         if not hasattr(self, "_kv_partition_keys"):
             self._kv_partition_keys = {}
 
-        # Generate global indexes for the keys
         start_index = self._get_next_kv_index(partition_id)
         global_indexes = list(range(start_index, start_index + len(keys)))
 
-        # Create metadata for each key
-        samples = []
-        for i, key in enumerate(keys):
-            field_meta = FieldMeta(
-                name="data",
-                dtype=torch.float32,
-                shape=torch.Size([1, 10]),
-                production_status=ProductionStatus.READY_FOR_CONSUME,
-            )
-            sample = SampleMeta(
-                partition_id=partition_id,
-                global_index=global_indexes[i],
-                fields={"data": field_meta},
-            )
-            samples.append(sample)
+        # Build columnar BatchMeta for KV interface
+        field_schema = {
+            "data": {"dtype": "torch.float32", "shape": [1, 10], "is_nested": False, "is_non_tensor": False}
+        }
+        import numpy as np
 
-        metadata = BatchMeta(samples=samples)
+        production_status = np.ones(len(global_indexes), dtype=np.int8)
+        metadata = BatchMeta(
+            global_indexes=global_indexes,
+            partition_ids=[partition_id] * len(global_indexes),
+            field_schema=field_schema,
+            production_status=production_status,
+        )
 
-        # Store keys for this partition (only when create=True)
         if create:
             if partition_id not in self._kv_partition_keys:
                 self._kv_partition_keys[partition_id] = []
             self._kv_partition_keys[partition_id].extend(keys)
 
-        # Update the next index for this partition
         if global_indexes:
             self._update_kv_index(partition_id, global_indexes[-1] + 1)
 
@@ -384,12 +367,12 @@ class MockStorage:
 
     def _handle_get_data(self, request_body):
         """Handle GET_DATA request by retrieving stored data"""
-        local_indexes = request_body.get("local_indexes", [])
+        global_indexes = request_body.get("global_indexes", [])
         fields = request_body.get("fields", [])
 
         result: dict[str, list] = {}
         for field in fields:
-            gathered_items = [TEST_DATA[field][i] for i in local_indexes]
+            gathered_items = [TEST_DATA[field][i] for i in global_indexes]
 
             if gathered_items:
                 all_tensors = all(isinstance(x, torch.Tensor) for x in gathered_items)
@@ -847,7 +830,7 @@ async def test_async_clear_samples_with_empty_metadata(client_setup):
     client, _, _ = client_setup
 
     # Create empty BatchMeta
-    metadata = BatchMeta(samples=[])
+    metadata = BatchMeta(global_indexes=[], partition_ids=[], field_schema={})
 
     # The clear operation should complete without raising an exception
     # because the mock storage manager is configured to handle this
