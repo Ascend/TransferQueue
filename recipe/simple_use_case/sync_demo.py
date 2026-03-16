@@ -190,11 +190,11 @@ def fit(config):
                 fields=["input_ids", "attention_mask", "generate_sequences_ids"]
             )
 
-            logger.info(f"demo get old log prob kv_batch_meta: {old_log_prob_meta}")
+            logger.info(f"demo get old log prob KVBatchMeta: {old_log_prob_meta}")
 
             # ============================== Simulate compute old log prob task ==============================
             old_log_prob_meta = actor_rollout_wg_compute_old_log_prob(old_log_prob_meta)
-            logger.info(f"demo get after old log prob kv_batch_meta: {old_log_prob_meta}")
+            logger.info(f"demo get after old log prob KVBatchMeta: {old_log_prob_meta}")
 
             # ============================== clear partition in TQ ==============================
             # For the master client, notify all controllers to clear data status, master returns metadata;
