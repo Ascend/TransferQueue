@@ -169,13 +169,16 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
         # When TensorDict converts a Python list to tensor, the first dimension equals batch_size
         # We need to strip this batch dimension to get per-sample shape
         if isinstance(value, torch.Tensor) and not is_nested and value.shape[0] > 0:
-            # Check if first dimension is batch dimension
-            assert value.shape[0] == batch_size
-            # if len(value.shape) > 1:
-            #     # Multi-dim tensor: shape = value.shape[1:]
-            #     sample_shape = value.shape[1:]
-            # else:
-            #     sample_shape = torch.Size([1])
+            if value.shape[0] != batch_size:
+                raise ValueError(
+                    f"Inconsistent batch dimension for field '{field_name}': "
+                    f"expected batch_size[0]={batch_size}, got value.shape[0]={value.shape[0]}"
+                )
+            if len(value.shape) > 1:
+                sample_shape = value.shape[1:]
+            else:
+                # When input is 1D tensor, manually set to torch.Size([1]).
+                sample_shape = torch.Size([1])
             sample_shape = value.shape[1:]
         else:
             sample_shape = getattr(first_item, "shape", None) if first_item is not None else None

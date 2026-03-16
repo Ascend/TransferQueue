@@ -138,19 +138,17 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                 ]
 
                 log_file_path = "/tmp/mooncake_master.log"
-                log_file = open(log_file_path, "w")
-
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True,
-                    start_new_session=True,
-                )
-
-                time.sleep(3)
+                with open(log_file_path, "w") as log_file:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                        start_new_session=True,
+                    )
+                    time.sleep(3)
 
                 if process.poll() is None:
                     logger.info(
@@ -323,11 +321,14 @@ def close():
                         )
 
                     if _TRANSFER_QUEUE_CLIENT:
-                        ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
-                        if ret < 0:
-                            logger.error("Failed to remove existing keys in mooncake_master.")
-                        else:
-                            logger.info("Successfully removed all existing keys in mooncake_master.")
+                        try:
+                            ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
+                            if ret < 0:
+                                logger.error("Failed to remove existing keys in mooncake_master.")
+                            else:
+                                logger.info("Successfully removed all existing keys in mooncake_master.")
+                        except Exception:
+                            pass
 
                     # os.system('pkill -f "mooncake_master"')
                     # process = value

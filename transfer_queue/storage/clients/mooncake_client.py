@@ -218,10 +218,9 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
                 if tensor is None:
                     raise RuntimeError(f"batch_get_tensor returned None for key '{batch_keys[j]}'")
                 if tensor.shape != torch.Size(shape):
-                    if not (tensor.shape == torch.Size([1]) and torch.Size(shape) == torch.Size([])):
-                        raise RuntimeError(
-                            f"Shape mismatch for key '{batch_keys[j]}': expected {shape}, got {tensor.shape}"
-                        )
+                    raise RuntimeError(
+                        f"Shape mismatch for key '{batch_keys[j]}': expected {shape}, got {tensor.shape}"
+                    )
                 if tensor.dtype != dtype:
                     raise RuntimeError(
                         f"Dtype mismatch for key '{batch_keys[j]}': expected {dtype}, got {tensor.dtype}"
@@ -248,7 +247,7 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
             keys (List[str]): List of keys to remove.
             custom_backend_meta (List[Any], optional): ...
         """
-        global_indexes_patterns = [key.split("@")[0] + "@.*" for key in keys]
+        global_indexes_patterns = {key.split("@")[0] + "@.*" for key in keys}
         for p in global_indexes_patterns:
             ret = self._store.remove_by_regex(p, force=True)
             if ret < 0:
