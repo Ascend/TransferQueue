@@ -217,7 +217,8 @@ def main(config):
     fit(config)
 
     # Cleanup resources
-    data_system_client.close()
+    tq_client = tq.get_client()
+    tq_client.close()
 
 
 if __name__ == "__main__":
