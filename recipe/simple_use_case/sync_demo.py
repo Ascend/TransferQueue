@@ -13,28 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
-import math
 import os
+import random
 import sys
 import time
+import uuid
 from pathlib import Path
+
+parent_dir = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(parent_dir))
 
 import ray
 import torch
 from omegaconf import OmegaConf
 from tensordict import NonTensorData, TensorDict
 
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
+import transfer_queue as tq
+from transfer_queue import BatchMeta, KVBatchMeta
 
-from transfer_queue import (  # noqa: E402
-    SimpleStorageUnit,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
-)
-from transfer_queue.utils.common import get_placement_group  # noqa: E402
+TQ_INITIALIZED = False
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -44,52 +43,41 @@ os.environ["RAY_DEBUG"] = "1"
 ray.init()
 
 
-def initialize_data_system(config):
-    # 1. Initialize TransferQueueStorage
-    total_storage_size = config.global_batch_size * config.num_global_batch * config.num_n_samples
-    data_system_storage_units = {}
-    storage_placement_group = get_placement_group(config.num_data_storage_units, num_cpus_per_actor=1)
-    for storage_unit_rank in range(config.num_data_storage_units):
-        storage_node = SimpleStorageUnit.options(
-            placement_group=storage_placement_group, placement_group_bundle_index=storage_unit_rank
-        ).remote(storage_unit_size=math.ceil(total_storage_size / config.num_data_storage_units))
-        data_system_storage_units[storage_unit_rank] = storage_node
-        logger.info(f"SimpleStorageUnit #{storage_unit_rank} has been created.")
+async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
+    global TQ_INITIALIZED
+    if not TQ_INITIALIZED:
+        tq.init()
+        TQ_INITIALIZED = True
+    tq_client = tq.get_client()
+    batch_meta = await tq_client.async_kv_retrieve_meta(keys=meta.keys, partition_id=meta.partition_id, create=False)
+    fields = meta.fields
+    if fields is not None:
+        if isinstance(fields, str):
+            fields = [fields]
+        batch_meta = batch_meta.select_fields(fields)
 
-    # 2. Initialize TransferQueueController (single controller only)
+    batch_meta.extra_info = meta.extra_info
+    return batch_meta
 
-    # Sampler usage instructions:
-    # For GRPO grouped sampling, you can initialize the controller with GRPOGroupNSampler:
-    # Option 1: Pass sampler class (will be instantiated automatically)
-    # data_system_controller = TransferQueueController.remote(sampler=GRPOGroupNSampler)
 
-    # Option 2: Pass sampler instance (if you need custom configuration)
-    # grpo_sampler = GRPOGroupNSampler()
-    # data_system_controller = TransferQueueController.remote(sampler=grpo_sampler)
+async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
+    global TQ_INITIALIZED
+    if not TQ_INITIALIZED:
+        tq.init()
+        TQ_INITIALIZED = True
+    tq_client = tq.get_client()
+    partition_id = meta.partition_ids[0]
+    assert all([partition_id == pid for pid in meta.partition_ids])
+    keys = await tq_client.async_kv_retrieve_keys(global_indexes=meta.global_indexes, partition_id=partition_id)
 
-    # Then use sampling_config in get_meta calls:
-    data_system_controller = TransferQueueController.remote()
-    logger.info("TransferQueueController has been created.")
-
-    # 3. Prepare necessary information
-    data_system_controller_info = process_zmq_server_info(data_system_controller)
-    data_system_storage_unit_infos = process_zmq_server_info(data_system_storage_units)
-
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})  # Note: Need to generate a new DictConfig
-    # with allow_objects=True to maintain ZMQServerInfo instance. Otherwise it will be flattened to dict
-    tq_config.controller_info = data_system_controller_info
-    tq_config.storage_unit_infos = data_system_storage_unit_infos
-    config = OmegaConf.merge(tq_config, config)
-
-    # 4. Create client
-    data_system_client = TransferQueueClient(
-        client_id="Trainer",
-        controller_info=data_system_controller_info,
+    kv_batch_meta = KVBatchMeta(
+        keys=keys,
+        tags=[{}] * meta.size,
+        partition_id=partition_id,
+        fields=meta.field_names,
+        extra_info=meta.extra_info,
     )
-
-    data_system_client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
-
-    return data_system_controller, data_system_storage_units, data_system_client
+    return kv_batch_meta
 
 
 def generate_sequences(data):
@@ -102,11 +90,16 @@ def compute_old_log_prob(data1, _data2):
     return data1
 
 
-def actor_rollout_wg_generate_sequences(data_meta, data_system_client):
-    # 1. Pull real data from the storage plane through client based on data_meta
-    data = data_system_client.get_data(data_meta)
+def actor_rollout_wg_generate_sequences(kv_meta: KVBatchMeta) -> KVBatchMeta:
+    # 1. Convert KVBatchMeta -> BatchMeta
+    batch_meta = asyncio.run(async_kv_batch_meta2batch_meta(kv_meta))
+
+    # 2. Pull real data from the storage plane through client based on batch_meta
+    tq_client = tq.get_client()
+    data = tq_client.get_data(batch_meta)
     logger.info(f"demo get data {data}")
 
+    # 3. Get generate results
     output = generate_sequences(data["input_ids"])
 
     output = TensorDict(
@@ -120,89 +113,108 @@ def actor_rollout_wg_generate_sequences(data_meta, data_system_client):
         batch_size=output.size(0),
     )
 
-    # 2. Write results back to the storage plane based on data_meta
-    data_system_client.put(data=output, metadata=data_meta)
-    data_meta.add_fields(output)
+    # 4. Write results back to the storage plane based on batch_meta
+    tq_client.put(data=output, metadata=batch_meta)
     logger.info("demo put data to storages done")
 
-    return data_meta
+    # 5. Convert BatchMeta -> KVBatchMeta and return for further usage
+    batch_meta.add_fields(output)
+    kv_meta = asyncio.run(async_batch_meta2kv_batch_meta(batch_meta))
+    return kv_meta
 
+def actor_rollout_wg_compute_old_log_prob(kv_meta: KVBatchMeta) -> KVBatchMeta:
+    # 1. Convert KVBatchMeta -> BatchMeta
+    batch_meta = asyncio.run(async_kv_batch_meta2batch_meta(kv_meta))
 
-def actor_rollout_wg_compute_old_log_prob(data_meta, data_system_client):
-    # 1. Pull real data from the storage plane through client based on data_meta
-    data = data_system_client.get_data(data_meta)
+    # 2. Pull real data from the storage plane through client based on batch_meta
+    tq_client = tq.get_client()
+    data = tq_client.get_data(batch_meta)
     logger.info(f"demo get data {data}")
 
+    # 3. Get generate results
     output = compute_old_log_prob(data["input_ids"], data["generate_sequences_ids"])
 
     output = TensorDict({"old_log_prob": output}, batch_size=output.size(0))
 
-    # 2. Write results back to the storage plane based on data_meta
-    data_system_client.put(data=output, metadata=data_meta)
-    data_meta.add_fields(output)
+    # 4. Write results back to the storage plane based on batch_meta
+    tq_client.put(data=output, metadata=batch_meta)
     logger.info("demo put data to storages done")
 
-    return data_meta
+    # 5. Convert BatchMeta -> KVBatchMeta and return for further usage
+    batch_meta.add_fields(output)
+    kv_meta = asyncio.run(async_batch_meta2kv_batch_meta(batch_meta))
+    return kv_meta
 
 
 # Simulate the fit function of the trainer
-def fit(config, data_system_client):
+def fit(config):
     for _epoch in range(1):
         train_dataloader = 1
         for step in range(train_dataloader):
-            input_ids = (torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8], [10, 11], [100, 111]])) * (step + 1)
+            # ============================== Construct prompt batch data ==============================
+            input_ids = (torch.tensor([[1, 2], [3, 4], [5, 6], [7, 8], [9, 10], [100, 111]])) * (step + 1)
             input_ids_repeated = torch.repeat_interleave(input_ids, config.num_n_samples, dim=0)
+            batch_keys = [str(uuid.uuid4()) for _ in range(len(input_ids_repeated))]
             prompt_batch = TensorDict(
-                {"input_ids": input_ids_repeated, "attention_mask": input_ids_repeated},
+                {
+                    "input_ids": input_ids_repeated,
+                    "attention_mask": input_ids_repeated
+                 },
                 batch_size=input_ids_repeated.size(0),
             )
 
-            data_system_client.put(data=prompt_batch, partition_id=f"train_{step}")
+            # ============================== Put prompts to TQ system ==============================
+            tq.kv_batch_put(keys=batch_keys, partition_id=f"train_{step}", fields=prompt_batch)
             logger.info("demo put prompts ok! ")
             time.sleep(5)
 
-            batch_meta = data_system_client.get_meta(
-                data_fields=["input_ids", "attention_mask"],
-                batch_size=config.global_batch_size,
+            # ============================== Sample generate KVBatchMeta ==============================
+            sampled_keys = random.sample(batch_keys, config.global_batch_size)
+            gen_meta = KVBatchMeta(
+                keys=sampled_keys,
+                tags=[{} for _ in sampled_keys],
                 partition_id=f"train_{step}",
-                task_name="generate_sequences",
+                fields=["input_ids", "attention_mask"]
             )
-            # Set output fields for RL training - in this case, we want to generate sequences from input_ids
-            logger.info(f"demo get meta {batch_meta}")
+            logger.info(f"demo get gen KVBatchMeta {gen_meta}")
 
-            # Simulate calling the generate sequences task of the worker group
-            batch_meta = actor_rollout_wg_generate_sequences(batch_meta, data_system_client)
-            log_prob_meta = data_system_client.get_meta(
-                data_fields=["input_ids", "attention_mask", "generate_sequences_ids"],
-                batch_size=config.global_batch_size,
+            # ============================== Simulate generate sequences task ==============================
+            gen_meta = actor_rollout_wg_generate_sequences(gen_meta)
+            logger.info(f"demo get after gen KVBatchMeta {gen_meta}")
+
+            # ============================== Create old log prob KVBatchMeta ==============================
+            old_log_prob_meta = KVBatchMeta(
+                keys=sampled_keys,
+                tags=[{} for _ in sampled_keys],
                 partition_id=f"train_{step}",
-                task_name="compute_old_log_prob",
+                fields=["input_ids", "attention_mask", "generate_sequences_ids"]
             )
-            # Set output fields for RL training - we want to compute log probs for the generated sequences
-            logger.info(f"demo get log prob meta: {log_prob_meta}")
 
-            # Simulate calling the compute old log prob task of the worker group
-            old_log_prob_meta = actor_rollout_wg_compute_old_log_prob(log_prob_meta, data_system_client)
+            logger.info(f"demo get old log prob kv_batch_meta: {old_log_prob_meta}")
 
-            batch_meta = batch_meta.union(old_log_prob_meta)
+            # ============================== Simulate compute old log prob task ==============================
+            old_log_prob_meta = actor_rollout_wg_compute_old_log_prob(old_log_prob_meta)
+            logger.info(f"demo get after old log prob kv_batch_meta: {old_log_prob_meta}")
 
+            # ============================== clear partition in TQ ==============================
             # For the master client, notify all controllers to clear data status, master returns metadata;
             # Client then notifies the storage plane to clear based on metadata
             # Client selects one master controller to get metadata,
             # other controllers directly clear without returning metadata
-            data_system_client.clear_partition(partition_id=f"train_{step}")
+            tq_client = tq.get_client()
+            tq_client.clear_partition(partition_id=f"train_{step}")
             logger.info("clear ok! ")
     logger.info("demo done!")
 
 
 def main(config):
-    # Initialize Data System: Launching the Controller and Storage based on Ray
-    _data_system_controller, _data_system_storage_units, data_system_client = initialize_data_system(config)
-    import time
+    # Initialize TransferQueue
+    tq.init(conf=config)
 
     time.sleep(5)
 
-    fit(config, data_system_client)
+    # Start training loop
+    fit(config)
 
     # Cleanup resources
     data_system_client.close()
