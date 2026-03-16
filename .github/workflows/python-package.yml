@@ -47,5 +47,7 @@ jobs:
     - name: Test with pytest
       run: |
         pytest tests
-        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/
+        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_e2e_lifecycle_consistency.py
+        pkill -f "mooncake_master"
+        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_kv_interface_e2e.py
         pkill -f "mooncake_master"
