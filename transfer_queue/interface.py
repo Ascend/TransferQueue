@@ -13,12 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.resources as pkg_resources
 import logging
 import math
 import os
 import subprocess
 import time
+from importlib import resources
 from typing import Any, Optional
 from urllib.parse import urlparse
 
@@ -241,8 +241,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
 
     # create config
     final_conf = OmegaConf.create({}, flags={"allow_objects": True})
-    with pkg_resources.path("transfer_queue", "config.yaml") as p:
-        default_conf = OmegaConf.load(p)
+    default_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
@@ -329,21 +328,6 @@ def close():
                                 logger.info("Successfully removed all existing keys in mooncake_master.")
                         except Exception:
                             pass
-
-                    # os.system('pkill -f "mooncake_master"')
-                    # process = value
-                    # if process and process.poll() is None:
-                    #     try:
-                    #         import signal
-                    #         pgid = os.getpgid(process.pid)
-                    #         os.killpg(pgid, signal.SIGTERM)
-                    #         try:
-                    #             process.wait(timeout=5)
-                    #         except subprocess.TimeoutExpired:
-                    #             os.killpg(pgid, signal.SIGKILL)
-                    #             process.wait(timeout=5)
-                    #     except ProcessLookupError:
-                    #         logger.warning(f"MooncakeStore process already exited: pid={process.pid}")
                 else:
                     logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
 

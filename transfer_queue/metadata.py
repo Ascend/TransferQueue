@@ -179,7 +179,6 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
             else:
                 # When input is 1D tensor, manually set to torch.Size([1]).
                 sample_shape = torch.Size([1])
-            sample_shape = value.shape[1:]
         else:
             sample_shape = getattr(first_item, "shape", None) if first_item is not None else None
 
