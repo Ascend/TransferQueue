@@ -331,10 +331,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
-        """Pack a list of per-sample values into a batched container.
+        """
+        Pack a list of per-sample values into a batched container.
 
-        A memory copy is intentional here: it detaches received tensors from
-        zero-copy buffers, gives them their own lifetime, and ensures writability.
+        For tensor values, this performs a memory copy via stacking or nested tensor creation.
+        Non-tensor values are grouped into a ``NonTensorStack`` without copying.
         """
         if not values:
             raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
