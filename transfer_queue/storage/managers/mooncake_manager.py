@@ -38,4 +38,10 @@ class MooncakeStorageManager(KVStorageManager):
         elif client_name != "MooncakeStoreClient":
             raise ValueError(f"Invalid 'client_name': {client_name} in config. Expecting 'MooncakeStoreClient'")
 
+        logger.warning(
+            "MooncakeStore backend doesn't support key update (upsert) for now. "
+            "You must delete the key before updating it. "
+            "Refer to https://github.com/kvcache-ai/Mooncake/issues/1645 for details."
+        )
+
         super().__init__(controller_info, config)

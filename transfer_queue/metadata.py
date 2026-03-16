@@ -171,11 +171,12 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
         if isinstance(value, torch.Tensor) and not is_nested and value.shape[0] > 0:
             # Check if first dimension is batch dimension
             assert value.shape[0] == batch_size
-            if len(value.shape) > 1:
-                # Multi-dim tensor: shape = value.shape[1:]
-                sample_shape = value.shape[1:]
-            else:
-                sample_shape = torch.Size([1])
+            # if len(value.shape) > 1:
+            #     # Multi-dim tensor: shape = value.shape[1:]
+            #     sample_shape = value.shape[1:]
+            # else:
+            #     sample_shape = torch.Size([1])
+            sample_shape = value.shape[1:]
         else:
             sample_shape = getattr(first_item, "shape", None) if first_item is not None else None
 

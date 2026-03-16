@@ -265,6 +265,8 @@ class FieldMeta:
                 # All remaining samples have the same shape - update to non-nested
                 self.is_nested = False
                 self.shape = next(iter(remaining_shapes))
+                # Clear per-sample shapes since we are no longer nested
+                self.per_sample_shapes.clear()
 
     def to_batch_schema(self, batch_global_indexes: list[int]) -> dict[str, Any]:
         """Export as a BatchMeta.field_schema-compatible dict for generate_batch_meta."""

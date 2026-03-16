@@ -280,7 +280,7 @@ class SimpleStorageUnit:
 
             if worker_socket in socks:
                 # Messages received from proxy: [identity, serialized_msg_frame1, ...]
-                messages = worker_socket.recv_multipart()
+                messages = worker_socket.recv_multipart(copy=False)
                 identity = messages[0]
                 serialized_msg = messages[1:]
 

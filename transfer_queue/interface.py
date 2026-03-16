@@ -305,9 +305,6 @@ def close():
     global _TRANSFER_QUEUE_CLIENT
     global _TRANSFER_QUEUE_STORAGE
     global _TRANSFER_QUEUE_CONTROLLER
-    if _TRANSFER_QUEUE_CLIENT:
-        _TRANSFER_QUEUE_CLIENT.close()
-        _TRANSFER_QUEUE_CLIENT = None
 
     try:
         if _TRANSFER_QUEUE_STORAGE:
@@ -321,9 +318,17 @@ def close():
                     if check.returncode == 0:
                         pids = check.stdout.strip().replace("\n", ", ")
                         logger.warning(
-                            f"mooncake_master process still exists with PID: {pids}. "
-                            f"Consider manually killing mooncake_master."
+                            f"TransferQueue will not stop mooncake_master process with PID: {pids}. "
+                            f"Consider manually killing the mooncake_master."
                         )
+
+                    if _TRANSFER_QUEUE_CLIENT:
+                        ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
+                        if ret < 0:
+                            logger.error("Failed to remove existing keys in mooncake_master.")
+                        else:
+                            logger.info("Successfully removed all existing keys in mooncake_master.")
+
                     # os.system('pkill -f "mooncake_master"')
                     # process = value
                     # if process and process.poll() is None:
@@ -344,6 +349,10 @@ def close():
         _TRANSFER_QUEUE_STORAGE = None
     except Exception:
         pass
+
+    if _TRANSFER_QUEUE_CLIENT:
+        _TRANSFER_QUEUE_CLIENT.close()
+        _TRANSFER_QUEUE_CLIENT = None
 
     if _TRANSFER_QUEUE_CONTROLLER:
         try:

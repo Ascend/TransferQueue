@@ -243,7 +243,7 @@ class TransferQueueStorageManager(ABC):
             while not response_received and timeout > 0:
                 try:
                     poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
-                    messages = await asyncio.wait_for(sock.recv_multipart(), timeout=poll_interval)
+                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=poll_interval)
                     response_msg = ZMQMessage.deserialize(messages)
 
                     if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]

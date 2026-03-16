@@ -231,7 +231,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
         logger.debug(
             f"[{self.client_id}]: Client get_meta response: {response_msg} from controller {self._controller.id}"
@@ -307,7 +307,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
         logger.debug(
             f"[{self.client_id}]: Client set_custom_meta response: {response_msg} from controller {self._controller.id}"
@@ -554,7 +554,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.CLEAR_META_RESPONSE:
@@ -582,7 +582,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.GET_PARTITION_META_RESPONSE:
@@ -610,7 +610,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.CLEAR_PARTITION_RESPONSE:
@@ -661,7 +661,7 @@ class AsyncTransferQueueClient:
 
         try:
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get consumption response: {response_msg} "
@@ -723,7 +723,7 @@ class AsyncTransferQueueClient:
 
         try:
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get production response: {response_msg} "
@@ -855,7 +855,7 @@ class AsyncTransferQueueClient:
         )
         try:
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client reset consumption response: {response_msg} "
@@ -901,7 +901,7 @@ class AsyncTransferQueueClient:
         try:
             assert socket is not None
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get partition list response: {response_msg} "
@@ -968,7 +968,7 @@ class AsyncTransferQueueClient:
         try:
             assert socket is not None
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get kv_retrieve_keys response: {response_msg} "
@@ -1029,7 +1029,7 @@ class AsyncTransferQueueClient:
         try:
             assert socket is not None
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get kv_retrieve_indexes response: {response_msg} "
@@ -1090,7 +1090,7 @@ class AsyncTransferQueueClient:
         try:
             assert socket is not None
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get kv_list response: {response_msg} from controller {self._controller.id}"

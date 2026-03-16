@@ -609,7 +609,6 @@ class TestKVClearE2E:
         assert key not in partition.keys_mapping
         assert other_key in partition.keys_mapping
 
-        tq.kv_clear(keys=key, partition_id=partition_id)
         tq.kv_clear(keys=other_key, partition_id=partition_id)
 
     def test_kv_clear_multiple_keys(self, controller):
