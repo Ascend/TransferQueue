@@ -1715,7 +1715,7 @@ class TransferQueueController:
 
             if self.handshake_socket in socks:
                 try:
-                    messages = self.handshake_socket.recv_multipart()
+                    messages = self.handshake_socket.recv_multipart(copy=False)
                     identity = messages.pop(0)
                     serialized_msg = messages
                     request_msg = ZMQMessage.deserialize(serialized_msg)
@@ -1784,7 +1784,7 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
-            messages = self.request_handle_socket.recv_multipart()
+            messages = self.request_handle_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
@@ -2027,7 +2027,7 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
-            messages = self.data_status_update_socket.recv_multipart()
+            messages = self.data_status_update_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)

@@ -128,10 +128,8 @@ async def test_async_storage_manager_mock_operations(mock_async_storage_manager)
     manager._put_to_single_storage_unit = AsyncMock()
     manager._get_from_single_storage_unit = AsyncMock(
         return_value=(
-            [0, 1],
             ["test_field"],
             {"test_field": [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]},
-            b"this is the serialized message object.",
         )
     )
     manager._clear_single_storage_unit = AsyncMock()
@@ -286,7 +284,7 @@ async def test_get_data_routes_from_hash():
         su = target_storage_unit
         called_with[su] = list(global_indexes)
         tensors = [torch.zeros(2) for _ in global_indexes]
-        return global_indexes, fields, {"f": tensors}, b""
+        return fields, {"f": tensors}
 
     manager._get_from_single_storage_unit = fake_get
 

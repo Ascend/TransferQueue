@@ -158,7 +158,7 @@ class TransferQueueStorageManager(ABC):
 
             if (socks.get(self.controller_handshake_socket, 0) & zmq.POLLIN) and pending_connection:
                 try:
-                    response_msg = ZMQMessage.deserialize(self.controller_handshake_socket.recv_multipart())
+                    response_msg = ZMQMessage.deserialize(self.controller_handshake_socket.recv_multipart(copy=False))
 
                     if response_msg.request_type == ZMQRequestType.HANDSHAKE_ACK:
                         is_connected = True
