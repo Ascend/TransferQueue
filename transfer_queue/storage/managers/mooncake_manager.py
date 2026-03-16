@@ -36,5 +36,5 @@ class MooncakeStorageManager(KVStorageManager):
             "Refer to https://github.com/kvcache-ai/Mooncake/issues/1645 for details."
         )
 
-        config["client_name"] = "MooncakeStorageClient"
+        config["client_name"] = "MooncakeStoreClient"
         super().__init__(controller_info, config)
