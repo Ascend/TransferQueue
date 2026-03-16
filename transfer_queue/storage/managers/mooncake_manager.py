@@ -30,14 +30,6 @@ class MooncakeStorageManager(KVStorageManager):
     """Storage manager for MooncakeStorage backend."""
 
     def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
-        client_name = config.get("client_name", None)
-
-        if client_name is None:
-            logger.info("Missing 'client_name' in config, using default value('MooncakeStoreClient')")
-            config["client_name"] = "MooncakeStoreClient"
-        elif client_name != "MooncakeStoreClient":
-            raise ValueError(f"Invalid 'client_name': {client_name} in config. Expecting 'MooncakeStoreClient'")
-
         logger.warning(
             "MooncakeStore backend doesn't support key update (upsert) for now. "
             "You must delete the key before updating it. "
