@@ -202,6 +202,7 @@ class FieldMeta:
     indexed by global_idx, O(B_nested) storage.
     """
 
+    global_indexes: set[int] = field(default_factory=set)
     dtype: Any = None
     shape: Optional[tuple] = None  # None when is_nested=True
     is_nested: bool = False
@@ -209,15 +210,16 @@ class FieldMeta:
 
     per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
 
-    def update(self, incoming: dict[str, Any]) -> None:
+    def update(self, incoming: dict[str, Any], incoming_global_indexes: list[int]) -> None:
         """Update this field's metadata from an incoming schema dict.
 
         Encapsulates dtype consistency check, shape conflict detection,
         and automatic is_nested inference.
 
         Args:
-            incoming: Schema dict with optional keys: dtype, shape, is_nested, is_non_tensor.
-
+            incoming: Schema dict with optional keys:
+                      global_indexes, dtype, shape, is_nested, is_non_tensor, per_sample_shape
+            incoming_global_indexes: global indexes of the inupt meta
         Raises:
             ValueError: If incoming dtype conflicts with existing dtype.
         """
@@ -232,24 +234,55 @@ class FieldMeta:
                     f"All batches for the same field must have the same dtype."
                 )
 
-        # shape consistency check → is_nested inference
-        new_shape = incoming.get("shape")
-        if new_shape is not None:
-            if self.shape is None and not self.is_nested:
-                self.shape = new_shape
-            elif self.shape is not None and self.shape != new_shape:
+        new_is_nested = incoming.get("is_nested")
+        new_is_non_tensor = incoming.get("is_non_tensor")
+
+        if new_is_nested:
+            new_per_sample_shapes = incoming.get("per_sample_shapes", None)
+            if new_per_sample_shapes is None:
+                raise ValueError("Receiving a nested field without 'per_sample_shapes'!")
+            if not self.is_nested:
+                # new input is nested, but original is regular tensor.
+                # We need to write old shape into per_sample_shampes
+                assert self.shape is not None
+                for gi in self.global_indexes:
+                    self.per_sample_shapes[gi] = self.shape
                 self.is_nested = True
                 self.shape = None
 
-        # explicit is_nested flag overrides inference
-        if incoming.get("is_nested"):
-            self.is_nested = True
-            self.shape = None
+            # Update newly provided per_sample_shapes
+            self.per_sample_shapes.update(new_per_sample_shapes)
+
+        else:
+            if not new_is_non_tensor:
+                # newly input is regular tensor
+                new_shape = incoming.get("shape", None)
+                if new_shape is None:
+                    raise ValueError("Receiving a regular tensor without 'shape'!")
+                if self.is_nested:
+                    # we need to update incoming shape into per_sample_shapes
+                    for gi in incoming_global_indexes:
+                        self.per_sample_shapes[gi] = new_shape
+                else:
+                    if not self.is_non_tensor:
+                        # original data is also regular tensor
+                        assert self.shape is not None
+                        if self.shape != new_shape:
+                            for gi in self.global_indexes:
+                                self.per_sample_shapes[gi] = self.shape
+                            for gi in incoming_global_indexes:
+                                self.per_sample_shapes[gi] = new_shape
+
+                            self.shape = None
+                            self.is_nested = True
+
+        self.global_indexes.update(incoming_global_indexes)
 
     def remove_samples(self, indexes: list[int]):
         """Remove sample-level data for the given indexes."""
         for idx in indexes:
             self.per_sample_shapes.pop(idx, None)
+            self.global_indexes.discard(idx)
 
         # After removing samples, check if we can update is_nested and shape
         # If per_sample_shapes is empty or all remaining shapes are the same,
@@ -260,7 +293,9 @@ class FieldMeta:
             self.shape = None
         else:
             # Check if all remaining shapes are the same
-            remaining_shapes = set(self.per_sample_shapes.values())
+            remaining_shapes = set(
+                tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
+            )
             if len(remaining_shapes) == 1:
                 # All remaining samples have the same shape - update to non-nested
                 self.is_nested = False
@@ -278,6 +313,7 @@ class FieldMeta:
         }
         if self.is_nested and self.per_sample_shapes:
             schema["per_sample_shapes"] = [self.per_sample_shapes.get(gi) for gi in batch_global_indexes]
+
         return schema
 
 
@@ -540,38 +576,15 @@ class DataPartitionStatus:
         for field_name, meta in field_schema.items():
             if field_name not in self.field_metadata:
                 self.field_metadata[field_name] = FieldMeta(
+                    global_indexes=set(global_indexes),
                     dtype=meta.get("dtype"),
                     shape=meta.get("shape"),
                     is_nested=meta.get("is_nested", False),
                     is_non_tensor=meta.get("is_non_tensor", False),
+                    per_sample_shapes=meta.get("per_sample_shapes", {}),
                 )
             else:
-                # Track if is_nested changed from False to True during update
-                was_not_nested = not self.field_metadata[field_name].is_nested
-                # Save old shape before update (for filling per_sample_shapes of existing samples)
-                old_shape = self.field_metadata[field_name].shape
-                self.field_metadata[field_name].update(meta)
-                # If is_nested became True due to shape mismatch, capture shapes for all samples
-                if was_not_nested and self.field_metadata[field_name].is_nested:
-                    col_meta = self.field_metadata[field_name]
-                    new_shape = meta.get("shape")
-                    # Fill new samples with new shape
-                    if new_shape is not None:
-                        for gi in global_indexes:
-                            col_meta.per_sample_shapes[gi] = new_shape
-                    # Fill existing samples with old shape
-                    if old_shape is not None:
-                        for gi in self.global_indexes:
-                            if gi not in col_meta.per_sample_shapes:
-                                col_meta.per_sample_shapes[gi] = old_shape
-
-            # nested per-sample shapes
-            per_sample_shapes = meta.get("per_sample_shapes")
-            if per_sample_shapes:
-                col_meta = self.field_metadata[field_name]
-                for gi, shape in zip(global_indexes, per_sample_shapes, strict=False):
-                    if shape is not None:
-                        col_meta.per_sample_shapes[gi] = shape
+                self.field_metadata[field_name].update(meta, global_indexes)
 
         # custom_backend_meta remains row-oriented storage
         if custom_backend_meta:

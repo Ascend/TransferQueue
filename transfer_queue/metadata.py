@@ -176,7 +176,7 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
                 )
             first_item = value[0]
 
-        if is_tensor or isinstance(first_item, np.ndarray):
+        if is_tensor:
             sample_shape = first_item.shape
         else:
             sample_shape = None

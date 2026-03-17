@@ -219,6 +219,13 @@ class TransferQueueStorageManager(ABC):
         try:
             sock.connect(self.controller_info.to_addr("data_status_update_socket"))
 
+            # FIXME: convert per_sample_shapes into dict
+            for field in field_schema.values():
+                per_sample_shapes = field.get("per_sample_shapes", None)
+                if per_sample_shapes:
+                    per_sample_shapes = {global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))}
+                    field["per_sample_shapes"] = per_sample_shapes
+
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
