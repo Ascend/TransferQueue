@@ -176,14 +176,14 @@ class TestTransferQueueController:
         # Test get clear meta
         clear_meta = ray.get(
             tq_controller.get_metadata.remote(
-                data_fields=[],
+                data_fields=gen_meta.field_names,
                 partition_id=partition_id,
-                mode="insert",
+                mode="force_fetch",
             )
         )
         assert clear_meta.global_indexes == list(range(gbs * num_n_samples))
         # In insert mode with no fields, field_schema should be empty
-        assert clear_meta.field_schema == {} or clear_meta.field_names == []
+        assert clear_meta.field_names == gen_meta.field_names
         print("✓ Clear metadata correct")
 
         # Test clear_partition
@@ -431,9 +431,9 @@ class TestTransferQueueController:
         # Test get clear meta
         clear_meta = ray.get(
             tq_controller.get_metadata.remote(
-                data_fields=[],
+                data_fields=gen_meta.field_names,
                 partition_id=partition_id_1,
-                mode="insert",
+                mode="force_fetch",
             )
         )
         assert clear_meta

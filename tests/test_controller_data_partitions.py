@@ -1057,10 +1057,11 @@ class TestFieldMeta:
         fm = FieldMeta(is_nested=True)
         fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
         fm.remove_samples([0, 2])
-        assert fm.per_sample_shapes == {1: (5,)}
+        assert fm.per_sample_shapes == {}
+        assert fm.shape == (5,)
+        assert not fm.is_nested
         # Removing non-existent index should not raise
         fm.remove_samples([99])
-        assert fm.per_sample_shapes == {1: (5,)}
 
     def test_to_batch_schema_regular(self):
         from transfer_queue.controller import FieldMeta

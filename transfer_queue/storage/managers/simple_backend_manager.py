@@ -30,7 +30,7 @@ import zmq
 from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
-from transfer_queue.metadata import BatchMeta
+from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.utils.zmq_utils import (
@@ -252,7 +252,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if batch_size == 0:
             return
 
-        field_schema = self._extract_field_schema(data)
+        field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
         tasks = [
@@ -305,7 +305,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         try:
             data = request_msg.serialize()
             await socket.send_multipart(data, copy=False)
-            messages = await socket.recv_multipart()
+            messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:

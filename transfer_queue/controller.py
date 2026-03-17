@@ -251,6 +251,23 @@ class FieldMeta:
         for idx in indexes:
             self.per_sample_shapes.pop(idx, None)
 
+        # After removing samples, check if we can update is_nested and shape
+        # If per_sample_shapes is empty or all remaining shapes are the same,
+        # we should reset is_nested to False and update shape accordingly
+        if not self.per_sample_shapes:
+            # All samples removed - reset to non-nested state
+            self.is_nested = False
+            self.shape = None
+        else:
+            # Check if all remaining shapes are the same
+            remaining_shapes = set(self.per_sample_shapes.values())
+            if len(remaining_shapes) == 1:
+                # All remaining samples have the same shape - update to non-nested
+                self.is_nested = False
+                self.shape = next(iter(remaining_shapes))
+                # Clear per-sample shapes since we are no longer nested
+                self.per_sample_shapes.clear()
+
     def to_batch_schema(self, batch_global_indexes: list[int]) -> dict[str, Any]:
         """Export as a BatchMeta.field_schema-compatible dict for generate_batch_meta."""
         schema = {
@@ -529,7 +546,24 @@ class DataPartitionStatus:
                     is_non_tensor=meta.get("is_non_tensor", False),
                 )
             else:
+                # Track if is_nested changed from False to True during update
+                was_not_nested = not self.field_metadata[field_name].is_nested
+                # Save old shape before update (for filling per_sample_shapes of existing samples)
+                old_shape = self.field_metadata[field_name].shape
                 self.field_metadata[field_name].update(meta)
+                # If is_nested became True due to shape mismatch, capture shapes for all samples
+                if was_not_nested and self.field_metadata[field_name].is_nested:
+                    col_meta = self.field_metadata[field_name]
+                    new_shape = meta.get("shape")
+                    # Fill new samples with new shape
+                    if new_shape is not None:
+                        for gi in global_indexes:
+                            col_meta.per_sample_shapes[gi] = new_shape
+                    # Fill existing samples with old shape
+                    if old_shape is not None:
+                        for gi in self.global_indexes:
+                            if gi not in col_meta.per_sample_shapes:
+                                col_meta.per_sample_shapes[gi] = old_shape
 
             # nested per-sample shapes
             per_sample_shapes = meta.get("per_sample_shapes")
@@ -1214,31 +1248,31 @@ class TransferQueueController:
                 self.create_partition(partition_id)
 
             partition = self._get_partition(partition_id)
-            if data_fields:
-                # This is called during put_data call without providing metadata.
-                # try to use pre-allocated global index first
+            if data_fields is None:
+                raise RuntimeError("Must provide data_fields for inserting new data")
 
-                if batch_size is None:
-                    raise ValueError("must provide batch_size for inserting new data")
+            # This is called during put_data call without providing metadata.
+            # try to use pre-allocated global index first
 
-                assert partition is not None
-                batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+            if batch_size is None:
+                raise ValueError("must provide batch_size for inserting new data")
 
-                if len(batch_global_indexes) < batch_size:
-                    new_global_indexes = self.index_manager.allocate_indexes(
-                        partition_id, count=(batch_size - len(batch_global_indexes))
-                    )
-                    batch_global_indexes.extend(new_global_indexes)
+            assert partition is not None
+            batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
 
-                # register global_indexes in partition
-                partition.global_indexes.update(batch_global_indexes)
+            if len(batch_global_indexes) < batch_size:
+                new_global_indexes = self.index_manager.allocate_indexes(
+                    partition_id, count=(batch_size - len(batch_global_indexes))
+                )
+                batch_global_indexes.extend(new_global_indexes)
 
-            else:
-                batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
+            # register global_indexes in partition
+            partition.global_indexes.update(batch_global_indexes)
+
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
 
-        assert task_name is not None
         if mode == "fetch":
+            assert task_name is not None
             # Find ready samples within current data partition and package into BatchMeta when reading
 
             if batch_size is None:
@@ -1288,17 +1322,17 @@ class TransferQueueController:
                     f"after sampling: {len(batch_global_indexes)}"
                 )
 
+            # Mark samples as consumed if in fetch mode
+            if consumed_indexes:
+                partition = self.partitions[partition_id]
+                partition.mark_consumed(task_name, consumed_indexes)
+
         elif mode == "force_fetch":
             batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
             consumed_indexes = []
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
-
-        # Mark samples as consumed if in fetch mode
-        if mode == "fetch" and consumed_indexes:
-            partition = self.partitions[partition_id]
-            partition.mark_consumed(task_name, consumed_indexes)
 
         return metadata
 
@@ -1779,12 +1813,18 @@ class TransferQueueController:
                 with perf_monitor.measure(op_type="GET_PARTITION_META"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
+                    partition = self._get_partition(partition_id)
+                    if partition is not None:
+                        partition_data_fields = list(partition.field_name_mapping.keys())
 
-                    metadata = self.get_metadata(
-                        data_fields=[],
-                        partition_id=partition_id,
-                        mode="insert",
-                    )
+                        metadata = self.get_metadata(
+                            data_fields=partition_data_fields,
+                            partition_id=partition_id,
+                            mode="force_fetch",
+                        )
+                    else:
+                        metadata = None
+
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.GET_PARTITION_META_RESPONSE,
                         sender_id=self.controller_id,

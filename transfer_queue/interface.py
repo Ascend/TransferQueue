@@ -13,12 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import importlib.resources as pkg_resources
 import logging
 import math
 import os
+import subprocess
 import time
+from importlib import resources
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import ray
 import torch
@@ -73,6 +75,7 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
         _TRANSFER_QUEUE_STORAGE = {}
         if conf.backend.storage_backend == "SimpleStorage":
             # initialize SimpleStorageUnit
+            simple_storage_handles = {}
             num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
             total_storage_size = conf.backend.SimpleStorage.total_storage_size
             storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
@@ -86,13 +89,84 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                 ).remote(
                     storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
                 )
-                _TRANSFER_QUEUE_STORAGE[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
+                simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
                 logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")
 
-            storage_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_STORAGE)
+            storage_zmq_info = process_zmq_server_info(simple_storage_handles)
             backend_name = conf.backend.storage_backend
             conf.backend[backend_name].zmq_info = storage_zmq_info
+            _TRANSFER_QUEUE_STORAGE["SimpleStorage"] = simple_storage_handles
+        if conf.backend.storage_backend == "MooncakeStore":
+            if conf.backend.MooncakeStore.auto_init:
+                # Try to kill existing mooncake_master processes before starting a new one to avoid potential conflicts
+                check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
+                if check.returncode == 0:
+                    pids = check.stdout.strip().replace("\n", ", ")
+                    logging.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
 
+                    result = os.system('pkill -f "[m]ooncake_master"')
+                    if result == 0:
+                        logging.info("Successfully killed existing mooncake_master processes.")
+                    else:
+                        raise RuntimeError(f"Failed to kill existing mooncake_master processes (exit code: {result}).")
+
+                raw_address = conf.backend.MooncakeStore.metadata_server
+                if "://" not in raw_address:
+                    raw_address = "//" + raw_address
+
+                parsed = urlparse(raw_address)
+
+                if not parsed.hostname or parsed.port is None:
+                    raise ValueError(
+                        f"Invalid metadata_server '{conf.backend.MooncakeStore.metadata_server}'. "
+                        f"Host and port are required (e.g., host:port)."
+                    )
+
+                metadata_server_host = parsed.hostname
+                metadata_server_port = str(parsed.port)
+
+                cmd = [
+                    "mooncake_master",
+                    "-default_kv_lease_ttl=999999",
+                    "-default_kv_soft_pin_ttl=999999",
+                    "--eviction_high_watermark_ratio=1.0",
+                    "--eviction_ratio=0.0",
+                    "--enable_http_metadata_server=true",
+                    "--allow_evict_soft_pinned_objects=false",
+                    f"--http_metadata_server_host={metadata_server_host}",
+                    f"--http_metadata_server_port={metadata_server_port}",
+                ]
+
+                log_file_path = "/tmp/mooncake_master.log"
+                with open(log_file_path, "w") as log_file:
+                    process = subprocess.Popen(
+                        cmd,
+                        stdout=log_file,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                        start_new_session=True,
+                    )
+                    time.sleep(3)
+
+                if process.poll() is None:
+                    logger.info(
+                        f"mooncake_master started, PID: {process.pid}. Logs are at: {os.path.abspath(log_file_path)}"
+                    )
+                else:
+                    error_msg = ""
+                    try:
+                        with open(log_file_path) as f:
+                            error_msg = f.read()
+                    except Exception as e:
+                        error_msg = f"Failed to read log file: {e}"
+
+                    raise RuntimeError(
+                        f"mooncake_master exited with error. Check {log_file_path} for detailed logs. "
+                        f"Output:\n{error_msg}"
+                    )
+                _TRANSFER_QUEUE_STORAGE["MooncakeStore"] = process
     return conf
 
 
@@ -167,8 +241,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
 
     # create config
     final_conf = OmegaConf.create({}, flags={"allow_objects": True})
-    with pkg_resources.path("transfer_queue", "config.yaml") as p:
-        default_conf = OmegaConf.load(p)
+    default_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
@@ -229,18 +302,42 @@ def close():
     global _TRANSFER_QUEUE_CLIENT
     global _TRANSFER_QUEUE_STORAGE
     global _TRANSFER_QUEUE_CONTROLLER
-    if _TRANSFER_QUEUE_CLIENT:
-        _TRANSFER_QUEUE_CLIENT.close()
-        _TRANSFER_QUEUE_CLIENT = None
 
     try:
         if _TRANSFER_QUEUE_STORAGE:
-            # only the process that do first-time init can clean the distributed storage
-            for storage in _TRANSFER_QUEUE_STORAGE.values():
-                ray.kill(storage)
+            for key, value in _TRANSFER_QUEUE_STORAGE.items():
+                if key == "SimpleStorage":
+                    # only the process that do first-time init can clean the distributed storage
+                    for storage in value.values():
+                        ray.kill(storage)
+                elif key == "MooncakeStore":
+                    check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
+                    if check.returncode == 0:
+                        pids = check.stdout.strip().replace("\n", ", ")
+                        logger.warning(
+                            f"TransferQueue will not stop mooncake_master process with PID: {pids}. "
+                            f"Consider manually killing the mooncake_master."
+                        )
+
+                    if _TRANSFER_QUEUE_CLIENT:
+                        try:
+                            ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
+                            if ret < 0:
+                                logger.error("Failed to remove existing keys in mooncake_master.")
+                            else:
+                                logger.info("Successfully removed all existing keys in mooncake_master.")
+                        except Exception:
+                            pass
+                else:
+                    logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
+
         _TRANSFER_QUEUE_STORAGE = None
     except Exception:
         pass
+
+    if _TRANSFER_QUEUE_CLIENT:
+        _TRANSFER_QUEUE_CLIENT.close()
+        _TRANSFER_QUEUE_CLIENT = None
 
     if _TRANSFER_QUEUE_CONTROLLER:
         try:

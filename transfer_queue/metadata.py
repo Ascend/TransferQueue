@@ -141,6 +141,63 @@ class _SampleViewList:
         return (_SampleView(self._batch, i) for i in range(len(self)))
 
 
+def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
+    """Extract field-level schema from TensorDict."""
+    field_schema: dict[str, dict[str, Any]] = {}
+    batch_size = data.batch_size[0]
+
+    for field_name, value in data.items():
+        is_tensor = isinstance(value, torch.Tensor)
+        is_nested = is_tensor and value.is_nested
+
+        first_item = None
+        if is_nested:
+            unbound = value.unbind()
+            first_item = unbound[0] if unbound else None
+        elif is_tensor:
+            first_item = value[0] if value.shape[0] > 0 else None
+        else:
+            first_item = value[0] if len(value) > 0 else None
+
+        # Determine is_non_tensor: when first_item is None (empty field), cannot determine type
+        if first_item is None:
+            is_non_tensor = None
+        else:
+            is_non_tensor = not is_tensor
+
+        # Determine the shape of each sample (excluding batch dimension)
+        # When TensorDict converts a Python list to tensor, the first dimension equals batch_size
+        # We need to strip this batch dimension to get per-sample shape
+        if isinstance(value, torch.Tensor) and not is_nested and value.shape[0] > 0:
+            if value.shape[0] != batch_size:
+                raise ValueError(
+                    f"Inconsistent batch dimension for field '{field_name}': "
+                    f"expected batch_size[0]={batch_size}, got value.shape[0]={value.shape[0]}"
+                )
+            if len(value.shape) > 1:
+                sample_shape = value.shape[1:]
+            else:
+                # When input is 1D tensor, manually set to torch.Size([1]).
+                sample_shape = torch.Size([1])
+        else:
+            sample_shape = getattr(first_item, "shape", None) if first_item is not None else None
+
+        field_meta = {
+            "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+            "shape": sample_shape,
+            "is_nested": is_nested,
+            "is_non_tensor": is_non_tensor,
+        }
+
+        # For nested tensors, record per-sample shapes
+        if is_nested:
+            field_meta["per_sample_shapes"] = [tuple(t.shape) for t in value.unbind()]
+
+        field_schema[field_name] = field_meta
+
+    return field_schema
+
+
 @dataclass
 class BatchMeta:
     """Records the metadata of a batch of data samples with optimized field-level schema.
@@ -160,9 +217,9 @@ class BatchMeta:
 
     global_indexes: list[int]
     partition_ids: list[str]
-    # O(F) field-level metadata: {field_name: {dtype, shape, is_nested, is_non_tensor}}
+    # field-level metadata: {field_name: {dtype, shape, is_nested, is_non_tensor}}
     field_schema: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
-    # O(B) vectorized production status; always np.ndarray after __post_init__ (never None)
+    # vectorized production status matrix
     production_status: np.ndarray = dataclasses.field(default=None, repr=False)  # type: ignore[assignment]
     extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
     # user-defined meta for each sample (sample-level), list aligned with global_indexes
@@ -387,33 +444,10 @@ class BatchMeta:
         if batch_size != self.size:
             raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")
 
-        for name, value in tensor_dict.items():
-            # Determine if this is a nested tensor
-            is_nested = isinstance(value, torch.Tensor) and value.is_nested
+        field_schema = extract_field_schema(tensor_dict)
 
-            first_item = None
-            if is_nested:
-                unbound = value.unbind()
-                first_item = unbound[0] if unbound else None
-            else:
-                first_item = value[0] if len(value) > 0 else None
-
-            # Determine if this is non-tensor data.
-            # When first_item is None (empty field), we cannot determine type—leave as None.
-            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else None
-
-            field_meta = {
-                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
-                "shape": getattr(first_item, "shape", None) if not is_nested else None,
-                "is_nested": is_nested,
-                "is_non_tensor": is_non_tensor,
-            }
-
-            # For nested tensors, record per-sample shapes
-            if is_nested:
-                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in value.unbind()]
-
-            self.field_schema[name] = field_meta
+        for key, value in field_schema.items():
+            self.field_schema[key] = value
 
         if set_all_ready:
             self.production_status[:] = 1

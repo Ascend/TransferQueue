@@ -16,7 +16,7 @@
 # This module is currently empty but reserved for future client implementations
 from .base import TransferQueueStorageKVClient
 from .factory import StorageClientFactory
-from .mooncake_client import MooncakeStorageClient
+from .mooncake_client import MooncakeStoreClient
 from .ray_storage_client import RayStorageClient
 from .yuanrong_client import YuanrongStorageClient
 
@@ -24,6 +24,6 @@ __all__ = [
     "TransferQueueStorageKVClient",
     "StorageClientFactory",
     "RayStorageClient",
-    "MooncakeStorageClient",
+    "MooncakeStoreClient",
     "YuanrongStorageClient",
 ]

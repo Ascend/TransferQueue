@@ -24,10 +24,27 @@ backend:
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
+  # For MooncakeStore:
+  MooncakeStore:
+    # Whether to let TQ automatically init metadata_server.
+    auto_init: true
+    # Address of the HTTP metadata server
+    metadata_server: localhost:50050
+    # Address of master server
+    master_server_address: localhost:50051
+    # Address of local host. Set to "" to use Ray IP as local host address
+    local_hostname: ""
+    # Protocol for transmission. Choose from: tcp, rdma. (default: tcp)
+    protocol: tcp
+    # Memory segment size in bytes for mounting (default: 4GB)
+    global_segment_size: 4294967296
+    # Local buffer size in bytes (default: 1GB)
+    local_buffer_size: 1073741824
+    # Network device name. Set to "" to let Mooncake to auto-picks devices
+    device_name: ""
+
+  # For RayStore:
   RayStore:
 
   # For Yuanrong:
-  # TODO
-
-  # For MooncakeStore:
   # TODO

@@ -32,7 +32,7 @@ from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 from torch import Tensor
 
-from transfer_queue.metadata import BatchMeta
+from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.factory import StorageClientFactory
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
@@ -243,7 +243,7 @@ class TransferQueueStorageManager(ABC):
             while not response_received and timeout > 0:
                 try:
                     poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
-                    messages = await asyncio.wait_for(sock.recv_multipart(), timeout=poll_interval)
+                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=poll_interval)
                     response_msg = ZMQMessage.deserialize(messages)
 
                     if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
@@ -312,41 +312,6 @@ class TransferQueueStorageManager(ABC):
             metadata: BatchMeta of the data to be cleared from the storage.
         """
         raise NotImplementedError("Subclasses must implement clear_data")
-
-    @staticmethod
-    def _extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
-        """Extract field-level schema from TensorDict. O(F) complexity."""
-        field_schema: dict[str, dict[str, Any]] = {}
-
-        for field_name in data.keys():
-            field_data = data[field_name]
-
-            is_tensor = isinstance(field_data, torch.Tensor)
-            is_nested = is_tensor and field_data.is_nested
-
-            if is_nested:
-                unbound = field_data.unbind()
-                first_item = unbound[0] if unbound else None
-            elif is_tensor:
-                first_item = field_data[0] if field_data.shape[0] > 0 else None
-            else:
-                first_item = field_data[0] if len(field_data) > 0 else None
-
-            is_non_tensor = not isinstance(first_item, torch.Tensor) if first_item is not None else False
-
-            field_meta = {
-                "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
-                "shape": getattr(first_item, "shape", None) if is_tensor and not is_nested else None,
-                "is_nested": is_nested,
-                "is_non_tensor": is_non_tensor,
-            }
-
-            if is_nested:
-                field_meta["per_sample_shapes"] = [tuple(t.shape) for t in unbound]
-
-            field_schema[field_name] = field_meta
-
-        return field_schema
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
@@ -557,31 +522,23 @@ class KVStorageManager(TransferQueueStorageManager):
         shapes = []
         dtypes = []
         custom_backend_meta_list = []
-        num_samples = len(metadata)
 
         for field_name in sorted(metadata.field_names):
-            field_meta = metadata.field_schema.get(field_name, {})
-            field_shape = field_meta.get("shape")
-            field_dtype = field_meta.get("dtype")
-            per_sample_shapes = field_meta.get("per_sample_shapes")
+            field_shape = metadata.get_shapes(field_name)
+            field_dtype = metadata.get_dtypes(field_name)
 
-            for index in range(num_samples):
-                if per_sample_shapes is not None:
-                    shapes.append(per_sample_shapes[index])
-                else:
-                    shapes.append(field_shape)
-                dtypes.append(field_dtype)
-                custom_backend_meta_list.append(metadata._custom_backend_meta[index].get(field_name, None))
+            shapes.extend(field_shape)
+            dtypes.extend(field_dtype)
+
+            custom_backend_meta_list.extend(
+                [metadata._custom_backend_meta[i].get(field_name, None) for i in range(metadata.size)]
+            )
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
         """
         Store tensor data in the backend storage and notify the controller.
         """
-        if not metadata.field_names:
-            logger.warning("Attempted to put data, but metadata contains no fields.")
-            return
-
         num_samples = len(metadata.global_indexes)
         if num_samples == 0:
             return
@@ -592,7 +549,7 @@ class KVStorageManager(TransferQueueStorageManager):
 
         custom_backend_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
 
-        field_schema = self._extract_field_schema(data)
+        field_schema = extract_field_schema(data)
 
         per_field_custom_backend_meta: dict[int, dict[str, Any]] = {}
         if custom_backend_meta:
@@ -645,9 +602,12 @@ class KVStorageManager(TransferQueueStorageManager):
 
     async def clear_data(self, metadata: BatchMeta) -> None:
         """Remove stored data associated with the given metadata."""
+
         if not metadata.field_names:
-            logger.warning("Attempted to clear data, but metadata contains no fields.")
-            return
+            raise RuntimeError(
+                "Fail to clear_data for key-value based backends due to lack of `field_names` in BatchMeta"
+            )
+
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
         self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)

@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 import ray
 import torch
+from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 # Add parent directory to path
@@ -37,6 +38,40 @@ import transfer_queue as tq  # noqa: E402
 
 # Configure Ray for tests
 os.environ["RAY_DEDUP_LOGS"] = "0"
+
+# Backend configurations for E2E tests
+# Adjust values for GitHub CI environment (smaller memory footprint)
+BACKEND_CONFIGS = {
+    "SimpleStorage": {
+        "controller": {
+            "polling_mode": True,
+        },
+        "backend": {
+            "storage_backend": "SimpleStorage",
+            "SimpleStorage": {
+                "total_storage_size": 200,
+                "num_data_storage_units": 2,
+            },
+        },
+    },
+    "MooncakeStore": {
+        "controller": {
+            "polling_mode": True,
+        },
+        "backend": {
+            "storage_backend": "MooncakeStore",
+            "MooncakeStore": {
+                # Reduced memory sizes for CI/testing environment
+                "global_segment_size": 134217728,  # 128MB
+                "local_buffer_size": 134217728,  # 128MB
+                "metadata_server": os.environ.get("TQ_MOONCAKE_METADATA_SERVER", "localhost:50050"),
+                "master_server_address": os.environ.get("TQ_MOONCAKE_MASTER_SERVER", "localhost:50051"),
+                "protocol": "tcp",
+                "device_name": "",
+            },
+        },
+    },
+}
 
 
 @pytest.fixture(scope="module")
@@ -50,9 +85,32 @@ def ray_init():
 
 
 @pytest.fixture(scope="module")
-def tq_system(ray_init):
-    """Initialize TransferQueue system for the test module."""
-    tq.init()
+def backend_name():
+    """Get the backend name from environment variable.
+
+    Environment variables:
+        TQ_TEST_BACKEND: Backend name (SimpleStorage or MooncakeStore)
+
+    To run tests for a specific backend:
+        TQ_TEST_BACKEND=SimpleStorage pytest tests/e2e/test_kv_interface_e2e.py
+        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_kv_interface_e2e.py
+    """
+    return os.environ.get("TQ_TEST_BACKEND", "SimpleStorage")
+
+
+@pytest.fixture(scope="module")
+def tq_system(ray_init, backend_name):
+    """Initialize TransferQueue system for the test module.
+
+    Args:
+        ray_init: Ray cluster fixture
+        backend_name: Backend name from TQ_TEST_BACKEND env var
+    """
+    if backend_name not in BACKEND_CONFIGS:
+        raise ValueError(f"Unknown backend: {backend_name}. Available: {list(BACKEND_CONFIGS.keys())}")
+
+    config = BACKEND_CONFIGS[backend_name]
+    tq.init(OmegaConf.create(config))
     yield
     tq.close()
 
@@ -109,6 +167,9 @@ class TestKVPutE2E:
         expected = torch.tensor([[1, 2, 3, 4]])  # unsqueezed
         assert_tensor_equal(retrieved["data"], expected)
 
+        # delete the key (MooncakeStore does not support updating existing key, so we need to clear it before next test)
+        tq.kv_clear(keys=key, partition_id=partition_id)
+
     def test_kv_put_with_tensordict_fields(self, controller):
         """Test kv_put with tensordict fields."""
         partition_id = "test_partition"
@@ -127,6 +188,8 @@ class TestKVPutE2E:
         retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id)
         expected = torch.tensor([[1, 2, 3, 4]])  # unsqueezed
         assert_tensor_equal(retrieved["input_ids"], expected)
+
+        tq.kv_clear(keys=key, partition_id=partition_id)
 
     def test_kv_put_single_sample_with_fields_and_tag(self, controller):
         """Test putting a single sample with fields and tag."""
@@ -175,6 +238,8 @@ class TestKVPutE2E:
         assert_tensor_equal(retrieved["input_ids"], expected_input_ids)
         assert_tensor_equal(retrieved["attention_mask"], expected_attention_mask)
 
+        tq.kv_clear(keys=key, partition_id=partition_id)
+
     def test_kv_put_update_tag_only(self, controller):
         """Test updating only tag without providing fields."""
         partition_id = "test_partition"
@@ -197,6 +262,8 @@ class TestKVPutE2E:
         # Data should still be accessible
         retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id)
         assert_tensor_equal(retrieved["value"], torch.tensor([[10]]))
+
+        tq.kv_clear(keys=key, partition_id=partition_id)
 
     def test_kv_put_partial_update(self, controller):
         """Test adding new fields to existing sample."""
@@ -231,6 +298,8 @@ class TestKVPutE2E:
 
         # key should have response marked as produced
         assert partition.production_status[global_idx, response_col_idx] == 1, "Key should have response"
+
+        tq.kv_clear(keys=key, partition_id=partition_id)
 
 
 class TestKVBatchPutE2E:
@@ -282,6 +351,8 @@ class TestKVBatchPutE2E:
         assert_tensor_equal(retrieved["input_ids"], batch_input_ids)
         assert_tensor_equal(retrieved["attention_mask"], batch_attention_mask)
 
+        tq.kv_clear(keys=keys, partition_id=partition_id)
+
     def test_kv_batch_put_partial_update(self, controller):
         """Test adding new fields to existing samples."""
         partition_id = "test_partition"
@@ -320,6 +391,8 @@ class TestKVBatchPutE2E:
         # keys[1] should have response marked as produced
         assert partition.production_status[global_idx_1, response_col_idx] == 1, "Keys[1] should have response"
 
+        tq.kv_clear(keys=keys, partition_id=partition_id)
+
 
 class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
@@ -337,6 +410,8 @@ class TestKVGetE2E:
         retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id)
         assert_tensor_equal(retrieved["data"], expected_data)
 
+        tq.kv_clear(keys=key, partition_id=partition_id)
+
     def test_kv_batch_get_multiple_keys(self, controller):
         """Test getting data for multiple keys."""
         partition_id = "test_partition"
@@ -348,6 +423,8 @@ class TestKVGetE2E:
 
         retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id)
         assert_tensor_equal(retrieved["data"], expected_data)
+
+        tq.kv_clear(keys=keys, partition_id=partition_id)
 
     def test_kv_batch_get_partial_keys(self, controller):
         """Test getting data for partial keys."""
@@ -362,6 +439,8 @@ class TestKVGetE2E:
 
         retrieved = tq.kv_batch_get(keys=partial_keys, partition_id=partition_id)
         assert_tensor_equal(retrieved["data"], expected_data)
+
+        tq.kv_clear(keys=keys, partition_id=partition_id)
 
     def test_kv_batch_get_partial_fields(self, controller):
         """Test getting only partial fields."""
@@ -393,6 +472,8 @@ class TestKVGetE2E:
         assert "attention_mask" not in retrieved.keys()
         assert_tensor_equal(retrieved["input_ids"], input_ids)
         assert_tensor_equal(retrieved["response"], response)
+
+        tq.kv_clear(keys=key, partition_id=partition_id)
 
     def test_kv_batch_get_nonexistent_key(self, controller):
         """Test that getting data for non-existent key returns empty result."""
@@ -431,6 +512,8 @@ class TestKVListE2E:
         # Verify tags match
         for i, (key, tag) in enumerate(partition_info["test_partition"].items()):
             assert tag["id"] == i
+
+        tq.kv_clear(keys=keys, partition_id=partition_id)
 
     def test_kv_list_all_partitions(self, controller):
         """Test listing keys and tags in all partitions."""
@@ -488,6 +571,10 @@ class TestKVListE2E:
         for i, (key, tag) in enumerate(partition_info["test_partition2"].items()):
             assert tag["id"] == i + 6
 
+        tq.kv_clear(keys=keys_partition0, partition_id=partition_id[0])
+        tq.kv_clear(keys=keys_partition1, partition_id=partition_id[1])
+        tq.kv_clear(keys=keys_partition2, partition_id=partition_id[2])
+
     def test_kv_list_empty_partition(self):
         """Test listing empty partition."""
         partition_id = "test_partition_empty"
@@ -522,6 +609,8 @@ class TestKVClearE2E:
         assert key not in partition.keys_mapping
         assert other_key in partition.keys_mapping
 
+        tq.kv_clear(keys=other_key, partition_id=partition_id)
+
     def test_kv_clear_multiple_keys(self, controller):
         """Test clearing multiple keys."""
         partition_id = "test_partition"
@@ -540,6 +629,8 @@ class TestKVClearE2E:
         assert keys[1] not in partition_info[partition_id]
         assert keys[2] in partition_info[partition_id]
         assert keys[3] in partition_info[partition_id]
+
+        tq.kv_clear(keys=keys[2:], partition_id=partition_id)
 
 
 class TestKVE2ECornerCases:
@@ -577,6 +668,8 @@ class TestKVE2ECornerCases:
         assert "field_a" in data
         assert "field_b" not in data
         assert "field_c" not in data
+
+        tq.kv_clear(keys=keys, partition_id=partition_id)
 
 
 def run_tests():

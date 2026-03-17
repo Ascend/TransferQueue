@@ -33,6 +33,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[test,build,yuanrong]"
+        pip install mooncake-transfer-engine-non-cuda
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
@@ -43,11 +44,10 @@ jobs:
       run: |
         python -m build --wheel
         pip install dist/*.whl --force-reinstall
-    - name: Test with pytest (TQ_ZERO_COPY_SERIALIZATION=False)
+    - name: Test with pytest
       run: |
         pytest tests
-    - name: Test with pytest (TQ_ZERO_COPY_SERIALIZATION=True)
-      run: |
-        ray stop --force
-        export TQ_ZERO_COPY_SERIALIZATION=True
-        pytest tests
+        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_e2e_lifecycle_consistency.py
+        pkill -f "mooncake_master"
+        TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_kv_interface_e2e.py
+        pkill -f "mooncake_master"
