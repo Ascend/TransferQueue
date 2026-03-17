@@ -203,10 +203,10 @@ class FieldMeta:
     """
 
     global_indexes: set[int] = field(default_factory=set)
-    dtype: Any = None
+    dtype: Optional[Any] = None
     shape: Optional[tuple] = None  # None when is_nested=True
-    is_nested: bool = False
-    is_non_tensor: bool = False
+    is_nested: Optional[bool] = None
+    is_non_tensor: Optional[bool] = None
 
     per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
 
@@ -241,7 +241,7 @@ class FieldMeta:
             new_per_sample_shapes = incoming.get("per_sample_shapes", None)
             if new_per_sample_shapes is None:
                 raise ValueError("Receiving a nested field without 'per_sample_shapes'!")
-            if not self.is_nested:
+            if self.is_nested is not None and not self.is_nested:
                 # new input is nested, but original is regular tensor.
                 # We need to write old shape into per_sample_shampes
                 assert self.shape is not None
@@ -264,7 +264,7 @@ class FieldMeta:
                     for gi in incoming_global_indexes:
                         self.per_sample_shapes[gi] = new_shape
                 else:
-                    if not self.is_non_tensor:
+                    if self.is_non_tensor is not None and not self.is_non_tensor:
                         # original data is also regular tensor
                         assert self.shape is not None
                         if self.shape != new_shape:
@@ -287,21 +287,24 @@ class FieldMeta:
         # After removing samples, check if we can update is_nested and shape
         # If per_sample_shapes is empty or all remaining shapes are the same,
         # we should reset is_nested to False and update shape accordingly
-        if not self.per_sample_shapes:
+        if len(self.global_indexes) == 0:
             # All samples removed - reset to non-nested state
             self.is_nested = False
             self.shape = None
+            self.is_non_tensor = None
+            self.dtype = None
         else:
-            # Check if all remaining shapes are the same
-            remaining_shapes = set(
-                tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
-            )
-            if len(remaining_shapes) == 1:
-                # All remaining samples have the same shape - update to non-nested
-                self.is_nested = False
-                self.shape = next(iter(remaining_shapes))
-                # Clear per-sample shapes since we are no longer nested
-                self.per_sample_shapes.clear()
+            if self.is_nested:
+                # Check if all remaining shapes are the same
+                remaining_shapes = set(
+                    tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
+                )
+                if len(remaining_shapes) == 1:
+                    # All remaining samples have the same shape - update to non-nested
+                    self.is_nested = False
+                    self.shape = next(iter(remaining_shapes))
+                    # Clear per-sample shapes since we are no longer nested
+                    self.per_sample_shapes.clear()
 
     def to_batch_schema(self, batch_global_indexes: list[int]) -> dict[str, Any]:
         """Export as a BatchMeta.field_schema-compatible dict for generate_batch_meta."""
