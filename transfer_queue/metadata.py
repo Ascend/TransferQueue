@@ -146,47 +146,46 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
     field_schema: dict[str, dict[str, Any]] = {}
     batch_size = data.batch_size[0]
 
+    if batch_size == 0:
+        logger.warning("Trying to extract field schema for empty batch. No action is taken.")
+
     for field_name, value in data.items():
         is_tensor = isinstance(value, torch.Tensor)
         is_nested = is_tensor and value.is_nested
 
-        first_item = None
         if is_nested:
             unbound = value.unbind()
-            first_item = unbound[0] if unbound else None
+            if len(unbound) != batch_size:
+                raise ValueError(
+                    f"Inconsistent batch dimension for field '{field_name}': "
+                    f"expected batch_size[0]={batch_size}, got nested tensor composed of {len(unbound)} tensors"
+                )
+            first_item = unbound[0]
         elif is_tensor:
-            first_item = value[0] if value.shape[0] > 0 else None
-        else:
-            first_item = value[0] if len(value) > 0 else None
-
-        # Determine is_non_tensor: when first_item is None (empty field), cannot determine type
-        if first_item is None:
-            is_non_tensor = None
-        else:
-            is_non_tensor = not is_tensor
-
-        # Determine the shape of each sample (excluding batch dimension)
-        # When TensorDict converts a Python list to tensor, the first dimension equals batch_size
-        # We need to strip this batch dimension to get per-sample shape
-        if isinstance(value, torch.Tensor) and not is_nested and value.shape[0] > 0:
             if value.shape[0] != batch_size:
                 raise ValueError(
                     f"Inconsistent batch dimension for field '{field_name}': "
                     f"expected batch_size[0]={batch_size}, got value.shape[0]={value.shape[0]}"
                 )
-            if len(value.shape) > 1:
-                sample_shape = value.shape[1:]
-            else:
-                # When input is 1D tensor, manually set to torch.Size([1]).
-                sample_shape = torch.Size([1])
+            first_item = value[0]
         else:
-            sample_shape = getattr(first_item, "shape", None) if first_item is not None else None
+            if len(value) != batch_size:
+                raise ValueError(
+                    f"Inconsistent batch dimension for field '{field_name}': "
+                    f"expected batch_size[0]={batch_size}, got len(value)={len(value)}"
+                )
+            first_item = value[0]
+
+        if is_tensor or isinstance(first_item, np.ndarray):
+            sample_shape = first_item.shape
+        else:
+            sample_shape = None
 
         field_meta = {
             "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
             "shape": sample_shape,
             "is_nested": is_nested,
-            "is_non_tensor": is_non_tensor,
+            "is_non_tensor": not is_tensor,
         }
 
         # For nested tensors, record per-sample shapes
@@ -441,6 +440,10 @@ class BatchMeta:
             set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME. Default is True.
         """
         batch_size = tensor_dict.batch_size[0]
+
+        if batch_size == 0:
+            logger.warning(f"Input TensorDict is empty with batch_size={batch_size}. No action is taken.")
+
         if batch_size != self.size:
             raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")
 
