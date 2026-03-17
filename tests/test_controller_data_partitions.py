@@ -521,7 +521,14 @@ class TestUpdateFieldMetadata:
 
     def test_nested_per_sample_shapes(self):
         partition = self._make_partition()
-        schema = {"f3": {"dtype": "torch.float32", "shape": None, "is_nested": True, "per_sample_shapes": [(3,), (5,)]}}
+        schema = {
+            "f3": {
+                "dtype": "torch.float32",
+                "shape": None,
+                "is_nested": True,
+                "per_sample_shapes": {10: (3,), 11: (5,)},
+            }
+        }
         partition._update_field_metadata([10, 11], schema)
         assert partition.field_metadata["f3"].is_nested is True
         assert partition.field_metadata["f3"].per_sample_shapes == {10: (3,), 11: (5,)}
@@ -1056,10 +1063,12 @@ class TestFieldMeta:
 
         fm = FieldMeta(is_nested=True)
         fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
+        fm.global_indexes = {0, 1, 2}
         fm.remove_samples([0, 2])
         assert fm.per_sample_shapes == {}
         assert fm.shape == (5,)
         assert not fm.is_nested
+        assert fm.global_indexes == {1}
         # Removing non-existent index should not raise
         fm.remove_samples([99])
 
@@ -1099,13 +1108,138 @@ class TestFieldMeta:
         from transfer_queue.controller import FieldMeta
 
         fm = FieldMeta(dtype="torch.int32", shape=(16,))
+        fm.global_indexes = {0}
         with pytest.raises(ValueError, match="dtype mismatch"):
-            fm.update({"dtype": "torch.float64"})
+            fm.update({"dtype": "torch.float64"}, [1])
 
-    def test_update_shape_conflict_promotes_nested(self):
+    def test_update_regular_to_regular_different_shape_becomes_nested(self):
+        """Test that two regular tensor updates with different shapes promotes to nested."""
         from transfer_queue.controller import FieldMeta
 
-        fm = FieldMeta(dtype="torch.float32", shape=(256,))
-        fm.update({"dtype": "torch.float32", "shape": (128,)})
+        # Start with a regular tensor
+        fm = FieldMeta(dtype="torch.float32", shape=(256,), is_nested=False)
+        fm.global_indexes = {0}
+
+        # Update with a different shape regular tensor
+        fm.update({"dtype": "torch.float32", "shape": (128,)}, [1])
+
+        # Should now be nested with both shapes saved
         assert fm.is_nested is True
         assert fm.shape is None
+        assert fm.per_sample_shapes[0] == (256,)
+        assert fm.per_sample_shapes[1] == (128,)
+        assert fm.global_indexes == {0, 1}
+
+    def test_update_regular_to_nested_promotes_nested(self):
+        """Test that updating from regular tensor to nested tensor correctly promotes."""
+        from transfer_queue.controller import FieldMeta
+
+        # Start with a regular tensor
+        fm = FieldMeta(dtype="torch.float32", shape=(256,), is_nested=False)
+        fm.global_indexes = {0, 1, 2}
+
+        # Update with a nested tensor (different per_sample_shapes)
+        incoming = {"dtype": "torch.float32", "is_nested": True, "per_sample_shapes": {3: (128,), 4: (512,)}}
+        fm.update(incoming, [3, 4])
+
+        # Should now be nested
+        assert fm.is_nested is True
+        # Original shape should be saved in per_sample_shapes
+        assert fm.per_sample_shapes[0] == (256,)
+        assert fm.per_sample_shapes[1] == (256,)
+        assert fm.per_sample_shapes[2] == (256,)
+        # New shapes should be added
+        assert fm.per_sample_shapes[3] == (128,)
+        assert fm.per_sample_shapes[4] == (512,)
+        # shape should be None for nested
+        assert fm.shape is None
+        # global_indexes should be updated
+        assert fm.global_indexes == {0, 1, 2, 3, 4}
+
+    def test_update_nested_to_regular_merges_shapes(self):
+        """Test that updating from nested to regular tensor adds new shapes to per_sample_shapes."""
+        from transfer_queue.controller import FieldMeta
+
+        # Start with a nested tensor
+        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
+        fm.per_sample_shapes = {0: (128,), 1: (512,)}
+        fm.global_indexes = {0, 1}
+
+        # Update with a regular tensor (all same shape)
+        incoming = {"dtype": "torch.float32", "is_nested": False, "shape": (256,)}
+        fm.update(incoming, [2, 3])
+
+        # Once nested, stays nested (historical data is nested)
+        assert fm.is_nested is True
+        # Old shapes should remain unchanged
+        assert fm.per_sample_shapes[0] == (128,)
+        assert fm.per_sample_shapes[1] == (512,)
+        # New shapes should be added to per_sample_shapes
+        assert fm.per_sample_shapes[2] == (256,)
+        assert fm.per_sample_shapes[3] == (256,)
+        # global_indexes should be updated
+        assert fm.global_indexes == {0, 1, 2, 3}
+
+    def test_remove_samples_different_removed_becomes_regular(self):
+        """Test that removing samples with different shapes converts back to
+        regular tensor when remaining shapes are same.
+        """
+        from transfer_queue.controller import FieldMeta
+
+        # Start with nested field having different shapes: {0: (256,), 1: (128,), 2: (256,)}
+        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
+        fm.per_sample_shapes = {0: (256,), 1: (128,), 2: (256,)}
+        fm.global_indexes = {0, 1, 2}
+
+        # Remove the sample with different shape (index 1)
+        fm.remove_samples([1])
+
+        # After removing index 1, remaining shapes are all (256,)
+        # Should convert back to non-nested
+        assert fm.is_nested is False
+        assert fm.shape == (256,)
+        # per_sample_shapes should be cleared
+        assert fm.per_sample_shapes == {}
+        assert fm.global_indexes == {0, 2}
+
+    def test_remove_samples_all_removed_resets_state(self):
+        """Test that removing all samples resets the field meta."""
+        from transfer_queue.controller import FieldMeta
+
+        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
+        fm.per_sample_shapes = {0: (256,), 1: (128,)}
+        fm.global_indexes = {0, 1}
+
+        fm.remove_samples([0, 1])
+
+        # All samples removed - should reset
+        assert fm.is_nested is False
+        assert fm.shape is None
+        assert fm.per_sample_shapes == {}
+        assert fm.global_indexes == set()
+
+    def test_update_nested_with_partial_overlap(self):
+        """Test update with nested tensor where some indexes already exist."""
+        from transfer_queue.controller import FieldMeta
+
+        # Start with a regular tensor
+        fm = FieldMeta(dtype="torch.float32", shape=(256,), is_nested=False)
+        fm.global_indexes = {0, 1}
+
+        # Update with nested tensor that includes overlapping indexes
+        incoming = {
+            "dtype": "torch.float32",
+            "is_nested": True,
+            "per_sample_shapes": {1: (128,), 2: (512,)},  # 1 overlaps
+        }
+        fm.update(incoming, [1, 2])
+
+        # Should now be nested
+        assert fm.is_nested is True
+        # Original shape for index 0 should be saved
+        assert fm.per_sample_shapes[0] == (256,)
+        # Index 1 should be updated with new shape
+        assert fm.per_sample_shapes[1] == (128,)
+        # Index 2 is new
+        assert fm.per_sample_shapes[2] == (512,)
+        assert fm.global_indexes == {0, 1, 2}
