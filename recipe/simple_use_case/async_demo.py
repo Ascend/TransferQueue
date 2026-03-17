@@ -190,13 +190,21 @@ class AsyncRolloutWorker:
         self.async_vllm_server = AsyncvLLMServer.remote(config)
 
     async def generate_sequences(self, kv_meta_chunk):
-        tasks = []
-        for i in range(kv_meta_chunk.size):
-            # asyncio.create_task cannot directly call Ray Actor methods,
-            # otherwise an error will be reported：a coroutine was expected, got ObjectRef(xxx)
-            tasks.append(asyncio.create_task(self.generate(kv_meta_chunk[i])))
-        kv_metas = await asyncio.gather(*tasks)
-        return KVBatchMeta.concat(kv_metas)
+        if isinstance(kv_meta_chunk, list):
+            tasks = []
+            for item in kv_meta_chunk:
+                # asyncio.create_task cannot directly call Ray Actor methods,
+                # otherwise an error will be reported：a coroutine was expected, got ObjectRef(xxx)
+                tasks.append(asyncio.create_task(self.generate(item)))
+            kv_metas = await asyncio.gather(*tasks)
+            return KVBatchMeta.concat(kv_metas)
+
+        elif isinstance(kv_meta_chunk, KVBatchMeta):
+            kv_meta = await self.generate(kv_meta_chunk)
+            return kv_meta
+
+        else:
+            raise TypeError(f"Unsupported type for kv_meta_chunk: {type(kv_meta_chunk)}")
 
     async def generate(self, kv_meta):
         kv_meta_new = await self.async_vllm_server.generate.remote(kv_meta)
