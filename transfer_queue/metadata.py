@@ -148,6 +148,7 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
 
     if batch_size == 0:
         logger.warning("Trying to extract field schema for empty batch. No action is taken.")
+        return field_schema
 
     for field_name, value in data.items():
         is_tensor = isinstance(value, torch.Tensor)
@@ -446,6 +447,7 @@ class BatchMeta:
 
         if batch_size == 0:
             logger.warning(f"Input TensorDict is empty with batch_size={batch_size}. No action is taken.")
+            return self
 
         if batch_size != self.size:
             raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")

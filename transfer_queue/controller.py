@@ -285,14 +285,13 @@ class FieldMeta:
             self.global_indexes.discard(idx)
 
         # After removing samples, check if we can update is_nested and shape
-        # If per_sample_shapes is empty or all remaining shapes are the same,
-        # we should reset is_nested to False and update shape accordingly
         if len(self.global_indexes) == 0:
-            # All samples removed - reset to non-nested state
-            self.is_nested = False
-            self.shape = None
+            # If no samples remain, fully reset field-level metadata.
+            self.is_nested = None
             self.is_non_tensor = None
+            self.shape = None
             self.dtype = None
+            self.per_sample_shapes.clear()
         else:
             if self.is_nested:
                 # Check if all remaining shapes are the same
@@ -928,8 +927,11 @@ class DataPartitionStatus:
                     consumption_tensor[indexes_to_release] = 0
 
             self.global_indexes.difference_update(indexes_to_release)
-            for field_meta in self.field_metadata.values():
+
+            for field_name, field_meta in self.field_metadata.items():
                 field_meta.remove_samples(indexes_to_release)
+            if len(self.global_indexes) == 0:
+                self.field_metadata.clear()
             for idx in indexes_to_release:
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)
