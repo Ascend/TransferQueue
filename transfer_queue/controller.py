@@ -210,6 +210,7 @@ class FieldMeta:
 
     per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
 
+    # TODO: FieldMeta needs to be refactored to prevent these complicated and fragile logics
     def update(self, incoming: dict[str, Any], incoming_global_indexes: list[int]) -> None:
         """Update this field's metadata from an incoming schema dict.
 
@@ -218,8 +219,8 @@ class FieldMeta:
 
         Args:
             incoming: Schema dict with optional keys:
-                      global_indexes, dtype, shape, is_nested, is_non_tensor, per_sample_shape
-            incoming_global_indexes: global indexes of the inupt meta
+                      global_indexes, dtype, shape, is_nested, is_non_tensor, per_sample_shapes
+            incoming_global_indexes: global indexes of the input meta
         Raises:
             ValueError: If incoming dtype conflicts with existing dtype.
         """
@@ -243,7 +244,7 @@ class FieldMeta:
                 raise ValueError("Receiving a nested field without 'per_sample_shapes'!")
             if self.is_nested is not None and not self.is_nested:
                 # new input is nested, but original is regular tensor.
-                # We need to write old shape into per_sample_shampes
+                # We need to write old shape into per_sample_shapes
                 assert self.shape is not None
                 for gi in self.global_indexes:
                     self.per_sample_shapes[gi] = self.shape
@@ -928,10 +929,18 @@ class DataPartitionStatus:
 
             self.global_indexes.difference_update(indexes_to_release)
 
+            empty_fields = []
             for field_name, field_meta in self.field_metadata.items():
                 field_meta.remove_samples(indexes_to_release)
+                if len(field_meta.global_indexes) == 0:
+                    empty_fields.append(field_name)
             if len(self.global_indexes) == 0:
+                # clear the whole field_meta if the whole partition is empty
                 self.field_metadata.clear()
+            else:
+                # only clear empty fields
+                for field_name in empty_fields:
+                    self.field_metadata.pop(field_name)
             for idx in indexes_to_release:
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)

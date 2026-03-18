@@ -182,11 +182,13 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
 
         if is_tensor:
             sample_shape = first_item.shape
+            dtype = getattr(first_item, "dtype", None)
         else:
             sample_shape = None
+            dtype = None
 
         field_meta = {
-            "dtype": getattr(first_item, "dtype", type(first_item) if first_item is not None else None),
+            "dtype": dtype,
             "shape": sample_shape,
             "is_nested": is_nested,
             "is_non_tensor": not is_tensor,

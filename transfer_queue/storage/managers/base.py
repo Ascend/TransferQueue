@@ -219,7 +219,26 @@ class TransferQueueStorageManager(ABC):
         try:
             sock.connect(self.controller_info.to_addr("data_status_update_socket"))
 
-            # FIXME: convert per_sample_shapes into dict
+            normalized_field_schema = {}
+            for field_name, field in field_schema.items():
+                # Work on a shallow copy to avoid mutating caller-provided schema
+                field_copy = field.copy()
+                per_sample_shapes = field_copy.get("per_sample_shapes", None)
+                if isinstance(per_sample_shapes, list | tuple):
+                    if len(per_sample_shapes) != len(global_indexes):
+                        raise ValueError(
+                            f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                            f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
+                            f"skipping per_sample_shapes normalization."
+                        )
+                    else:
+                        field_copy["per_sample_shapes"] = {
+                            global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
+                        }
+
+                normalized_field_schema[field_name] = field_copy
+
+            # convert per_sample_shapes into dict
             for field in field_schema.values():
                 per_sample_shapes = field.get("per_sample_shapes", None)
                 if per_sample_shapes:
@@ -232,7 +251,7 @@ class TransferQueueStorageManager(ABC):
                 body={
                     "partition_id": partition_id,
                     "global_indexes": global_indexes,
-                    "field_schema": field_schema,
+                    "field_schema": normalized_field_schema,
                     "custom_backend_meta": custom_backend_meta,
                 },
             ).serialize()
