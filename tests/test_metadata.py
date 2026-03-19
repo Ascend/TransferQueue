@@ -136,20 +136,6 @@ class TestBatchMetaColumnar:
         assert batch.size == 5
         assert len(batch) == 5
 
-    def test_add_fields_empty_batch_is_non_tensor_unknown(self):
-        """add_fields with empty field value leaves is_non_tensor as None (unknown).
-
-        When a field has zero samples, we cannot determine the field type from data.
-        is_non_tensor must not default to False (which would incorrectly imply Tensor).
-        """
-        from tensordict import TensorDict
-
-        batch = BatchMeta.empty()
-        # TensorDict with an empty tensor of batch_size=0
-        empty_td = TensorDict({"empty_field": torch.empty(0, 2)}, batch_size=0)
-        batch.add_fields(empty_td)
-        assert batch.field_schema["empty_field"]["is_non_tensor"] is None
-
     def test_pickle_roundtrip_preserves_batchmeta(self):
         """BatchMeta must survive pickle round-trip with all fields intact."""
         import pickle

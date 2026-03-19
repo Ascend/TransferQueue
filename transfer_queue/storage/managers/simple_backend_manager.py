@@ -24,7 +24,6 @@ from operator import itemgetter
 from typing import Any, Callable, NamedTuple
 from uuid import uuid4
 
-import numpy as np
 import torch
 import zmq
 from omegaconf import DictConfig
@@ -332,10 +331,11 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
-        """Pack a list of per-sample values into a batched container.
+        """
+        Pack a list of per-sample values into a batched container.
 
-        A memory copy is intentional here: it detaches received tensors from
-        zero-copy buffers, gives them their own lifetime, and ensures writability.
+        For tensor values, this performs a memory copy via stacking or nested tensor creation.
+        Non-tensor values are grouped into a ``NonTensorStack`` without copying.
         """
         if not values:
             raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
@@ -345,11 +345,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             if all(v.shape == values[0].shape for v in values):
                 return torch.stack(values)
             return torch.nested.as_nested_tensor(values, layout=torch.jagged)
-        if all(isinstance(v, np.ndarray) for v in values):
-            # Detach numpy arrays from ZMQ frame memory (copy=False path).
-            # Use per-element .copy() instead of np.stack because string-dtype
-            # arrays may have heterogeneous shapes.
-            return NonTensorStack(*[v.copy() for v in values])
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -392,7 +387,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         n = len(metadata.global_indexes)
         ordered_data: dict[str, list] = {field: [None] * n for field in metadata.field_names}
 
-        for (su_id, group), (_, fields, su_data, _) in zip(routing.items(), results, strict=True):
+        for (su_id, group), (fields, su_data) in zip(routing.items(), results, strict=True):
             for field in fields:
                 for i, pos in enumerate(group.batch_positions):
                     ordered_data[field][pos] = su_data[field][i]
@@ -423,7 +418,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
                 storage_unit_data = response_msg.body["data"]
-                return global_indexes, fields, storage_unit_data, messages
+                return fields, storage_unit_data
             else:
                 raise RuntimeError(
                     f"Failed to get data from storage unit {target_storage_unit}: "
@@ -484,7 +479,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             )
 
             await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart()
+            messages = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
