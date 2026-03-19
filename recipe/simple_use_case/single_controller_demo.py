@@ -185,7 +185,7 @@ class AsyncvLLMServer:
 
 
 @ray.remote(num_cpus=1)
-class AsyncRolloutWorker:
+class AgentLoopWorker:
     def __init__(self, config):
         self.async_vllm_server = AsyncvLLMServer.remote(config)
 
@@ -211,7 +211,7 @@ class AsyncRolloutWorker:
         return kv_meta_new
 
 
-class RolloutManager:
+class AgentLoopManager:
     def __init__(self, config):
         self.config = config
         tq.init(config)
@@ -220,7 +220,7 @@ class RolloutManager:
         num_workers = self.config.rollout_agent_num_workers
 
         for _ in range(num_workers):
-            self.async_rollout_workers.append(AsyncRolloutWorker.remote(config))
+            self.async_rollout_workers.append(AgentLoopWorker.remote(config))
 
     def generate_sequences(self, kv_meta):
         kv_meta_chunks = kv_meta.chunk(len(self.async_rollout_workers))
@@ -242,7 +242,7 @@ class Trainer:
         tq.init(config)
         self.data_system_client = tq.get_client()
         self.actor_rollout_wg = ActorRolloutRefWorker()
-        self.async_rollout_manager = RolloutManager(self.config)
+        self.async_rollout_manager = AgentLoopManager(self.config)
 
     def fit(self):
         for _epoch in range(1):
