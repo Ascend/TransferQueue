@@ -520,9 +520,20 @@ def test_cross_shard_complex_update(e2e_client):
             i for i, global_index in enumerate(full_meta.global_indexes) if global_index in update_gis
         ]
         extended_fields = base_fields + ["new_extra_tensor", "new_extra_non_tensor"]
+        extended_meta = poll_for_meta(
+            client,
+            partition_id,
+            extended_fields,
+            40,
+            task_name,
+            mode="force_fetch",
+        )
+        assert extended_meta is not None and extended_meta.size > 0, (
+            "Failed to fetch extended metadata for update region; "
+            "poll_for_meta returned no or empty metadata."
+        )
         extended_meta = (
-            poll_for_meta(client, partition_id, extended_fields, 40, task_name, mode="force_fetch")
-            .select_samples(update_positions_in_full)
+            extended_meta.select_samples(update_positions_in_full)
             .select_fields(extended_fields)
         )
         update_region_data = client.get_data(extended_meta)

@@ -548,7 +548,7 @@ class KVStorageManager(TransferQueueStorageManager):
             return
 
         # Generate keys and values.
-        # The field_name of metadata is old fashion, we will generate keys/values according to data.
+        # metadata.field_names is legacy; generate keys/values from the actual data field names instead.
         data_field_names = list(sorted(data.keys()))
         keys = self._generate_keys(data_field_names, metadata.global_indexes)
         values = self._generate_values(data)
