@@ -43,6 +43,7 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
     """
 
     def __init__(self, config: dict[str, Any]):
+        super().__init__(config)
         if not MOONCAKE_STORE_IMPORTED:
             raise ImportError("Mooncake Store not installed. Please install via: pip install mooncake-transfer-engine")
 

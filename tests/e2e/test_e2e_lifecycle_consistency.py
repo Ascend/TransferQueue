@@ -529,13 +529,9 @@ def test_cross_shard_complex_update(e2e_client):
             mode="force_fetch",
         )
         assert extended_meta is not None and extended_meta.size > 0, (
-            "Failed to fetch extended metadata for update region; "
-            "poll_for_meta returned no or empty metadata."
+            "Failed to fetch extended metadata for update region; poll_for_meta returned no or empty metadata."
         )
-        extended_meta = (
-            extended_meta.select_samples(update_positions_in_full)
-            .select_fields(extended_fields)
-        )
+        extended_meta = extended_meta.select_samples(update_positions_in_full).select_fields(extended_fields)
         update_region_data = client.get_data(extended_meta)
         assert "new_extra_tensor" in update_region_data.keys(), "new_extra_tensor should exist"
         assert "new_extra_non_tensor" in update_region_data.keys(), "new_extra_non_tensor should exist"

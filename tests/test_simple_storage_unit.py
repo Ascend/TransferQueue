@@ -47,7 +47,7 @@ class MockStorageClient:
             body={"global_indexes": global_indexes, "data": field_data},
         )
         self.socket.send_multipart(msg.serialize())
-        return ZMQMessage.deserialize(self.socket.recv_multipart())
+        return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
     def send_get(self, client_id, global_indexes, fields):
         msg = ZMQMessage.create(
@@ -56,7 +56,7 @@ class MockStorageClient:
             body={"global_indexes": global_indexes, "fields": fields},
         )
         self.socket.send_multipart(msg.serialize())
-        return ZMQMessage.deserialize(self.socket.recv_multipart())
+        return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
     def send_clear(self, client_id, global_indexes):
         msg = ZMQMessage.create(
@@ -65,7 +65,7 @@ class MockStorageClient:
             body={"global_indexes": global_indexes},
         )
         self.socket.send_multipart(msg.serialize())
-        return ZMQMessage.deserialize(self.socket.recv_multipart())
+        return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
     def close(self):
         self.socket.close()

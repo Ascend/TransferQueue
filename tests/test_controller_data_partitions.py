@@ -521,7 +521,14 @@ class TestUpdateFieldMetadata:
 
     def test_nested_per_sample_shapes(self):
         partition = self._make_partition()
-        schema = {"f3": {"dtype": "torch.float32", "shape": None, "is_nested": True, "per_sample_shapes": [(3,), (5,)]}}
+        schema = {
+            "f3": {
+                "dtype": "torch.float32",
+                "shape": None,
+                "is_nested": True,
+                "per_sample_shapes": {10: (3,), 11: (5,)},
+            }
+        }
         partition._update_field_metadata([10, 11], schema)
         assert partition.field_metadata["f3"].is_nested is True
         assert partition.field_metadata["f3"].per_sample_shapes == {10: (3,), 11: (5,)}
@@ -1048,26 +1055,281 @@ class TestDataPartitionStatusKvInterface:
         assert keys == ["key_1", "key_3"]
 
 
-class TestFieldMeta:
-    """Unit tests for FieldMeta dataclass."""
+class TestFieldMetaIntegration:
+    """Unit tests for DataPartitionStatus integration with FieldMeta.
 
-    def test_remove_samples(self):
-        from transfer_queue.controller import FieldMeta
+    Tests that _update_field_metadata correctly updates underlying FieldMeta state,
+    and clear_data properly handles FieldMeta when partition becomes empty or partially empty.
+    """
 
-        fm = FieldMeta(is_nested=True)
-        fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
-        fm.remove_samples([0, 2])
-        assert fm.per_sample_shapes == {}
-        assert fm.shape == (5,)
-        assert not fm.is_nested
-        # Removing non-existent index should not raise
-        fm.remove_samples([99])
+    def _make_partition(self):
+        from transfer_queue.controller import DataPartitionStatus
 
-    def test_to_batch_schema_regular(self):
-        from transfer_queue.controller import FieldMeta
+        return DataPartitionStatus(partition_id="fieldmeta_integration_test")
 
-        fm = FieldMeta(dtype="torch.float32", shape=(512,), is_nested=False, is_non_tensor=False)
-        schema = fm.to_batch_schema([0, 1, 2])
+    def test_update_field_metadata_creates_fieldmeta(self):
+        """Test that _update_field_metadata creates FieldMeta for new fields."""
+        partition = self._make_partition()
+
+        # Update with some field metadata
+        partition._update_field_metadata(
+            global_indexes=[0, 1, 2],
+            field_schema={
+                "input_ids": {"dtype": "torch.int32", "shape": (512,), "is_nested": False, "is_non_tensor": False},
+                "attention_mask": {"dtype": "torch.bool", "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            },
+        )
+
+        # Verify FieldMeta was created for both fields
+        assert "input_ids" in partition.field_metadata
+        assert "attention_mask" in partition.field_metadata
+
+        # Verify FieldMeta properties
+        input_ids_meta = partition.field_metadata["input_ids"]
+        assert input_ids_meta.dtype == "torch.int32"
+        assert input_ids_meta.shape == (512,)
+        assert input_ids_meta.is_nested is False
+        assert input_ids_meta.is_non_tensor is False
+        assert input_ids_meta.global_indexes == {0, 1, 2}
+
+        attention_mask_meta = partition.field_metadata["attention_mask"]
+        assert attention_mask_meta.dtype == "torch.bool"
+        assert attention_mask_meta.shape == (512,)
+
+    def test_update_field_metadata_incremental_add(self):
+        """Test that _update_field_metadata correctly handles incremental field additions."""
+        partition = self._make_partition()
+
+        # First update
+        partition._update_field_metadata(
+            global_indexes=[0, 1],
+            field_schema={"field_a": {"dtype": "torch.int32", "shape": (16,)}},
+        )
+
+        field_meta = partition.field_metadata["field_a"]
+        assert field_meta.dtype == "torch.int32"
+        assert field_meta.shape == (16,)
+        assert field_meta.global_indexes == {0, 1}
+
+        # Second update with new indexes
+        partition._update_field_metadata(
+            global_indexes=[2, 3],
+            field_schema={"field_a": {"dtype": "torch.int32", "shape": (16,)}},
+        )
+
+        # Verify indexes were added
+        assert field_meta.global_indexes == {0, 1, 2, 3}
+        assert field_meta.dtype == "torch.int32"
+        assert field_meta.shape == (16,)
+
+    def test_update_field_metadata_dtype_conflict_raises(self):
+        """Test that _update_field_metadata raises error on dtype conflict."""
+        import pytest
+
+        partition = self._make_partition()
+
+        # First update
+        partition._update_field_metadata(
+            global_indexes=[0],
+            field_schema={"field_x": {"dtype": "torch.int32", "shape": (16,)}},
+        )
+
+        # Second update with conflicting dtype should raise
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            partition._update_field_metadata(
+                global_indexes=[1],
+                field_schema={"field_x": {"dtype": "torch.float64", "shape": (16,)}},
+            )
+
+    def test_update_field_metadata_shape_conflict_promotes_nested(self):
+        """Test that shape conflict promotes field to nested."""
+        partition = self._make_partition()
+
+        # First update with shape (256,)
+        partition._update_field_metadata(
+            global_indexes=[0],
+            field_schema={"field_nested": {"dtype": "torch.float32", "shape": (256,)}},
+        )
+
+        # Second update with different shape (128,)
+        partition._update_field_metadata(
+            global_indexes=[1],
+            field_schema={"field_nested": {"dtype": "torch.float32", "shape": (128,)}},
+        )
+
+        field_meta = partition.field_metadata["field_nested"]
+        # Should now be nested
+        assert field_meta.is_nested is True
+        assert field_meta.shape is None
+        # Both shapes should be tracked
+        assert 0 in field_meta.per_sample_shapes
+        assert 1 in field_meta.per_sample_shapes
+        assert field_meta.per_sample_shapes[0] == (256,)
+        assert field_meta.per_sample_shapes[1] == (128,)
+
+    def test_update_field_metadata_with_custom_backend_meta(self):
+        """Test that _update_field_metadata correctly stores custom_backend_meta."""
+        partition = self._make_partition()
+
+        partition._update_field_metadata(
+            global_indexes=[0, 1, 2],
+            field_schema={"field_a": {"dtype": "torch.int32"}},
+            custom_backend_meta={
+                0: {"field_a": {"token_count": 100}},
+                1: {"field_a": {"token_count": 200}},
+                2: {"field_a": {"token_count": 300}},
+            },
+        )
+
+        # Verify custom_backend_meta was stored
+        assert 0 in partition.field_custom_backend_meta
+        assert partition.field_custom_backend_meta[0]["field_a"]["token_count"] == 100
+        assert partition.field_custom_backend_meta[1]["field_a"]["token_count"] == 200
+        assert partition.field_custom_backend_meta[2]["field_a"]["token_count"] == 300
+
+    def test_update_field_metadata_empty_indexes_is_noop(self):
+        """Test that _update_field_metadata with empty indexes does nothing."""
+        partition = self._make_partition()
+
+        # Empty update should not raise and should not create any field_metadata
+        partition._update_field_metadata(
+            global_indexes=[],
+            field_schema={},
+        )
+
+        assert partition.field_metadata == {}
+
+    def test_clear_data_removes_samples_from_fieldmeta(self):
+        """Test that clear_data correctly removes samples from FieldMeta."""
+        partition = self._make_partition()
+
+        # Set up some data using update_production_status (which properly initializes global_indexes)
+        partition.update_production_status(
+            global_indices=[0, 1, 2, 3, 4],
+            field_names=["field_a", "field_b"],
+            field_schema={
+                "field_a": {"dtype": "torch.int32", "shape": (16,)},
+                "field_b": {"dtype": "torch.float32", "shape": (32,)},
+            },
+        )
+
+        # Verify initial state
+        assert partition.field_metadata["field_a"].global_indexes == {0, 1, 2, 3, 4}
+        assert partition.field_metadata["field_b"].global_indexes == {0, 1, 2, 3, 4}
+        assert partition.global_indexes == {0, 1, 2, 3, 4}
+
+        # Clear some samples (0, 2, 4)
+        partition.clear_data([0, 2, 4], clear_consumption=False)
+
+        # Verify samples were removed from FieldMeta
+        assert partition.field_metadata["field_a"].global_indexes == {1, 3}
+        assert partition.field_metadata["field_b"].global_indexes == {1, 3}
+
+    def test_clear_data_all_samples_clears_fieldmeta_when_empty_partition(self):
+        """Test that clear_data clears all FieldMeta when partition becomes empty."""
+        partition = self._make_partition()
+
+        # Set up some data using update_production_status
+        partition.update_production_status(
+            global_indices=[0, 1, 2],
+            field_names=["field_a", "field_b"],
+            field_schema={
+                "field_a": {"dtype": "torch.int32", "shape": (16,)},
+                "field_b": {"dtype": "torch.float32", "shape": (32,)},
+            },
+        )
+
+        # Verify initial state
+        assert len(partition.field_metadata) == 2
+        assert partition.global_indexes == {0, 1, 2}
+
+        # Clear all samples - should clear field_metadata when partition is empty
+        partition.clear_data([0, 1, 2], clear_consumption=False)
+
+        # After clearing all samples, field_metadata should be cleared
+        assert partition.field_metadata == {}
+
+    def test_clear_data_nested_field_becomes_regular(self):
+        """Test that nested FieldMeta becomes regular when remaining samples have same shape."""
+        partition = self._make_partition()
+
+        # Create nested field with different shapes using update_production_status
+        partition.update_production_status(
+            global_indices=[0, 1],
+            field_names=["nested_field"],
+            field_schema={"nested_field": {"dtype": "torch.float32", "shape": (256,)}},
+        )
+        partition.update_production_status(
+            global_indices=[2],
+            field_names=["nested_field"],
+            field_schema={"nested_field": {"dtype": "torch.float32", "shape": (128,)}},
+        )
+
+        # Verify it's nested
+        assert partition.field_metadata["nested_field"].is_nested is True
+        assert partition.field_metadata["nested_field"].global_indexes == {0, 1, 2}
+        assert partition.field_metadata["nested_field"].per_sample_shapes == {0: (256,), 1: (256,), 2: (128,)}
+
+        # Clear the sample with different shape (index 2)
+        partition.clear_data([2], clear_consumption=False)
+
+        # Now only samples 0, 1 remain with same shape (256,)
+        # FieldMeta should become non-nested
+        field_meta = partition.field_metadata["nested_field"]
+        assert field_meta.is_nested is False
+        assert field_meta.shape == (256,)
+        assert field_meta.global_indexes == {0, 1}
+        assert field_meta.per_sample_shapes == {}
+
+    def test_update_production_status_updates_field_metadata(self):
+        """Test that update_production_status correctly updates field_metadata via _update_field_metadata."""
+        partition = self._make_partition()
+
+        # Use update_production_status (which internally calls _update_field_metadata)
+        partition.update_production_status(
+            global_indices=[0, 1, 2],
+            field_names=["input_ids", "attention_mask"],
+            field_schema={
+                "input_ids": {"dtype": "torch.int32", "shape": (512,), "is_nested": False, "is_non_tensor": False},
+                "attention_mask": {"dtype": "torch.bool", "shape": (512,), "is_nested": False, "is_non_tensor": False},
+            },
+        )
+
+        # Verify field_metadata was updated
+        assert "input_ids" in partition.field_metadata
+        assert "attention_mask" in partition.field_metadata
+        assert partition.field_metadata["input_ids"].dtype == "torch.int32"
+        assert partition.field_metadata["attention_mask"].dtype == "torch.bool"
+
+    def test_fieldmeta_global_indexes_in_sync_with_partition(self):
+        """Test that FieldMeta global_indexes stays in sync with partition's global_indexes."""
+        partition = self._make_partition()
+
+        # Add data
+        partition.update_production_status(
+            global_indices=[0, 1, 2, 3, 4],
+            field_names=["field_a"],
+            field_schema={"field_a": {"dtype": "torch.int32", "shape": (16,)}},
+        )
+
+        # Verify sync
+        assert partition.global_indexes == {0, 1, 2, 3, 4}
+        assert partition.field_metadata["field_a"].global_indexes == {0, 1, 2, 3, 4}
+
+    def test_fieldmeta_to_batch_schema_regular(self):
+        """Test that FieldMeta.to_batch_schema works correctly for regular tensors."""
+        partition = self._make_partition()
+
+        # Create a regular field
+        partition.update_production_status(
+            global_indices=[0, 1, 2],
+            field_names=["regular_field"],
+            field_schema={"regular_field": {"dtype": "torch.float32", "shape": (512,), "is_nested": False}},
+        )
+
+        field_meta = partition.field_metadata["regular_field"]
+        schema = field_meta.to_batch_schema([0, 1, 2])
+
         assert schema == {
             "dtype": "torch.float32",
             "shape": (512,),
@@ -1076,36 +1338,63 @@ class TestFieldMeta:
         }
         assert "per_sample_shapes" not in schema
 
-    def test_to_batch_schema_nested(self):
-        from transfer_queue.controller import FieldMeta
+    def test_fieldmeta_to_batch_schema_nested(self):
+        """Test that FieldMeta.to_batch_schema works correctly for nested tensors."""
+        partition = self._make_partition()
 
-        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
-        fm.per_sample_shapes = {0: (3,), 1: (5,), 2: (7,)}
-        schema = fm.to_batch_schema([0, 2, 1])
+        # Create nested field
+        partition.update_production_status(
+            global_indices=[0, 1],
+            field_names=["nested_field"],
+            field_schema={
+                "nested_field": {"dtype": "torch.float32", "is_nested": True, "per_sample_shapes": {0: (3,), 1: (5,)}}
+            },
+        )
+
+        field_meta = partition.field_metadata["nested_field"]
+        schema = field_meta.to_batch_schema([0, 1])
+
         assert schema["is_nested"] is True
-        assert schema["per_sample_shapes"] == [(3,), (7,), (5,)]
+        assert schema["per_sample_shapes"] == [(3,), (5,)]
 
-    def test_to_batch_schema_nested_missing_sample(self):
-        from transfer_queue.controller import FieldMeta
+    def test_fieldmeta_to_batch_schema_nested_different_order(self):
+        """Test that FieldMeta.to_batch_schema returns shapes in requested order."""
+        partition = self._make_partition()
 
-        fm = FieldMeta(dtype="torch.float32", shape=None, is_nested=True)
-        fm.per_sample_shapes = {0: (3,)}
-        schema = fm.to_batch_schema([0, 1])
+        # Create nested field
+        partition.update_production_status(
+            global_indices=[0, 1, 2],
+            field_names=["nested_field"],
+            field_schema={
+                "nested_field": {
+                    "dtype": "torch.float32",
+                    "is_nested": True,
+                    "per_sample_shapes": {0: (3,), 1: (5,), 2: (7,)},
+                }
+            },
+        )
+
+        field_meta = partition.field_metadata["nested_field"]
+        # Request in different order
+        schema = field_meta.to_batch_schema([2, 0, 1])
+
+        assert schema["per_sample_shapes"] == [(7,), (3,), (5,)]
+
+    def test_fieldmeta_to_batch_schema_nested_missing_sample(self):
+        """Test that FieldMeta.to_batch_schema returns None for missing samples."""
+        partition = self._make_partition()
+
+        # Create nested field with only one sample
+        partition.update_production_status(
+            global_indices=[0],
+            field_names=["nested_field"],
+            field_schema={
+                "nested_field": {"dtype": "torch.float32", "is_nested": True, "per_sample_shapes": {0: (3,)}}
+            },
+        )
+
+        field_meta = partition.field_metadata["nested_field"]
+        # Request samples where one doesn't exist
+        schema = field_meta.to_batch_schema([0, 1])
+
         assert schema["per_sample_shapes"] == [(3,), None]
-
-    def test_update_dtype_conflict(self):
-        import pytest
-
-        from transfer_queue.controller import FieldMeta
-
-        fm = FieldMeta(dtype="torch.int32", shape=(16,))
-        with pytest.raises(ValueError, match="dtype mismatch"):
-            fm.update({"dtype": "torch.float64"})
-
-    def test_update_shape_conflict_promotes_nested(self):
-        from transfer_queue.controller import FieldMeta
-
-        fm = FieldMeta(dtype="torch.float32", shape=(256,))
-        fm.update({"dtype": "torch.float32", "shape": (128,)})
-        assert fm.is_nested is True
-        assert fm.shape is None
