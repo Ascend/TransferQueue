@@ -1,0 +1,6 @@
+# TransferQueue (default) backend configuration
+num_data_storage_units: 8
+# storage_unit_placement: "normal" (default) or "remote"
+#   - normal: create storage units on current node using placement group
+#   - remote: create all storage units on WORKER_NODE_IP
+storage_unit_placement: normal
