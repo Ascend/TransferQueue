@@ -31,7 +31,7 @@ from omegaconf import OmegaConf
 from tensordict import NonTensorData, TensorDict
 
 import transfer_queue as tq
-from transfer_queue import BatchMeta, KVBatchMeta
+from transfer_queue import KVBatchMeta
 
 TQ_INITIALIZED = False
 
@@ -43,121 +43,96 @@ os.environ["RAY_DEBUG"] = "1"
 ray.init()
 
 
-async def async_kv_batch_meta2batch_meta(meta: KVBatchMeta) -> BatchMeta:
-    global TQ_INITIALIZED
-    if not TQ_INITIALIZED:
-        tq.init()
-        TQ_INITIALIZED = True
-    tq_client = tq.get_client()
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=meta.keys, partition_id=meta.partition_id, create=False)
-    fields = meta.fields
-    if fields is not None:
-        if isinstance(fields, str):
-            fields = [fields]
-        batch_meta = batch_meta.select_fields(fields)
-
-    batch_meta.extra_info = meta.extra_info
-    return batch_meta
-
-
-async def async_batch_meta2kv_batch_meta(meta: BatchMeta) -> KVBatchMeta:
-    global TQ_INITIALIZED
-    if not TQ_INITIALIZED:
-        tq.init()
-        TQ_INITIALIZED = True
-    tq_client = tq.get_client()
-    partition_id = meta.partition_ids[0]
-    assert all([partition_id == pid for pid in meta.partition_ids])
-    keys = await tq_client.async_kv_retrieve_keys(global_indexes=meta.global_indexes, partition_id=partition_id)
-
-    kv_batch_meta = KVBatchMeta(
-        keys=keys,
-        tags=[{}] * meta.size,
-        partition_id=partition_id,
-        fields=meta.field_names,
-        extra_info=meta.extra_info,
-    )
-    return kv_batch_meta
-
-
-def compute_old_log_prob(data1, _data2):
+def compute_log_prob(data1, _data2):
     time.sleep(3)
     return data1
 
+def compute_loss(data1, _data2):
+    time.sleep(3)
+    return data1
 
 def generate_sequences(data):
     time.sleep(3)
     return data
 
+class TrainingWorker:
+    def __init__(self, role):
+        self.role = role
+
+    def train_mini_batch(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
+        """Simulate multi-mini-batch training loop"""
+
+        assert self.role == "actor"
+
+        # 1. Pull data from storage
+        data = tq.kv_batch_get(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=kv_meta.fields)
+        logger.info(f"train_mini_batch: got data {data}")
+
+        # 2. Compute loss
+        output = compute_loss(data["old_log_prob"], data["ref_log_prob"])
+        output = TensorDict({"loss": output}, batch_size=output.size(0))
+        kv_meta.fields.append("loss")
+
+        # 3. Write back
+        tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
+        logger.info("train_mini_batch: put data done")
+
+        return kv_meta
+
+    def infer_batch(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
+        """Simulate forward-only inference"""
+        # 1. Pull data from storage
+        data = tq.kv_batch_get(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=kv_meta.fields)
+        logger.info(f"compute_log_prob: got data {data}")
+
+        # 2. Model forward
+        output = compute_log_prob(data["input_ids"], data["generate_sequences_ids"])
+        if self.role == "actor":
+            output = TensorDict({"old_log_prob": output}, batch_size=output.size(0))
+            kv_meta.fields.append("old_log_prob")
+        elif self.role == "ref":
+            output = TensorDict({"ref_log_prob": output}, batch_size=output.size(0))
+            kv_meta.fields.append("ref_log_prob")
+        else:
+            raise ValueError(f"Role {self.role} not supported.")
+
+        # 3. Write back
+        tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
+        logger.info("infer_batch: put data done")
+
+        return kv_meta
+
 
 class ActorRolloutRefWorker:
     def __init__(self):
-        self.tq_client = tq.get_client()
+        self.actor = TrainingWorker(role="actor")
+        self.ref = TrainingWorker(role="ref")
 
-    def actor_rollout_wg_generate_sequences(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
-        # 1. Convert KVBatchMeta -> BatchMeta
-        batch_meta = asyncio.run(async_kv_batch_meta2batch_meta(kv_meta))
+    def compute_ref_log_prob(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
+        output = self.ref.infer_batch(kv_meta)
+        return output
 
-        # 2. Pull real data from the storage plane through client based on batch_meta
-        data = asyncio.run(self.tq_client.async_get_data(batch_meta))
-        logger.info(f"demo get data -> generate_sequences {data}")
+    def compute_log_prob(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
+        output = self.actor.infer_batch(kv_meta)
+        return output
 
-        # 3. Get generate results
-        output = generate_sequences(data["input_ids"])
+    def update_actor(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
+        output = self.actor.train_mini_batch(kv_meta)
+        return output
 
-        output = TensorDict(
-            {
-                "generate_sequences_ids": output,
-                "non_tensor_data": torch.stack([NonTensorData("test_str") for _ in range(output.size(0))]),
-                "nested_tensor": torch.nested.as_nested_tensor(
-                    [torch.randn(1, 2) for _ in range(output.size(0))], layout=torch.jagged
-                ),
-            },
-            batch_size=output.size(0),
-        )
-
-        # 4. Write results back to the storage plane based on batch_meta
-        asyncio.run(self.tq_client.async_put(data=output, metadata=batch_meta))
-        logger.info("demo put data to storages done")
-
-        # 5. Convert BatchMeta -> KVBatchMeta and return for further usage
-        batch_meta.add_fields(output)
-        kv_meta = asyncio.run(async_batch_meta2kv_batch_meta(batch_meta))
-        return kv_meta
-
-    def actor_rollout_wg_compute_old_log_prob(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
-        # 1. Convert KVBatchMeta -> BatchMeta
-        batch_meta = asyncio.run(async_kv_batch_meta2batch_meta(kv_meta))
-
-        # 2. Pull real data from the storage plane through client based on batch_meta
-        data = asyncio.run(self.tq_client.async_get_data(batch_meta))
-        logger.info(f"demo get data {data}")
-
-        # 3. Get generate results
-        output = compute_old_log_prob(data["input_ids"], data["generate_sequences_ids"])
-
-        output = TensorDict({"old_log_prob": output}, batch_size=output.size(0))
-
-        # 4. Write results back to the storage plane based on batch_meta
-        asyncio.run(self.tq_client.async_put(data=output, metadata=batch_meta))
-        logger.info("demo put data to storages done")
-
-        # 5. Convert BatchMeta -> KVBatchMeta and return for further usage
-        batch_meta.add_fields(output)
-        kv_meta = asyncio.run(async_batch_meta2kv_batch_meta(batch_meta))
-        return kv_meta
+    async def update_weights(self, global_steps: int = None):
+        # Simulate weight sync from actor to rollout
+        logger.info(f"update_weights: syncing weights at step {global_steps}")
+        await asyncio.sleep(1)
 
 
 @ray.remote
 class AsyncvLLMServer:
     def __init__(self, config):
         tq.init(config)
-        self.data_system_client = tq.get_client()
 
     async def generate(self, kv_meta: KVBatchMeta) -> KVBatchMeta:
-        batch_meta = await async_kv_batch_meta2batch_meta(kv_meta)
-
-        data = await self.data_system_client.async_get_data(batch_meta)
+        data = tq.kv_batch_get(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=kv_meta.fields)
         logger.info(f"demo get data -> generate_sequences {data}")
 
         data = data["input_ids"]
@@ -174,12 +149,10 @@ class AsyncvLLMServer:
             },
             batch_size=data.size(0),
         )
+        kv_meta.fields.append("generate_sequences_ids", "non_tensor_data", "nested_tensor")
 
-        await self.data_system_client.async_put(data=output, metadata=batch_meta)
+        tq.kv_batch_put(keys=kv_meta.keys, partition_id=kv_meta.partition_id, fields=output)
         logger.info("demo Async Server put data to storages done")
-
-        batch_meta.add_fields(output)
-        kv_meta = await async_batch_meta2kv_batch_meta(batch_meta)
 
         return kv_meta
 
@@ -277,30 +250,57 @@ class Trainer:
                 )
                 logger.info(f"demo get gen KVBatchMeta {gen_meta}")
 
-                # ============================== Simulate generate sequences task ==============================
-                if not self.config.async_rollout_mode:
-                    gen_meta = self.actor_rollout_wg.actor_rollout_wg_generate_sequences(gen_meta)
-                else:
-                    gen_meta = self.async_rollout_manager.generate_sequences(gen_meta)
+                # ============================== Rollout: generate sequences ==============================
+                gen_meta = self.async_rollout_manager.generate_sequences(gen_meta)
                 logger.info(f"demo get after gen KVBatchMeta {gen_meta}")
 
-                # ============================== Create old log prob KVBatchMeta ==============================
+                # ============================== Compute ref log prob ==============================
+                ref_log_prob_meta = KVBatchMeta(
+                    keys=sampled_keys,
+                    tags=[{} for _ in sampled_keys],
+                    partition_id=f"train_{step}",
+                    fields=["input_ids", "attention_mask", "generate_sequences_ids"]
+                )
+                ref_log_prob_meta = self.actor_rollout_wg.compute_ref_log_prob(ref_log_prob_meta)
+                logger.info(f"demo get ref log prob KVBatchMeta: {ref_log_prob_meta}")
+
+                # ============================== Compute old log prob ==============================
                 old_log_prob_meta = KVBatchMeta(
                     keys=sampled_keys,
                     tags=[{} for _ in sampled_keys],
                     partition_id=f"train_{step}",
                     fields=["input_ids", "attention_mask", "generate_sequences_ids"]
                 )
-
+                old_log_prob_meta = self.actor_rollout_wg.compute_log_prob(old_log_prob_meta)
                 logger.info(f"demo get old log prob KVBatchMeta: {old_log_prob_meta}")
 
-                # ============================== Simulate compute old log prob task ==============================
-                old_log_prob_meta = self.actor_rollout_wg.actor_rollout_wg_compute_old_log_prob(old_log_prob_meta)
-                logger.info(f"demo get after old log prob KVBatchMeta: {old_log_prob_meta}")
+                # ============================== Compute reward ==============================
+                # Simulated inline; in real training this calls a reward model worker
+                reward_meta = KVBatchMeta(
+                    keys=sampled_keys,
+                    tags=[{} for _ in sampled_keys],
+                    partition_id=f"train_{step}",
+                    fields=["generate_sequences_ids", "ref_log_prob", "old_log_prob"]
+                )
+                logger.info("demo computing reward (simulated)")
+                time.sleep(1)
+                logger.info(f"demo reward KVBatchMeta: {reward_meta}")
 
-                # ============================== clear partition in TQ ==============================
-                # Client notifies controller to clear data status, controller returns metadata;
-                # Client then notifies the storage plane to clear based on metadata
+                # ============================== Update actor ==============================
+                train_meta = KVBatchMeta(
+                    keys=sampled_keys,
+                    tags=[{} for _ in sampled_keys],
+                    partition_id=f"train_{step}",
+                    fields=["input_ids", "attention_mask", "generate_sequences_ids", "old_log_prob", "ref_log_prob"]
+                )
+                train_meta = self.actor_rollout_wg.update_actor(train_meta)
+                logger.info(f"demo get after update actor KVBatchMeta: {train_meta}")
+
+                # ============================== Sync weights to rollout ==============================
+                asyncio.run(self.actor_rollout_wg.update_weights(global_steps=step))
+                logger.info("demo update weights done")
+
+                # ============================== Clear partition in TQ ==============================
                 asyncio.run(self.data_system_client.async_clear_partition(partition_id=f"train_{step}"))
                 logger.info("clear ok! ")
         logger.info("demo done!")
@@ -319,7 +319,6 @@ if __name__ == "__main__":
       async_rollout_mode: True
       rollout_agent_num_workers: 2
       num_n_samples: 2
-
     """
     dict_conf = OmegaConf.create(config_str)
 
