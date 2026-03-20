@@ -399,10 +399,10 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                 return torch.stack(values)
             try:
                 return torch.nested.as_nested_tensor(values, layout=torch.jagged)
-            except RuntimeError as e:
+            except (RuntimeError, TypeError) as e:
                 logger.warning(
                     f"Failed to pack nested tensor with jagged layout. "
-                    f"Try to fallback as strided layout. Detailed error: {e}"
+                    f"Falling back to strided layout. Detailed error: {e}"
                 )
                 return torch.nested.as_nested_tensor(values, layout=torch.strided)
         return NonTensorStack(*values)

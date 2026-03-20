@@ -486,6 +486,61 @@ class TestSelectByPositions:
         result = AsyncSimpleStorageManager._select_by_positions(arr, [0, 2])
         np.testing.assert_array_equal(result, np.array([10, 30]))
 
+    def test_regular_tensor_single_element(self):
+        """Case 1: Single element selection returns a single-row view."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        result = AsyncSimpleStorageManager._select_by_positions(t, [1])
+        assert result.shape == (1, 2)
+        assert torch.equal(result, torch.tensor([[3.0, 4.0]]))
+
+    def test_regular_tensor_strided_slice(self):
+        """Case 2: Constant stride (step > 1) uses Python slicing for zero-copy view."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0], [9.0, 10.0]])
+        result = AsyncSimpleStorageManager._select_by_positions(t, [0, 2, 4])
+        # positions form constant stride of 2
+        expected = torch.tensor([[1.0, 2.0], [5.0, 6.0], [9.0, 10.0]])
+        assert torch.equal(result, expected)
+
+    def test_regular_tensor_irregular_indices_fallback(self):
+        """Case 3: Irregular indices fall back to index_select to avoid ZMQ frame fragmentation."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        # positions [0, 2, 3] have irregular gaps (2, then 1) - not constant stride
+        result = AsyncSimpleStorageManager._select_by_positions(t, [0, 2, 3])
+        expected = torch.tensor([[1.0, 2.0], [5.0, 6.0], [7.0, 8.0]])
+        assert torch.equal(result, expected)
+
+    def test_regular_tensor_irregular_reverse_order(self):
+        """Irregular indices in reverse order also falls back to index_select."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]])
+        result = AsyncSimpleStorageManager._select_by_positions(t, [3, 1, 0])
+        expected = torch.tensor([[7.0, 8.0], [3.0, 4.0], [1.0, 2.0]])
+        assert torch.equal(result, expected)
+
+    def test_nested_tensor_single_element(self):
+        """Single element from nested tensor uses the lambda path."""
+        t = torch.nested.as_nested_tensor(
+            [torch.tensor([1.0]), torch.tensor([2.0, 3.0]), torch.tensor([4.0, 5.0, 6.0])],
+            layout=torch.jagged,
+        )
+        result = AsyncSimpleStorageManager._select_by_positions(t, [1])
+        assert isinstance(result, list)
+        assert len(result) == 1
+        assert torch.equal(result[0], torch.tensor([2.0, 3.0]))
+
+    def test_empty_positions_raises_error(self):
+        """Empty positions list should raise ValueError."""
+        t = torch.tensor([1.0, 2.0, 3.0])
+        with pytest.raises(ValueError, match="No positions specified"):
+            AsyncSimpleStorageManager._select_by_positions(t, [])
+
+    def test_regular_tensor_negative_stride_rejected(self):
+        """Negative stride (reversed order) should fall back to index_select."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        # positions [2, 1, 0] have step = -1 (negative)
+        result = AsyncSimpleStorageManager._select_by_positions(t, [2, 1, 0])
+        expected = torch.tensor([[5.0, 6.0], [3.0, 4.0], [1.0, 2.0]])
+        assert torch.equal(result, expected)
+
 
 class TestPackFieldValues:
     """Test _pack_field_values static method packing logic."""
