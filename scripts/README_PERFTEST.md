@@ -71,6 +71,11 @@ Sample config files are in `configs/`:
   master_server_address: 127.0.0.1:8081
   ```
 
+For device support of each backend,
+- `default` backend supports `cpu`
+- `yuanrong` supports `cpu` and `npu`
+- `mooncake` supports `cpu` and `gpu`
+
 ## Examples
 
 ### Intra-node test with default backend

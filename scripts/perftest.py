@@ -318,19 +318,25 @@ class TQThroughputTester:
 
         logger.info(f"Writer is on {writer_node}, Reader is on {reader_node}")
 
-        # Prepare device resource
-        device_resource = {}
-        if self.device in ["npu", "gpu"]:
-            device_resource = {self.device: 1}
+        # Prepare base options
+        writer_options = {
+            "resources": {f"node:{writer_node}": 0.001},
+        }
+        reader_options = {
+            "resources": {f"node:{reader_node}": 0.001},
+        }
+
+        # Add device-specific options
+        if self.device == "gpu":
+            writer_options["num_gpus"] = 1
+            reader_options["num_gpus"] = 1
+        elif self.device == "npu":
+            writer_options["resources"]["NPU"] = 1
+            reader_options["resources"]["NPU"] = 1
 
         # Create writer and reader actors
-        self.writer = TQClientActor.options(
-            resources={f"node:{writer_node}": 0.001, **device_resource},
-        ).remote("writer", self.data_system_controller_info)
-
-        self.reader = TQClientActor.options(
-            resources={f"node:{reader_node}": 0.001, **device_resource},
-        ).remote("reader", self.data_system_controller_info)
+        self.writer = TQClientActor.options(**writer_options).remote("writer", self.data_system_controller_info)
+        self.reader = TQClientActor.options(**reader_options).remote("reader", self.data_system_controller_info)
 
         # Initialize storage managers
         logger.info(f"Using {self.manager_type} as storage backend.")
