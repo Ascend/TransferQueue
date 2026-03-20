@@ -215,11 +215,16 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         - list: direct index selection via itemgetter
         - Regular tensors / numpy arrays: fancy indexing
         """
-        if isinstance(field_data, torch.Tensor) and field_data.is_nested:
-            unbound = field_data.unbind()
-            getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
-            selected = getter(unbound)
-            return list(selected)
+        if isinstance(field_data, torch.Tensor):
+            if field_data.is_nested:
+                # for nested tensor, unbind and select will not lead to memory copy
+                unbound = field_data.unbind()
+                getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
+                selected = getter(unbound)
+                return list(selected)
+            else:
+                # for ordinary tensor, use simple view will also prevent memory copy
+                return [field_data[i] for i in positions]
         elif isinstance(field_data, NonTensorStack):
             items = field_data.tolist()
             getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
