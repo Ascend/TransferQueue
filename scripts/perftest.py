@@ -284,7 +284,7 @@ class TQThroughputTester:
             # Remote mode: create all storage units on worker node
             for storage_unit_rank in range(num_data_storage_units):
                 storage_node = SimpleStorageUnit.options(
-                    num_cpus=10,
+                    num_cpus=1,
                     resources={f"node:{self.worker_node_ip}": 0.001},
                 ).remote(storage_unit_size=3 * math.ceil(total_storage_size / num_data_storage_units))
                 self.data_system_storage_units[storage_unit_rank] = storage_node
@@ -438,7 +438,7 @@ def load_backend_config(config_path: str | None, backend: str) -> dict[str, Any]
 
     # Default configs
     if backend == "default":
-        return {"num_data_storage_units": 8, "storage_unit_placement": "normal"}
+        return {"num_data_storage_units": 1, "storage_unit_placement": "normal"}
     elif backend == "yuanrong":
         return {
             "host": "127.0.0.1",
