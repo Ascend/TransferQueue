@@ -99,8 +99,6 @@ class MsgpackEncoder:
         - TensorDict: Convert to dict structure for recursive processing
         - numpy.ndarray: Convert to tensor for unified handling
 
-        Note: BatchMeta is handled by _preprocess_for_batchmeta() before encode() is called,
-        so it will never reach this hook.
         """
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
@@ -343,7 +341,6 @@ class MsgpackDecoder:
         - torch.Tensor: Extract buffer, store metadata
         - TensorDict: Convert to dict structure for recursive processing
         - numpy.ndarray: Convert to tensor for unified handling
-        - BatchMeta: Reconstruct from pickle
         """
         if code == CUSTOM_TYPE_PICKLE:
             return pickle.loads(data)
