@@ -37,8 +37,7 @@ CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
-CUSTOM_TYPE_BATCHMETA = 5  # For BatchMeta serialization
-CUSTOM_TYPE_NUMPY = 6  # For numpy ndarray with buffer reference
+CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
@@ -79,8 +78,6 @@ class MsgpackEncoder:
 
     def encode(self, obj: Any) -> Sequence[bytestr]:
         """Encode a given object to a byte array."""
-        # Pre-process to convert BatchMeta to Ext; msgspec auto-serializes dataclasses and won't call enc_hook for them.
-        obj = self._preprocess_for_batchmeta(obj)
 
         bufs: list[bytestr] = [b""]
         token = _encoder_aux_buffers.set(bufs)
@@ -93,24 +90,6 @@ class MsgpackEncoder:
             return bufs
         finally:
             _encoder_aux_buffers.reset(token)
-
-    def _preprocess_for_batchmeta(self, obj: Any) -> Any:
-        """Recursively preprocess object to convert BatchMeta to Ext.
-
-        This is necessary because msgspec auto-serializes dataclasses and
-        won't call enc_hook for them.
-        """
-        from transfer_queue.metadata import BatchMeta
-
-        if isinstance(obj, BatchMeta):
-            return self._encode_batchmeta(obj)
-        elif isinstance(obj, dict):
-            return {k: self._preprocess_for_batchmeta(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [self._preprocess_for_batchmeta(item) for item in obj]
-        elif isinstance(obj, tuple):
-            return tuple(self._preprocess_for_batchmeta(item) for item in obj)
-        return obj
 
     def enc_hook(self, obj: Any) -> Any:
         """Custom encoding hook for types msgspec doesn't natively support.
@@ -147,15 +126,6 @@ class MsgpackEncoder:
 
         # Fallback to pickle for unknown types
         return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
-
-    def _encode_batchmeta(self, obj: Any) -> msgpack.Ext:
-        """Encode BatchMeta as a pickle-based Ext payload.
-
-        BatchMeta must be preprocessed before encode() because msgspec auto-serializes
-        dataclasses (bypassing enc_hook), and BatchMeta fields contain torch.dtype which
-        msgpack cannot handle natively.
-        """
-        return msgpack.Ext(CUSTOM_TYPE_BATCHMETA, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
     def _encode_tensordict(self, obj: Any) -> dict:
         """Convert TensorDict to a dict structure for recursive msgpack processing.
@@ -385,8 +355,6 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NESTED_TENSOR:
             nested_meta = pickle.loads(data)
             return self._decode_nested_tensor(nested_meta)
-        if code == CUSTOM_TYPE_BATCHMETA:
-            return pickle.loads(data)
         if code == CUSTOM_TYPE_NUMPY:
             meta = pickle.loads(data)
             return self._decode_numpy(meta)

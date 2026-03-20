@@ -233,31 +233,6 @@ class TestBatchMetaColumnar:
         result = BatchMeta.concat([batch1, batch2])
         assert torch.equal(result.extra_info["embedding"], t)
 
-    def test_setstate_readonly_production_status(self):
-        """__setstate__ must make read-only production_status writable.
-
-        When Ray deserializes a BatchMeta via Arrow zero-copy, numpy arrays
-        become read-only. Since pickle skips __init__/__post_init__, the
-        .copy() guard is bypassed. __setstate__ must fix this.
-        """
-        batch = self._make_batch()
-        # Simulate pickle round-trip with Arrow zero-copy (read-only array)
-        state = batch.__dict__.copy()
-        state["production_status"] = state["production_status"].copy()
-        state["production_status"].flags.writeable = False
-
-        restored = BatchMeta.__new__(BatchMeta)
-        restored.__setstate__(state)
-
-        # production_status must be writable after __setstate__
-        assert restored.production_status.flags.writeable
-        # Verify add_fields works without ValueError
-        from tensordict import TensorDict
-
-        td = TensorDict({"new_field": torch.randn(3, 4)}, batch_size=3)
-        restored.add_fields(td)  # Should not raise
-        assert restored.is_ready
-
     def test_shallow_copy_isolation_global_indexes(self):
         """Modifying the original global_indexes list does not affect BatchMeta."""
         original_indexes = [0, 1, 2]
