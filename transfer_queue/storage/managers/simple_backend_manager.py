@@ -209,23 +209,69 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     def _select_by_positions(field_data, positions: list[int]):
         """Slice a single field's data by non-contiguous batch positions.
 
-        Handles four data types:
-        - Nested tensors: unbind → select → return as list
-        - Regular tensors: select by single position → warp by list
-        - NonTensorStack: tolist → select → re-wrap
-        - list: direct index selection via itemgetter
-        - numpy arrays: fancy indexing
+        This method attempts to preserve zero-copy views whenever possible, while
+        falling back to memory-copied single tensors when indices are irregular.
+        This prevents severe network fragmentation (emitting too many ZMQ frames)
+        during serialization.
+
+        Supported data types:
+        - Nested tensors: unbind → select → return as a list of views (zero-copy).
+        - Regular tensors: Checks for constant-stride to return a single sliced view.
+          Falls back to `index_select` (memory copy) to ensure a single buffer.
+        - NonTensorStack: tolist → select → re-wrap.
+        - List: Direct index selection via `itemgetter`.
+        - Numpy arrays / Others: Advanced indexing (memory copy).
         """
+
+        n = len(positions)
+        if n == 0:
+            raise ValueError("No positions specified for selection.")
+
+        # --- Handle PyTorch Tensors ---
         if isinstance(field_data, torch.Tensor):
             if field_data.is_nested:
-                # for nested tensor, unbind and select will not lead to memory copy
+                # Nested tensors cannot be directly sliced into a single tensor view.
+                # Unbinding and selecting returns a list of individual views (zero-copy),
+                # which is acceptable for nested structures.
                 unbound = field_data.unbind()
                 getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
                 selected = getter(unbound)
                 return list(selected)
             else:
-                # for ordinary tensor, use simple view will also prevent memory copy
-                return [field_data[i] for i in positions]
+                # --- Smart Slicing for Regular Tensors ---
+                # Goal: Return a single underlying memory view (zero-copy) to avoid both
+                # memory allocation overhead and downstream ZMQ frame fragmentation.
+
+                # Case 1: Single element selection (returns a single-row view)
+                if n == 1:
+                    return field_data[positions[0] : positions[0] + 1]
+
+                # Case 2: Check if positions form a constant-stride sequence
+                step = positions[1] - positions[0]
+                is_constant_stride = True
+                for i in range(2, n):
+                    if positions[i] - positions[i - 1] != step:
+                        is_constant_stride = False
+                        break
+
+                # If perfectly regular (e.g., [0, 2, 4]), use Python slicing to get a view
+                if is_constant_stride and step > 0:
+                    return field_data[positions[0] : positions[-1] + 1 : step]
+
+                # Case 3: Fallback for irregular indices (Typically this will not happen!)
+                # We intentionally accept a memory copy here to assemble a single contiguous
+                # tensor. Returning a list of individual views for irregular indices would
+                # generate excessive multipart ZMQ frames, severely degrading network performance.
+                else:
+                    logger.debug(
+                        f"Irregular indices detected for tensor of shape {field_data.shape}. "
+                        "Falling back to index_select (memory copy will occur)."
+                    )
+                    # Note: Ensure idx_tensor is on the same device as field_data
+                    idx_tensor = torch.tensor(positions, device=field_data.device)
+                    return torch.index_select(field_data, dim=0, index=idx_tensor)
+
+        # --- Handle Non-Tensor Types ---
         elif isinstance(field_data, NonTensorStack):
             items = field_data.tolist()
             getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)

@@ -457,10 +457,7 @@ class TestSelectByPositions:
     def test_regular_tensor(self):
         t = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
         result = AsyncSimpleStorageManager._select_by_positions(t, [0, 2])
-        assert isinstance(result, list)
-        assert len(result) == 2
-        assert torch.equal(result[0], t[0])
-        assert torch.equal(result[1], t[2])
+        assert torch.equal(result, torch.tensor([[1.0, 2.0], [5.0, 6.0]]))
 
     def test_nested_tensor(self):
         t = torch.nested.as_nested_tensor(
