@@ -397,7 +397,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if all(isinstance(v, torch.Tensor) for v in values):
             if all(v.shape == values[0].shape for v in values):
                 return torch.stack(values)
-            return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            try:
+                return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            except RuntimeError as e:
+                logger.warning(
+                    f"Failed to pack nested tensor with jagged layout. "
+                    f"Try to fallback as strided layout. Detailed error: {e}"
+                )
+                return torch.nested.as_nested_tensor(values, layout=torch.strided)
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
