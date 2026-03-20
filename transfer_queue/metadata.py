@@ -301,6 +301,26 @@ class BatchMeta:
                     f"_custom_backend_meta length {len(self._custom_backend_meta)} != batch_size {batch_size}"
                 )
 
+    def __getstate__(self):
+        """Serialize for pickle/Ray.
+
+        Returns tuple of slot values to ensure proper reconstruction.
+        """
+        return tuple(getattr(self, slot) for slot in self.__slots__)
+
+    def __setstate__(self, state):
+        """Deserialize from pickle/Ray.
+
+        Ray Arrow zero-copy deserialization produces read-only numpy
+        arrays. This method ensures production_status is writable after
+        deserialization.
+        """
+        for slot, value in zip(self.__slots__, state, strict=False):
+            # Ray Arrow zero-copy produces read-only numpy arrays
+            if slot == "production_status" and isinstance(value, np.ndarray) and not value.flags.writeable:
+                value = value.copy()
+            setattr(self, slot, value)
+
     @property
     def size(self) -> int:
         """Return the number of samples in this batch"""
