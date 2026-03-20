@@ -209,15 +209,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     def _select_by_positions(field_data, positions: list[int]):
         """Slice a single field's data by non-contiguous batch positions.
 
-        This method attempts to preserve zero-copy views whenever possible, while
-        falling back to memory-copied single tensors when indices are irregular.
-        This prevents severe network fragmentation (emitting too many ZMQ frames)
-        during serialization.
-
-        Supported data types:
-        - Nested tensors: unbind → select → return as a list of views (zero-copy).
-        - Regular tensors: Checks for constant-stride to return a single sliced view.
-          Falls back to `index_select` (memory copy) to ensure a single buffer.
+        This method optimizes selection to minimize memory overhead and network fragmentation:
+        - Nested tensors: Unbinds into a list of views (end-to-end zero-copy).
+        - Regular tensors (step == 1): Returns a contiguous slice (end-to-end zero-copy).
+        - Regular tensors (step > 1): Returns a strided view (shares storage). Note that
+          downstream serialization will force a `.contiguous()` copy, but slicing is still
+          faster than `index_select` and the peak memory period is reduced.
+        - Regular tensors (irregular): Falls back to `index_select` to assemble a single
+          contiguous tensor, preventing excessive ZMQ multipart frames.
         - NonTensorStack: tolist → select → re-wrap.
         - List: Direct index selection via `itemgetter`.
         - Numpy arrays / Others: Advanced indexing (memory copy).
@@ -244,6 +243,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
                 # Case 1: Single element selection (returns a single-row view)
                 if n == 1:
+                    # Single element is natively contiguous
                     return field_data[positions[0] : positions[0] + 1]
 
                 # Case 2: Check if positions form a constant-stride sequence
@@ -256,6 +256,12 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
                 # If perfectly regular (e.g., [0, 2, 4]), use Python slicing to get a view
                 if is_constant_stride and step > 0:
+                    # Note:
+                    # A strided slice (step > 1) creates a non-contiguous view.
+                    # While it shares storage here, the downstream MsgpackEncoder will force
+                    # a .contiguous() copy before extracting the buffer. However, this pure
+                    # Python slicing is still more efficient than falling back to index_select,
+                    # and it reduces memory peak period.
                     return field_data[positions[0] : positions[-1] + 1 : step]
 
                 # Case 3: Fallback for irregular indices (Typically this will not happen!)
@@ -263,11 +269,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                 # tensor. Returning a list of individual views for irregular indices would
                 # generate excessive multipart ZMQ frames, severely degrading network performance.
                 else:
-                    logger.debug(
-                        f"Irregular indices detected for tensor of shape {field_data.shape}. "
-                        "Falling back to index_select (memory copy will occur)."
-                    )
-                    # Note: Ensure idx_tensor is on the same device as field_data
                     idx_tensor = torch.tensor(positions, device=field_data.device)
                     return torch.index_select(field_data, dim=0, index=idx_tensor)
 
