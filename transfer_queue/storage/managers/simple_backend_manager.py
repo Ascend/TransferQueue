@@ -211,9 +211,10 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         Handles four data types:
         - Nested tensors: unbind → select → return as list
+        - Regular tensors: select by single position → warp by list
         - NonTensorStack: tolist → select → re-wrap
         - list: direct index selection via itemgetter
-        - Regular tensors / numpy arrays: fancy indexing
+        - numpy arrays: fancy indexing
         """
         if isinstance(field_data, torch.Tensor):
             if field_data.is_nested:
