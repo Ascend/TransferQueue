@@ -30,7 +30,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[test,build,yuanrong]"
+        pip install -e .
     - name: Start Ray cluster
       run: |
         # Get the host IP
@@ -52,6 +52,7 @@ jobs:
           --field_num=4 \
           --seq_len=1024 \
           --head_node_ip=$HOST_IP
+          --output_csv=results.csv
     - name: Stop Ray cluster
       run: |
         ray stop
