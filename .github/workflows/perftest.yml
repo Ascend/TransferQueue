@@ -38,6 +38,7 @@ jobs:
         echo "Host IP: $HOST_IP"
         # Start Ray with node resource
         ray start --head --resources="{\"node:$HOST_IP\":1}"
+        ray status
     - name: Run SimpleStorage performance test
       run: |
         # Get the host IP

@@ -253,7 +253,7 @@ class TQThroughputTester:
 
         self.data_system_storage_units = {}
 
-        storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=0.001)
+        storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
         for storage_unit_rank in range(num_data_storage_units):
             storage_node = SimpleStorageUnit.options(
                 placement_group=storage_placement_group,
