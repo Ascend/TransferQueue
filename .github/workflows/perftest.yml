@@ -14,7 +14,7 @@ on:
 jobs:
   perftest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -51,7 +51,7 @@ jobs:
           --global_batch_size=128 \
           --field_num=4 \
           --seq_len=1024 \
-          --head_node_ip=$HOST_IP
+          --head_node_ip=$HOST_IP \
           --output_csv=results.csv
     - name: Stop Ray cluster
       run: |
