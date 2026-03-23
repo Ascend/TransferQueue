@@ -1,4 +1,0 @@
-# Mooncake backend configuration
-local_hostname: 127.0.0.1
-metadata_server: 127.0.0.1:8080
-master_server_address: 127.0.0.1:8081

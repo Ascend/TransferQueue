@@ -47,4 +47,10 @@ backend:
   RayStore:
 
   # For Yuanrong:
-  # TODO
+  Yuanrong:
+    # IP of local yuanrong datasystem worker
+    host: 127.0.0.1
+    # Port of local yuanrong datasystem worker
+    port: 31501
+    # If enable npu transport
+    enable_yr_npu_transport: false

@@ -17,7 +17,6 @@
 import argparse
 import csv
 import logging
-import math
 import sys
 import time
 from pathlib import Path
@@ -32,15 +31,9 @@ parent_dir = Path(__file__).resolve().parent.parent.parent
 sys.path.append(str(parent_dir))
 
 import transfer_queue as tq  # noqa: E402
-from transfer_queue.storage.simple_backend import SimpleStorageUnit  # noqa: E402
-from transfer_queue.utils.common import get_placement_group  # noqa: E402
-from transfer_queue.utils.zmq_utils import process_zmq_server_info  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
-
-# Constants
-NUM_TEST_ITERATIONS = 3
 
 
 def create_test_case(
@@ -93,19 +86,15 @@ def create_test_case(
 class TQClientActor:
     """Ray actor that uses tq.init(config) to initialize."""
 
-    def __init__(self, base_config: dict[str, Any]):
-        self.base_config = base_config
+    def __init__(self, config: dict[str, Any]):
+        self.config = config
         self.test_data = None
         self.total_data_size_gb = 0.0
         self.test_keys = None
 
-    def initialize(self, zmq_info: Any = None) -> None:
+    def initialize(self) -> None:
         """Initialize transfer_queue with the config."""
-        config = OmegaConf.create(self.base_config, flags={"allow_objects": True})
-        if zmq_info is not None and self.base_config["backend"]["storage_backend"] == "SimpleStorage":
-            # Use dict-style assignment to avoid OmegaConf validation
-            config["backend"]["SimpleStorage"]["zmq_info"] = zmq_info
-        tq.init(config)
+        tq.init(OmegaConf.create(self.config))
 
     def create_test_case(
         self,
@@ -137,19 +126,22 @@ class TQClientActor:
             keys = self.test_keys
         tq.kv_batch_get(keys=keys, partition_id=partition_id)
 
+    def close(self) -> None:
+        """Close transfer_queue."""
+        tq.close()
+
 
 class TQThroughputTester:
     """Main throughput tester for TransferQueue backends."""
 
     def __init__(
         self,
-        backend: str,
-        backend_config: dict[str, Any],
+        backend_config_path: str,
         device: str,
         global_batch_size: int,
         field_num: int,
         seq_len: int,
-        num_global_batch: int,
+        num_test_iterations: int,
         head_node_ip: str,
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
@@ -157,121 +149,71 @@ class TQThroughputTester:
         """Initialize the throughput tester.
 
         Args:
-            backend: Backend type ("SimpleStorage", "Yuanrong", "MooncakeStore")
-            backend_config: Backend configuration dictionary
+            backend_config_path: Path to backend config YAML file
             device: Device type ("cpu", "npu", "gpu")
             global_batch_size: Global batch size
             field_num: Number of fields
             seq_len: Sequence length
-            num_global_batch: Number of global batches
+            num_test_iterations: Number of test iterations
             head_node_ip: Head node IP address
-            worker_node_ip: Worker node IP address (required for Yuanrong inter_node)
+            worker_node_ip: Worker node IP address (required for Yuanrong)
             output_csv: Path to output CSV file (optional)
         """
-        self.backend = backend
-        self.backend_config = backend_config
+        self.backend_config_path = backend_config_path
         self.device = device
         self.global_batch_size = global_batch_size
         self.field_num = field_num
         self.seq_len = seq_len
-        self.num_global_batch = num_global_batch
+        self.num_test_iterations = num_test_iterations
         self.head_node_ip = head_node_ip
         self.worker_node_ip = worker_node_ip
         self.output_csv = output_csv
 
-        # Get client_placement from Yuanrong config, default to inter_node
-        self.client_placement = (
-            self.backend_config.get("client_placement", "inter_node") if self.backend == "Yuanrong" else "intra_node"
-        )
+        # Prepare full config for tq.init()
+        self.full_config = self._prepare_config()
+
+        # Get backend from config
+        self.backend = self.full_config["backend"]["storage_backend"]
+
+        # For Yuanrong, always use inter_node
+        self.use_inter_node = self.backend == "Yuanrong"
 
         # Validate arguments
         self._validate_args()
 
-        # Prepare full config for tq.init()
-        self.base_config, self.zmq_info = self._prepare_configs()
-
-        # Initialize the test infrastructure
-        self._initialize_data_system()
+        # Initialize clients
         self._initialize_clients()
 
     def _validate_args(self) -> None:
         """Validate input arguments."""
-        # Check worker_node_ip for Yuanrong inter_node
-        if self.backend == "Yuanrong" and self.client_placement == "inter_node" and self.worker_node_ip is None:
-            raise ValueError("worker_node_ip is required for Yuanrong with client_placement=inter_node")
+        # Check worker_node_ip for Yuanrong
+        if self.use_inter_node and self.worker_node_ip is None:
+            raise ValueError("worker_node_ip is required for Yuanrong backend")
 
-    def _prepare_configs(self) -> tuple[dict[str, Any], Any]:
-        """Prepare the base config and storage units.
+    def _prepare_config(self) -> dict[str, Any]:
+        """Prepare the config by directly reading the backend_config file.
 
         Returns:
-            Tuple of (base_config, zmq_info)
+            Configuration dictionary
         """
-        total_storage_size = self.global_batch_size * self.num_global_batch
+        # Directly read the backend_config file, no merging with default
+        config = OmegaConf.load(self.backend_config_path)
 
-        config = {
-            "controller": {
-                "sampler": "SequentialSampler",
-                "polling_mode": False,
-            },
-            "backend": {
-                "storage_backend": self.backend,
-            },
-        }
+        # If backend.storage_backend is SimpleStorage, override total_storage_size
+        total_storage_size = self.global_batch_size * self.num_test_iterations
+        if config.backend.storage_backend == "SimpleStorage":
+            config.backend.SimpleStorage.total_storage_size = total_storage_size
 
-        # Set client_name based on backend
-        if self.backend == "Yuanrong":
-            self.backend_config["client_name"] = "YuanrongStorageClient"
-        elif self.backend == "MooncakeStore":
-            self.backend_config["client_name"] = "MooncakeStoreClient"
-
-        # Add backend-specific config
-        if self.backend == "SimpleStorage":
-            config["backend"]["SimpleStorage"] = {
-                "total_storage_size": total_storage_size,
-                "num_data_storage_units": self.backend_config.get("num_data_storage_units", 1),
-            }
-        elif self.backend == "Yuanrong":
-            config["backend"]["Yuanrong"] = self.backend_config.copy()
-            # Remove client_placement from the backend config passed to tq
-            if "client_placement" in config["backend"]["Yuanrong"]:
-                del config["backend"]["Yuanrong"]["client_placement"]
-        elif self.backend == "MooncakeStore":
-            config["backend"]["MooncakeStore"] = self.backend_config.copy()
-
-        return config, None
-
-    def _initialize_data_system(self) -> None:
-        """Initialize controller and storage units if needed."""
-        # For SimpleStorage, we need to manually create storage units with placement
-        if self.backend == "SimpleStorage":
-            self._initialize_storage_units()
-
-    def _initialize_storage_units(self) -> None:
-        """Initialize SimpleStorageUnits for SimpleStorage backend."""
-        num_data_storage_units = self.backend_config.get("num_data_storage_units", 1)
-        total_storage_size = self.global_batch_size * self.num_global_batch
-
-        self.data_system_storage_units = {}
-
-        storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
-        for storage_unit_rank in range(num_data_storage_units):
-            storage_node = SimpleStorageUnit.options(
-                placement_group=storage_placement_group,
-                placement_group_bundle_index=storage_unit_rank,
-            ).remote(storage_unit_size=NUM_TEST_ITERATIONS * math.ceil(total_storage_size / num_data_storage_units))
-            self.data_system_storage_units[storage_unit_rank] = storage_node
-        logger.info(f"StorageUnit #0 ~ #{num_data_storage_units - 1} has been created.")
-
-        self.zmq_info = process_zmq_server_info(self.data_system_storage_units)
+        return OmegaConf.to_container(config, resolve=True)
 
     def _initialize_clients(self) -> None:
         """Initialize writer and reader TQClientActors."""
         # Determine node placement
-        if self.client_placement == "intra_node":
-            writer_node = reader_node = self.head_node_ip
-        else:
+        if self.use_inter_node:
             writer_node = self.head_node_ip
             reader_node = self.worker_node_ip
+        else:
+            writer_node = reader_node = self.head_node_ip
 
         logger.info(f"Writer is on {writer_node}, Reader is on {reader_node}")
 
@@ -294,14 +236,14 @@ class TQThroughputTester:
             reader_options["resources"]["NPU"] = 1
 
         # Create writer and reader actors
-        self.writer = TQClientActor.options(**writer_options).remote(self.base_config)
-        self.reader = TQClientActor.options(**reader_options).remote(self.base_config)
+        self.writer = TQClientActor.options(**writer_options).remote(self.full_config)
+        self.reader = TQClientActor.options(**reader_options).remote(self.full_config)
 
         # Initialize transfer_queue
         logger.info(f"Using {self.backend} as storage backend.")
 
-        w = self.writer.initialize.remote(self.zmq_info)
-        r = self.reader.initialize.remote(self.zmq_info)
+        w = self.writer.initialize.remote()
+        r = self.reader.initialize.remote()
         ray.get([w, r])
 
     def run_throughput_test(self) -> dict[str, Any]:
@@ -333,18 +275,12 @@ class TQThroughputTester:
         put_time = end_put - start_put
         put_gbit_per_sec = (total_data_size_gb * 8) / put_time
         put_gbyte_per_sec = total_data_size_gb / put_time
-        logger.info(f"put cost time: {put_time:.8f}s")
-        logger.info(f"PUT Throughput: {put_gbit_per_sec:.8f} Gb/s ({put_gbyte_per_sec:.8f} GB/s)")
 
         time.sleep(2)
 
         # LIST_KEYS operation using kv_list
         logger.info("Starting LIST_KEYS operation (kv_list)...")
-        start_list = time.perf_counter()
         keys = ray.get(self.reader.list_keys.remote(partition_id=partition_id))
-        end_list = time.perf_counter()
-        logger.info(f"list_keys cost time: {end_list - start_list:.8f}s")
-        logger.info(f"Found {len(keys)} keys")
 
         time.sleep(2)
 
@@ -357,9 +293,6 @@ class TQThroughputTester:
         get_gbit_per_sec = (total_data_size_gb * 8) / get_time
         get_gbyte_per_sec = total_data_size_gb / get_time
 
-        logger.info(f"get_data cost time: {get_time:.8f}s")
-        logger.info(f"GET Throughput: {get_gbit_per_sec:.8f} Gb/s ({get_gbyte_per_sec:.8f} GB/s)")
-
         # Print summary
         total_gbit_per_sec = (total_data_size_gb * 16) / (put_time + get_time)
         total_gbyte_per_sec = (total_data_size_gb * 2) / (put_time + get_time)
@@ -368,7 +301,6 @@ class TQThroughputTester:
         logger.info("THROUGHPUT TEST SUMMARY")
         logger.info("=" * 60)
         logger.info(f"Backend: {self.backend}")
-        logger.info(f"Client Placement: {self.client_placement}")
         logger.info(f"Device: {self.device}")
         logger.info(f"Total Data Size: {total_data_size_gb:.6f} GB")
         logger.info(f"PUT Time: {put_time:.8f}s")
@@ -378,55 +310,21 @@ class TQThroughputTester:
         logger.info(f"Total Throughput: {total_gbit_per_sec:.8f} Gb/s ({total_gbyte_per_sec:.8f} GB/s)")
         logger.info("=" * 60)
 
-        # Return results
+        # Return results (only Gb/s for CSV, not GB/s)
         return {
             "backend": self.backend,
-            "client_placement": self.client_placement,
             "device": self.device,
             "total_data_size_gb": total_data_size_gb,
             "put_time": put_time,
             "get_time": get_time,
             "put_gbit_per_sec": put_gbit_per_sec,
-            "put_gbyte_per_sec": put_gbyte_per_sec,
             "get_gbit_per_sec": get_gbit_per_sec,
-            "get_gbyte_per_sec": get_gbyte_per_sec,
             "total_gbit_per_sec": total_gbit_per_sec,
-            "total_gbyte_per_sec": total_gbyte_per_sec,
         }
 
-
-def load_backend_config(config_path: str | None, backend: str) -> dict[str, Any]:
-    """Load backend config from YAML file or use defaults.
-
-    Args:
-        config_path: Path to YAML config file (optional)
-        backend: Backend type for default config
-
-    Returns:
-        Backend configuration dictionary
-    """
-    if config_path is not None:
-        config = OmegaConf.load(config_path)
-        return OmegaConf.to_container(config, resolve=True)
-
-    # Default configs
-    if backend == "SimpleStorage":
-        return {"num_data_storage_units": 1}
-    elif backend == "Yuanrong":
-        return {
-            "host": "127.0.0.1",
-            "port": 31501,
-            "enable_yr_npu_transport": False,
-            "client_placement": "inter_node",
-        }
-    elif backend == "MooncakeStore":
-        return {
-            "local_hostname": "127.0.0.1",
-            "metadata_server": "127.0.0.1:8080",
-            "master_server_address": "127.0.0.1:8081",
-        }
-    else:
-        return {}
+    def close(self) -> None:
+        """Close the transfer_queue clients."""
+        ray.get([self.writer.close.remote(), self.reader.close.remote()])
 
 
 def write_results_to_csv(results: list[dict[str, Any]], output_path: str) -> None:
@@ -454,17 +352,10 @@ def main() -> None:
     """Main entry point for the perftest script."""
     parser = argparse.ArgumentParser(description="TransferQueue Throughput Test")
     parser.add_argument(
-        "--backend",
-        type=str,
-        default="SimpleStorage",
-        choices=["SimpleStorage", "Yuanrong", "MooncakeStore"],
-        help="Backend type to test (default: SimpleStorage)",
-    )
-    parser.add_argument(
         "--backend_config",
         type=str,
-        default=None,
-        help="Path to backend config YAML file (optional)",
+        required=True,
+        help="Path to backend config YAML file",
     )
     parser.add_argument(
         "--device",
@@ -492,10 +383,10 @@ def main() -> None:
         help="Sequence length (default: 8192)",
     )
     parser.add_argument(
-        "--num_global_batch",
+        "--num_test_iterations",
         type=int,
-        default=1,
-        help="Number of global batches (default: 1)",
+        default=3,
+        help="Number of test iterations (default: 3)",
     )
     parser.add_argument(
         "--head_node_ip",
@@ -507,7 +398,7 @@ def main() -> None:
         "--worker_node_ip",
         type=str,
         default=None,
-        help="Worker node IP address (required for Yuanrong inter_node)",
+        help="Worker node IP address (required for Yuanrong)",
     )
     parser.add_argument(
         "--ray_address",
@@ -524,22 +415,18 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Load backend config
-    backend_config = load_backend_config(args.backend_config, args.backend)
-
     # Initialize Ray
     logger.info(f"Connecting to Ray cluster at {args.ray_address}")
     ray.init(address=args.ray_address)
 
     # Create and run tester
     tester = TQThroughputTester(
-        backend=args.backend,
-        backend_config=backend_config,
+        backend_config_path=args.backend_config,
         device=args.device,
         global_batch_size=args.global_batch_size,
         field_num=args.field_num,
         seq_len=args.seq_len,
-        num_global_batch=args.num_global_batch,
+        num_test_iterations=args.num_test_iterations,
         head_node_ip=args.head_node_ip,
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
@@ -547,9 +434,9 @@ def main() -> None:
 
     # Run test multiple times for consistent results using a for loop
     all_results = []
-    for i in range(NUM_TEST_ITERATIONS):
+    for i in range(args.num_test_iterations):
         logger.info("-" * 60)
-        logger.info(f"Iteration {i + 1}/{NUM_TEST_ITERATIONS}")
+        logger.info(f"Iteration {i + 1}/{args.num_test_iterations}")
         logger.info("-" * 60)
         result = tester.run_throughput_test()
         all_results.append(result)
@@ -557,6 +444,9 @@ def main() -> None:
     # Write to CSV if output path is specified
     if args.output_csv:
         write_results_to_csv(all_results, args.output_csv)
+
+    # Close transfer_queue
+    tester.close()
 
     logger.info("Throughput test completed successfully!")
 

@@ -47,7 +47,7 @@ jobs:
         # Run the perftest with small batch size for quick test
         cd scripts/performance_test
         python perftest.py \
-          --backend=SimpleStorage \
+          --backend_config=../../transfer_queue/config.yaml \
           --device=cpu \
           --global_batch_size=128 \
           --field_num=4 \
