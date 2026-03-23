@@ -2,3 +2,4 @@
 host: 127.0.0.1
 port: 31501
 enable_yr_npu_transport: false
+client_placement: inter_node
