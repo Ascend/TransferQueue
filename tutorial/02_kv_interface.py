@@ -167,7 +167,7 @@ def demonstrate_kv_api():
     print("  Fetching only 'input_ids' to save bandwidth (ignoring 'attention_mask' and 'response').")
 
     all_keys = list(partition_info[partition_id].keys())
-    retrieved_input_ids = tq.kv_batch_get(keys=all_keys, partition_id=partition_id, fields="input_ids")
+    retrieved_input_ids = tq.kv_batch_get(keys=all_keys, partition_id=partition_id, select_fields="input_ids")
     print(f"  ✓ Successfully retrieved only {list(retrieved_input_ids.keys())} field for all samples.")
 
     # # Step 7: Retrieve all fields using kv_batch_get

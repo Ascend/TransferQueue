@@ -473,14 +473,14 @@ class TestKVGetE2E:
         tq.kv_put(key=key, partition_id=partition_id, fields=fields, tag=None)
 
         # Get only input_ids
-        retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id, fields="input_ids")
+        retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id, select_fields="input_ids")
         assert "input_ids" in retrieved.keys()
         assert "attention_mask" not in retrieved.keys()
         assert "response" not in retrieved.keys()
         assert_tensor_equal(retrieved["input_ids"], input_ids)
 
         # Get multiple specific fields
-        retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id, fields=["input_ids", "response"])
+        retrieved = tq.kv_batch_get(keys=key, partition_id=partition_id, select_fields=["input_ids", "response"])
         assert "input_ids" in retrieved.keys()
         assert "response" in retrieved.keys()
         assert "attention_mask" not in retrieved.keys()
