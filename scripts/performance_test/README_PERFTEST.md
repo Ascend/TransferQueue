@@ -32,16 +32,15 @@ python perftest.py \
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--backend_config` | Path to backend config YAML file (required) | - |
-| `--device` | Device: cpu, npu, gpu | cpu |
-| `--global_batch_size` | Global batch size | 1024 |
-| `--field_num` | Number of fields | 10 |
-| `--seq_len` | Sequence length | 8192 |
-| `--num_test_iterations` | Number of test iterations | 3 |
-| `--head_node_ip` | Head node IP (required) | - |
-| `--worker_node_ip` | Worker node IP (required for Yuanrong) | None |
-| `--ray_address` | Ray cluster address | auto |
-| `--output_csv` | Path to output CSV file (optional) | None |
+| `--backend_config` | Path to backend config YAML file (required) | -       |
+| `--device` | Device: cpu, npu, gpu | cpu     |
+| `--global_batch_size` | Global batch size | 1024    |
+| `--field_num` | Number of fields | 10      |
+| `--seq_len` | Sequence length | 8192    |
+| `--num_test_iterations` | Number of test iterations | 4       |
+| `--head_node_ip` | Head node IP (required) | -       |
+| `--worker_node_ip` | Worker node IP (required for Yuanrong) | None    |
+| `--output_csv` | Path to output CSV file (optional) | None    |
 
 ## Backend Configuration
 
@@ -60,25 +59,25 @@ For Yuanrong backend, writer runs on head node and reader runs on worker node.
 
 ### SimpleStorage/Mooncake backend
 ```bash
-python perftest.py --backend_config=../../transfer_queue/config.yaml \
+python perftest.py --backend_config=perftest_config.yaml \
   --head_node_ip=192.168.0.1
 ```
 
 ### Yuanrong backend
 ```bash
-python perftest.py --backend_config=../../transfer_queue/config.yaml \
+python perftest.py --backend_config=perftest_config.yaml \
   --head_node_ip=192.168.0.1 --worker_node_ip=192.168.0.2
 ```
 
 ### NPU device test
 ```bash
-python perftest.py --backend_config=../../transfer_queue/config.yaml --device=npu \
+python perftest.py --backend_config=perftest_config.yaml --device=npu \
   --head_node_ip=192.168.0.1 --worker_node_ip=192.168.0.2
 ```
 
 ### Output to CSV
 ```bash
-python perftest.py --backend_config=../../transfer_queue/config.yaml \
+python perftest.py --backend_config=perftest_config.yaml \
   --head_node_ip=192.168.0.1 --output_csv=results.csv
 ```
 
@@ -104,4 +103,4 @@ When using `--output_csv`, the test writes results to a CSV file with the follow
 - get_gbit_per_sec
 - total_gbit_per_sec
 
-The test runs `--num_test_iterations` iterations (default: 3) and saves all results to the CSV.
+The test runs `--num_test_iterations` iterations (default: 4) and saves all results to the CSV.

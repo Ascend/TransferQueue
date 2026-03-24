@@ -120,6 +120,11 @@ yuanrong = [
 mooncake = [
     "mooncake-transfer-engine"
 ]
+perftest = [
+    "matplotlib",
+    "seaborn",
+    "pandas"
+]
 
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]
