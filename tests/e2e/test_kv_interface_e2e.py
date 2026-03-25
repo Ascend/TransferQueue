@@ -619,7 +619,7 @@ class TestKVGetE2E:
             retrieved = tq_api.kv_batch_get(keys="nonexistent_key", partition_id=partition_id)
             # If it returns, it should be empty
             assert retrieved.batch_size[0] == 0
-        except RuntimeError as e:
+        except ValueError as e:
             # Or it might raise an error about keys not found
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 

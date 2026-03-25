@@ -879,8 +879,8 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
