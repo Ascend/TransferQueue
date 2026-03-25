@@ -45,6 +45,8 @@ for backend in "${BACKENDS[@]}"; do
             --num_test_iterations="${NUM_TEST_ITERATIONS}" \
             --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
             --output_csv="${output_csv}"
+
+        sleep 10
     done
 done
 

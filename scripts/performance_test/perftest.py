@@ -199,6 +199,12 @@ class TQClientActor:
             keys = self.test_keys
         tq.kv_batch_get(keys=keys, partition_id=partition_id)
 
+    def delete(self, partition_id: str, keys: list[str] | None = None) -> None:
+        """Delete data from storage using kv_batch_delete."""
+        if keys is None:
+            keys = self.test_keys
+        tq.kv_batch_delete(keys=keys, partition_id=partition_id)
+
     def close(self) -> None:
         """Close transfer_queue."""
         tq.close()
@@ -358,6 +364,7 @@ class TQThroughputTester:
                 device=self.device,
             )
         )
+        logger.info(f"Total Data Size: {total_data_size_gb:.6f} GB")
         end_create_data = time.perf_counter()
         logger.info(f"Data creation time: {end_create_data - start_create_data:.8f}s")
 
@@ -388,6 +395,16 @@ class TQThroughputTester:
         get_time = end_get_data - start_get_data
         get_gbit_per_sec = (total_data_size_gb * 8) / get_time
         get_gbyte_per_sec = total_data_size_gb / get_time
+
+        time.sleep(2)
+
+        # DELETE operation using kv_batch_delete
+        logger.info("Starting DELETE operation (kv_batch_delete)...")
+        start_delete = time.perf_counter()
+        ray.get(self.writer.delete.remote(partition_id=partition_id, keys=keys))
+        end_delete = time.perf_counter()
+        delete_time = end_delete - start_delete
+        logger.info(f"DELETE Time: {delete_time:.8f}s")
 
         # Print summary
         total_gbit_per_sec = (total_data_size_gb * 16) / (put_time + get_time)
