@@ -19,6 +19,7 @@ from .client import TransferQueueClient
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
     async_kv_batch_get,
+    async_kv_batch_get_by_meta,
     async_kv_batch_put,
     async_kv_clear,
     async_kv_list,
@@ -27,6 +28,7 @@ from .interface import (
     get_client,
     init,
     kv_batch_get,
+    kv_batch_get_by_meta,
     kv_batch_put,
     kv_clear,
     kv_list,
