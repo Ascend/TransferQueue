@@ -433,17 +433,25 @@ class TestKVGetE2E:
         partial_keys = ["get_multi_3", "get_multi_5"]
         input_data = torch.tensor([[1, 2], [3, 4], [5, 6]])
         nested_data = torch.nested.nested_tensor([[10, 11, 12], [20], [30, 31]])
+        three_d_nested_data = torch.nested.nested_tensor(
+            [[[10, 11], [12, 13]], [[20, 21], [22, 23]], [[30, 31], [32, 33]]]
+        )
+        expected_three_d_nested_data = [torch.tensor([[10, 11], [12, 13]]), torch.tensor([[30, 31], [32, 33]])]
         expected_data = torch.tensor([[1, 2], [5, 6]])
         expected_nested_data = [torch.tensor([10, 11, 12]), torch.tensor([30, 31])]
 
-        fields = TensorDict({"data": input_data, "nested_data": nested_data}, batch_size=3)
+        fields = TensorDict(
+            {"data": input_data, "nested_data": nested_data, "three_d_nested_data": three_d_nested_data}, batch_size=3
+        )
         tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}, {}])
 
         retrieved = tq.kv_batch_get(keys=partial_keys, partition_id=partition_id)
         assert_tensor_equal(retrieved["data"], expected_data)
 
-        print(retrieved["nested_data"])
         for actual, expected in zip(retrieved["nested_data"], expected_nested_data, strict=True):
+            assert_tensor_equal(actual, expected)
+
+        for actual, expected in zip(retrieved["three_d_nested_data"], expected_three_d_nested_data, strict=True):
             assert_tensor_equal(actual, expected)
 
         tq.kv_clear(keys=keys, partition_id=partition_id)
