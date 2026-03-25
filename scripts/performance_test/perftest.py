@@ -200,10 +200,10 @@ class TQClientActor:
         tq.kv_batch_get(keys=keys, partition_id=partition_id)
 
     def delete(self, partition_id: str, keys: list[str] | None = None) -> None:
-        """Delete data from storage using kv_batch_delete."""
+        """Delete data from storage using kv_clear."""
         if keys is None:
             keys = self.test_keys
-        tq.kv_batch_delete(keys=keys, partition_id=partition_id)
+        tq.kv_clear(keys=keys, partition_id=partition_id)
 
     def close(self) -> None:
         """Close transfer_queue."""
@@ -398,8 +398,8 @@ class TQThroughputTester:
 
         time.sleep(2)
 
-        # DELETE operation using kv_batch_delete
-        logger.info("Starting DELETE operation (kv_batch_delete)...")
+        # DELETE operation using kv_clear
+        logger.info("Starting DELETE operation (kv_clear)...")
         start_delete = time.perf_counter()
         ray.get(self.writer.delete.remote(partition_id=partition_id, keys=keys))
         end_delete = time.perf_counter()
