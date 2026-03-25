@@ -428,7 +428,7 @@ def kv_put(
                     batch[field_name] = NonTensorStack(value)
             fields = TensorDict(batch, batch_size=[1])
         elif not isinstance(fields, TensorDict):
-            raise ValueError("field can only be dict or TensorDict")
+            raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta)
@@ -783,7 +783,7 @@ async def async_kv_put(
                     batch[field_name] = NonTensorStack(value)
             fields = TensorDict(batch, batch_size=[1])
         elif not isinstance(fields, TensorDict):
-            raise ValueError("field can only be dict or TensorDict")
+            raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = await tq_client.async_put(fields, batch_meta)
