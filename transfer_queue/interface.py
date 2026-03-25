@@ -430,14 +430,13 @@ def kv_put(
         elif not isinstance(fields, TensorDict):
             raise ValueError("field can only be dict or TensorDict")
 
-        # custom_meta (tag) will be put to controller through the internal put process
-        # After put, batch_meta.field_names() will include the new fields written by user
+        # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names
     else:
-        # directly update custom_meta (tag) to controller
+        # Directly update custom_meta (tag) to controller
         tq_client.set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
+
+    fields_to_return = batch_meta.field_names
 
     return KVBatchMeta(
         keys=[key],
@@ -514,13 +513,13 @@ def kv_batch_put(
 
     # 3. put data
     if fields is not None:
-        # After put, batch_meta.field_names() will include the new fields written by user
+        # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names
     else:
-        # directly update custom_meta (tags) to controller
+        # Directly update custom_meta (tags) to controller
         tq_client.set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
+
+    fields_to_return = batch_meta.field_names
 
     return KVBatchMeta(
         keys=keys,
@@ -561,6 +560,8 @@ def kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
         >>> # Then retrieve it using the returned metadata
         >>> data = tq.kv_batch_get_by_meta(meta)
     """
+    if meta.partition_id is None:
+        raise ValueError("Must provide partition_id in the input KVBatchMeta.")
     return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=meta.fields)
 
 
@@ -763,14 +764,13 @@ async def async_kv_put(
         elif not isinstance(fields, TensorDict):
             raise ValueError("field can only be dict or TensorDict")
 
-        # custom_meta (tag) will be put to controller through the put process
-        # After put, batch_meta.field_names() will include the new fields written by user
-        await tq_client.async_put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names
+        # After put, batch_meta.field_names will include the new fields written by user
+        batch_meta = await tq_client.async_put(fields, batch_meta)
     else:
-        # directly update custom_meta (tag) to controller
+        # Directly update custom_meta (tag) to controller
         await tq_client.async_set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
+
+    fields_to_return = batch_meta.field_names
 
     return KVBatchMeta(
         keys=[key],
@@ -846,13 +846,13 @@ async def async_kv_batch_put(
 
     # 3. put data
     if fields is not None:
-        # After put, batch_meta.field_names() will include the new fields written by user
+        # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = await tq_client.async_put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names
     else:
-        # directly update custom_meta (tags) to controller
+        # Directly update custom_meta (tags) to controller
         await tq_client.async_set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
+
+    fields_to_return = batch_meta.field_names
 
     return KVBatchMeta(
         keys=keys,
@@ -893,6 +893,8 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
         >>> # Then retrieve it using the returned metadata
         >>> data = await tq.async_kv_batch_get_by_meta(meta)
     """
+    if meta.partition_id is None:
+        raise ValueError("Must provide partition_id in the input KVBatchMeta.")
     return await async_kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=meta.fields)
 
 

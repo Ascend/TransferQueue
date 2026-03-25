@@ -624,6 +624,58 @@ class TestKVGetE2E:
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 
 
+class TestKVBatchGetByMetaE2E:
+    """End-to-end tests for kv_batch_get_by_meta functionality."""
+
+    def test_kv_batch_get_by_meta_from_kv_batch_put(self, controller, tq_api):
+        """Test kv_batch_get_by_meta using KVBatchMeta returned from kv_batch_put."""
+        partition_id = "test_partition"
+        keys = ["meta_batch_0", "meta_batch_1", "meta_batch_2"]
+        expected_input_ids = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        expected_attention_mask = torch.ones_like(expected_input_ids)
+
+        fields = TensorDict(
+            {
+                "input_ids": expected_input_ids,
+                "attention_mask": expected_attention_mask,
+            },
+            batch_size=3,
+        )
+        tags = [{"idx": i} for i in range(3)]
+
+        # Batch put and get KVBatchMeta
+        meta = tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+
+        # Retrieve using kv_batch_get_by_meta
+        retrieved = tq_api.kv_batch_get_by_meta(meta)
+        assert_tensor_equal(retrieved["input_ids"], expected_input_ids)
+        assert_tensor_equal(retrieved["attention_mask"], expected_attention_mask)
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+    def test_kv_batch_get_by_meta_multiple_puts(self, controller, tq_api):
+        """Test kv_batch_get_by_meta with data from multiple sequential puts."""
+        partition_id = "test_partition"
+        keys = ["meta_multi_0", "meta_multi_1"]
+
+        # First put
+        first_data = TensorDict({"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]])}, batch_size=2)
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=first_data, tags=[{}, {}])
+
+        # Second put adds more fields
+        second_data = TensorDict({"attention_mask": torch.tensor([[1, 1, 1], [1, 1, 1]])}, batch_size=2)
+        second_meta = tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=second_data, tags=[{}, {}])
+
+        # Use second meta (contains both fields)
+        retrieved = tq_api.kv_batch_get_by_meta(second_meta)
+        assert "input_ids" in retrieved.keys()
+        assert "attention_mask" in retrieved.keys()
+        assert_tensor_equal(retrieved["input_ids"], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+        assert_tensor_equal(retrieved["attention_mask"], torch.tensor([[1, 1, 1], [1, 1, 1]]))
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+
 class TestKVListE2E:
     """End-to-end tests for kv_list functionality."""
 
