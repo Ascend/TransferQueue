@@ -570,11 +570,12 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | 
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
     if select_fields is not None:
         if isinstance(select_fields, str):
-            fields_to_fetch = [select_fields]
+            fields_to_fetch: Optional[list[str]] = [select_fields]
         else:
             fields_to_fetch = select_fields
 
-        if any(f not in meta.fields for f in fields_to_fetch):
+        assert fields_to_fetch is not None
+        if meta.fields is None or any(f not in meta.fields for f in fields_to_fetch):
             raise ValueError(
                 f"Some fields assigned in select_fields not found in the metadata. "
                 f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
@@ -622,6 +623,7 @@ def kv_batch_get(
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
 
+    fields_to_fetch: list[str] | None
     if select_fields is not None:
         if isinstance(select_fields, str):
             fields_to_fetch = [select_fields]
@@ -920,13 +922,16 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[
     """
     if meta.partition_id is None:
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
+
+    fields_to_fetch: list[str] | None
     if select_fields is not None:
         if isinstance(select_fields, str):
             fields_to_fetch = [select_fields]
         else:
             fields_to_fetch = select_fields
 
-        if any(f not in meta.fields for f in fields_to_fetch):
+        assert fields_to_fetch is not None
+        if meta.fields is None or any(f not in meta.fields for f in fields_to_fetch):
             raise ValueError(
                 f"Some fields assigned in select_fields not found in the metadata. "
                 f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
