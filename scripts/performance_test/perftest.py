@@ -307,9 +307,24 @@ class TQThroughputTester:
             writer_options["resources"]["NPU"] = 1
             reader_options["resources"]["NPU"] = 1
 
+        # Prepare configs for writer and reader
+        # For Yuanrong backend, set different hosts for writer and reader
+        if self.backend == "Yuanrong":
+            import copy
+
+            writer_config = copy.deepcopy(self.full_config)
+            reader_config = copy.deepcopy(self.full_config)
+            writer_config["backend"]["Yuanrong"]["host"] = self.head_node_ip
+            reader_config["backend"]["Yuanrong"]["host"] = self.worker_node_ip
+            logger.info(f"Writer Yuanrong host: {self.head_node_ip}")
+            logger.info(f"Reader Yuanrong host: {self.worker_node_ip}")
+        else:
+            writer_config = self.full_config
+            reader_config = self.full_config
+
         # Create writer and reader actors
-        self.writer = TQClientActor.options(**writer_options).remote(self.full_config)
-        self.reader = TQClientActor.options(**reader_options).remote(self.full_config)
+        self.writer = TQClientActor.options(**writer_options).remote(writer_config)
+        self.reader = TQClientActor.options(**reader_options).remote(reader_config)
 
         # Initialize transfer_queue
         logger.info(f"Using {self.backend} as storage backend.")
