@@ -506,7 +506,7 @@ def kv_batch_put(
         )
 
     # 2. register the user-specified tags to BatchMeta
-    if tags:
+    if tags is not None:
         if len(tags) != len(keys):
             raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         batch_meta.update_custom_meta(tags)
@@ -545,18 +545,19 @@ def kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
         >>> tq.init()
         >>> # First put some data
-        >>> meta = tq.kv_batch_put(
-        ...     keys=["sample_1", "sample_2"],
-        ...     partition_id="train",
-        ...     fields={"input_ids": torch.randn(2, 10)},
-        ... )
+        >>> keys = ["sample_1", "sample_2", "sample_3"]
+        >>> fields = TensorDict({
+        ...     "input_ids": torch.randn(3, 10),
+        ...     "attention_mask": torch.ones(3, 10),
+        ... }, batch_size=3)
+        >>> meta = tq.kv_batch_put(keys=keys, partition_id="train", fields=fields)
         >>> # Then retrieve it using the returned metadata
         >>> data = tq.kv_batch_get_by_meta(meta)
     """
@@ -581,8 +582,8 @@ def kv_batch_get(
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
@@ -601,7 +602,7 @@ def kv_batch_get(
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size == 0:
-        raise RuntimeError("keys or partition were not found!")
+        raise ValueError("keys or partition were not found!")
 
     if select_fields is not None:
         if isinstance(select_fields, str):
@@ -611,7 +612,7 @@ def kv_batch_get(
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
-        raise RuntimeError("Some fields are not ready in all the requested keys!")
+        raise ValueError("Some fields are not ready in all the requested keys!")
 
     data = tq_client.get_data(batch_meta)
     return data
@@ -745,7 +746,7 @@ async def async_kv_put(
         raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match with input `key` size of 1!")
 
     # 2. register the user-specified tag to BatchMeta
-    if tag:
+    if tag is not None:
         batch_meta.update_custom_meta([tag])
 
     # 3. put data
@@ -885,11 +886,12 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
         >>> import transfer_queue as tq
         >>> tq.init()
         >>> # First put some data
-        >>> meta = await tq.async_kv_batch_put(
-        ...     keys=["sample_1", "sample_2"],
-        ...     partition_id="train",
-        ...     fields={"input_ids": torch.randn(2, 10)},
-        ... )
+        >>> keys = ["sample_1", "sample_2", "sample_3"]
+        >>> fields = TensorDict({
+        ...     "input_ids": torch.randn(3, 10),
+        ...     "attention_mask": torch.ones(3, 10),
+        ... }, batch_size=3)
+        >>> meta = await tq.async_kv_batch_put(keys=keys, partition_id="train", fields=fields)
         >>> # Then retrieve it using the returned metadata
         >>> data = await tq.async_kv_batch_get_by_meta(meta)
     """
@@ -914,8 +916,8 @@ async def async_kv_batch_get(
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
@@ -934,7 +936,7 @@ async def async_kv_batch_get(
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size == 0:
-        raise RuntimeError("keys or partition were not found!")
+        raise ValueError("keys or partition were not found!")
 
     if select_fields is not None:
         if isinstance(select_fields, str):
@@ -944,7 +946,7 @@ async def async_kv_batch_get(
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
-        raise RuntimeError("Some fields are not ready in all the requested keys!")
+        raise ValueError("Some fields are not ready in all the requested keys!")
 
     data = await tq_client.async_get_data(batch_meta)
     return data
