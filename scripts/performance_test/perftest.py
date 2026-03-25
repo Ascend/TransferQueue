@@ -204,6 +204,7 @@ class TQClientActor:
         if keys is None:
             keys = self.test_keys
         tq.kv_clear(keys=keys, partition_id=partition_id)
+        self.test_data = None
 
     def close(self) -> None:
         """Close transfer_queue."""
@@ -550,6 +551,7 @@ def main() -> None:
         logger.info("-" * 60)
         result = tester.run_throughput_test()
         all_results.append(result)
+        time.sleep(10)
 
     # Write to CSV if output path is specified
     if args.output_csv:
