@@ -627,6 +627,82 @@ class TestKVGetE2E:
 class TestKVBatchGetByMetaE2E:
     """End-to-end tests for kv_batch_get_by_meta functionality."""
 
+    def test_kv_batch_get_by_meta_select_fields_override(self, controller, tq_api):
+        """Test kv_batch_get_by_meta with select_fields to override meta.fields."""
+        partition_id = "test_partition"
+        keys = ["meta_override_0", "meta_override_1", "meta_override_2"]
+        expected_input_ids = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        expected_attention_mask = torch.ones_like(expected_input_ids)
+        expected_response = torch.tensor([[10, 20], [30, 40], [50, 60]])
+
+        fields = TensorDict(
+            {
+                "input_ids": expected_input_ids,
+                "attention_mask": expected_attention_mask,
+                "response": expected_response,
+            },
+            batch_size=3,
+        )
+        tags = [{"idx": i} for i in range(3)]
+
+        # Batch put all fields
+        meta = tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
+
+        # Verify meta.fields contains all fields
+        assert "input_ids" in meta.fields
+        assert "attention_mask" in meta.fields
+        assert "response" in meta.fields
+        assert len(meta.fields) == 3
+
+        # Retrieve using kv_batch_get_by_meta with select_fields override - only input_ids
+        retrieved = tq_api.kv_batch_get_by_meta(meta, select_fields="input_ids")
+        assert "input_ids" in retrieved.keys()
+        assert "attention_mask" not in retrieved.keys()
+        assert "response" not in retrieved.keys()
+        assert_tensor_equal(retrieved["input_ids"], expected_input_ids)
+
+        # Retrieve using kv_batch_get_by_meta with select_fields override - subset of fields
+        retrieved = tq_api.kv_batch_get_by_meta(meta, select_fields=["attention_mask", "response"])
+        assert "input_ids" not in retrieved.keys()
+        assert "attention_mask" in retrieved.keys()
+        assert "response" in retrieved.keys()
+        assert_tensor_equal(retrieved["attention_mask"], expected_attention_mask)
+        assert_tensor_equal(retrieved["response"], expected_response)
+
+        # Retrieve without select_fields - should get all fields from meta
+        retrieved = tq_api.kv_batch_get_by_meta(meta)
+        assert "input_ids" in retrieved.keys()
+        assert "attention_mask" in retrieved.keys()
+        assert "response" in retrieved.keys()
+        assert_tensor_equal(retrieved["input_ids"], expected_input_ids)
+        assert_tensor_equal(retrieved["attention_mask"], expected_attention_mask)
+        assert_tensor_equal(retrieved["response"], expected_response)
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+    def test_kv_batch_get_by_meta_select_fields_invalid(self, controller, tq_api):
+        """Test kv_batch_get_by_meta raises error when select_fields contains invalid field."""
+        partition_id = "test_partition"
+        keys = ["meta_invalid_0", "meta_invalid_1"]
+        fields = TensorDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            },
+            batch_size=2,
+        )
+
+        meta = tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}])
+
+        # Try to retrieve with a field that doesn't exist in meta
+        with pytest.raises(ValueError, match=r"select_fields.*not found"):
+            tq_api.kv_batch_get_by_meta(meta, select_fields="nonexistent_field")
+
+        # Try to retrieve with mix of valid and invalid fields
+        with pytest.raises(ValueError, match=r"select_fields.*not found"):
+            tq_api.kv_batch_get_by_meta(meta, select_fields=["input_ids", "invalid_field"])
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
     def test_kv_batch_get_by_meta_from_kv_batch_put(self, controller, tq_api):
         """Test kv_batch_get_by_meta using KVBatchMeta returned from kv_batch_put."""
         partition_id = "test_partition"

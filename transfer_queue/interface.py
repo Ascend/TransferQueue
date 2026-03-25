@@ -530,16 +530,20 @@ def kv_batch_put(
     )
 
 
-def kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
+def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
     """Get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
-    from a previous put operation. It extracts the keys, partition_id, and fields
-    from the metadata to fetch the corresponding data.
+    from a previous put operation. It extracts the keys and partition_id from
+    the metadata to fetch the corresponding data.
 
     Args:
         meta: KVBatchMeta object returned from a previous put operation (e.g., kv_put,
               kv_batch_put). It contains keys, partition_id, and fields information.
+        select_fields: Optional field(s) to retrieve, which overrides the fields
+                       recorded in the given KVBatchMeta. If None, uses all fields
+                       from meta.fields. Can be a single field name (str) or a list
+                       of field names.
 
     Returns:
         TensorDict with the requested data
@@ -547,6 +551,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
     Example:
         >>> import transfer_queue as tq
@@ -563,7 +568,20 @@ def kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
     """
     if meta.partition_id is None:
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
-    return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=meta.fields)
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+
+        if any(f not in meta.fields for f in fields_to_fetch):
+            raise ValueError(
+                f"Some fields assigned in select_fields not found in the metadata. "
+                f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
+            )
+    else:
+        fields_to_fetch = meta.fields
+    return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
 
 
 def kv_batch_get(
@@ -864,16 +882,20 @@ async def async_kv_batch_put(
     )
 
 
-async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
+async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
     """Asynchronously get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
-    from a previous put operation. It extracts the keys, partition_id, and fields
-    from the metadata to fetch the corresponding data.
+    from a previous put operation. It extracts the keys and partition_id from
+    the metadata to fetch the corresponding data.
 
     Args:
         meta: KVBatchMeta object returned from a previous put operation (e.g., async_kv_put,
               async_kv_batch_put). It contains keys, partition_id, and fields information.
+        select_fields: Optional field(s) to retrieve, which overrides the fields
+                       recorded in the given KVBatchMeta. If None, uses all fields
+                       from meta.fields. Can be a single field name (str) or a list
+                       of field names.
 
     Returns:
         TensorDict with the requested data
@@ -881,6 +903,7 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
     Example:
         >>> import transfer_queue as tq
@@ -897,7 +920,20 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta) -> TensorDict:
     """
     if meta.partition_id is None:
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
-    return await async_kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=meta.fields)
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+
+        if any(f not in meta.fields for f in fields_to_fetch):
+            raise ValueError(
+                f"Some fields assigned in select_fields not found in the metadata. "
+                f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
+            )
+    else:
+        fields_to_fetch = meta.fields
+    return await async_kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
 
 
 async def async_kv_batch_get(
