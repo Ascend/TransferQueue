@@ -39,21 +39,12 @@ for backend in "${BACKENDS[@]}"; do
 
         echo "  Setting: ${name} (batch=${batch_size}, fields=${field_num}, seq=${seq_len})"
 
-        if [[ "$backend" == "Yuanrong" ]]; then
-            python "${PERFTEST_PY}" --backend_config="${CONFIG_YAML}" --backend="${backend}" \
-                --device="${DEVICE}" \
-                --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
-                --num_test_iterations="${NUM_TEST_ITERATIONS}" \
-                --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
-                --output_csv="${output_csv}"
-        else
-            python "${PERFTEST_PY}" --backend_config="${CONFIG_YAML}" --backend="${backend}" \
-                --device="${DEVICE}" \
-                --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
-                --num_test_iterations="${NUM_TEST_ITERATIONS}" \
-                --head_node_ip="${HEAD_NODE_IP}" \
-                --output_csv="${output_csv}"
-        fi
+        python "${PERFTEST_PY}" --backend_config="${CONFIG_YAML}" --backend="${backend}" \
+            --device="${DEVICE}" \
+            --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
+            --num_test_iterations="${NUM_TEST_ITERATIONS}" \
+            --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
+            --output_csv="${output_csv}"
     done
 done
 
