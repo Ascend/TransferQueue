@@ -46,15 +46,16 @@ def create_test_case(
 
     Creates TensorDict with:
     - Regular tensors: (batch_size, seq_length) shape, each element is float32
-    - Nested Tensors: variable-length sequences, each batch element has length
-      uniformly sampled from [1, seq_length]
+    - Nested Tensors (non-NPU): variable-length sequences with lengths forming an
+      arithmetic progression from 1 to seq_length (average length ≈ seq_length/2)
+    - Nested Tensors (NPU): regular tensors of shape (batch_size, seq_length//2)
     - NonTensorStack wrapped strings: each string size ~= seq_length * 4 bytes
       (to match memory footprint of one tensor element)
 
     Args:
         batch_size: Batch size for the test case
         seq_length: Maximum sequence length (used for regular tensors and
-            as upper bound for nested tensor sampling)
+            as upper bound for nested tensor lengths)
         field_num: Total number of fields to create (distributed across types)
         device: Device to create tensors on ("cpu", "npu", or "gpu")
 
@@ -72,10 +73,15 @@ def create_test_case(
     regular_field_size_bytes = batch_size * seq_length * bytes_per_element
     regular_field_size_gb = regular_field_size_bytes / (1024**3)
 
-    # Nested tensor field: average length = (1 + seq_length) / 2,
+    # Nested tensor field: average length = (1 + seq_length) / 2 (arithmetic progression),
     # so avg size = batch_size * (1 + seq_length) / 2 * 4 bytes
-    avg_nested_length = (1 + seq_length) / 2
-    nested_field_size_bytes = int(batch_size * avg_nested_length * bytes_per_element)
+    # For NPU, nested fields become regular tensors of seq_length // 2
+    if device == "npu":
+        avg_nested_length = seq_length // 2
+        nested_field_size_bytes = int(batch_size * avg_nested_length * bytes_per_element)
+    else:
+        avg_nested_length = (1 + seq_length) / 2
+        nested_field_size_bytes = int(batch_size * avg_nested_length * bytes_per_element)
     nested_field_size_gb = nested_field_size_bytes / (1024**3)
 
     # NonTensorStack string field: each string ~= seq_length * 4 bytes to match one tensor element
@@ -101,11 +107,8 @@ def create_test_case(
         torch_device = "cuda:0"
 
     # Set seeds for reproducibility (within this process)
-    # Sample lengths for all nested fields at once
-    nested_lengths = [
-        torch.randint(1, seq_length + 1, (batch_size,), generator=torch.Generator().manual_seed(42 + i))
-        for i in range(num_nested_fields)
-    ]
+    # For non-NPU: arithmetic progression lengths from 1 to seq_length for each nested field
+    # For NPU: nested fields become regular tensors of seq_length // 2
 
     batch_size_tuple = (batch_size,)
 
@@ -117,21 +120,27 @@ def create_test_case(
         tensor_data = torch.randn(batch_size, seq_length, dtype=torch.float32, device=torch_device)
         prompt_batch.set(field_name, tensor_data)
 
-    # 2. Nested Tensor fields (variable-length sequences)
+    # 2. Nested Tensor fields (variable-length sequences) or regular tensors for NPU
     for i in range(num_nested_fields):
         field_name = f"nested_field_{i}"
-        actual_lengths = nested_lengths[i]
 
-        # Create nested tensor from variable-length sequences
-        nested_list = []
-        for j in range(batch_size):
-            length = actual_lengths[j].item()
-            # Create sequence data: arange for each element (representing sequence indices)
-            seq_data = torch.arange(length, dtype=torch.float32, device=torch_device)
-            nested_list.append(seq_data)
+        if device == "npu":
+            # For NPU: create a regular tensor of seq_length // 2
+            tensor_data = torch.randn(batch_size, seq_length // 2, dtype=torch.float32, device=torch_device)
+            prompt_batch.set(field_name, tensor_data)
+        else:
+            # For non-NPU: create nested tensor with arithmetic progression lengths
+            # Lengths go from 1 to seq_length in equal increments
+            step = (seq_length - 1) / (batch_size - 1) if batch_size > 1 else 0
+            nested_list = []
+            for j in range(batch_size):
+                length = int(round(1 + j * step))
+                length = max(1, min(length, seq_length))  # Clamp to [1, seq_length]
+                seq_data = torch.arange(length, dtype=torch.float32, device=torch_device)
+                nested_list.append(seq_data)
 
-        nested_tensor = torch.nested.as_nested_tensor(nested_list, layout=torch.jagged)
-        prompt_batch.set(field_name, nested_tensor)
+            nested_tensor = torch.nested.as_nested_tensor(nested_list, layout=torch.jagged)
+            prompt_batch.set(field_name, nested_tensor)
 
     # 3. NonTensorStack wrapped strings
     # Each string ~= seq_length * 4 bytes to match one tensor element's memory footprint

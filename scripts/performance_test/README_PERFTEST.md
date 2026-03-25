@@ -51,33 +51,93 @@ For device support of each backend,
 - `Yuanrong` supports `cpu` and `npu`
 - `MooncakeStore` supports `cpu` and `gpu`
 
+## Test Data Format
+
+The test case creates TensorDict with three types of fields:
+
+1. **Regular tensors**: Shape `(batch_size, seq_length)`, float32
+2. **Nested tensors** (non-NPU devices): Variable-length sequences with lengths forming an arithmetic progression from 1 to `seq_length`. For a batch of size N, element j has length `1 + j * (seq_length - 1) / (N - 1)`. This gives an average nested length of approximately `seq_length / 2`, making the nested column size roughly half of a regular tensor column.
+3. **NonTensorStack strings**: Each string is `seq_length * 4` bytes to match the memory footprint of one tensor element.
+
+### NPU Fallback
+
+NPU does not support nested tensors. When running with `--device=npu`, the nested tensor fields are replaced with regular tensors of shape `(batch_size, seq_length // 2)` to maintain comparable total data size while avoiding nested tensor operations.
+
 ## Yuanrong Backend
 
 For Yuanrong backend, writer runs on head node and reader runs on worker node.
 
+## Running Full Test Suite
+
+The `run_perf_test.sh` script automates the full performance test suite:
+
+```bash
+cd scripts/performance_test
+./run_perf_test.sh
+```
+
+### Configuration
+
+Configure the test environment via environment variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEAD_NODE_IP` | Head node IP address | 127.0.0.1 |
+| `WORKER_NODE_IP` | Worker node IP address | 127.0.0.1 |
+| `DEVICE` | Device type (cpu, npu, gpu) | cpu |
+| `NUM_TEST_ITERATIONS` | Number of iterations per test | 4 |
+
+Example:
+```bash
+HEAD_NODE_IP=192.168.0.1 WORKER_NODE_IP=192.168.0.2 DEVICE=npu ./run_perf_test.sh
+```
+
+### Test Matrix
+
+The script tests all combinations of:
+- **Backends**: SimpleStorage, Yuanrong, MooncakeStore, Ray (baseline)
+- **Data sizes**: Small (batch=128, fields=3, seq=1024), Medium (batch=1024, fields=9, seq=8192), Large (batch=4096, fields=21, seq=128000)
+
+### Output
+
+- CSV results are saved to `results/{backend}_{size}.csv` (e.g., `results/simplestorage_small.csv`)
+- A performance comparison chart is generated as `results/performance_comparison.pdf`
+
+### draw_figure.py
+
+After running the tests, `draw_figure.py` reads all CSV files from the `results/` directory and generates a bar chart comparing total throughput (Gbps) across backends and data sizes.
+
 ## Examples
 
-### SimpleStorage/Mooncake backend
+Individual test examples using `perftest.py`:
+
+### SimpleStorage backend
 ```bash
-python perftest.py --backend_config=perftest_config.yaml \
+python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
   --head_node_ip=192.168.0.1
 ```
 
 ### Yuanrong backend
 ```bash
-python perftest.py --backend_config=perftest_config.yaml \
+python perftest.py --backend_config=perftest_config.yaml --backend=Yuanrong \
   --head_node_ip=192.168.0.1 --worker_node_ip=192.168.0.2
 ```
 
-### NPU device test
+### MooncakeStore backend
 ```bash
-python perftest.py --backend_config=perftest_config.yaml --device=npu \
+python perftest.py --backend_config=perftest_config.yaml --backend=MooncakeStore \
+  --head_node_ip=192.168.0.1
+```
+
+### NPU device test (Yuanrong backend)
+```bash
+python perftest.py --backend_config=perftest_config.yaml --backend=Yuanrong --device=npu \
   --head_node_ip=192.168.0.1 --worker_node_ip=192.168.0.2
 ```
 
 ### Output to CSV
 ```bash
-python perftest.py --backend_config=perftest_config.yaml \
+python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
   --head_node_ip=192.168.0.1 --output_csv=results.csv
 ```
 
