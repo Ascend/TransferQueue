@@ -38,18 +38,18 @@ class MockDsTensorClient:
     def init(self):
         pass
 
-    def dev_mset(self, keys, values):
+    def mset_d2h(self, keys, values):
         for k, v in zip(keys, values, strict=True):
             assert v.device.type == "npu"
             self.storage[k] = v
 
-    def dev_mget(self, keys, out_tensors):
+    def mget_h2d(self, keys, out_tensors):
         for i, k in enumerate(keys):
             # Note: If key is missing, tensor remains unchanged (mock limitation)
             if k in self.storage:
                 out_tensors[i].copy_(self.storage[k])
 
-    def dev_delete(self, keys):
+    def delete(self, keys):
         for k in keys:
             self.storage.pop(k, None)
 

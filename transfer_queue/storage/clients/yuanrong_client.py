@@ -123,12 +123,12 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         for i in range(0, len(keys), self.KEYS_LIMIT):
             batch_keys = keys[i : i + self.KEYS_LIMIT]
             batch_values = values[i : i + self.KEYS_LIMIT]
-            # _npu_ds_client.dev_mset doesn't support to overwrite
+            # mset_d2h cannot overwrite existing keys
             try:
-                self._ds_client.dev_delete(batch_keys)
+                self._ds_client.delete(batch_keys)
             except Exception:
                 pass
-            self._ds_client.dev_mset(batch_keys, batch_values)
+            self._ds_client.mset_d2h(batch_keys, batch_values)
 
     def supports_get(self, strategy_tag: str) -> bool:
         """Matches 'DsTensorClient' Strategy tag."""
@@ -147,8 +147,8 @@ class NPUTensorKVClientAdapter(StorageStrategy):
             batch_dtypes = dtypes[i : i + self.KEYS_LIMIT]
 
             batch_values = self._create_empty_npu_tensorlist(batch_shapes, batch_dtypes)
-            self._ds_client.dev_mget(batch_keys, batch_values)
-            # Todo(dpj): consider checking and logging keys that fail during dev_mget
+            self._ds_client.mget_h2d(batch_keys, batch_values)
+            # Todo(dpj): consider checking and logging keys that fail during mget_h2d
             results.extend(batch_values)
         return results
 
@@ -161,7 +161,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         for i in range(0, len(keys), self.KEYS_LIMIT):
             batch = keys[i : i + self.KEYS_LIMIT]
             # Todo(dpj): Test call clear when no (key,value) put in ds
-            self._ds_client.dev_delete(batch)
+            self._ds_client.delete(batch)
 
     def _create_empty_npu_tensorlist(self, shapes, dtypes):
         """
