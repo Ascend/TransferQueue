@@ -28,9 +28,9 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
-from transfer_queue import KVBatchMeta
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
+from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.simple_backend import SimpleStorageUnit
@@ -433,11 +433,11 @@ def kv_put(
         # custom_meta (tag) will be put to controller through the internal put process
         # After put, batch_meta.field_names() will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names()
+        fields_to_return = batch_meta.field_names
     else:
         # directly update custom_meta (tag) to controller
         tq_client.set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names() if batch_meta.field_names() else None
+        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
 
     return KVBatchMeta(
         keys=[key],
@@ -516,11 +516,11 @@ def kv_batch_put(
     if fields is not None:
         # After put, batch_meta.field_names() will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names()
+        fields_to_return = batch_meta.field_names
     else:
         # directly update custom_meta (tags) to controller
         tq_client.set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names() if batch_meta.field_names() else None
+        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
 
     return KVBatchMeta(
         keys=keys,
@@ -605,6 +605,8 @@ def kv_batch_get(
     if select_fields is not None:
         if isinstance(select_fields, str):
             fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
@@ -764,11 +766,11 @@ async def async_kv_put(
         # custom_meta (tag) will be put to controller through the put process
         # After put, batch_meta.field_names() will include the new fields written by user
         await tq_client.async_put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names()
+        fields_to_return = batch_meta.field_names
     else:
         # directly update custom_meta (tag) to controller
         await tq_client.async_set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names() if batch_meta.field_names() else None
+        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
 
     return KVBatchMeta(
         keys=[key],
@@ -846,11 +848,11 @@ async def async_kv_batch_put(
     if fields is not None:
         # After put, batch_meta.field_names() will include the new fields written by user
         batch_meta = await tq_client.async_put(fields, batch_meta)
-        fields_to_return = batch_meta.field_names()
+        fields_to_return = batch_meta.field_names
     else:
         # directly update custom_meta (tags) to controller
         await tq_client.async_set_custom_meta(batch_meta)
-        fields_to_return = batch_meta.field_names() if batch_meta.field_names() else None
+        fields_to_return = batch_meta.field_names if batch_meta.field_names else None
 
     return KVBatchMeta(
         keys=keys,
@@ -935,6 +937,8 @@ async def async_kv_batch_get(
     if select_fields is not None:
         if isinstance(select_fields, str):
             fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:

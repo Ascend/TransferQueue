@@ -301,6 +301,58 @@ class TestKVPutE2E:
 
         tq.kv_clear(keys=key, partition_id=partition_id)
 
+    def test_kv_put_returns_cumulative_fields(self, controller):
+        """Test that kv_put returns KVBatchMeta with cumulative fields (previous + new)."""
+        partition_id = "test_partition"
+        key = "sample_cumulative"
+
+        # First put: only input_ids
+        first_data = TensorDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+            },
+            batch_size=1,
+        )
+        first_meta = tq.kv_put(key=key, partition_id=partition_id, fields=first_data, tag={"step": 1})
+
+        # Verify first meta contains only input_ids
+        assert first_meta.fields is not None
+        assert "input_ids" in first_meta.fields
+        assert len(first_meta.fields) == 1
+
+        # Second put: add attention_mask
+        second_data = TensorDict(
+            {
+                "attention_mask": torch.tensor([[1, 1, 1]]),
+            },
+            batch_size=1,
+        )
+        second_meta = tq.kv_put(key=key, partition_id=partition_id, fields=second_data, tag={"step": 2})
+
+        # Verify second meta contains BOTH previous (input_ids) and new (attention_mask) fields
+        assert second_meta.fields is not None
+        assert "input_ids" in second_meta.fields, "Previous field 'input_ids' should be in returned fields"
+        assert "attention_mask" in second_meta.fields, "New field 'attention_mask' should be in returned fields"
+        assert len(second_meta.fields) == 2, f"Expected 2 fields, got {second_meta.fields}"
+
+        # Third put: add response field
+        third_data = TensorDict(
+            {
+                "response": torch.tensor([[10, 20]]),
+            },
+            batch_size=1,
+        )
+        third_meta = tq.kv_put(key=key, partition_id=partition_id, fields=third_data, tag={"step": 3})
+
+        # Verify third meta contains ALL three fields
+        assert third_meta.fields is not None
+        assert "input_ids" in third_meta.fields, "Previous field 'input_ids' should still be present"
+        assert "attention_mask" in third_meta.fields, "Previous field 'attention_mask' should still be present"
+        assert "response" in third_meta.fields, "New field 'response' should be present"
+        assert len(third_meta.fields) == 3, f"Expected 3 fields, got {third_meta.fields}"
+
+        tq.kv_clear(keys=key, partition_id=partition_id)
+
 
 class TestKVBatchPutE2E:
     """End-to-end tests for kv_batch_put functionality."""
@@ -390,6 +442,46 @@ class TestKVBatchPutE2E:
 
         # keys[1] should have response marked as produced
         assert partition.production_status[global_idx_1, response_col_idx] == 1, "Keys[1] should have response"
+
+        tq.kv_clear(keys=keys, partition_id=partition_id)
+
+    def test_kv_batch_put_returns_cumulative_fields(self, controller):
+        """Test that kv_batch_put returns KVBatchMeta with cumulative fields (previous + new)."""
+        partition_id = "test_partition"
+        keys = ["batch_cumulative_0", "batch_cumulative_1"]
+
+        # First batch put: only input_ids
+        first_data = TensorDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            },
+            batch_size=2,
+        )
+        first_meta = tq.kv_batch_put(
+            keys=keys, partition_id=partition_id, fields=first_data, tags=[{"step": 1}, {"step": 1}]
+        )
+
+        # Verify first meta contains only input_ids
+        assert first_meta.fields is not None
+        assert "input_ids" in first_meta.fields
+        assert len(first_meta.fields) == 1
+
+        # Second batch put: add attention_mask for both keys
+        second_data = TensorDict(
+            {
+                "attention_mask": torch.tensor([[1, 1, 1], [1, 1, 1]]),
+            },
+            batch_size=2,
+        )
+        second_meta = tq.kv_batch_put(
+            keys=keys, partition_id=partition_id, fields=second_data, tags=[{"step": 2}, {"step": 2}]
+        )
+
+        # Verify second meta contains BOTH previous (input_ids) and new (attention_mask) fields
+        assert second_meta.fields is not None
+        assert "input_ids" in second_meta.fields, "Previous field 'input_ids' should be in returned fields"
+        assert "attention_mask" in second_meta.fields, "New field 'attention_mask' should be in returned fields"
+        assert len(second_meta.fields) == 2, f"Expected 2 fields, got {second_meta.fields}"
 
         tq.kv_clear(keys=keys, partition_id=partition_id)
 
