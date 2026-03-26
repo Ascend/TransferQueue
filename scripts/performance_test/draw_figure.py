@@ -95,12 +95,19 @@ df["X_label"] = pd.Categorical(
 df["Bandwidth"] = df["total_gbit_per_sec"]
 df["Scenario"] = df["backend_parsed"]
 
+# Set backend display order
+backend_order = ["Ray", "SimpleStorage", "Yuanrong", "MooncakeStore"]
+
+df["Scenario"] = pd.Categorical(df["Scenario"], categories=backend_order, ordered=True)
+
 # ========== Plotting ==========
 sns.set_theme(style="white", palette="husl")
 
 fig, ax = plt.subplots(figsize=(12, 7))
 
-palette = sns.color_palette("Set2", n_colors=df["Scenario"].nunique())
+# Use the backend order to ensure consistent coloring
+existing_backends = df["Scenario"].unique()
+palette = sns.color_palette("Set2", n_colors=len(existing_backends))
 barplot = sns.barplot(data=df, x="X_label", y="Bandwidth", hue="Scenario", ax=ax, alpha=0.8, palette=palette)
 
 # Legend: match old style — at the top center, horizontal, with frame

@@ -401,11 +401,7 @@ class TQThroughputTester:
 
         # DELETE operation using kv_clear
         logger.info("Starting DELETE operation (kv_clear)...")
-        start_delete = time.perf_counter()
         ray.get(self.writer.delete.remote(partition_id=partition_id, keys=keys))
-        end_delete = time.perf_counter()
-        delete_time = end_delete - start_delete
-        logger.info(f"DELETE Time: {delete_time:.8f}s")
 
         # Print summary
         total_gbit_per_sec = (self.total_data_size_gb * 16) / (put_time + get_time)
