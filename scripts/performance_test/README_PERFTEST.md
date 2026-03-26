@@ -96,7 +96,7 @@ HEAD_NODE_IP=192.168.0.1 WORKER_NODE_IP=192.168.0.2 DEVICE=npu ./run_perf_test.s
 
 The script tests all combinations of:
 - **Backends**: SimpleStorage, Yuanrong, MooncakeStore, Ray (baseline)
-- **Data sizes**: Small (batch=128, fields=3, seq=1024), Medium (batch=1024, fields=9, seq=8192), Large (batch=4096, fields=21, seq=128000)
+- **Data sizes**: Small (batch=1024, fields=9, seq=8192), Medium (batch=4096, fields=15, seq=32768), Large (batch=8192, fields=21, seq=128000)
 
 ### Output
 
