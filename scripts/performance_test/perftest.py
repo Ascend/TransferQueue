@@ -203,7 +203,6 @@ class TQClientActor:
         if keys is None:
             keys = self.test_keys
         tq.kv_clear(keys=keys, partition_id=partition_id)
-        self.test_data = None
 
     def close(self) -> None:
         """Close transfer_queue."""
