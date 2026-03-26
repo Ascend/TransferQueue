@@ -22,9 +22,9 @@ BACKENDS=("SimpleStorage" "Yuanrong" "MooncakeStore")
 
 # Test settings: global_batch_size, field_num, seq_len, name
 declare -a SETTINGS=(
-    "128,3,1024,Small"
-    "1024,9,8192,Medium"
-    "4096,21,128000,Large"
+    "1024,9,8192,Small"
+    "4096,15,32768,Medium"
+    "8192,21,128000,Large"
 )
 
 # ---- TransferQueue perftest ----

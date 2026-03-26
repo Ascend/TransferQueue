@@ -17,6 +17,7 @@
 import argparse
 import csv
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -121,6 +122,11 @@ def create_test_case(
         prompt_batch.set(field_name, tensor_data)
 
     # 2. Nested Tensor fields (variable-length sequences) or regular tensors for NPU
+    if device != "npu":
+        step = (seq_length - 1) / (batch_size - 1) if batch_size > 1 else 0
+        lengths = [max(1, min(int(round(1 + j * step)), seq_length)) for j in range(batch_size)]
+        total_elements = sum(lengths)
+
     for i in range(num_nested_fields):
         field_name = f"nested_field_{i}"
 
@@ -129,27 +135,20 @@ def create_test_case(
             tensor_data = torch.randn(batch_size, seq_length // 2, dtype=torch.float32, device=torch_device)
             prompt_batch.set(field_name, tensor_data)
         else:
-            # For non-NPU: create nested tensor with arithmetic progression lengths
-            # Lengths go from 1 to seq_length in equal increments
-            step = (seq_length - 1) / (batch_size - 1) if batch_size > 1 else 0
-            nested_list = []
-            for j in range(batch_size):
-                length = int(round(1 + j * step))
-                length = max(1, min(length, seq_length))  # Clamp to [1, seq_length]
-                seq_data = torch.arange(length, dtype=torch.float32, device=torch_device)
-                nested_list.append(seq_data)
-
-            nested_tensor = torch.nested.as_nested_tensor(nested_list, layout=torch.jagged)
+            flat_data = torch.randn(total_elements, dtype=torch.float32, device=torch_device)
+            nested_tuple = torch.split(flat_data, lengths)
+            nested_tensor = torch.nested.as_nested_tensor(nested_tuple, layout=torch.jagged)
             prompt_batch.set(field_name, nested_tensor)
 
     # 3. NonTensorStack wrapped strings
     # Each string ~= seq_length * 4 bytes to match one tensor element's memory footprint
     string_char_count = seq_length * bytes_per_element  # 4 bytes per char (unicode)
-    string_template = "x" * string_char_count
 
     for i in range(num_nontensor_fields):
         field_name = f"nontensor_field_{i}"
-        string_data = [string_template for _ in range(batch_size)]
+        bytes_needed = string_char_count // 2
+        string_data = [os.urandom(bytes_needed).hex() for _ in range(batch_size)]
+
         prompt_batch.set(field_name, NonTensorStack.from_list(string_data))
 
     return prompt_batch, total_size_gb
@@ -349,25 +348,27 @@ class TQThroughputTester:
         r = self.reader.initialize.remote()
         ray.get([w, r])
 
-    def run_throughput_test(self) -> dict[str, Any]:
+    def run_throughput_test(self, skip_dataset_create=False) -> dict[str, Any]:
         """Run the throughput test and print results.
 
         Returns:
             Dictionary with test results
         """
-        logger.info("Creating large batch for throughput test...")
-        start_create_data = time.perf_counter()
-        data_fields, total_data_size_gb = ray.get(
-            self.writer.create_test_case.remote(
-                batch_size=self.global_batch_size,
-                seq_length=self.seq_len,
-                field_num=self.field_num,
-                device=self.device,
+        # Create test data
+        if not skip_dataset_create:
+            logger.info("Creating large batch for throughput test...")
+            start_create_data = time.perf_counter()
+            data_fields, self.total_data_size_gb = ray.get(
+                self.writer.create_test_case.remote(
+                    batch_size=self.global_batch_size,
+                    seq_length=self.seq_len,
+                    field_num=self.field_num,
+                    device=self.device,
+                )
             )
-        )
-        logger.info(f"Total Data Size: {total_data_size_gb:.6f} GB")
-        end_create_data = time.perf_counter()
-        logger.info(f"Data creation time: {end_create_data - start_create_data:.8f}s")
+            end_create_data = time.perf_counter()
+            logger.info(f"Total Data Size: {self.total_data_size_gb:.6f} GB")
+            logger.info(f"Data creation time: {end_create_data - start_create_data:.8f}s")
 
         partition_id = "train_0"
 
@@ -377,8 +378,8 @@ class TQThroughputTester:
         ray.get(self.writer.put.remote(partition_id=partition_id))
         end_put = time.perf_counter()
         put_time = end_put - start_put
-        put_gbit_per_sec = (total_data_size_gb * 8) / put_time
-        put_gbyte_per_sec = total_data_size_gb / put_time
+        put_gbit_per_sec = (self.total_data_size_gb * 8) / put_time
+        put_gbyte_per_sec = self.total_data_size_gb / put_time
 
         time.sleep(2)
 
@@ -394,8 +395,8 @@ class TQThroughputTester:
         ray.get(self.reader.get_data.remote(partition_id=partition_id, keys=keys))
         end_get_data = time.perf_counter()
         get_time = end_get_data - start_get_data
-        get_gbit_per_sec = (total_data_size_gb * 8) / get_time
-        get_gbyte_per_sec = total_data_size_gb / get_time
+        get_gbit_per_sec = (self.total_data_size_gb * 8) / get_time
+        get_gbyte_per_sec = self.total_data_size_gb / get_time
 
         time.sleep(2)
 
@@ -408,15 +409,15 @@ class TQThroughputTester:
         logger.info(f"DELETE Time: {delete_time:.8f}s")
 
         # Print summary
-        total_gbit_per_sec = (total_data_size_gb * 16) / (put_time + get_time)
-        total_gbyte_per_sec = (total_data_size_gb * 2) / (put_time + get_time)
+        total_gbit_per_sec = (self.total_data_size_gb * 16) / (put_time + get_time)
+        total_gbyte_per_sec = (self.total_data_size_gb * 2) / (put_time + get_time)
 
         logger.info("=" * 60)
         logger.info("THROUGHPUT TEST SUMMARY")
         logger.info("=" * 60)
         logger.info(f"Backend: {self.backend}")
         logger.info(f"Device: {self.device}")
-        logger.info(f"Total Data Size: {total_data_size_gb:.6f} GB")
+        logger.info(f"Total Data Size: {self.total_data_size_gb:.6f} GB")
         logger.info(f"PUT Time: {put_time:.8f}s")
         logger.info(f"GET Time: {get_time:.8f}s")
         logger.info(f"PUT Throughput: {put_gbit_per_sec:.8f} Gb/s ({put_gbyte_per_sec:.8f} GB/s)")
@@ -428,7 +429,7 @@ class TQThroughputTester:
         return {
             "backend": self.backend,
             "device": self.device,
-            "total_data_size_gb": total_data_size_gb,
+            "total_data_size_gb": self.total_data_size_gb,
             "put_time": put_time,
             "get_time": get_time,
             "put_gbit_per_sec": put_gbit_per_sec,
@@ -549,7 +550,7 @@ def main() -> None:
         logger.info("-" * 60)
         logger.info(f"Iteration {i + 1}/{args.num_test_iterations}")
         logger.info("-" * 60)
-        result = tester.run_throughput_test()
+        result = tester.run_throughput_test(skip_dataset_create=(i != 0))
         all_results.append(result)
         time.sleep(10)
 
