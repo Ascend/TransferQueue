@@ -178,6 +178,17 @@ def assert_tensor_close(tensor_a, tensor_b, rtol=1e-5, atol=1e-8, msg=""):
     assert torch.allclose(tensor_a, tensor_b, rtol=rtol, atol=atol), f"{msg} Tensors are not close"
 
 
+def assert_nested_tensor_equal(nested_a, nested_b, msg=""):
+    """Assert two nested (jagged) tensors are equal component-wise."""
+    components_a = list(nested_a)
+    components_b = list(nested_b)
+    assert len(components_a) == len(components_b), (
+        f"{msg} Length mismatch: {len(components_a)} vs {len(components_b)}"
+    )
+    for i, (a, b) in enumerate(zip(components_a, components_b, strict=True)):
+        assert torch.equal(a, b), f"{msg} Component {i} not equal: {a} vs {b}"
+
+
 class TestKVPutE2E:
     """End-to-end tests for kv_put functionality."""
 
@@ -518,6 +529,26 @@ class TestKVBatchPutE2E:
 class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
 
+
+    def test_kv_batch_get_nested_tensor(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = []
+        data_list = []
+
+        for i in range(1, 4):
+            key = f"nested_tensor_{i}"
+            keys.append(key)
+            data = torch.randn(size=(i,))
+            data_list.append(data)
+            fields = TensorDict({"data": torch.nested.as_nested_tensor([data], layout=torch.jagged)}, batch_size=1)
+            tq_api.kv_put(key=key, partition_id=partition_id, fields=fields, tag=None)
+
+        retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
+
+        assert_nested_tensor_equal(retrieved["data"], torch.nested.as_nested_tensor(data_list, layout=torch.jagged))
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+
     def test_kv_batch_get_single_key(self, controller, tq_api):
         """Test getting data for a single key."""
         partition_id = "test_partition"
@@ -569,11 +600,8 @@ class TestKVGetE2E:
         retrieved = tq_api.kv_batch_get(keys=partial_keys, partition_id=partition_id)
         assert_tensor_equal(retrieved["data"], expected_data)
 
-        for actual, expected in zip(retrieved["nested_data"], expected_nested_data, strict=True):
-            assert_tensor_equal(actual, expected)
-
-        for actual, expected in zip(retrieved["three_d_nested_data"], expected_three_d_nested_data, strict=True):
-            assert_tensor_equal(actual, expected)
+        assert_nested_tensor_equal(retrieved["nested_data"], expected_nested_data)
+        assert_nested_tensor_equal(retrieved["three_d_nested_data"], expected_three_d_nested_data)
 
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
