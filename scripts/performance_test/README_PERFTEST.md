@@ -96,9 +96,17 @@ Configure via environment variables:
 | `WORKER_NODE_IP` | Worker node IP address | `127.0.0.1` |
 | `DEVICE` | Device type (`cpu`, `npu`, `gpu`) | `cpu` |
 | `NUM_TEST_ITERATIONS` | Number of iterations per test | `4` |
+| `USE_COMPLEX_CASE` | Run with complex test case (nested + nontensor fields) | `false` |
 
 Example:
 ```bash
+# Simple case (default, regular tensors only)
+./run_perf_test.sh
+
+# Complex case (nested tensors + nontensor strings)
+USE_COMPLEX_CASE=true ./run_perf_test.sh
+
+# With specific node IPs & use NPU
 HEAD_NODE_IP=192.168.0.1 WORKER_NODE_IP=192.168.0.2 DEVICE=npu ./run_perf_test.sh
 ```
 

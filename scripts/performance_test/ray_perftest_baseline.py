@@ -40,6 +40,55 @@ def create_test_case(
     field_num: int | None = None,
     device: str = "cpu",
 ) -> tuple[TensorDict, float]:
+    """Create a test case with only regular tensors.
+
+    Creates TensorDict with:
+    - Regular tensors: (batch_size, seq_length) shape, each element is float32
+
+    Args:
+        batch_size: Batch size for the test case
+        seq_length: Maximum sequence length
+        field_num: Total number of fields to create
+        device: Device to create tensors on ("cpu", "npu", or "gpu")
+
+    Returns:
+        Tuple of (TensorDict, total_size_gb)
+    """
+    bytes_per_element = 4  # float32
+
+    # Each regular tensor field: batch_size * seq_length * 4 bytes
+    regular_field_size_bytes = batch_size * seq_length * bytes_per_element
+    regular_field_size_gb = regular_field_size_bytes / (1024**3)
+
+    total_size_gb = regular_field_size_gb * field_num
+
+    logger.info(f"Total data size: {total_size_gb:.6f} GB")
+
+    # Determine torch device
+    torch_device = None
+    if device == "npu":
+        torch_device = "npu:0"
+    elif device == "gpu":
+        torch_device = "cuda:0"
+
+    batch_size_tuple = (batch_size,)
+
+    prompt_batch = TensorDict(batch_size=batch_size_tuple)
+
+    for i in range(field_num):
+        field_name = f"field_{i}"
+        tensor_data = torch.randn(batch_size, seq_length, dtype=torch.float32, device=torch_device)
+        prompt_batch.set(field_name, tensor_data)
+
+    return prompt_batch, total_size_gb
+
+
+def create_complex_test_case(
+    batch_size: int | None = None,
+    seq_length: int | None = None,
+    field_num: int | None = None,
+    device: str = "cpu",
+) -> tuple[TensorDict, float]:
     """Create a test case with complex data formats.
 
     Creates TensorDict with:
@@ -180,6 +229,7 @@ class RayBaselineTester:
         head_node_ip: str,
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
+        use_complex_case: bool = False,
     ):
         """Initialize the Ray baseline tester.
 
@@ -191,6 +241,7 @@ class RayBaselineTester:
             head_node_ip: Head node IP address
             worker_node_ip: Worker node IP address
             output_csv: Path to output CSV file (optional)
+            use_complex_case: Whether to use complex test case (nested + nontensor fields)
         """
         self.global_batch_size = global_batch_size
         self.field_num = field_num
@@ -199,6 +250,7 @@ class RayBaselineTester:
         self.head_node_ip = head_node_ip
         self.worker_node_ip = worker_node_ip
         self.output_csv = output_csv
+        self.use_complex_case = use_complex_case
 
         # Initialize remote store on worker node
         self._initialize_remote_store()
@@ -227,12 +279,20 @@ class RayBaselineTester:
         if not skip_dataset_create:
             logger.info("Creating large batch for throughput test...")
             start_create_data = time.perf_counter()
-            self.test_data, self.total_data_size_gb = create_test_case(
-                batch_size=self.global_batch_size,
-                seq_length=self.seq_len,
-                field_num=self.field_num,
-                device="cpu",
-            )
+            if self.use_complex_case:
+                self.test_data, self.total_data_size_gb = create_complex_test_case(
+                    batch_size=self.global_batch_size,
+                    seq_length=self.seq_len,
+                    field_num=self.field_num,
+                    device="cpu",
+                )
+            else:
+                self.test_data, self.total_data_size_gb = create_test_case(
+                    batch_size=self.global_batch_size,
+                    seq_length=self.seq_len,
+                    field_num=self.field_num,
+                    device="cpu",
+                )
             end_create_data = time.perf_counter()
             logger.info(f"Data creation time: {end_create_data - start_create_data:.8f}s")
 
@@ -350,6 +410,12 @@ def main() -> None:
         default=None,
         help="Path to output CSV file (optional)",
     )
+    parser.add_argument(
+        "--use_complex_case",
+        action="store_true",
+        default=False,
+        help="Use complex test case with nested tensors and nontensor fields (default: False, simple case)",
+    )
 
     args = parser.parse_args()
 
@@ -362,6 +428,7 @@ def main() -> None:
         head_node_ip=args.head_node_ip,
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
+        use_complex_case=args.use_complex_case,
     )
 
     # Run test multiple times

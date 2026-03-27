@@ -43,6 +43,62 @@ def create_test_case(
     field_num: int | None = None,
     device: str = "cpu",
 ) -> tuple[TensorDict, float]:
+    """Create a test case with tensor data formats.
+
+    Creates TensorDict with:
+    - Regular tensors: (batch_size, seq_length) shape, each element is float32
+
+    Args:
+        batch_size: Batch size for the test case
+        seq_length: Maximum sequence length (used for regular tensors and
+            as upper bound for nested tensor lengths)
+        field_num: Total number of fields to create (distributed across types)
+        device: Device to create tensors on ("cpu", "npu", or "gpu")
+
+    Returns:
+        Tuple of (TensorDict, total_size_gb)
+    """
+    bytes_per_element = 4  # float32
+
+    # Each regular tensor field: batch_size * seq_length * 4 bytes
+    regular_field_size_bytes = batch_size * seq_length * bytes_per_element
+    regular_field_size_gb = regular_field_size_bytes / (1024**3)
+
+    # Total size = sum of all field types
+    total_size_gb = regular_field_size_gb * field_num
+
+    logger.info(f"Total data size: {total_size_gb:.6f} GB")
+
+    # Determine torch device
+    torch_device = None
+    if device == "npu":
+        torch_device = "npu:0"
+    elif device == "gpu":
+        torch_device = "cuda:0"
+
+    # Set seeds for reproducibility (within this process)
+    # For non-NPU: arithmetic progression lengths from 1 to seq_length for each nested field
+    # For NPU: nested fields become regular tensors of seq_length // 2
+
+    batch_size_tuple = (batch_size,)
+
+    prompt_batch = TensorDict(batch_size=batch_size_tuple)
+
+    # 1. Regular tensor fields
+    for i in range(field_num):
+        field_name = f"field_{i}"
+        tensor_data = torch.randn(batch_size, seq_length, dtype=torch.float32, device=torch_device)
+        prompt_batch.set(field_name, tensor_data)
+
+    return prompt_batch, total_size_gb
+
+
+def create_complex_test_case(
+    batch_size: int | None = None,
+    seq_length: int | None = None,
+    field_num: int | None = None,
+    device: str = "cpu",
+) -> tuple[TensorDict, float]:
     """Create a test case with complex data formats.
 
     Creates TensorDict with:
@@ -158,8 +214,9 @@ def create_test_case(
 class TQClientActor:
     """Ray actor that uses tq.init(config) to initialize."""
 
-    def __init__(self, config: dict[str, Any]):
+    def __init__(self, config: dict[str, Any], use_complex_case: bool = False):
         self.config = config
+        self.use_complex_case = use_complex_case
         self.test_data = None
         self.total_data_size_gb = 0.0
         self.test_keys = None
@@ -176,7 +233,12 @@ class TQClientActor:
         device: str = "cpu",
     ) -> tuple[list[str], float]:
         """Create test case on the actor."""
-        self.test_data, self.total_data_size_gb = create_test_case(batch_size, seq_length, field_num, device)
+        if self.use_complex_case:
+            self.test_data, self.total_data_size_gb = create_complex_test_case(
+                batch_size, seq_length, field_num, device
+            )
+        else:
+            self.test_data, self.total_data_size_gb = create_test_case(batch_size, seq_length, field_num, device)
         # Create keys for each sample in the batch
         self.test_keys = [f"test_key_{i}" for i in range(batch_size)]
         return list(self.test_data.keys()), self.total_data_size_gb
@@ -224,6 +286,7 @@ class TQThroughputTester:
         backend: str | None = None,
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
+        use_complex_case: bool = False,
     ):
         """Initialize the throughput tester.
 
@@ -238,6 +301,7 @@ class TQThroughputTester:
             head_node_ip: Head node IP address
             worker_node_ip: Worker node IP address (required for Yuanrong)
             output_csv: Path to output CSV file (optional)
+            use_complex_case: Whether to use complex test case (nested + nontensor fields)
         """
         self.backend_config_path = backend_config_path
         self.backend_override = backend
@@ -249,6 +313,7 @@ class TQThroughputTester:
         self.head_node_ip = head_node_ip
         self.worker_node_ip = worker_node_ip
         self.output_csv = output_csv
+        self.use_complex_case = use_complex_case
 
         # Prepare full config for tq.init()
         self.full_config = self._prepare_config()
@@ -337,8 +402,8 @@ class TQThroughputTester:
             reader_config = self.full_config
 
         # Create writer and reader actors
-        self.writer = TQClientActor.options(**writer_options).remote(writer_config)
-        self.reader = TQClientActor.options(**reader_options).remote(reader_config)
+        self.writer = TQClientActor.options(**writer_options).remote(writer_config, self.use_complex_case)
+        self.reader = TQClientActor.options(**reader_options).remote(reader_config, self.use_complex_case)
 
         # Initialize transfer_queue
         logger.info(f"Using {self.backend} as storage backend.")
@@ -522,6 +587,12 @@ def main() -> None:
         default=None,
         help="Path to output CSV file (optional)",
     )
+    parser.add_argument(
+        "--use_complex_case",
+        action="store_true",
+        default=False,
+        help="Use complex test case with nested tensors and nontensor fields (default: False, simple case)",
+    )
 
     args = parser.parse_args()
 
@@ -537,6 +608,7 @@ def main() -> None:
         backend=args.backend,
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
+        use_complex_case=args.use_complex_case,
     )
 
     # Run test multiple times for consistent results using a for loop

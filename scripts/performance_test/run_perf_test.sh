@@ -15,6 +15,7 @@ HEAD_NODE_IP="${HEAD_NODE_IP:-127.0.0.1}"
 WORKER_NODE_IP="${WORKER_NODE_IP:-127.0.0.1}"
 DEVICE="${DEVICE:-cpu}"
 NUM_TEST_ITERATIONS="${NUM_TEST_ITERATIONS:-4}"
+USE_COMPLEX_CASE="${USE_COMPLEX_CASE:-false}"
 # ========================================
 
 # Backends to test (passed via --backend to perftest.py)
@@ -26,6 +27,13 @@ declare -a SETTINGS=(
     "4096,15,32768,Medium"
     "8192,21,128000,Large"
 )
+
+# Complex case flag
+if [[ "${USE_COMPLEX_CASE}" == "true" ]]; then
+    COMPLEX_FLAG="--use_complex_case"
+else
+    COMPLEX_FLAG=""
+fi
 
 # ---- TransferQueue perftest ----
 for backend in "${BACKENDS[@]}"; do
@@ -44,7 +52,8 @@ for backend in "${BACKENDS[@]}"; do
             --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
             --num_test_iterations="${NUM_TEST_ITERATIONS}" \
             --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
-            --output_csv="${output_csv}"
+            --output_csv="${output_csv}" \
+            ${COMPLEX_FLAG}
 
         sleep 10
     done
@@ -64,7 +73,8 @@ for setting in "${SETTINGS[@]}"; do
         --global_batch_size="${batch_size}" --field_num="${field_num}" --seq_len="${seq_len}" \
         --num_test_iterations="${NUM_TEST_ITERATIONS}" \
         --head_node_ip="${HEAD_NODE_IP}" --worker_node_ip="${WORKER_NODE_IP}" \
-        --output_csv="${output_csv}"
+        --output_csv="${output_csv}" \
+        ${COMPLEX_FLAG}
 done
 
 # ---- Draw figures ----
