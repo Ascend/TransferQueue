@@ -182,9 +182,7 @@ def assert_nested_tensor_equal(nested_a, nested_b, msg=""):
     """Assert two nested (jagged) tensors are equal component-wise."""
     components_a = list(nested_a)
     components_b = list(nested_b)
-    assert len(components_a) == len(components_b), (
-        f"{msg} Length mismatch: {len(components_a)} vs {len(components_b)}"
-    )
+    assert len(components_a) == len(components_b), f"{msg} Length mismatch: {len(components_a)} vs {len(components_b)}"
     for i, (a, b) in enumerate(zip(components_a, components_b, strict=True)):
         assert torch.equal(a, b), f"{msg} Component {i} not equal: {a} vs {b}"
 
@@ -529,7 +527,6 @@ class TestKVBatchPutE2E:
 class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
 
-
     def test_kv_batch_get_nested_tensor(self, controller, tq_api):
         partition_id = "test_partition"
         keys = []
@@ -547,7 +544,6 @@ class TestKVGetE2E:
 
         assert_nested_tensor_equal(retrieved["data"], torch.nested.as_nested_tensor(data_list, layout=torch.jagged))
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
-
 
     def test_kv_batch_get_single_key(self, controller, tq_api):
         """Test getting data for a single key."""

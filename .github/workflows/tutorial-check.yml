@@ -33,8 +33,14 @@ jobs:
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[yuanrong]"
-    - name: Run tutorials
+        pip install nbconvert ipykernel
+    - name: Run Python tutorials
       run: |
         export TQ_NUM_THREADS=2
         export RAY_DEDUP_LOGS=0
         for file in tutorial/*.py; do python3 "$file"; done
+    - name: Run notebook tutorials
+      run: |
+        export TQ_NUM_THREADS=2
+        export RAY_DEDUP_LOGS=0
+        jupyter nbconvert --to notebook --execute --ExecutePreprocessor.timeout=120 tutorial/basic.ipynb
