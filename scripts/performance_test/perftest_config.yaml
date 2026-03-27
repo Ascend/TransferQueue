@@ -53,4 +53,4 @@ backend:
     # Port of local yuanrong datasystem worker
     port: 31501
     # If enable npu transport
-    enable_yr_npu_transport: false
+    enable_yr_npu_transport: true
