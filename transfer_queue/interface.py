@@ -233,7 +233,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
         >>> metadata = tq.get_meta(...)
         >>> data = tq.get_data(metadata)
     """
-    if conf is None and _init_from_existing():
+    if _init_from_existing():
         return
 
     # First-time initialize TransferQueue
@@ -271,10 +271,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
         logger.info("TransferQueueController has been created.")
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
-        if conf is None:
-            _init_from_existing()
-            return
-        _TRANSFER_QUEUE_CONTROLLER = ray.get_actor("TransferQueueController")
+        _init_from_existing()
 
     controller_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info

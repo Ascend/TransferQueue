@@ -47,6 +47,7 @@ class TestYuanrongKVClientZCopy:
 
         mocker.patch("yr.datasystem.KVClient", return_value=mock_client)
         mocker.patch("yr.datasystem.DsTensorClient")
+        mocker.patch("transfer_queue.storage.clients.yuanrong_client.find_reachable_host", return_value="127.0.0.1")
 
         return mock_client
 

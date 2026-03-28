@@ -34,12 +34,12 @@ backend:
     master_server_address: localhost:50051
     # Address of local host. Set to "" to use Ray IP as local host address
     local_hostname: ""
-    # Protocol for transmission. Choose from: tcp, rdma. (default: tcp)
-    protocol: tcp
-    # Memory segment size in bytes for mounting (default: 4GB)
-    global_segment_size: 4294967296
-    # Local buffer size in bytes (default: 1GB)
-    local_buffer_size: 1073741824
+    # Protocol for transmission. Choose from: tcp, rdma. (default: rdma)
+    protocol: rdma
+    # Memory segment size in bytes for mounting
+    global_segment_size: 86294967296
+    # Local buffer size in bytes
+    local_buffer_size: 86294967296
     # Network device name. Set to "" to let Mooncake to auto-picks devices
     device_name: ""
 

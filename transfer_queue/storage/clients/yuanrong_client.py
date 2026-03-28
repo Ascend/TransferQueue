@@ -15,6 +15,7 @@
 
 import logging
 import os
+import socket
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -25,11 +26,109 @@ from torch import Tensor
 
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
-from transfer_queue.utils.common import find_reachable_host
 from transfer_queue.utils.serial_utils import _decoder, _encoder
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+
+
+def get_local_ip_addresses() -> list[str]:
+    """Get all local IP addresses including 127.0.0.1.
+
+    Returns:
+        List of local IP addresses, with 127.0.0.1 first.
+    """
+    ips = ["127.0.0.1"]
+
+    try:
+        hostname = socket.gethostname()
+        # Add hostname resolution
+        try:
+            host_ip = socket.gethostbyname(hostname)
+            if host_ip not in ips:
+                ips.append(host_ip)
+        except socket.gaierror:
+            pass
+
+        # Get all network interfaces
+        import netifaces
+
+        for interface in netifaces.interfaces():
+            try:
+                addrs = netifaces.ifaddresses(interface)
+                if netifaces.AF_INET in addrs:
+                    for addr_info in addrs[netifaces.AF_INET]:
+                        ip = addr_info.get("addr")
+                        if ip and ip not in ips:
+                            ips.append(ip)
+            except (ValueError, KeyError):
+                continue
+    except ImportError:
+        # Fallback if netifaces is not available
+        try:
+            # Try to get IP by connecting to an external address
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Doesn't need to be reachable
+                s.connect(("8.8.8.8", 80))
+                ip = s.getsockname()[0]
+                if ip not in ips:
+                    ips.append(ip)
+            except Exception:
+                pass
+            finally:
+                s.close()
+        except Exception:
+            pass
+
+    return ips
+
+
+def check_port_connectivity(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Check if a TCP port is reachable on the given host.
+
+    Args:
+        host: Host IP address to check
+        port: Port number to check
+        timeout: Connection timeout in seconds
+
+    Returns:
+        True if the port is reachable, False otherwise
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except Exception:
+        return False
+
+
+def find_reachable_host(port: int, timeout: float = 1.0) -> Optional[str]:
+    """Find a reachable local host IP address for the given port.
+
+    Tries all local IP addresses in order and returns the first one
+    that has the given port open.
+
+    Args:
+        port: Port number to check
+        timeout: Connection timeout in seconds per check
+
+    Returns:
+        The first reachable host IP address, or None if none found.
+    """
+    local_ips = get_local_ip_addresses()
+    logger.info(f"Checking port {port} on local IPs: {local_ips}")
+
+    for ip in local_ips:
+        if check_port_connectivity(ip, port, timeout):
+            logger.info(f"Found reachable host: {ip}:{port}")
+            return ip
+
+    logger.warning(f"No reachable host found for port {port}")
+    return None
+
 
 YUANRONG_DATASYSTEM_IMPORTED: bool = True
 
