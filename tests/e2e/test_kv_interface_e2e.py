@@ -528,6 +528,7 @@ class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
 
     def test_kv_batch_get_nested_tensor(self, controller, tq_api):
+        # test put a regular tensor with batch size 1 and get it back as a nested tensor
         partition_id = "test_partition"
         keys = []
         data_list = []
@@ -537,7 +538,7 @@ class TestKVGetE2E:
             keys.append(key)
             data = torch.randn(size=(i,))
             data_list.append(data)
-            fields = TensorDict({"data": torch.nested.as_nested_tensor([data], layout=torch.jagged)}, batch_size=1)
+            fields = TensorDict({"data": data.unsqueeze(0)}, batch_size=1)
             tq_api.kv_put(key=key, partition_id=partition_id, fields=fields, tag=None)
 
         retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
