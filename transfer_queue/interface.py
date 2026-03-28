@@ -272,6 +272,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
+        return
 
     controller_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
