@@ -136,7 +136,7 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
 
                 if not master_server_parsed.hostname or master_server_parsed.port is None:
                     raise ValueError(
-                        f"Invalid master_server '{conf.backend.MooncakeStore.master_server_address}'. "
+                        f"Invalid master_server_address '{conf.backend.MooncakeStore.master_server_address}'. "
                         f"Host and port are required (e.g., host:port)."
                     )
 
