@@ -95,8 +95,14 @@ df["X_label"] = pd.Categorical(
 df["Bandwidth"] = df["total_gbit_per_sec"]
 df["Scenario"] = df["backend_parsed"]
 
-# Set backend display order
-backend_order = ["Ray", "SimpleStorage", "Yuanrong", "MooncakeStore"]
+# Set backend display order: only include backends that actually exist in the data
+preferred_backend_order = ["Ray", "SimpleStorage", "Yuanrong", "MooncakeStore"]
+
+# Get actual backends present in the data, maintaining preferred order
+actual_backends = df["Scenario"].unique().tolist()
+backend_order = [b for b in preferred_backend_order if b in actual_backends]
+# Add any unknown backends at the end (shouldn't happen normally)
+backend_order += [b for b in actual_backends if b not in preferred_backend_order]
 
 df["Scenario"] = pd.Categorical(df["Scenario"], categories=backend_order, ordered=True)
 
@@ -105,9 +111,9 @@ sns.set_theme(style="white", palette="husl")
 
 fig, ax = plt.subplots(figsize=(12, 7))
 
-# Use the backend order to ensure consistent coloring
-existing_backends = df["Scenario"].unique()
-palette = sns.color_palette("Set2", n_colors=len(existing_backends))
+# Use Set2 palette to generate colors for all backends
+# Set2 has 8 colors, which should be enough for typical use cases
+palette = sns.color_palette("Set2", n_colors=len(backend_order))
 barplot = sns.barplot(data=df, x="X_label", y="Bandwidth", hue="Scenario", ax=ax, alpha=0.8, palette=palette)
 
 # Legend: match old style — at the top center, horizontal, with frame
