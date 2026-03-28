@@ -1,0 +1,36 @@
+name: Recipe check
+
+on:
+  push:
+    branches:
+      - main
+      - v0.*
+  pull_request:
+    branches:
+      - main
+      - v0.*
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[yuanrong]"
+    - name: Run recipes
+      run: |
+        export RAY_DEDUP_LOGS=0
+        python3 recipe/simple_use_case/single_controller_demo.py --num-samples 8 --global-batch-size 4 --rollout-agent-num-workers 1
