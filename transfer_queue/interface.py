@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -236,23 +237,18 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         start_new_session=True,
                     )
                     time.sleep(3)  # Wait for etcd to start
-                    # TODO: check if etcd is healthy
-                    etcd_is_healthy = etcd_process.poll() is None
-                    # check
-                    #
-                    #
-                    #
-                    #
-                    if not etcd_is_healthy:
-                        # etcd exited immediately, indicate failure
-                        # Clean up data directory on failure
-                        try:
-                            shutil.rmtree(etcd_data_dir, ignore_errors=True)
-                        except Exception:
-                            pass
+
+                    if etcd_process.poll() is None:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(2)
+                        result = sock.connect_ex((host, port))
+                        sock.close()
+                        if result != 0:
+                            raise RuntimeError(f"etcd process started but not listening on {host}:{port}")
+                    else:
                         raise RuntimeError(f"etcd exited immediately with return code {etcd_process.returncode}")
 
-                    # Wait a moment for etcd to be ready
+                    logger.info(f"etcd started, PID: {etcd_process.pid}")
                     time.sleep(2)
 
                     # ========== Start datasystem worker ==========
@@ -265,8 +261,10 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         "dscli",
                         "start",
                         "-w",
-                        f"--worker_address={worker_address}",
-                        f"--etcd_address={etcd_address}",
+                        "--worker_address",
+                        worker_address,
+                        "--etcd_address",
+                        etcd_address,
                     ]
 
                     try:
@@ -278,13 +276,16 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                             timeout=90,
                         )
                     except subprocess.TimeoutExpired as err:
-                        raise RuntimeError("dscli start timed out") from err
+                        raise RuntimeError(f"dscli start timed out: {err}") from err
                     # Wait for dscli to start and exit (it starts worker and exits)
                     if ds_result.returncode == 0 and "[  OK  ]" in ds_result.stdout:
                         logger.info(f"dscli started Yuanrong datasystem worker at {worker_address} successfully.")
 
                     else:
-                        raise RuntimeError(f"Failed to start datasystem worker at {worker_address}.")
+                        raise RuntimeError(
+                            f"Failed to start datasystem worker at {worker_address}. "
+                            f"Return code: {ds_result.returncode}, Output: {ds_result.stdout}"
+                        )
 
                     # Store processes and data directory
                     _TRANSFER_QUEUE_STORAGE["Yuanrong"] = {
@@ -494,7 +495,7 @@ def close():
                             try:
                                 subprocess.run(
                                     ["dscli", "stop", "--worker_address", worker_address],
-                                    timeout=5,
+                                    timeout=90,
                                     capture_output=True,
                                 )
                                 logger.info(f"Stopped datasystem worker at {worker_address} via dscli stop")
