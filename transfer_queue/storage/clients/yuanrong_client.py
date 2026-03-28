@@ -25,6 +25,7 @@ from torch import Tensor
 
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.utils.common import find_reachable_host
 from transfer_queue.utils.serial_utils import _decoder, _encoder
 
 logger = logging.getLogger(__name__)
@@ -83,8 +84,19 @@ class NPUTensorKVClientAdapter(StorageStrategy):
     KEYS_LIMIT: int = 10_000
 
     def __init__(self, config: dict):
-        host = config.get("host")
         port = config.get("port")
+
+        if port is None or not isinstance(port, int):
+            raise ValueError("Missing or invalid 'port' in config")
+
+        logger.info(f"Auto-detecting reachable host for Yuanrong port {port}...")
+        host = find_reachable_host(port)
+        if host is None:
+            raise ValueError(
+                f"Could not find any reachable host for Yuanrong port {port}. "
+                "Please ensure yuanrong datasystem is running."
+            )
+        logger.info(f"Using auto-detected host: {host}")
 
         self.device_id = torch.npu.current_device()
         torch.npu.set_device(self.device_id)
@@ -199,8 +211,19 @@ class GeneralKVClientAdapter(StorageStrategy):
     DS_MAX_WORKERS: int = 16
 
     def __init__(self, config: dict):
-        host = config.get("host")
         port = config.get("port")
+
+        if port is None or not isinstance(port, int):
+            raise ValueError("Missing or invalid 'port' in config")
+
+        logger.info(f"Auto-detecting reachable host for Yuanrong port {port}...")
+        host = find_reachable_host(port)
+        if host is None:
+            raise ValueError(
+                f"Could not find any reachable host for Yuanrong port {port}. "
+                "Please ensure yuanrong datasystem is running."
+            )
+        logger.info(f"Using auto-detected host: {host}")
 
         self._ds_client = datasystem.KVClient(host, port)
         self._ds_client.init()
@@ -356,6 +379,11 @@ class YuanrongStorageClient(TransferQueueStorageKVClient):
     def __init__(self, config: dict[str, Any]):
         if not YUANRONG_DATASYSTEM_IMPORTED:
             raise ImportError("YuanRong DataSystem not installed.")
+
+        port = config.get("port")
+
+        if port is None or not isinstance(port, int):
+            raise ValueError("Missing or invalid 'port' in config")
 
         super().__init__(config)
 
