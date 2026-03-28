@@ -25,7 +25,7 @@ BACKENDS=("SimpleStorage" "Yuanrong" "MooncakeStore")
 declare -a SETTINGS=(
     "1024,9,8192,Small"
     "4096,15,32768,Medium"
-    "8192,21,128000,Large"
+    "8192,18,100000,Large"
 )
 
 # Complex case flag
