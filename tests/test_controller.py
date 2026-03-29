@@ -19,7 +19,7 @@ import pytest
 import ray
 import torch
 
-from transfer_queue.controller import TestTransferQueueController
+from transfer_queue.controller import TransferQueueController
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
