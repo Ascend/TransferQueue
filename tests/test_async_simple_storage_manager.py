@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -24,14 +22,10 @@ import torch
 import zmq
 from tensordict import NonTensorStack, TensorDict
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.metadata import BatchMeta  # noqa: E402
-from transfer_queue.storage import AsyncSimpleStorageManager  # noqa: E402
-from transfer_queue.utils.enum_utils import TransferQueueRole  # noqa: E402
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo  # noqa: E402
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage import AsyncSimpleStorageManager
+from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
 @pytest_asyncio.fixture

@@ -13,19 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
 
-# Import your classes here
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder  # noqa: E402
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 @pytest.mark.parametrize(

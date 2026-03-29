@@ -15,20 +15,14 @@
 
 """Unit tests for TransferQueue samplers."""
 
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.sampler import BaseSampler  # noqa: E402
-from transfer_queue.sampler.grpo_group_n_sampler import GRPOGroupNSampler  # noqa: E402
-from transfer_queue.sampler.rank_aware_sampler import RankAwareSampler  # noqa: E402
-from transfer_queue.sampler.sequential_sampler import SequentialSampler  # noqa: E402
+from transfer_queue.sampler import BaseSampler
+from transfer_queue.sampler.grpo_group_n_sampler import GRPOGroupNSampler
+from transfer_queue.sampler.rank_aware_sampler import RankAwareSampler
+from transfer_queue.sampler.sequential_sampler import SequentialSampler
 
 
 class TestBaseSampler:

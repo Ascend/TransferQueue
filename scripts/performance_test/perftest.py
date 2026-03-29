@@ -18,9 +18,7 @@ import argparse
 import csv
 import logging
 import os
-import sys
 import time
-from pathlib import Path
 from typing import Any
 
 import ray
@@ -28,10 +26,7 @@ import torch
 from omegaconf import OmegaConf
 from tensordict import NonTensorStack, TensorDict
 
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
-
-import transfer_queue as tq  # noqa: E402
+import transfer_queue as tq
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

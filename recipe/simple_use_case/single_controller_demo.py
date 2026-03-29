@@ -18,12 +18,10 @@ import asyncio
 import logging
 import os
 import random
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
 from importlib import resources
-from pathlib import Path
 
 import ray
 import torch
@@ -34,9 +32,6 @@ from torch.utils.data import DataLoader, Dataset
 
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
-
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

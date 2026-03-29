@@ -15,18 +15,11 @@
 
 """Unit tests for TransferQueue metadata module - Columnar BatchMeta + KVBatchMeta."""
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.metadata import BatchMeta, KVBatchMeta  # noqa: E402
+from transfer_queue.metadata import BatchMeta, KVBatchMeta
 
 # ==============================================================================
 # Columnar BatchMeta Tests

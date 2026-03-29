@@ -16,7 +16,6 @@
 import os
 import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -25,10 +24,6 @@ import torch
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorData
-
-# Setup paths (transfer_queue is not pip-installed)
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
 
 # Module-level default fields to avoid repeated generation
 DEFAULT_FIELDS = [

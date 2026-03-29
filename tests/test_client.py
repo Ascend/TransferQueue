@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 import time
-from pathlib import Path
 from threading import Thread
 from unittest.mock import patch
 
@@ -24,16 +22,10 @@ import torch
 import zmq
 from tensordict import NonTensorStack, TensorDict
 
-# Import your classes here
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue import TransferQueueClient  # noqa: E402
-from transfer_queue.metadata import (  # noqa: E402
-    BatchMeta,
-)
-from transfer_queue.utils.enum_utils import TransferQueueRole  # noqa: E402
-from transfer_queue.utils.zmq_utils import (  # noqa: E402
+from transfer_queue import TransferQueueClient
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,

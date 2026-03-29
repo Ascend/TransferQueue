@@ -22,8 +22,6 @@ This test module validates the KV interface functionality by:
 
 import asyncio
 import os
-import sys
-from pathlib import Path
 
 import pytest
 import ray
@@ -31,11 +29,7 @@ import torch
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 
-# Add parent directory to path
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
-
-import transfer_queue as tq  # noqa: E402
+import transfer_queue as tq
 
 
 class TQAPIWrapper:

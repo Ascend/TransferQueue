@@ -14,21 +14,16 @@
 # limitations under the License.
 
 import logging
-import sys
-from pathlib import Path
 
 import pytest
 import ray
 import torch
 
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
+from transfer_queue.controller import TestTransferQueueController
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-from transfer_queue.controller import TransferQueueController  # noqa: E402
 
 
 @pytest.fixture(scope="function")

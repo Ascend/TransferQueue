@@ -18,17 +18,12 @@ import argparse
 import csv
 import logging
 import os
-import sys
 import time
-from pathlib import Path
 from typing import Any
 
 import ray
 import torch
 from tensordict import NonTensorStack, TensorDict
-
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)

@@ -15,13 +15,7 @@
 
 import logging
 import os
-import sys
 import time
-from pathlib import Path
-
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
