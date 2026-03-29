@@ -362,9 +362,7 @@ def dynamic_zmq_socket(
                 if server_info is None:
                     raise RuntimeError(f"Server '{target_name}' not found in registered servers")
             else:
-                raise RuntimeError(
-                    f"Unsupported server registry type for '{server_attr}': {type(server_obj).__name__}"
-                )
+                raise RuntimeError(f"Unsupported server registry type for '{server_attr}': {type(server_obj).__name__}")
 
             port = server_info.ports.get(socket_name)
             if port is None:
