@@ -18,12 +18,14 @@ import os
 import socket
 import time
 from dataclasses import dataclass
-from typing import Any, Optional, TypeAlias
+from functools import wraps
+from typing import Any, Callable, Mapping, Optional, TypeAlias
 from uuid import uuid4
 
 import psutil
 import ray
 import zmq
+import zmq.asyncio
 from ray.util import get_node_ip_address
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
@@ -299,6 +301,97 @@ def create_zmq_socket(
     if identity is not None:
         socket.setsockopt(zmq.IDENTITY, identity)
     return socket
+
+
+def dynamic_zmq_socket(
+    socket_name: str,
+    *,
+    owner_id_attr: str,
+    server_attr: str,
+    target_kwarg: Optional[str] = None,
+    timeout: Optional[int] = None,
+):
+    """Create a reusable async decorator for request sockets.
+
+    This decorator encapsulates the common socket lifecycle used by both
+    client-side and storage-manager-side request paths:
+    create context/socket -> connect -> inject socket -> close/term.
+
+    Args:
+        socket_name: Socket port key in ``ZMQServerInfo.ports``.
+        owner_id_attr: Attribute name on ``self`` used in identity/log prefix
+            (e.g., ``client_id`` or ``storage_manager_id``).
+        server_attr: Attribute name on ``self`` that stores server info.
+            - ``ZMQServerInfo`` for single-target calls.
+            - ``Mapping[str, ZMQServerInfo]`` for multi-target calls.
+        target_kwarg: Optional kwarg name that provides target server id when
+            ``server_attr`` is a mapping.
+        timeout: Optional timeout (seconds) for both send/recv operations.
+    """
+
+    def decorator(func: Callable):
+        @wraps(func)
+        async def wrapper(self, *args, **kwargs):
+            owner_id = getattr(self, owner_id_attr, None)
+            if owner_id is None:
+                raise RuntimeError(f"Missing owner id attribute: {owner_id_attr}")
+
+            server_obj = getattr(self, server_attr, None)
+            if server_obj is None:
+                raise RuntimeError(f"Missing server registry attribute: {server_attr}")
+
+            target_name: Optional[str] = None
+            if target_kwarg is not None:
+                target_name = kwargs.get(target_kwarg)
+                if target_name is None:
+                    for arg in args:
+                        if isinstance(arg, str):
+                            target_name = arg
+                            break
+
+            if isinstance(server_obj, ZMQServerInfo):
+                if target_name is not None and target_name != server_obj.id:
+                    raise RuntimeError(
+                        f"Target mismatch: target '{target_name}' does not match registered server '{server_obj.id}'"
+                    )
+                server_info = server_obj
+            elif isinstance(server_obj, Mapping):
+                if target_name is None:
+                    raise RuntimeError(f"Missing target server identifier via '{target_kwarg}'")
+                server_info = server_obj.get(target_name)
+                if server_info is None:
+                    raise RuntimeError(f"Server '{target_name}' not found in registered servers")
+            else:
+                raise RuntimeError(
+                    f"Unsupported server registry type for '{server_attr}': {type(server_obj).__name__}"
+                )
+
+            port = server_info.ports.get(socket_name)
+            if port is None:
+                raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
+
+            context = zmq.asyncio.Context()
+            address = format_zmq_address(server_info.ip, port)
+            identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
+            sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
+
+            try:
+                sock.connect(address)
+                if timeout is not None:
+                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+                kwargs["socket"] = sock
+                return await func(self, *args, **kwargs)
+            finally:
+                try:
+                    if not sock.closed:
+                        sock.close(linger=-1)
+                finally:
+                    context.term()
+
+        return wrapper
+
+    return decorator
 
 
 def process_zmq_server_info(

@@ -19,10 +19,8 @@ import os
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
-from functools import wraps
 from operator import itemgetter
-from typing import Any, Callable, NamedTuple, Optional
-from uuid import uuid4
+from typing import Any, NamedTuple
 
 import torch
 import zmq
@@ -36,8 +34,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    create_zmq_socket,
-    format_zmq_address,
+    dynamic_zmq_socket,
 )
 
 logger = logging.getLogger(__name__)
@@ -50,6 +47,15 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
+
+# Pre-bound decorator for storage-unit socket operations.
+_storage_unit_socket = dynamic_zmq_socket(
+    "put_get_socket",
+    owner_id_attr="storage_manager_id",
+    server_attr="storage_unit_infos",
+    target_kwarg="target_storage_unit",
+    timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+)
 
 
 class RoutingGroup(NamedTuple):
@@ -113,78 +119,6 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             raise ValueError(f"Invalid server infos: {server_infos}")
 
         return server_infos_transform
-
-    # TODO (TQStorage): Provide a general dynamic socket function for both Client & Storage @huazhong.
-    @staticmethod
-    def dynamic_storage_manager_socket(socket_name: str, timeout: int):
-        """Decorator to auto-manage ZMQ sockets for Controller/Storage servers (create -> connect -> inject -> close).
-
-        Args:
-            socket_name (str): Port name (from server config) to use for ZMQ connection (e.g., "data_req_port").
-            timeout (float): Timeout in seconds for ZMQ connection (in seconds).
-
-        Decorated Function Rules:
-            1. Must be an async class method (needs `self`).
-            2. `self` requires:
-            - `storage_unit_infos: storage unit infos (ZMQServerInfo | dict[Any, ZMQServerInfo]).
-            3. Specify target server via:
-            - `target_storage_unit` arg.
-            4. Receives ZMQ socket via `socket` keyword arg (injected by decorator).
-        """
-
-        def decorator(func: Callable):
-            @wraps(func)
-            async def wrapper(self, *args, **kwargs):
-                server_key = kwargs.get("target_storage_unit")
-                if server_key is None:
-                    for arg in args:
-                        if isinstance(arg, str) and arg in self.storage_unit_infos.keys():
-                            server_key = arg
-                            break
-
-                server_info = self.storage_unit_infos.get(server_key)
-
-                if not server_info:
-                    raise RuntimeError(f"Server {server_key} not found in registered servers")
-
-                context = zmq.asyncio.Context()
-                address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
-                identity = f"{self.storage_manager_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity)
-
-                try:
-                    sock.connect(address)
-                    # Timeouts to avoid indefinite await on recv/send
-                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
-                    logger.debug(
-                        f"[{self.storage_manager_id}]: Connected to StorageUnit {server_info.id} at {address} "
-                        f"with identity {identity.decode()}"
-                    )
-
-                    kwargs["socket"] = sock
-                    return await func(self, *args, **kwargs)
-                except Exception as e:
-                    logger.error(
-                        f"[{self.storage_manager_id}]: Error in socket operation with "
-                        f"StorageUnit {server_info.id} at {address}: "
-                        f"{type(e).__name__}: {e}"
-                    )
-                    raise
-                finally:
-                    try:
-                        if not sock.closed:
-                            sock.close(linger=-1)
-                    except Exception as e:
-                        logger.warning(
-                            f"[{self.storage_manager_id}]: Error closing socket to StorageUnit {server_info.id}: {e}"
-                        )
-
-                    context.term()
-
-            return wrapper
-
-        return decorator
 
     def _group_by_hash(self, global_indexes: list[int]) -> dict[str, RoutingGroup]:
         """Group samples by global_idx % num_su, return {storage_id: RoutingGroup}.
@@ -347,7 +281,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             field_schema,
         )
 
-    @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)
+    @_storage_unit_socket
     async def _put_to_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -483,7 +417,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
 
         return TensorDict(tensor_data, batch_size=len(metadata))
 
-    @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)
+    @_storage_unit_socket
     async def _get_from_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -555,7 +489,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             if isinstance(result, Exception):
                 logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
 
-    @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)
+    @_storage_unit_socket
     async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
         try:
             request_msg = ZMQMessage.create(
