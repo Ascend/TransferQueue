@@ -17,9 +17,10 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Mapping, Optional, TypeAlias
+from typing import Any, Callable, Optional, TypeAlias
 from uuid import uuid4
 
 import psutil
