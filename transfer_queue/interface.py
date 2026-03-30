@@ -86,7 +86,6 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                     placement_group=storage_placement_group,
                     placement_group_bundle_index=storage_unit_rank,
                     name=f"TransferQueueStorageUnit#{storage_unit_rank}",
-                    lifetime="detached",
                 ).remote(
                     storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
                 )
