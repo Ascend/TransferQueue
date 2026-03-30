@@ -42,19 +42,63 @@ python perftest.py \
 | `--head_node_ip` | Head node IP address | - | Yes |
 | `--worker_node_ip` | Worker node IP address (required for Yuanrong) | None | No |
 | `--output_csv` | Path to output CSV file | None | No |
+| `--use_complex_case` | Use complex test case with nested tensors and NonTensorStack fields | False | No |
 
 ## Backend Configuration
 
 The script reads the backend configuration directly from the provided `--backend_config` YAML file. The backend type is determined by `backend.storage_backend` in the config file. When `--backend` is specified, it overrides the value in the config.
 
-For device support of each backend:
-- `SimpleStorage`: `cpu`
-- `Yuanrong`: `cpu`, `npu`
-- `MooncakeStore`: `cpu`, `gpu`
+### SimpleStorage Configuration
 
-## Test Data Format
+```yaml
+backend:
+  storage_backend: SimpleStorage
+  SimpleStorage:
+    total_storage_size: 100000
+    num_data_storage_units: 16
+```
 
-The test case creates a `TensorDict` with three types of fields to simulate real training batches:
+### Yuanrong Configuration
+
+```yaml
+backend:
+  storage_backend: Yuanrong
+  Yuanrong:
+    port: 31501
+    enable_yr_npu_transport: true
+```
+
+For Yuanrong backend, writer runs on the head node and reader runs on the worker node. `--worker_node_ip` is required.
+
+### MooncakeStore Configuration
+
+```yaml
+backend:
+  storage_backend: MooncakeStore
+  MooncakeStore:
+    auto_init: true
+    metadata_server: localhost:50050
+    master_server_address: localhost:50051
+    local_hostname: ""
+    protocol: rdma
+    global_segment_size: 86294967296
+    local_buffer_size: 86294967296
+    device_name: ""
+```
+
+## Test Scenarios
+
+### Simple Test Case (Default)
+
+When `--use_complex_case` is **not** specified (default), the test creates a `TensorDict` with only regular tensors:
+
+- **Regular tensors**: Shape `(batch_size, seq_length)`, float32.
+
+Each regular tensor field size = `batch_size × seq_length × 4` bytes.
+
+### Complex Test Case
+
+When `--use_complex_case` is specified, the test creates a `TensorDict` with three types of fields to simulate real training batches:
 
 1. **Regular tensors**: Shape `(batch_size, seq_length)`, float32.
 2. **Nested tensors** (non-NPU devices): Variable-length ragged sequences with lengths forming an arithmetic progression from 1 to `seq_length`. Average length ≈ `seq_length / 2`, so each nested field is roughly half the size of a regular field.
@@ -72,10 +116,6 @@ Each iteration performs a PUT → LIST → GET → DELETE cycle via TransferQueu
 4. **DELETE** (`kv_clear`): Writer removes the written data.
 
 The test runs `--num_test_iterations` iterations. Data creation only happens in the first iteration; subsequent iterations reuse the same TensorDict to isolate transfer overhead.
-
-## Yuanrong Backend
-
-For Yuanrong backend, writer runs on the head node and reader runs on the worker node. `--worker_node_ip` is required.
 
 ## Running Full Test Suite
 
@@ -130,10 +170,16 @@ After running the tests, `draw_figure.py` reads all CSV files from `results/` an
 
 ## Examples
 
-### SimpleStorage backend
+### SimpleStorage backend (simple case)
 ```bash
 python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
   --head_node_ip=192.168.0.1
+```
+
+### SimpleStorage backend (complex case)
+```bash
+python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
+  --head_node_ip=192.168.0.1 --use_complex_case
 ```
 
 ### Yuanrong backend (inter-node)
