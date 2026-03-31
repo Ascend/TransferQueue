@@ -169,7 +169,7 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
                     f"expected batch_size[0]={batch_size}, got value.shape[0]={value.shape[0]}"
                 )
             if len(value.shape) == 1:
-                logger.warning(f"Receiving 1D tensor for field '{field_name}'. Unsqueeze the last dimension.")
+                logger.info(f"Receiving 1D tensor for field '{field_name}'. Unsqueeze the last dimension.")
                 value = value.unsqueeze(-1)
             first_item = value[0]
         else:

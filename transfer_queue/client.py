@@ -389,7 +389,7 @@ class AsyncTransferQueueClient:
 
         for field_name, field_data in data.items():
             if isinstance(field_data, torch.Tensor) and field_data.ndim == 1:
-                logger.warning(
+                logger.info(
                     f"[{self.client_id}]: Data field '{field_name}' is a tensor with only one dimension. "
                     f"You may receive 2D tensors in key-value based backend."
                 )

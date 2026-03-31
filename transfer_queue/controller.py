@@ -63,7 +63,6 @@ TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GE
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
 # determine consumption status even before producers have generated the samples.
-TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
 
 class PartitionIndexManager:
@@ -335,6 +334,7 @@ class DataPartitionStatus:
 
     # Production status tensor - dynamically expandable
     # Values: 0 = not produced, 1 = ready for consumption
+    TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
     production_status: Tensor = torch.zeros(TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
 
@@ -1050,6 +1050,8 @@ class TransferQueueController:
         Returns:
             True if partition was created successfully, False if it already exists
         """
+        TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
+
         if partition_id in self.partitions:
             logger.warning(f"Partition {partition_id} already exists")
             return False
@@ -1313,38 +1315,54 @@ class TransferQueueController:
 
                 if len(ready_for_consume_indexes) < batch_size:
                     if self.polling_mode:
-                        logger.debug(
-                            f"[{self.controller_id}]: Not enough data for task {task_name} in partition {partition_id}."
-                            f" Required: {batch_size}, Available: {len(ready_for_consume_indexes)}."
-                            f" Returning None due to polling mode."
+                        sampling_config = sampling_config or {}
+                        states = self.sampler._states.get(partition_id, {}).get(task_name, {})
+                        dp_rank = sampling_config.get("dp_rank", None)
+                        batch_index = sampling_config.get("batch_index", None)
+
+                        # Return cached result if available
+                        if dp_rank is not None and dp_rank in states and batch_index in states[dp_rank]:
+                            break
+                        else:
+                            logger.debug(
+                                f"[{self.controller_id}]: Not enough data for task {task_name} in "
+                                f"partition {partition_id}. Required: {batch_size}, "
+                                f"Available: {len(ready_for_consume_indexes)}."
+                                f" Returning None due to polling mode."
+                            )
+                            return BatchMeta.empty()
+                    else:
+                        logger.warning(
+                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
+                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
                         )
-                        return BatchMeta.empty()
+                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
                     if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
                         raise TimeoutError(
                             f"Timeout while waiting for sufficient data for task {task_name}. "
                             f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
                         )
-                    logger.warning(
-                        f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                        f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                        f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                        f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
-                    )
-                    time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
                 else:
                     break
 
             batch_global_indexes, consumed_indexes = self.sampler(
                 ready_for_consume_indexes,
                 batch_size,
+                partition=self._get_partition(partition_id),
                 **(sampling_config or {}),
                 **kwargs,
             )
 
-            # Check if we got valid results from the sampler
-            if len(batch_global_indexes) != batch_size:
+            # Check if we got valid results from the sampler.
+            # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
+            # batches per DP rank, so we only check for empty results.
+            if len(batch_global_indexes) == 0:
+                if self.polling_mode:
+                    return BatchMeta.empty()
                 raise RuntimeError(
-                    f"Sampler returned insufficient samples. Please check the sampler logic. "
+                    f"Sampler returned no samples. Please check the sampler logic. "
                     f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
                     f"after sampling: {len(batch_global_indexes)}"
                 )
@@ -1826,7 +1844,7 @@ class TransferQueueController:
                         partition_id=params["partition_id"],
                         mode=params.get("mode", "fetch"),
                         task_name=params.get("task_name"),
-                        sampling_config=params.get("sampling_config"),
+                        sampling_config=params.get("sampling_config", {}),
                     )
 
                     response_msg = ZMQMessage.create(

@@ -38,6 +38,7 @@ from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
 from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
 from .sampler.rank_aware_sampler import RankAwareSampler
+from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
 
 __all__ = (
@@ -76,6 +77,7 @@ __all__ = (
         "GRPOGroupNSampler",
         "SequentialSampler",
         "RankAwareSampler",
+        "SeqlenBalancedSampler",
     ]
 )
 
