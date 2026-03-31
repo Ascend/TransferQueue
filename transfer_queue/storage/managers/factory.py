@@ -13,9 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import warnings
 from typing import Any
 
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
+from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 
 class TransferQueueStorageManagerFactory:
@@ -39,10 +41,34 @@ class TransferQueueStorageManagerFactory:
         return decorator
 
     @classmethod
-    def create(cls, manager_type: str, config: dict[str, Any]) -> TransferQueueStorageManager:
+    def create(
+        cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]
+    ) -> TransferQueueStorageManager:
         """Create and return a TransferQueueStorageManager instance."""
         if manager_type not in cls._registry:
-            raise ValueError(
-                f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
-            )
-        return cls._registry[manager_type](config)
+            if manager_type == "AsyncSimpleStorageManager":
+                warnings.warn(
+                    f"The manager_type {manager_type} will be deprecated in 0.1.7, please use SimpleStorage instead.",
+                    category=DeprecationWarning,
+                    stacklevel=2,
+                )
+                manager_type = "SimpleStorage"
+            elif manager_type == "MooncakeStorageManager":
+                warnings.warn(
+                    f"The manager_type {manager_type} will be deprecated in 0.1.7, please use MooncakeStore instead.",
+                    category=DeprecationWarning,
+                    stacklevel=2,
+                )
+                manager_type = "MooncakeStore"
+            elif manager_type == "YuanrongStorageManager":
+                warnings.warn(
+                    f"The manager_type {manager_type} will be deprecated in 0.1.7, please use Yuanrong instead.",
+                    category=DeprecationWarning,
+                    stacklevel=2,
+                )
+                manager_type = "Yuanrong"
+            else:
+                raise ValueError(
+                    f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
+                )
+        return cls._registry[manager_type](controller_info, config)

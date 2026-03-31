@@ -65,7 +65,7 @@ def limit_pytorch_auto_parallel_threads(target_num_threads: Optional[int] = None
             target_num_threads = physical_cores
 
     if target_num_threads > physical_cores:
-        logger.error(
+        logger.warning(
             f"target_num_threads {target_num_threads} should not exceed total "
             f"physical CPU cores {physical_cores}. Setting to {physical_cores}."
         )

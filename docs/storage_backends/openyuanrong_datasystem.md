@@ -132,11 +132,11 @@ from transfer_queue import (
     TransferQueueController,
     process_zmq_server_info,
 )
-# host, port, manager_type and client_name are the config for booting the datasystem.
+# port, manager_type and client_name are the config for booting the datasystem.
+# host will be auto-detected by checking local IP addresses.
 config_str = """
   manager_type: YuanrongStorageManager
   client_name: YuanrongStorageClient
-  host: 127.0.0.1
   port: 31501
 """
 dict_conf = OmegaConf.create(config_str, flags={"allow_objects": True})
@@ -360,26 +360,22 @@ def main():
     config_str = """
         manager_type: YuanrongStorageManager
         client_name: YuanrongStorageClient
-        host: 10.170.27.24
         port: 31501
     """
     dict_conf = OmegaConf.create(config_str, flags={"allow_objects": True})
     # It is important to pay attention to the controller's lifecycle.
     controller, dict_conf.controller_info = initialize_controller()
-    
-    conf_writer = dict_conf.copy()
-    conf_writer.host = HEAD_NODE_IP
-    conf_reader = dict_conf.copy()
-    conf_reader.host = WORKER_NODE_IP
+
+    # Note: host is auto-detected on each node, no need to configure explicitly
     data = TensorDict({ "prompt": torch.ones(3, 512), "big_tensor": torch.randn(3,1024,1024)}, batch_size=[3])
     # you could assign npu or gpu devices by 'resources'
     # resources={f"node:{HEAD_NODE_IP}": 0.001} could Force the actor to run on HEAD_NODE
     writer = TransferQueueClientActor.options(
             resources={f"node:{HEAD_NODE_IP}": 0.001},
-    ).remote(conf_writer, "train")
+    ).remote(dict_conf, "train")
     reader = TransferQueueClientActor.options(
             resources={f"node:{WORKER_NODE_IP}": 0.001}
-    ).remote(conf_reader, "rollout")
+    ).remote(dict_conf, "rollout")
         
     ray.get(writer.put.remote(data=data, partition_id="train_0"))
 

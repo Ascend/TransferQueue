@@ -36,57 +36,17 @@ warnings.filterwarnings(
 
 import ray  # noqa: E402
 import torch  # noqa: E402
-from omegaconf import OmegaConf  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 # Add the parent directory to the path
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-from transfer_queue import (  # noqa: E402
-    SimpleStorageUnit,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
-)
+import transfer_queue as tq  # noqa: E402
 
 # Configure Ray
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"
-
-
-def setup_transfer_queue():
-    """Setup TransferQueue components."""
-    if not ray.is_initialized():
-        ray.init()
-
-    config = OmegaConf.create(
-        {
-            "num_data_storage_units": 2,
-        }
-    )
-
-    storage_units = {}
-    for i in range(config["num_data_storage_units"]):
-        storage_units[i] = SimpleStorageUnit.remote(storage_unit_size=100)
-
-    controller = TransferQueueController.remote()
-    controller_info = process_zmq_server_info(controller)
-    storage_unit_infos = process_zmq_server_info(storage_units)
-
-    client = TransferQueueClient(
-        client_id="TutorialClient",
-        controller_info=controller_info,
-    )
-
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})
-    tq_config.controller_info = controller_info
-    tq_config.storage_unit_infos = storage_unit_infos
-    config = OmegaConf.merge(tq_config, config)
-
-    client.initialize_storage_manager(manager_type="AsyncSimpleStorageManager", config=config)
-
-    return controller, storage_units, client
 
 
 def demonstrate_partition_isolation():
@@ -97,18 +57,23 @@ def demonstrate_partition_isolation():
 
     print("\nDifferent partitions are completely isolated - data doesn't interfere between partitions")
 
-    controller, storage_units, client = setup_transfer_queue()
+    if not ray.is_initialized():
+        ray.init(namespace="TransferQueueTutorial")
+
+    tq.init()
+
+    tq_client = tq.get_client()
 
     # Partition 1: Training data
     print("\n[Partition 1] Putting training data...")
     train_data = TensorDict(
         {
             "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
-            "labels": torch.tensor([0, 1]),
+            "labels": torch.tensor([[0], [1]]),
         },
         batch_size=2,
     )
-    client.put(data=train_data, partition_id="train")
+    tq_client.put(data=train_data, partition_id="train")
     print("  ✓ Training data added to 'train' partition")
 
     # Partition 2: Validation data
@@ -116,29 +81,29 @@ def demonstrate_partition_isolation():
     val_data = TensorDict(
         {
             "input_ids": torch.tensor([[7, 8, 9], [10, 11, 12]]),
-            "labels": torch.tensor([2, 3]),
+            "labels": torch.tensor([[2], [3]]),
         },
         batch_size=2,
     )
-    client.put(data=val_data, partition_id="val")
+    tq_client.put(data=val_data, partition_id="val")
     print("  ✓ Validation data added to 'val' partition")
 
     # Get from train partition
     print("\n[Retrieving from 'train' partition]")
-    train_meta = client.get_meta(
+    train_meta = tq_client.get_meta(
         data_fields=["input_ids", "labels"], batch_size=2, partition_id="train", task_name="train_task"
     )
 
-    retrieved_train_data = client.get_data(train_meta)
+    retrieved_train_data = tq_client.get_data(train_meta)
     print(f"  ✓ Got BatchMeta={train_meta} from partition 'train'")
     print(f"  ✓ Retrieved Data: input_ids={retrieved_train_data['input_ids']}, labels={retrieved_train_data['labels']}")
 
     # Get from val partition
     print("\n[Retrieving from 'val' partition]")
-    val_meta = client.get_meta(
+    val_meta = tq_client.get_meta(
         data_fields=["input_ids", "labels"], batch_size=2, partition_id="val", task_name="val_task"
     )
-    retrieved_val_data = client.get_data(val_meta)
+    retrieved_val_data = tq_client.get_data(val_meta)
     print(f"  ✓ Got BatchMeta={val_meta} from partition 'val'")
     print(f"  ✓ Retrieved Data: input_ids={retrieved_val_data['input_ids']}, labels={retrieved_val_data['labels']}")
 
@@ -146,9 +111,9 @@ def demonstrate_partition_isolation():
     print("  ✓ Data isolation: 'train' and 'val' partitions are completely independent")
 
     # Cleanup
-    client.clear_partition(partition_id="train")
-    client.clear_partition(partition_id="val")
-    client.close()
+    tq_client.clear_partition(partition_id="train")
+    tq_client.clear_partition(partition_id="val")
+    tq.close()
     ray.shutdown()
 
 
@@ -160,7 +125,12 @@ def demonstrate_dynamic_expansion():
 
     print("\nPartitions dynamically expand to accommodate new data (rows and columns)")
 
-    controller, storage_units, client = setup_transfer_queue()
+    if not ray.is_initialized():
+        ray.init(namespace="TransferQueueTutorial")
+
+    tq.init()
+
+    tq_client = tq.get_client()
 
     # Add first batch with 2 samples, 2 fields
     print("\n[Step 1] Adding initial data (2 samples, 2 fields)...")
@@ -171,7 +141,7 @@ def demonstrate_dynamic_expansion():
         },
         batch_size=2,
     )
-    meta1 = client.put(data=data1, partition_id="dynamic")
+    meta1 = tq_client.put(data=data1, partition_id="dynamic")
     print("  ✓ Added 2 samples")
     print(f"  ✓ Got BatchMeta: {meta1} samples")
 
@@ -184,9 +154,9 @@ def demonstrate_dynamic_expansion():
         },
         batch_size=3,
     )
-    meta2 = client.put(data=data2, partition_id="dynamic")
+    meta2 = tq_client.put(data=data2, partition_id="dynamic")
 
-    all_meta = client.get_meta(
+    all_meta = tq_client.get_meta(
         data_fields=["field1", "field2"], batch_size=5, partition_id="dynamic", task_name="dynamic_task"
     )
     print("  ✓ Added 3 more samples (total: 5)")
@@ -201,7 +171,7 @@ def demonstrate_dynamic_expansion():
         },
         batch_size=2,
     )
-    meta3 = client.put(data=data3, metadata=meta1)
+    meta3 = tq_client.put(data=data3, metadata=meta1)
     print("  ✓ Added 2 samples with new field 'field3'")
     print(f"  ✓ Got BatchMeta: {meta3} for newly put data with new field")
 
@@ -210,8 +180,8 @@ def demonstrate_dynamic_expansion():
     print("  ✓ Columns auto-expand: Can add new fields anytime")
 
     # Cleanup
-    client.clear_partition(partition_id="dynamic")
-    client.close()
+    tq_client.clear_partition(partition_id="dynamic")
+    tq.close()
     ray.shutdown()
 
 
@@ -221,7 +191,12 @@ def demonstrate_default_consumption_sample_strategy():
     print("Feature 3: Default Sampling Strategy for Controller - No Duplicate, Sequential Samples")
     print("=" * 80)
 
-    controller, storage_units, client = setup_transfer_queue()
+    if not ray.is_initialized():
+        ray.init(namespace="TransferQueueTutorial")
+
+    tq.init()
+
+    tq_client = tq.get_client()
 
     # Add 6 samples
     print("\n[Setup] Adding 6 samples...")
@@ -231,22 +206,22 @@ def demonstrate_default_consumption_sample_strategy():
         },
         batch_size=6,
     )
-    client.put(data=all_data, partition_id="sampling")
+    tq_client.put(data=all_data, partition_id="sampling")
     print("  ✓ 6 samples added")
 
     # First get - should get samples 0,1,2
     print("\n[Task A, Get 1] Requesting 3 samples...")
-    meta1 = client.get_meta(data_fields=["data"], batch_size=3, partition_id="sampling", task_name="A")
+    meta1 = tq_client.get_meta(data_fields=["data"], batch_size=3, partition_id="sampling", task_name="A")
     print(f"  ✓ Got samples: {meta1.global_indexes}")
 
     # Second get - should get samples 3,4,5 (no duplicates!)
     print("\n[Task A, Get 2] Requesting 3 more samples...")
-    meta2 = client.get_meta(data_fields=["data"], batch_size=3, partition_id="sampling", task_name="A")
+    meta2 = tq_client.get_meta(data_fields=["data"], batch_size=3, partition_id="sampling", task_name="A")
     print(f"  ✓ Got samples: {meta2.global_indexes}")
 
     # Third get - should get samples 0,1
     print("\n[Task B, Get 1] Requesting 2 samples...")
-    meta3 = client.get_meta(data_fields=["data"], batch_size=2, partition_id="sampling", task_name="B")
+    meta3 = tq_client.get_meta(data_fields=["data"], batch_size=2, partition_id="sampling", task_name="B")
     print(f"  ✓ Got samples: {meta3.global_indexes}")
 
     print("\n[Verification]")
@@ -257,8 +232,8 @@ def demonstrate_default_consumption_sample_strategy():
     print("  ✓ Third get (Task B): samples 0,1")
 
     # Cleanup
-    client.clear_partition(partition_id="sampling")
-    client.close()
+    tq_client.clear_partition(partition_id="sampling")
+    tq.close()
     ray.shutdown()
 
 
@@ -268,7 +243,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 3: Understanding TransferQueueController
+        TransferQueue Tutorial 4: Understanding TransferQueueController
 
         This script demonstrates TransferQueueController's key features:
 

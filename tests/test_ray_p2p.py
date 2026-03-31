@@ -13,23 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 import time
-from pathlib import Path
 
+import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tensordict import TensorDict
 
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.client import TransferQueueClient  # noqa: E402
-from transfer_queue.metadata import BatchMeta, FieldMeta, SampleMeta  # noqa: E402
-from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory  # noqa: E402
-from transfer_queue.utils.zmq_utils import ZMQServerInfo  # noqa: E402
+from transfer_queue.client import TransferQueueClient
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.base import KVStorageManager
+from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 TEST_CONFIGS: list[tuple[tuple[int, int], torch.dtype]] = [
     ((5000, 5000), torch.float32),
@@ -115,17 +111,19 @@ class WriterActor:
             batch_size=batch_size,
         )
 
-        samples = [
-            SampleMeta(
-                global_index=i,
-                partition_id=partition_id,
-                fields={
-                    "input_ids": FieldMeta(name="input_ids", dtype=torch.float32, shape=(seq_len,)),
-                },
-            )
-            for i in range(batch_size)
-        ]
-        meta = BatchMeta(samples=samples)
+        meta = BatchMeta(
+            global_indexes=list(range(batch_size)),
+            partition_ids=[partition_id] * batch_size,
+            field_schema={
+                "input_ids": {
+                    "dtype": torch.float32,
+                    "shape": (seq_len,),
+                    "is_nested": False,
+                    "is_non_tensor": False,
+                }
+            },
+            production_status=np.zeros(batch_size, dtype=np.int8),
+        )
 
         self.data = data
         self.meta = meta

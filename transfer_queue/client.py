@@ -18,23 +18,19 @@ import logging
 import os
 import threading
 from functools import wraps
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
-import ray
 import torch
 import zmq
 import zmq.asyncio
 from tensordict import TensorDict
 from torch import Tensor
 
-from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import (
     BatchMeta,
 )
 from transfer_queue.storage import (
-    SimpleStorageUnit,
-    TransferQueueStorageManager,
     TransferQueueStorageManagerFactory,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
@@ -43,6 +39,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     create_zmq_socket,
+    format_zmq_address,
 )
 
 logger = logging.getLogger(__name__)
@@ -95,11 +92,12 @@ class AsyncTransferQueueClient:
                           AsyncSimpleStorageManager, KVStorageManager (under development), etc.
             config: Configuration dictionary for the storage manager.
                     For AsyncSimpleStorageManager, must contain the following required keys:
-                    - controller_info: ZMQ server information about the controller
-                    - storage_unit_infos: ZMQ server information about the storage units
+                    - zmq_info: ZMQ server information about the storage units
 
         """
-        self.storage_manager = TransferQueueStorageManagerFactory.create(manager_type, config)
+        self.storage_manager = TransferQueueStorageManagerFactory.create(
+            manager_type, controller_info=self._controller, config=config
+        )
 
     # TODO (TQStorage): Provide a general dynamic socket function for both Client & Storage @huazhong.
     @staticmethod
@@ -127,9 +125,9 @@ class AsyncTransferQueueClient:
                     raise RuntimeError("No controller registered")
 
                 context = zmq.asyncio.Context()
-                address = f"tcp://{server_info.ip}:{server_info.ports.get(socket_name)}"
+                address = format_zmq_address(server_info.ip, server_info.ports.get(socket_name))
                 identity = f"{self.client_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, identity=identity)
+                sock = create_zmq_socket(context, zmq.DEALER, identity=identity, ip=server_info.ip)
 
                 try:
                     sock.connect(address)
@@ -156,6 +154,7 @@ class AsyncTransferQueueClient:
 
         return decorator
 
+    # ==================== Basic API ====================
     @dynamic_socket(socket_name="request_handle_socket")
     async def async_get_meta(
         self,
@@ -218,7 +217,7 @@ class AsyncTransferQueueClient:
         """
         assert socket is not None
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_META,
+            request_type=ZMQRequestType.GET_META,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={
@@ -232,15 +231,14 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
         logger.debug(
             f"[{self.client_id}]: Client get_meta response: {response_msg} from controller {self._controller.id}"
         )
 
         if response_msg.request_type == ZMQRequestType.GET_META_RESPONSE:
-            metadata_dict = response_msg.body["metadata"]
-            return BatchMeta.from_dict(metadata_dict) if isinstance(metadata_dict, dict) else metadata_dict
+            return response_msg.body["metadata"]
         else:
             raise RuntimeError(
                 f"[{self.client_id}]: Failed to get metadata from controller {self._controller.id}: "
@@ -262,8 +260,8 @@ class AsyncTransferQueueClient:
 
         Args:
             metadata: BatchMeta containing the samples and their custom metadata to store.
-                     The custom_meta should be set using BatchMeta.update_custom_meta() or
-                     BatchMeta.set_custom_meta() before calling this method.
+                     The custom_meta should be set using BatchMeta.update_custom_meta()
+                     before calling this method.
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Raises:
@@ -272,7 +270,7 @@ class AsyncTransferQueueClient:
         Example:
             >>> # Create batch with custom metadata
             >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=4, ...)
-            >>> batch_meta.update_custom_meta({0: {"score": 0.9}, 1: {"score": 0.8}})
+            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
             >>> asyncio.run(client.async_set_custom_meta(batch_meta))
         """
         assert socket is not None
@@ -294,10 +292,13 @@ class AsyncTransferQueueClient:
         partition_custom_meta: dict[str, dict[int, dict]] = {pid: {} for pid in set(metadata.partition_ids)}
 
         for meta in metadata_chunks:
-            partition_custom_meta[meta.partition_ids[0]].update(meta.get_all_custom_meta())
+            custom_meta = meta.get_all_custom_meta()
+            partition_custom_meta[meta.partition_ids[0]].update(
+                {meta.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))}
+            )
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.SET_CUSTOM_META,
+            request_type=ZMQRequestType.SET_CUSTOM_META,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={
@@ -306,7 +307,7 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
         logger.debug(
             f"[{self.client_id}]: Client set_custom_meta response: {response_msg} from controller {self._controller.id}"
@@ -385,6 +386,13 @@ class AsyncTransferQueueClient:
                 f"[{self.client_id}]: Storage manager not initialized. "
                 "Call initialize_storage_manager() before performing storage operations."
             )
+
+        for field_name, field_data in data.items():
+            if isinstance(field_data, torch.Tensor) and field_data.ndim == 1:
+                logger.info(
+                    f"[{self.client_id}]: Data field '{field_name}' is a tensor with only one dimension. "
+                    f"You may receive 2D tensors in key-value based backend."
+                )
 
         if metadata is None:
             if partition_id is None:
@@ -479,6 +487,10 @@ class AsyncTransferQueueClient:
 
             metadata = await self._get_partition_meta(partition_id)
 
+            if not metadata:
+                logger.warning(f"Try to clear an non-exist partition {partition_id}. No action will be taken.")
+                return
+
             # Clear the controller metadata
             await self._clear_partition_in_controller(partition_id)
 
@@ -535,14 +547,14 @@ class AsyncTransferQueueClient:
         """
 
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.CLEAR_META,
+            request_type=ZMQRequestType.CLEAR_META,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={"global_indexes": metadata.global_indexes, "partition_ids": metadata.partition_ids},
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.CLEAR_META_RESPONSE:
@@ -563,24 +575,20 @@ class AsyncTransferQueueClient:
             RuntimeError: If controller returns error response
         """
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_PARTITION_META,
+            request_type=ZMQRequestType.GET_PARTITION_META,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={"partition_id": partition_id},
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.GET_PARTITION_META_RESPONSE:
             raise RuntimeError("Failed to get metadata for clear operation.")
 
-        return (
-            BatchMeta.from_dict(response_msg.body["metadata"])
-            if isinstance(response_msg.body["metadata"], dict)
-            else response_msg.body["metadata"]
-        )
+        return response_msg.body["metadata"]
 
     @dynamic_socket(socket_name="request_handle_socket")
     async def _clear_partition_in_controller(self, partition_id, socket=None):
@@ -602,12 +610,13 @@ class AsyncTransferQueueClient:
         )
 
         await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart()
+        response_serialized = await socket.recv_multipart(copy=False)
         response_msg = ZMQMessage.deserialize(response_serialized)
 
         if response_msg.request_type != ZMQRequestType.CLEAR_PARTITION_RESPONSE:
             raise RuntimeError(f"Failed to clear partition {partition_id} in controller.")
 
+    # ==================== Status Query API ====================
     @dynamic_socket(socket_name="request_handle_socket")
     async def async_get_consumption_status(
         self,
@@ -641,7 +650,7 @@ class AsyncTransferQueueClient:
 
         assert socket is not None
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_CONSUMPTION,
+            request_type=ZMQRequestType.GET_CONSUMPTION,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={
@@ -652,7 +661,7 @@ class AsyncTransferQueueClient:
 
         try:
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get consumption response: {response_msg} "
@@ -678,7 +687,7 @@ class AsyncTransferQueueClient:
         partition_id: str,
         socket: Optional[zmq.asyncio.Socket] = None,
     ) -> tuple[Optional[Tensor], Optional[Tensor]]:
-        """Get production status for current partition for specific fields.
+        """Get production status for specific data fields and partition.
 
         Args:
             data_fields: Data fields to check production status for
@@ -703,7 +712,7 @@ class AsyncTransferQueueClient:
         """
         assert socket is not None
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_PRODUCTION,
+            request_type=ZMQRequestType.GET_PRODUCTION,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={
@@ -714,7 +723,7 @@ class AsyncTransferQueueClient:
 
         try:
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get production response: {response_msg} "
@@ -804,6 +813,68 @@ class AsyncTransferQueueClient:
         return torch.all(production_status == 1).item()
 
     @dynamic_socket(socket_name="request_handle_socket")
+    async def async_reset_consumption(
+        self,
+        partition_id: str,
+        task_name: Optional[str] = None,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> bool:
+        """Asynchronously reset consumption status for a partition.
+
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
+
+        Args:
+            partition_id: Partition id to reset consumption status for
+            task_name: Name of the task to reset. If None, resets all tasks.
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Returns:
+            bool: True if reset was successful, False otherwise
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Reset consumption for train task to re-train on same data
+            >>> success = asyncio.run(client.async_reset_consumption(
+            ...     partition_id="train_0",
+            ...     task_name="train"
+            ... ))
+            >>> print(f"Reset successful: {success}")
+        """
+        assert socket is not None
+        body = {"partition_id": partition_id}
+        if task_name is not None:
+            body["task_name"] = task_name
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.RESET_CONSUMPTION,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body=body,
+        )
+        try:
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Client reset consumption response: {response_msg} "
+                f"from controller {self._controller.id}"
+            )
+            if response_msg.request_type == ZMQRequestType.RESET_CONSUMPTION_RESPONSE:
+                success = response_msg.body.get("success", False)
+                if not success:
+                    logger.warning(f"[{self.client_id}]: Reset consumption failed: {response_msg.body.get('message')}")
+                return success
+            else:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Failed to reset consumption from controller {self._controller.id}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in reset_consumption: {str(e)}") from e
+
+    @dynamic_socket(socket_name="request_handle_socket")
     async def async_get_partition_list(
         self,
         socket: Optional[zmq.asyncio.Socket] = None,
@@ -815,9 +886,13 @@ class AsyncTransferQueueClient:
 
         Returns:
             list[str]: List of partition ids managed by the controller
+
+        Example:
+            >>> partition_ids = asyncio.run(client.get_partition_list())
+            >>> print(f"Available partitions: {partition_ids}")
         """
         request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_LIST_PARTITIONS,
+            request_type=ZMQRequestType.GET_LIST_PARTITIONS,  # type: ignore[arg-type]
             sender_id=self.client_id,
             receiver_id=self._controller.id,
             body={},
@@ -826,7 +901,7 @@ class AsyncTransferQueueClient:
         try:
             assert socket is not None
             await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart()
+            response_serialized = await socket.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_serialized)
             logger.debug(
                 f"[{self.client_id}]: Client get partition list response: {response_msg} "
@@ -843,6 +918,194 @@ class AsyncTransferQueueClient:
                 )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_partition_list: {str(e)}") from e
+
+    # ==================== KV Interface API ====================
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_kv_retrieve_meta(
+        self,
+        keys: list[str] | str,
+        partition_id: str,
+        create: bool = False,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> BatchMeta:
+        """Asynchronously retrieve BatchMeta from the controller using user-specified keys.
+
+        Args:
+            keys: List of keys to retrieve from the controller
+            partition_id: The ID of the logical partition to search for keys.
+            create: Whether to register new keys if not found.
+            socket: ZMQ socket (injected by decorator)
+
+        Returns:
+            metadata: BatchMeta of the corresponding keys
+
+        Raises:
+            TypeError: If `keys` is not a list of string or a string
+        """
+
+        if isinstance(keys, str):
+            keys = [keys]
+        elif isinstance(keys, list):
+            if len(keys) < 1:
+                raise ValueError("Received an empty list as keys.")
+            # validate all the elements are str
+            if not all(isinstance(k, str) for k in keys):
+                raise TypeError("Not all elements in `keys` are strings.")
+        else:
+            raise TypeError("Only string or list of strings are allowed as `keys`.")
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.KV_RETRIEVE_META,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "keys": keys,
+                "partition_id": partition_id,
+                "create": create,
+            },
+        )
+
+        try:
+            assert socket is not None
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Client get kv_retrieve_keys response: {response_msg} "
+                f"from controller {self._controller.id}"
+            )
+
+            if response_msg.request_type == ZMQRequestType.KV_RETRIEVE_META_RESPONSE:
+                metadata = response_msg.body.get("metadata", BatchMeta.empty())
+                return metadata
+            else:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Failed to retrieve keys from controller {self._controller.id}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in kv_retrieve_keys: {str(e)}") from e
+
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_kv_retrieve_keys(
+        self,
+        global_indexes: list[int] | int,
+        partition_id: str,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> list[str]:
+        """Asynchronously retrieve keys according to global_indexes from the controller.
+
+        Args:
+            global_indexes: List of global_indexes to retrieve from the controller
+            partition_id: The ID of the logical partition to search for global_indexes.
+            socket: ZMQ socket (injected by decorator)
+
+        Returns:
+            keys: list of keys of the corresponding global_indexes
+
+        Raises:
+            TypeError: If `global_indexes` is not a list of int or an int
+            RuntimeError: If some indexes in `global_indexes` do not have corresponding keys
+        """
+
+        if isinstance(global_indexes, int):
+            global_indexes = [global_indexes]
+        elif isinstance(global_indexes, list):
+            if len(global_indexes) < 1:
+                raise ValueError("Received an empty list as `global_indexes`.")
+            # validate all the elements are int
+            if not all(isinstance(idx, int) for idx in global_indexes):
+                raise TypeError("Not all elements in `global_indexes` are int.")
+        else:
+            raise TypeError("Only int or list of int are allowed as `global_indexes`.")
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.KV_RETRIEVE_KEYS,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={"global_indexes": global_indexes, "partition_id": partition_id},
+        )
+
+        try:
+            assert socket is not None
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Client get kv_retrieve_indexes response: {response_msg} "
+                f"from controller {self._controller.id}"
+            )
+
+            if response_msg.request_type == ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE:
+                keys = response_msg.body.get("keys", [])
+                if len(keys) != len(global_indexes):
+                    raise RuntimeError("Some global_indexes have no corresponding keys!")
+                return keys
+            else:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Failed to retrieve indexes from controller {self._controller.id}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in kv_retrieve_indexes: {str(e)}") from e
+
+    @dynamic_socket(socket_name="request_handle_socket")
+    async def async_kv_list(
+        self,
+        partition_id: Optional[str] = None,
+        socket: Optional[zmq.asyncio.Socket] = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Asynchronously retrieve keys and custom_meta from the controller for one or all partitions.
+
+        Args:
+            partition_id: The specific partition_id to query.
+                If None (default), returns keys from all partitions.
+            socket: ZMQ socket (injected by decorator)
+
+        Returns:
+            A nested dictionary mapping partition IDs to their keys and metadata.
+
+            Structure:
+            {
+                "partition_id": {
+                    "key_name": {
+                        "tag1": <value>,
+                        ... (other metadata)
+                    },
+                    ...,
+                },
+                ...
+            }
+        """
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.KV_LIST,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={
+                "partition_id": partition_id,
+            },
+        )
+
+        try:
+            assert socket is not None
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Client get kv_list response: {response_msg} from controller {self._controller.id}"
+            )
+
+            if response_msg.request_type == ZMQRequestType.KV_LIST_RESPONSE:
+                partition_info = response_msg.body.get("partition_info", {})
+                return partition_info
+            else:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Failed to list keys from controller {self._controller.id}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager."""
@@ -917,6 +1180,103 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
+        self._reset_consumption = _make_sync(self.async_reset_consumption)
+        self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
+        self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
+        self._kv_list = _make_sync(self.async_kv_list)
+
+    # ==================== Basic API ====================
+    def get_meta(
+        self,
+        data_fields: list[str],
+        batch_size: int,
+        partition_id: str,
+        mode: str = "fetch",
+        task_name: Optional[str] = None,
+        sampling_config: Optional[dict[str, Any]] = None,
+    ) -> BatchMeta:
+        """Synchronously fetch data metadata from the controller via ZMQ.
+
+        Args:
+            data_fields: List of data field names to retrieve metadata for
+            batch_size: Number of samples to request in the batch
+            partition_id: Current data partition id
+            mode: Data fetch mode. Options:
+                - 'fetch': Get ready data only
+                - 'force_fetch': Get data regardless of readiness (may return unready samples)
+                - 'insert': Internal usage - should not be used by users
+            task_name: Optional task name associated with the request
+            sampling_config: Optional sampling configuration for custom samplers.
+
+
+        Returns:
+            BatchMeta: Metadata object containing data structure, sample information, and readiness status
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Example 1: Basic fetch metadata
+            >>> batch_meta = client.get_meta(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     batch_size=4,
+            ...     partition_id="train_0",
+            ...     mode="fetch",
+            ...     task_name="generate_sequences"
+            ... )
+            >>> print(batch_meta.is_ready)  # True if all samples ready
+            >>>
+            >>> # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
+            >>> batch_meta = client.get_meta(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     batch_size=8,
+            ...     partition_id="train_0",
+            ...     mode="fetch",
+            ...     task_name="generate_sequences",
+            ...     sampling_config={"n_samples_per_prompt": 4}
+            ... )
+            >>> print(batch_meta.is_ready)  # True if all samples ready
+            >>>
+            >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
+            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
+            >>> batch_meta = client.get_meta(
+            ...     partition_id="train_0",   # optional
+            ...     mode="force_fetch",
+            ... )
+            >>> print(batch_meta.is_ready)  # May be False if some samples not ready
+        """
+        return self._get_meta(
+            data_fields=data_fields,
+            batch_size=batch_size,
+            partition_id=partition_id,
+            mode=mode,
+            task_name=task_name,
+            sampling_config=sampling_config,
+        )
+
+    def set_custom_meta(self, metadata: BatchMeta) -> None:
+        """Synchronously send custom metadata to the controller.
+
+        This method sends per-sample custom metadata (custom_meta) to the controller.
+        The custom_meta is stored in the controller and can be retrieved along with
+        the BatchMeta in subsequent get_meta calls.
+
+        Args:
+            metadata: BatchMeta containing the samples and their custom metadata to store.
+                     The custom_meta should be set using BatchMeta.update_custom_meta()
+                     before calling this method.
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> # Create batch with custom metadata
+            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=2, ...)
+            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
+            >>> client.set_custom_meta(batch_meta)
+        """
+
+        return self._set_custom_meta(metadata=metadata)
 
     def put(
         self, data: TensorDict, metadata: Optional[BatchMeta] = None, partition_id: Optional[str] = None
@@ -978,72 +1338,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._put(data=data, metadata=metadata, partition_id=partition_id)
 
-    def get_meta(
-        self,
-        data_fields: list[str],
-        batch_size: int,
-        partition_id: str,
-        task_name: Optional[str] = None,
-        sampling_config: Optional[dict[str, Any]] = None,
-    ) -> BatchMeta:
-        """Synchronously fetch data metadata from the controller via ZMQ.
-
-        Args:
-            data_fields: List of data field names to retrieve metadata for
-            batch_size: Number of samples to request in the batch
-            partition_id: Current data partition id
-            mode: Data fetch mode. Options:
-                - 'fetch': Get ready data only
-                - 'force_fetch': Get data regardless of readiness (may return unready samples)
-                - 'insert': Internal usage - should not be used by users
-            task_name: Optional task name associated with the request
-            sampling_config: Optional sampling configuration for custom samplers.
-
-
-        Returns:
-            BatchMeta: Metadata object containing data structure, sample information, and readiness status
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Example 1: Basic fetch metadata
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences"
-            ... )
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=8,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ...     sampling_config={"n_samples_per_prompt": 4}
-            ... )
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
-            >>> batch_meta = client.get_meta(
-            ...     partition_id="train_0",   # optional
-            ...     mode="force_fetch",
-            ... )
-            >>> print(batch_meta.is_ready)  # May be False if some samples not ready
-        """
-        return self._get_meta(
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            task_name=task_name,
-            sampling_config=sampling_config,
-        )
-
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
 
@@ -1055,7 +1349,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 - Requested data fields (e.g., "prompts", "attention_mask")
 
         Example:
-            >>> batch_meta = client.get_data(
+            >>> batch_meta = client.get_meta(
             ...     data_fields=["prompts", "attention_mask"],
             ...     batch_size=4,
             ...     partition_id="train_0",
@@ -1090,6 +1384,63 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._clear_samples(metadata=metadata)
 
+    # ==================== Status Query API ====================
+    def get_consumption_status(
+        self,
+        task_name: str,
+        partition_id: str,
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        """Synchronously get consumption status for a specific task and partition.
+
+        Args:
+            task_name: Name of the task to check consumption for
+            partition_id: Partition id to check consumption status for
+
+        Returns:
+            Tuple of:
+            - Partition global index tensor
+            - Consumption status tensor for the specified task. 1 for consumed, 0 for not consumed.
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> global_index, consumption_status = client.get_consumption_status(
+            ...     task_name="generate_sequences",
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
+        """
+        return self._get_consumption_status(task_name, partition_id)
+
+    def get_production_status(
+        self,
+        data_fields: list[str],
+        partition_id: str,
+    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        """Synchronously get production status for specific data fields and partition.
+
+        Args:
+            data_fields: Data fields to check production status for
+            partition_id: Partition id to check production status for
+
+        Returns:
+            Tuple of:
+            - Partition global index tensor
+            - Production status tensor for the specified fields. 1 for ready, 0 for not ready.
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> global_index, production_status = client.get_production_status(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"Global index: {global_index}, Production status: {production_status}")
+        """
+        return self._get_production_status(data_fields=data_fields, partition_id=partition_id)
+
     def check_consumption_status(self, task_name: str, partition_id: str) -> bool:
         """Synchronously check if all samples for a partition have been consumed by a specific task.
 
@@ -1113,37 +1464,15 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._check_consumption_status(task_name=task_name, partition_id=partition_id)
 
-    def get_consumption_status(
-        self,
-        task_name: str,
-        partition_id: str,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
-        """Synchronously get consumption status for a specific task and partition.
-
-        Args:
-            task_name: Name of the task to check consumption for
-            partition_id: Partition id to check consumption status for
-
-        Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Consumption status tensor for the specified task. 1 for consumed, 0 for not consumed.
-
-        Example:
-            >>> global_index, consumption_status = client.get_consumption_status(
-            ...     task_name="generate_sequences",
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
-        """
-        return self._get_consumption_status(task_name, partition_id)
-
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
         """Synchronously check if all samples for a partition are ready (produced) for consumption.
 
         Args:
             data_fields: Data fields to check production status for
             partition_id: Partition id to check production status for
+
+        Returns:
+            bool: True if all samples have been produced and ready, False otherwise
 
         Raises:
             RuntimeError: If communication fails or controller returns error response
@@ -1158,30 +1487,31 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._check_production_status(data_fields=data_fields, partition_id=partition_id)
 
-    def get_production_status(
-        self,
-        data_fields: list[str],
-        partition_id: str,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
-        """Synchronously get production status for a specific data fields and partition.
+    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None) -> bool:
+        """Synchronously reset consumption status for a partition.
+
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
 
         Args:
-            data_fields: Data fields to check production status for
-            partition_id: Partition id to check production status for
+            partition_id: Partition id to reset consumption status for
+            task_name: Name of the task to reset. If None, resets all tasks.
 
         Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Production status tensor for the specified fields. 1 for ready, 0 for not ready.
+            bool: True if reset was successful, False otherwise
+
+        Raises:
+            RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> global_index, production_status = client.get_production_status(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     partition_id="train_0"
+            >>> # Reset consumption for train task to re-train on same data
+            >>> success = client.reset_consumption(
+            ...     partition_id="train_0",
+            ...     task_name="train"
             ... )
-            >>> print(f"Global index: {global_index}, Production status: {production_status}")
+            >>> print(f"Reset successful: {success}")
         """
-        return self._get_production_status(data_fields=data_fields, partition_id=partition_id)
+        return self._reset_consumption(partition_id, task_name)
 
     def get_partition_list(
         self,
@@ -1190,32 +1520,85 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         Returns:
             list[str]: List of partition ids managed by the controller
+
+        Example:
+            >>> partition_ids = client.get_partition_list()
+            >>> print(f"Available partitions: {partition_ids}")
         """
         return self._get_partition_list()
 
-    def set_custom_meta(self, metadata: BatchMeta) -> None:
-        """Synchronously send custom metadata to the controller.
-
-        This method sends per-sample custom metadata (custom_meta) to the controller.
-        The custom_meta is stored in the controller and can be retrieved along with
-        the BatchMeta in subsequent get_meta calls.
+    # ==================== KV Interface API ====================
+    def kv_retrieve_meta(
+        self,
+        keys: list[str] | str,
+        partition_id: str,
+        create: bool = False,
+    ) -> BatchMeta:
+        """Synchronously retrieve BatchMeta from the controller using user-specified keys.
 
         Args:
-            metadata: BatchMeta containing the samples and their custom metadata to store.
-                     The custom_meta should be set using BatchMeta.update_custom_meta() or
-                     BatchMeta.set_custom_meta() before calling this method.
+            keys: List of keys to retrieve from the controller
+            partition_id: The ID of the logical partition to search for keys.
+            create: Whether to register new keys if not found.
+
+        Returns:
+            metadata: BatchMeta of the corresponding keys
 
         Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Create batch with custom metadata
-            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=4, ...)
-            >>> batch_meta.update_custom_meta({0: {"score": 0.9}, 1: {"score": 0.8}})
-            >>> client.set_custom_meta(batch_meta)
+            TypeError: If `keys` is not a list of string or a string
         """
 
-        return self._set_custom_meta(metadata=metadata)
+        return self._kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
+
+    def kv_retrieve_keys(
+        self,
+        global_indexes: list[int] | int,
+        partition_id: str,
+    ) -> BatchMeta:
+        """Synchronously retrieve keys according to global_indexes from the controller.
+
+        Args:
+            global_indexes: List of global_indexes to retrieve from the controller
+            partition_id: The ID of the logical partition to search for global_indexes.
+
+        Returns:
+            keys: list of keys of the corresponding global_indexes
+
+        Raises:
+            TypeError: If `global_indexes` is not a list of int or an int
+            RuntimeError: If some indexes in `global_indexes` do not have corresponding keys
+        """
+
+        return self._kv_retrieve_keys(global_indexes=global_indexes, partition_id=partition_id)
+
+    def kv_list(
+        self,
+        partition_id: Optional[str] = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Synchronously retrieve keys and custom_meta from the controller for one or all partitions.
+
+        Args:
+            partition_id: The specific partition_id to query.
+                If None (default), returns keys from all partitions.
+            socket: ZMQ socket (injected by decorator)
+
+        Returns:
+            A nested dictionary mapping partition IDs to their keys and metadata.
+
+            Structure:
+            {
+                "partition_id": {
+                    "key_name": {
+                        "tag1": <value>,
+                        ... (other metadata)
+                    },
+                    ...,
+                },
+                ...
+            }
+        """
+
+        return self._kv_list(partition_id=partition_id)
 
     def close(self) -> None:
         """Close the client and cleanup resources including event loop and thread."""
@@ -1234,36 +1617,3 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 logger.warning(f"[{self.client_id}]: Error closing event loop: {e}")
 
         super().close()
-
-
-def process_zmq_server_info(
-    handlers: dict[Any, Union["TransferQueueController", "TransferQueueStorageManager", "SimpleStorageUnit"]]
-    | Union["TransferQueueController", "TransferQueueStorageManager", "SimpleStorageUnit"],
-):  # noqa: UP007
-    """Extract ZMQ server information from handler objects.
-
-    Args:
-        handlers: Dictionary of handler objects (controllers, storage managers, or storage units),
-                  or a single handler object
-
-    Returns:
-        If handlers is a dictionary: Dictionary mapping handler names to their ZMQ server information
-        If handlers is a single object: ZMQ server information for that object
-
-    Examples:
-        >>> # Single handler
-        >>> controller = TransferQueueController.remote(...)
-        >>> info = process_zmq_server_info(controller)
-        >>>
-        >>> # Multiple handlers
-        >>> handlers = {"storage_0": storage_0, "storage_1": storage_1}
-        >>> info_dict = process_zmq_server_info(handlers)"""
-    # Handle single handler object case
-    if not isinstance(handlers, dict):
-        return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
-    else:
-        # Handle dictionary case
-        server_info = {}
-        for name, handler in handlers.items():
-            server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
-        return server_info

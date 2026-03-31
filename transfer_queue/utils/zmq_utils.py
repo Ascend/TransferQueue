@@ -15,7 +15,6 @@
 
 import logging
 import os
-import pickle
 import socket
 import time
 from dataclasses import dataclass
@@ -23,13 +22,12 @@ from typing import Any, Optional, TypeAlias
 from uuid import uuid4
 
 import psutil
+import ray
 import zmq
+from ray.util import get_node_ip_address
 
-from transfer_queue.utils.common import (
-    get_env_bool,
-)
 from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
-from transfer_queue.utils.serial_utils import _decoder, _encoder
+from transfer_queue.utils.serial_utils import decode, encode
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
@@ -42,8 +40,6 @@ if not logger.hasHandlers():
 
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
-
-TQ_ZERO_COPY_SERIALIZATION = get_env_bool("TQ_ZERO_COPY_SERIALIZATION", default=False)
 
 
 class ZMQRequestType(ExplicitEnum):
@@ -84,6 +80,8 @@ class ZMQRequestType(ExplicitEnum):
     # GET_CONSUMPTION
     GET_CONSUMPTION = "GET_CONSUMPTION"
     CONSUMPTION_RESPONSE = "CONSUMPTION_RESPONSE"
+    RESET_CONSUMPTION = "RESET_CONSUMPTION"
+    RESET_CONSUMPTION_RESPONSE = "RESET_CONSUMPTION_RESPONSE"
 
     # GET_PRODUCTION
     GET_PRODUCTION = "GET_PRODUCTION"
@@ -98,13 +96,21 @@ class ZMQRequestType(ExplicitEnum):
     NOTIFY_DATA_UPDATE_ACK = "NOTIFY_DATA_UPDATE_ACK"
     NOTIFY_DATA_UPDATE_ERROR = "NOTIFY_DATA_UPDATE_ERROR"
 
+    # KV_INTERFACE
+    KV_RETRIEVE_META = "KV_RETRIEVE_META"
+    KV_RETRIEVE_META_RESPONSE = "KV_RETRIEVE_META_RESPONSE"
+    KV_RETRIEVE_KEYS = "KV_RETRIEVE_KEYS"
+    KV_RETRIEVE_KEYS_RESPONSE = "KV_RETRIEVE_KEYS_RESPONSE"
+    KV_LIST = "KV_LIST"
+    KV_LIST_RESPONSE = "KV_LIST_RESPONSE"
+
 
 class ZMQServerInfo:
     """
     TransferQueue server info class.
     """
 
-    def __init__(self, role: TransferQueueRole, id: str, ip: str, ports: dict[str, str]):
+    def __init__(self, role: TransferQueueRole, id: str, ip: str, ports: dict[str, int]):
         self.role = role
         self.id = id
         self.ip = ip
@@ -112,7 +118,7 @@ class ZMQServerInfo:
 
     def to_addr(self, port_name: str) -> str:
         """Convert zmq port name to address string."""
-        return f"tcp://{self.ip}:{self.ports[port_name]}"
+        return format_zmq_address(self.ip, self.ports[port_name])
 
     def to_dict(self):
         """Convert ZMQServerInfo to dict."""
@@ -159,48 +165,92 @@ class ZMQMessage:
         )
 
     def serialize(self) -> list:
-        """
-        Serialize message using unified MsgpackEncoder or pickle.
-        Returns: list[bytestr] - [msgpack_header, *tensor_buffers] or [bytes]
-        """
-        if TQ_ZERO_COPY_SERIALIZATION:
-            msg_dict = {
-                "request_type": self.request_type.value,  # Enum -> str for msgpack
-                "sender_id": self.sender_id,
-                "receiver_id": self.receiver_id,
-                "request_id": self.request_id,
-                "timestamp": self.timestamp,
-                "body": self.body,
-            }
-            return list(_encoder.encode(msg_dict))
-        else:
-            return [pickle.dumps(self)]
+        """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
+        msg_dict = {
+            "request_type": self.request_type.value,  # Enum -> str for msgpack
+            "sender_id": self.sender_id,
+            "receiver_id": self.receiver_id,
+            "request_id": self.request_id,
+            "timestamp": self.timestamp,
+            "body": self.body,
+        }
+        return encode(msg_dict)
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
-        """
-        Deserialize message using unified MsgpackDecoder or pickle.
-        """
+        """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
         if not frames:
             raise ValueError("Empty frames received")
 
-        if TQ_ZERO_COPY_SERIALIZATION:
-            msg_dict = _decoder.decode(frames)
-            return cls(
-                request_type=ZMQRequestType(msg_dict["request_type"]),
-                sender_id=msg_dict["sender_id"],
-                receiver_id=msg_dict["receiver_id"],
-                body=msg_dict["body"],
-                request_id=msg_dict["request_id"],
-                timestamp=msg_dict["timestamp"],
-            )
-        else:
-            return pickle.loads(frames[0])
+        result = decode(frames)
+        return cls(
+            request_type=ZMQRequestType(result["request_type"]),
+            sender_id=result["sender_id"],
+            receiver_id=result["receiver_id"],
+            body=result["body"],
+            request_id=result["request_id"],
+            timestamp=result["timestamp"],
+        )
 
 
-def get_free_port() -> str:
-    """Get free port of the host."""
-    with socket.socket() as sock:
+def is_ipv6_address(ip: str) -> bool:
+    """Check if the given IP address is an IPv6 address."""
+    try:
+        socket.inet_pton(socket.AF_INET6, ip)
+        return True
+    except OSError:
+        return False
+
+
+def format_zmq_address(ip: str, port: int) -> str:
+    """
+    Format IP and port for ZMQ binding/connecting.
+
+    For IPv6 addresses, ZMQ requires the address to be wrapped in brackets:
+    - IPv6: tcp://[::1]:port
+    - IPv4: tcp://1.2.3.4:port
+
+    Args:
+        ip: IP address (IPv4 or IPv6)
+        port: Port number
+
+    Returns:
+        Formatted ZMQ address string
+    """
+    if is_ipv6_address(ip):
+        return f"tcp://[{ip}]:{port}"
+    else:
+        return f"tcp://{ip}:{port}"
+
+
+def get_node_ip_address_raw() -> str:
+    """A wrapper around Ray's get_node_ip_address().
+
+    This function intentionally returns a raw IPv4/IPv6 address WITHOUT brackets.
+    """
+
+    return get_node_ip_address().strip("[]")
+
+
+def get_free_port(ip: str) -> int:
+    """Get free port of the host.
+
+    Args:
+        ip: IP address to detect IPv6 and enable IPV6 socket option
+    """
+    is_ipv6 = is_ipv6_address(ip)
+    family = socket.AF_INET6 if is_ipv6 else socket.AF_INET
+
+    with socket.socket(family, socket.SOCK_STREAM) as sock:
+        if is_ipv6:
+            # Try to allow dual-stack if the platform supports it.
+            try:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except (OSError, AttributeError):
+                # Some platforms don't support IPV6_V6ONLY or this option;
+                # in that case just ignore and use the default behavior.
+                pass
+
         sock.bind(("", 0))
         return sock.getsockname()[1]
 
@@ -208,11 +258,23 @@ def get_free_port() -> str:
 def create_zmq_socket(
     ctx: zmq.Context,
     socket_type: Any,
+    ip: str,
     identity: Optional[bytestr] = None,
 ) -> zmq.Socket:
-    """Create ZMQ socket."""
+    """Create ZMQ socket.
+
+    Args:
+        ctx: ZMQ context
+        socket_type: ZMQ socket type
+        ip: IP address to detect IPv6 and enable IPV6 socket option
+        identity: Optional socket identity
+    """
     mem = psutil.virtual_memory()
     socket = ctx.socket(socket_type)
+
+    # Enable IPv6 if the IP address is IPv6
+    if is_ipv6_address(ip):
+        socket.setsockopt(zmq.IPV6, 1)
 
     # Calculate buffer size based on system memory
     total_mem = mem.total / 1024**3
@@ -237,3 +299,35 @@ def create_zmq_socket(
     if identity is not None:
         socket.setsockopt(zmq.IDENTITY, identity)
     return socket
+
+
+def process_zmq_server_info(
+    handlers: dict[Any, Any] | Any,
+):  # noqa: UP007
+    """Extract ZMQ server information from handler objects.
+
+    Args:
+        handlers: Dictionary of handler objects (controllers, storage managers, or storage units),
+                  or a single handler object
+
+    Returns:
+        If handlers is a dictionary: Dictionary mapping handler names to their ZMQ server information
+        If handlers is a single object: ZMQ server information for that object
+
+    Examples:
+        >>> # Single handler
+        >>> controller = TransferQueueController.remote(...)
+        >>> info = process_zmq_server_info(controller)
+        >>>
+        >>> # Multiple handlers
+        >>> handlers = {"storage_0": storage_0, "storage_1": storage_1}
+        >>> info_dict = process_zmq_server_info(handlers)"""
+    # Handle single handler object case
+    if not isinstance(handlers, dict):
+        return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
+    else:
+        # Handle dictionary case
+        server_info = {}
+        for name, handler in handlers.items():
+            server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
+        return server_info

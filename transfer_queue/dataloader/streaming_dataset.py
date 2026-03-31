@@ -16,15 +16,14 @@
 import logging
 import os
 import time
-import uuid
-from typing import Any, Callable, Iterator
+from typing import Callable, Iterator
 
+from omegaconf import DictConfig
 from tensordict import TensorDict
 from torch.utils.data import IterableDataset
 
-from transfer_queue import TransferQueueClient
+from transfer_queue.interface import get_client, init
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL = float(
     os.environ.get("TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL", 1)
@@ -68,13 +67,14 @@ class StreamingDataset(IterableDataset):
 
     def __init__(
         self,
-        config: dict[str, Any],
+        config: DictConfig,
         batch_size: int,
         micro_batch_size: int,
         data_fields: list[str],
         partition_id: str,
         task_name: str,
         dp_rank: int,
+        should_check_consumption_status: bool = False,
         fetch_batch_fn: Callable | None = None,
         process_batch_fn: Callable | None = None,
     ):
@@ -82,8 +82,8 @@ class StreamingDataset(IterableDataset):
 
         Args:
             config: Configuration dictionary containing:
-                - controller_info: ZMQServerInfo for the TransferQueueController
-                - storage_backend: Storage backend type (e.g., "AsyncSimpleStorageManager")
+                - controller.controller_info: ZMQServerInfo for the TransferQueueController
+                - backend.storage_backend: Storage backend type (e.g., "SimpleStorage")
                 - Other backend-specific configuration
             batch_size: Batch size for data loading per iter.
             micro_batch_size: Number of samples per micro-batch. This is the batch size
@@ -96,6 +96,14 @@ class StreamingDataset(IterableDataset):
                 which samples have been consumed by which task.
             dp_rank: The group ID of the current data group. All
                 ranks with the same dp_rank will receive identical samples.
+            should_check_consumption_status: Whether to check the consumption status of the
+                partition to decide when to stop iterating. Defaults to ``False``, which
+                means the iterator runs as an **infinite stream** — it will continuously
+                poll for new data and never exit on its own. This is the typical mode for
+                online/streaming training where producers keep feeding data indefinitely.
+                Set to ``True`` when the total number of samples is known in advance (i.e.
+                finite-dataset mode); the iterator will then stop once all samples in the
+                partition have been consumed.
             fetch_batch_fn: Optional custom function to retrieve batch data.
                 If None, uses default_fetch_batch_fn function.
             process_batch_fn: Optional custom function to post-process
@@ -121,6 +129,7 @@ class StreamingDataset(IterableDataset):
         self.partition_id = partition_id
         self.task_name = task_name
         self.dp_rank = dp_rank
+        self.should_check_consumption_status = should_check_consumption_status
         self.fetch_batch_fn = fetch_batch_fn if fetch_batch_fn else default_fetch_batch_fn
         self.process_batch_fn = process_batch_fn if process_batch_fn else chunk_batch_fn
 
@@ -149,35 +158,32 @@ class StreamingDataset(IterableDataset):
     def _create_client(self):
         """Create and initialize a TransferQueue client.
 
-        This method initializes the TransferQueueClient with the provided configuration
-        and storage backend, and sets up the storage manager for data retrieval.
-
-        Raises:
-            ValueError: If controller_info or storage_backend is missing or invalid.
+        This method initializes the TransferQueueClient with the provided configuration.
         """
-        client_id = uuid.uuid4().hex[:8]
-        controller_info = self.config.get("controller_info", None)
-        if not controller_info or not isinstance(controller_info, ZMQServerInfo):
-            raise ValueError("Invalid or missing controller_info in config")
 
-        storage_backend = self.config.get("storage_backend", None)
-        if not storage_backend:
-            raise ValueError("Missing storage_backend in config")
-
-        self._tq_client = TransferQueueClient(client_id, controller_info)
-        self._tq_client.initialize_storage_manager(manager_type=storage_backend, config=self.config)
+        init(self.config)
+        self._tq_client = get_client()
 
     def __iter__(self) -> Iterator[tuple[TensorDict, BatchMeta]]:
         """Iterate over the dataset, yielding batches of data.
+
+        The iteration behaviour depends on ``should_check_consumption_status``:
+
+        - **False (default — streaming mode)**: The iterator runs as an
+          infinite stream, continuously polling TransferQueue for new data.
+          It will block (with a 1-second sleep) when no data is available and
+          resume once new batches are produced.  This is the standard mode for
+          online / streaming training pipelines where producers feed data
+          indefinitely.
+        - **True (finite-dataset mode)**: The iterator terminates once all
+          samples in the partition have been consumed (as reported by
+          ``check_consumption_status``), *and* all buffered batches have been
+          yielded.
 
         Yields:
             Tuple[TensorDict, BatchMeta]: A tuple containing:
                 - TensorDict: Batch of data with the requested fields.
                 - BatchMeta: Corresponding metadata to interact with TransferQueue.
-        Note:
-            This iterator runs indefinitely until the data source is exhausted.
-            The caller should handle StopIteration when appropriate (e.g., when
-            all data has been consumed and no more data will be produced).
         """
         if self._tq_client is None:
             self._create_client()
@@ -188,24 +194,26 @@ class StreamingDataset(IterableDataset):
         # TQ_PRE_ALLOC_SAMPLE_NUM to the required global_batch_size to make sure consumers can accurately
         # determine consumption status even before producers have generated the samples.
         while (
-            not self._tq_client.check_consumption_status(self.task_name, self.partition_id)
+            not self.should_check_consumption_status
+            or not self._tq_client.check_consumption_status(self.task_name, self.partition_id)
             or self.batch_index <= len(self.buffer) - 1
         ):
             try:
                 if self.batch_index <= len(self.buffer) - 1:
                     current_data = self.buffer[self.batch_index]
                     self.batch_index += 1
+                    logger.info(f"StreamDataloader current batch index is {self.batch_index}/{len(self.buffer)}")
                     yield from self.process_batch_fn(*current_data, micro_batch_size=self.micro_batch_size)
 
                 else:
                     batch_data, batch_meta = self.fetch_batch_fn(
-                        self._tq_client,
-                        self.data_fields,
-                        self.batch_size,
-                        self.partition_id,
-                        self.task_name,
-                        self.sampling_config,
-                        self.batch_index,
+                        tq_client=self._tq_client,
+                        data_fields=self.data_fields,
+                        batch_size=self.batch_size,
+                        partition_id=self.partition_id,
+                        task_name=self.task_name,
+                        sampling_config=self.sampling_config,
+                        batch_index=self.batch_index,
                     )
                     if batch_data is not None:
                         self.buffer.append((batch_data, batch_meta))

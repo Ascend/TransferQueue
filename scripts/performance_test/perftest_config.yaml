@@ -1,0 +1,54 @@
+# This is the default configuration of TransferQueue. Users may modify the default value
+# and use transfer_queue.init(conf) to overwrite the config entries.
+
+controller:
+  # User-defined sampler. User can pass sampler instance to overwrite this string config.
+  sampler: SequentialSampler
+  # Whether return an empty BatchMeta to prevent request blocking when no enough data is available
+  polling_mode: False
+  # ZMQ Server IP & Ports (automatically generated during init)
+  zmq_info: null
+
+
+backend:
+  # Pluggable storage/transport backend of TransferQueue. Choose from:
+  # SimpleStorage, Yuanrong, MooncakeStore, ...
+  storage_backend: SimpleStorage
+
+  # For SimpleStorage:
+  SimpleStorage:
+    # Total number of samples
+    total_storage_size: 100000
+    # Number of distributed storage units for SimpleStorage backend
+    num_data_storage_units: 16
+    # ZMQ Server IP & Ports (automatically generated during init)
+    zmq_info: null
+
+  # For MooncakeStore:
+  MooncakeStore:
+    # Whether to let TQ automatically init metadata_server.
+    auto_init: true
+    # Address of the HTTP metadata server
+    metadata_server: localhost:50050
+    # Address of master server
+    master_server_address: localhost:50051
+    # Address of local host. Set to "" to use Ray IP as local host address
+    local_hostname: ""
+    # Protocol for transmission. Choose from: tcp, rdma. (default: rdma)
+    protocol: rdma
+    # Memory segment size in bytes for mounting
+    global_segment_size: 86294967296
+    # Local buffer size in bytes
+    local_buffer_size: 86294967296
+    # Network device name. Set to "" to let Mooncake to auto-picks devices
+    device_name: ""
+
+  # For RayStore:
+  RayStore:
+
+  # For Yuanrong:
+  Yuanrong:
+    # Port of local yuanrong datasystem worker
+    port: 31501
+    # If enable npu transport
+    enable_yr_npu_transport: true

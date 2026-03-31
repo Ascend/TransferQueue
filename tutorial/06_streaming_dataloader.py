@@ -57,39 +57,25 @@ warnings.filterwarnings(
 
 import ray  # noqa: E402
 import torch  # noqa: E402
-from omegaconf import DictConfig, OmegaConf  # noqa: E402
+from omegaconf import OmegaConf  # noqa: E402
 from tensordict import TensorDict  # noqa: E402
 
 # Add the parent directory to the path for imports
 parent_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(parent_dir))
 
-
+import transfer_queue as tq  # noqa: E402
 from transfer_queue import (  # noqa: E402
     RankAwareSampler,
-    SimpleStorageUnit,
     StreamingDataLoader,
     StreamingDataset,
-    TransferQueueClient,
-    TransferQueueController,
-    process_zmq_server_info,
 )
 
 
 def setup_transfer_queue():
     """Setup TransferQueue components."""
     if not ray.is_initialized():
-        ray.init()
-
-    config = OmegaConf.create(
-        {
-            "num_data_storage_units": 2,
-        }
-    )
-
-    storage_units = {}
-    for i in range(config["num_data_storage_units"]):
-        storage_units[i] = SimpleStorageUnit.remote(storage_unit_size=100)
+        ray.init(namespace="TransferQueueTutorial")
 
     print("[Setup]: Setup TransferQueue components")
     print(
@@ -101,26 +87,23 @@ def setup_transfer_queue():
         "TransferQueueController. In polling_mode, the controller will return empty BatchMeta when "
         "available data cannot meet the consumption requirements. User side need to retry later."
     )
-    controller = TransferQueueController.remote(
-        sampler=RankAwareSampler,  # RankAwareSampler enables consistent sampling for each DP rank
-        polling_mode=True,  # Enable polling mode for streaming data retrieval
+
+    config = OmegaConf.create(
+        {
+            "controller": {
+                "sampler": RankAwareSampler,  # RankAwareSampler enables consistent sampling for each DP rank
+                "polling_mode": True,  # Enable polling mode for streaming data retrieval
+            },
+            "backend": {"SimpleStorage": {"num_data_storage_units": 2}},
+        },
+        flags={"allow_objects": True},
     )
 
-    controller_info = process_zmq_server_info(controller)
-    storage_unit_infos = process_zmq_server_info(storage_units)
-
-    # Build the complete configuration
-    tq_config = OmegaConf.create({}, flags={"allow_objects": True})
-    tq_config.controller_info = controller_info
-    tq_config.storage_unit_infos = storage_unit_infos
-    config.storage_backend = "AsyncSimpleStorageManager"
-    config = OmegaConf.merge(tq_config, config)
-
-    return controller, storage_units, config
+    tq.init(config)
 
 
 @ray.remote(num_cpus=0.1)
-def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
+def generate_worker(rank_id: int, num_samples: int = 20):
     """
     Generate actor that produces training samples.
 
@@ -129,7 +112,6 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
 
     Args:
         rank_id: Unique identifier for this generator (used for sample indexing)
-        config: TransferQueue configuration
         num_samples: Number of samples to generate
 
     Note:
@@ -137,13 +119,11 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
         This ensures global uniqueness across all generator actors.
     """
     # Create a client for interacting with TransferQueue
-    client = TransferQueueClient(
-        client_id=f"gen_worker_{rank_id}",
-        controller_info=config.controller_info,
-    )
 
-    # Initialize the storage manager for this client
-    client.initialize_storage_manager(manager_type=config.storage_backend, config=config)
+    # Need to call tq.init() in each process
+    tq.init()
+
+    tq_client = tq.get_client()
 
     # Generate and put samples into the queue
     for i in range(num_samples):
@@ -159,7 +139,7 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
         print(f"[Generate Worker@{rank_id}]: Putting sample {seq_id} into TransferQueue")
 
         # Put data into the specified partition
-        client.put(data, partition_id="train")
+        tq_client.put(data, partition_id="train")
 
     print(f"[Generate Worker@{rank_id}]: Complete putting samples into TransferQueue")
 
@@ -168,7 +148,6 @@ def generate_worker(rank_id: int, config: DictConfig, num_samples: int = 20):
 def update_worker(
     rank_id: int,
     dp_rank: int,
-    config: DictConfig,
     max_steps: int = 5,
 ):
     """
@@ -182,7 +161,6 @@ def update_worker(
         rank_id: Global rank identifier for logging and display purposes
         dp_rank: Data parallel rank ID that this worker belongs to
             The same Ranks receive the same data samples
-        config: TransferQueue configuration
         max_steps: Maximum number of batches to consume
 
     Returns:
@@ -200,8 +178,15 @@ def update_worker(
         - batch_meta: Metadata for TransferQueue coordination (contains global_indexes)
     """
 
+    # Need to call tq.init() in each process
+    tq.init()
+
     # Step 1: Create StreamingDataset
     # This dataset integrates with TransferQueue and handles batch retrieval
+
+    controller = ray.get_actor("TransferQueueController")
+    config = ray.get(controller.get_config.remote())
+
     dataset = StreamingDataset(
         config=config,
         batch_size=2,
@@ -253,7 +238,7 @@ def update_worker(
     }
 
 
-def start_all_generate_actors(config):
+def start_all_generate_actors():
     """
     Launch generate_actors for producing training samples.
     """
@@ -261,12 +246,12 @@ def start_all_generate_actors(config):
     handlers = []
 
     for i in range(num_workers):
-        handlers.append(generate_worker.remote(rank_id=i, config=config, num_samples=20))
+        handlers.append(generate_worker.remote(rank_id=i, num_samples=20))
 
     return handlers
 
 
-def start_all_update_actors(config):
+def start_all_update_actors():
     """
     Launch update_actors for consuming training samples.
     """
@@ -285,7 +270,6 @@ def start_all_update_actors(config):
             update_worker.remote(
                 rank_id=rank_ids[i],
                 dp_rank=dp_rank[i],
-                config=config,
             )
         )
 
@@ -307,7 +291,7 @@ def main():
     print(
         textwrap.dedent(
             """
-        TransferQueue Tutorial 5: StreamingDataLoader for Distributed Training
+        TransferQueue Tutorial 6: StreamingDataLoader for Distributed Training
 
         This tutorial demonstrates the StreamingDataLoader interface for distributed
         training scenarios. It showcases how to use StreamingDataset and StreamingDataLoader
@@ -331,15 +315,15 @@ def main():
         "global_batch_size to make sure consumers can accurately determine consumption status even before "
         "producers have generated the samples."
     )
-    controller, storage_units, config = setup_transfer_queue()
+    setup_transfer_queue()
 
     # Step 2: Launch data generation actors
     print("\n[Phase 2] Starting data generation...")
-    generate_worker_handlers = start_all_generate_actors(config)
+    generate_worker_handlers = start_all_generate_actors()
 
     # Step 3: Launch data consumption actors
     print("\n[Phase 3] Starting data consumption...")
-    update_worker_handlers = start_all_update_actors(config)
+    update_worker_handlers = start_all_update_actors()
 
     # Wait for completion
     print("\n[Phase 4] Waiting for actors to complete...")

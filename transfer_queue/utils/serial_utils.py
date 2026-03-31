@@ -17,6 +17,8 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
+import logging
+import os
 import pickle
 import warnings
 from collections.abc import Sequence
@@ -35,8 +37,15 @@ CUSTOM_TYPE_PICKLE = 1
 CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
+CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
+
+# 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
+_PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
 
 bytestr: TypeAlias = bytes | bytearray | memoryview | zmq.Frame
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
 # Ignore warnings about non-writable buffers from torch.frombuffer. Upper codes will ensure
 # the tensors are writable to users.
@@ -69,6 +78,7 @@ class MsgpackEncoder:
 
     def encode(self, obj: Any) -> Sequence[bytestr]:
         """Encode a given object to a byte array."""
+
         bufs: list[bytestr] = [b""]
         token = _encoder_aux_buffers.set(bufs)
         try:
@@ -88,6 +98,7 @@ class MsgpackEncoder:
         - torch.Tensor: Extract buffer, store metadata
         - TensorDict: Convert to dict structure for recursive processing
         - numpy.ndarray: Convert to tensor for unified handling
+
         """
         if isinstance(obj, torch.Tensor):
             return self._encode_tensor(obj)
@@ -96,17 +107,15 @@ class MsgpackEncoder:
         if isinstance(obj, TensorDictBase):
             return self._encode_tensordict(obj)
 
-        # Handle numpy arrays by converting to tensor
-        # Only numeric dtypes are supported by torch.from_numpy:
-        # f=float, i=signed int, u=unsigned int, b=bool, c=complex
+        # Numpy arrays: serialize natively unless the dtype contains Python objects.
         if isinstance(obj, np.ndarray):
-            if obj.dtype.kind in ("f", "i", "u", "b", "c"):
+            if obj.dtype.kind != "O" and not obj.dtype.hasobject:
                 try:
-                    return self._encode_tensor(torch.from_numpy(obj))
-                except (TypeError, RuntimeError):
-                    # Fallback to pickle for unsupported dtypes (e.g., float16 on some platforms)
+                    return self._encode_numpy(obj)
+                except (TypeError, RuntimeError, ValueError):
+                    # Fallback to pickle for platforms that don't support the view
                     pass
-            # For object arrays, strings, or other unsupported types, use pickle
+            # Only true object arrays (or structured dtypes with object fields) reach here
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if isinstance(obj, FunctionType):
@@ -134,16 +143,7 @@ class MsgpackEncoder:
         }
 
     def _encode_tensor(self, obj: torch.Tensor) -> msgpack.Ext:
-        """Encode tensor with zero-copy buffer extraction.
-
-        Features:
-        - Auto GPU->CPU conversion
-        - Auto contiguous conversion
-        - Direct memoryview extraction via uint8 view (for BFloat16 support)
-        - Nested tensors: unbind and serialize each sub-tensor with zero-copy
-
-        Returns Ext type so decoding goes through ext_hook (which has buffer access).
-        """
+        """Encode tensor with zero-copy buffer extraction (handles GPU, non-contiguous, nested)."""
         assert len(self.aux_buffers) > 0
 
         # Handle nested tensors (strided or jagged) via unbind
@@ -217,6 +217,20 @@ class MsgpackEncoder:
         dtype = str(obj.dtype).removeprefix("torch.")
         meta = (dtype, tuple(obj.shape), idx)
         return msgpack.Ext(CUSTOM_TYPE_TENSOR, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
+
+    def _encode_numpy(self, obj: np.ndarray) -> msgpack.Ext:
+        """Encode numpy array with zero-copy buffer extraction."""
+        # Ensure C-contiguous layout; no-op when already contiguous
+        if not obj.flags["C_CONTIGUOUS"]:
+            obj = np.ascontiguousarray(obj)
+
+        # Byte-level view as uint8 then ravel → 1-D C-contiguous raw-bytes array
+        buf = memoryview(obj.view(np.uint8).ravel())
+        idx = len(self.aux_buffers)
+        self.aux_buffers.append(buf)
+
+        meta = (str(obj.dtype), tuple(obj.shape), idx)
+        return msgpack.Ext(CUSTOM_TYPE_NUMPY, pickle.dumps(meta, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 class MsgpackDecoder:
@@ -307,6 +321,19 @@ class MsgpackDecoder:
         else:  # strided
             return torch.nested.as_nested_tensor(sub_tensors, layout=torch.strided)
 
+    def _decode_numpy(self, meta: tuple) -> np.ndarray:
+        """Decode numpy array from (dtype_str, shape, buffer_idx) tuple."""
+        dtype_str, shape, idx = meta
+        buffer = self.aux_buffers[idx]
+        np_dtype = np.dtype(dtype_str)
+
+        if not buffer:  # empty array
+            return np.empty(shape, dtype=np_dtype)
+
+        # Reconstruct from raw bytes: uint8 view → reinterpret as original dtype
+        arr = np.frombuffer(buffer, dtype=np.uint8)
+        return arr.view(np_dtype).reshape(shape)
+
     def ext_hook(self, code: int, data: memoryview) -> Any:
         """Custom decoding hook for types msgspec doesn't natively support.
 
@@ -325,9 +352,39 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NESTED_TENSOR:
             nested_meta = pickle.loads(data)
             return self._decode_nested_tensor(nested_meta)
+        if code == CUSTOM_TYPE_NUMPY:
+            meta = pickle.loads(data)
+            return self._decode_numpy(meta)
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
 
 
 _encoder = MsgpackEncoder()
 _decoder = MsgpackDecoder()
+
+
+def encode(obj: Any) -> list[bytestr]:
+    """Encode an object via msgpack zero-copy; falls back to pickle on failure.
+
+    The pickle path is a normal degradation path (e.g. body contains torch.dtype
+    objects). Use this as the single entry point for all ZMQ message serialization.
+    """
+    try:
+        return list(_encoder.encode(obj))
+    except (TypeError, ValueError) as e:
+        logger.debug(
+            "encode: msgpack failed (%s), falling back to pickle.",
+            type(e).__name__,
+        )
+        return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
+
+
+def decode(frames: list) -> Any:
+    """Decode frames produced by encode.
+
+    Transparently handles both the msgpack zero-copy path and the pickle
+    fallback path based on the leading sentinel frame.
+    """
+    if len(frames) >= 2 and frames[0] == _PICKLE_FALLBACK_SENTINEL:
+        return pickle.loads(frames[1])
+    return _decoder.decode(frames)

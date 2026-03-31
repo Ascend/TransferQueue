@@ -13,18 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
-from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from tensordict import TensorDict
 
-# Import your classes here
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder  # noqa: E402
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 
 @pytest.mark.parametrize(
@@ -76,6 +71,8 @@ def test_zmq_msg_serialization():
     encoded_msg = msg.serialize()
     decoded_msg = ZMQMessage.deserialize(encoded_msg)
     assert decoded_msg.request_type == msg.request_type
+    # TensorDict converts numpy arrays to Tensors on insertion,
+    # so decoding yields a Tensor (not np.ndarray).
     assert torch.allclose(decoded_msg.body["data"]["numpy_array"], msg.body["data"]["numpy_array"])
     assert torch.allclose(decoded_msg.body["data"]["normal_tensor"], msg.body["data"]["normal_tensor"])
     assert msg.body["data"]["nested_tensor"].layout == decoded_msg.body["data"]["nested_tensor"].layout
@@ -823,20 +820,23 @@ class TestSerialThreadSafety:
 
 
 # ============================================================================
-# Numpy Array Type Compatibility Tests
+# Numpy Serialization Tests
 # ============================================================================
-class TestNumpyArrayTypeCompatibility:
+class TestNumpySerialization:
     """Test numpy array serialization with various dtypes.
 
-    These tests verify the fix for the TypeError when using torch.from_numpy()
-    with unsupported numpy dtypes (e.g., object arrays). The fix uses pickle
-    fallback for incompatible types while maintaining zero-copy for numeric types.
+    These tests verify:
+    1. The fix for the TypeError when using torch.from_numpy() with unsupported
+       numpy dtypes (e.g., object arrays). The fix uses pickle fallback for
+       incompatible types while maintaining zero-copy for numeric types.
+    2. Numeric numpy arrays round-trip as np.ndarray (not torch.Tensor),
+       preserving dtype and shape exactly, using zero-copy path.
     """
+
+    # --- Object / string array tests (formerly TestNumpyArrayTypeCompatibility) ---
 
     def test_numpy_object_array_strings(self):
         """Test numpy object array with string elements."""
-        import numpy as np
-
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
@@ -851,8 +851,6 @@ class TestNumpyArrayTypeCompatibility:
 
     def test_numpy_object_array_mixed_types(self):
         """Test numpy object array with mixed Python types."""
-        import numpy as np
-
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
@@ -867,8 +865,6 @@ class TestNumpyArrayTypeCompatibility:
 
     def test_numpy_object_array_dicts(self):
         """Test numpy object array containing Python dicts."""
-        import numpy as np
-
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
@@ -883,13 +879,10 @@ class TestNumpyArrayTypeCompatibility:
             assert orig == decoded
 
     def test_numpy_numeric_arrays_zero_copy(self):
-        """Test that numeric numpy arrays use zero-copy path."""
-        import numpy as np
-
+        """Test that numeric numpy arrays use zero-copy path and return np.ndarray."""
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
-        # These should use zero-copy (torch.from_numpy + tensor encoding)
         numeric_dtypes = [
             np.float32,
             np.float64,
@@ -910,19 +903,20 @@ class TestNumpyArrayTypeCompatibility:
 
             serialized = encoder.encode(arr)
 
-            # Zero-copy should produce multiple buffers (metadata + tensor buffer)
+            # Zero-copy must produce multiple buffers (metadata + data buffer)
             assert len(serialized) > 1, f"Expected zero-copy for dtype {dtype}"
 
             deserialized = decoder.decode(serialized)
 
-            # Deserialized as torch.Tensor (due to zero-copy path)
-            assert isinstance(deserialized, torch.Tensor)
-            assert torch.allclose(deserialized, torch.from_numpy(arr))
+            # After the fix: deserialized must be np.ndarray, not torch.Tensor
+            assert isinstance(deserialized, np.ndarray), (
+                f"Expected np.ndarray but got {type(deserialized)} for dtype={dtype}"
+            )
+            assert deserialized.dtype == arr.dtype
+            assert np.array_equal(deserialized, arr)
 
     def test_numpy_object_array_in_zmq_message(self):
         """Test numpy object array inside ZMQMessage."""
-        import numpy as np
-
         from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
         # Create message with both object array and regular tensors
@@ -951,8 +945,6 @@ class TestNumpyArrayTypeCompatibility:
 
     def test_numpy_unicode_string_array(self):
         """Test numpy unicode string array (dtype='<U...')."""
-        import numpy as np
-
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
@@ -966,8 +958,6 @@ class TestNumpyArrayTypeCompatibility:
 
     def test_numpy_bytes_array(self):
         """Test numpy bytes array (dtype='S...')."""
-        import numpy as np
-
         encoder = MsgpackEncoder()
         decoder = MsgpackDecoder()
 
@@ -978,3 +968,122 @@ class TestNumpyArrayTypeCompatibility:
         deserialized = decoder.decode(serialized)
 
         assert np.array_equal(deserialized, bytes_arr)
+
+    # --- Native serialization tests (formerly TestNumpyNativeSerialization) ---
+
+    @pytest.mark.parametrize(
+        "dtype",
+        [
+            # Numeric / bool / complex (original coverage)
+            np.float16,
+            np.float32,
+            np.float64,
+            np.int8,
+            np.int16,
+            np.int32,
+            np.int64,
+            np.uint8,
+            np.uint16,
+            np.uint32,
+            np.uint64,
+            np.bool_,
+            np.complex64,
+            np.complex128,
+            # Extended types now also covered via exclusion-based check
+            np.datetime64,  # kind='M', stored as int64
+            np.timedelta64,  # kind='m', stored as int64
+            np.dtype("S10"),  # kind='S', fixed-length bytes
+        ],
+    )
+    def test_numpy_roundtrip_preserves_type(self, dtype):
+        """All buffer-compatible ndarrays must come back as np.ndarray, not torch.Tensor."""
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        dtype = np.dtype(dtype)  # normalise in case a dtype instance was passed
+        if dtype == np.dtype("bool"):
+            arr = np.array([True, False, True, True], dtype=dtype)
+        elif dtype.kind == "c":  # complex
+            arr = np.array([1 + 2j, 3 + 4j], dtype=dtype)
+        elif dtype.kind == "M":  # datetime64
+            arr = np.array(["2024-01", "2024-02"], dtype=dtype)
+        elif dtype.kind == "m":  # timedelta64
+            arr = np.array([1, 2], dtype=dtype)
+        elif dtype.kind == "S":  # fixed-length bytes
+            arr = np.array([b"hello", b"world"], dtype=dtype)
+        elif np.issubdtype(dtype, np.integer):
+            arr = np.array([1, 2, 3, 4], dtype=dtype)
+        else:
+            arr = np.array([1.0, 2.0, 3.0, 4.0], dtype=dtype)
+
+        serialized = encoder.encode(arr)
+        deserialized = decoder.decode(serialized)
+
+        assert isinstance(deserialized, np.ndarray), f"Expected np.ndarray, got {type(deserialized)} for dtype={dtype}"
+        assert deserialized.dtype == arr.dtype
+        assert deserialized.shape == arr.shape
+        assert np.array_equal(deserialized, arr)
+
+    def test_numpy_zero_copy_uses_multiple_buffers(self):
+        """Zero-copy path must produce len(serialized) > 1."""
+        encoder = MsgpackEncoder()
+        arr = np.arange(100, dtype=np.float32)
+        serialized = encoder.encode(arr)
+        assert len(serialized) > 1, "Expected zero-copy (aux buffer) for float32 ndarray"
+
+    def test_numpy_non_contiguous_roundtrip(self):
+        """Non-C-contiguous arrays must be made contiguous before serialization."""
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        base = np.arange(100, dtype=np.float64).reshape(10, 10)
+        arr = base[::2, ::2]  # non-contiguous view
+        assert not arr.flags["C_CONTIGUOUS"]
+
+        serialized = encoder.encode(arr)
+        deserialized = decoder.decode(serialized)
+
+        assert isinstance(deserialized, np.ndarray)
+        assert np.array_equal(deserialized, arr)
+
+    def test_numpy_multidim_shape_preserved(self):
+        """Shape must survive a round-trip for multi-dimensional arrays."""
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        arr = np.arange(60, dtype=np.int32).reshape(3, 4, 5)
+        serialized = encoder.encode(arr)
+        deserialized = decoder.decode(serialized)
+
+        assert isinstance(deserialized, np.ndarray)
+        assert deserialized.shape == (3, 4, 5)
+        assert np.array_equal(deserialized, arr)
+
+    def test_numpy_empty_array_roundtrip(self):
+        """Empty arrays must round-trip correctly."""
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        arr = np.empty((0,), dtype=np.float32)
+        serialized = encoder.encode(arr)
+        deserialized = decoder.decode(serialized)
+
+        assert isinstance(deserialized, np.ndarray)
+        assert deserialized.shape == (0,)
+        assert deserialized.dtype == np.float32
+
+    def test_numpy_object_array_still_uses_pickle(self):
+        """Object arrays (kind='O' or hasobject) must fall back to pickle."""
+        encoder = MsgpackEncoder()
+        decoder = MsgpackDecoder()
+
+        # dtype=object — kind 'O', cannot be viewed as a contiguous byte buffer
+        arr = np.array(["a", "b", "c"], dtype=object)
+        serialized = encoder.encode(arr)
+
+        # Pickle-fallback produces a single buffer (no aux tensor buffer appended)
+        assert len(serialized) == 1, "Object array should not use zero-copy path"
+
+        deserialized = decoder.decode(serialized)
+        assert isinstance(deserialized, np.ndarray)
+        assert np.array_equal(deserialized, arr)

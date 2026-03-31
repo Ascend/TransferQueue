@@ -16,6 +16,7 @@
 from .base import TransferQueueStorageManager
 from .factory import TransferQueueStorageManagerFactory
 from .mooncake_manager import MooncakeStorageManager
+from .ray_storage_manager import RayStorageManager
 from .simple_backend_manager import AsyncSimpleStorageManager
 from .yuanrong_manager import YuanrongStorageManager
 
@@ -25,4 +26,5 @@ __all__ = [
     "AsyncSimpleStorageManager",
     "YuanrongStorageManager",
     "MooncakeStorageManager",
+    "RayStorageManager",
 ]

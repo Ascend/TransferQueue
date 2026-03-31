@@ -19,9 +19,7 @@ import json
 import logging
 import math
 import os
-import sys
 import time
-from pathlib import Path
 
 import numpy as np
 import ray
@@ -30,16 +28,11 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 from tensordict.utils import LinkedList
 
-parent_dir = Path(__file__).resolve().parent.parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue import (  # noqa: E402
-    AsyncTransferQueueClient,
-    SimpleStorageUnit,
-    TransferQueueController,
-    process_zmq_server_info,
-)
-from transfer_queue.utils.common import get_placement_group  # noqa: E402
+from transfer_queue import TransferQueueClient
+from transfer_queue.controller import TransferQueueController
+from transfer_queue.storage.simple_backend import SimpleStorageUnit
+from transfer_queue.utils.common import get_placement_group
+from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -309,7 +302,7 @@ class TQBandwidthTester:
         self.tq_config = OmegaConf.merge(tq_internal_conf, self.tq_config)
 
         # Client Init
-        self.data_system_client = AsyncTransferQueueClient(
+        self.data_system_client = TransferQueueClient(
             client_id="Trainer", controller_info=self.data_system_controller_info
         )
         self.data_system_client.initialize_storage_manager(

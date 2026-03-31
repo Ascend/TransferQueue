@@ -13,28 +13,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 from typing import Any
 
 from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
 
-
-@TransferQueueStorageManagerFactory.register("MooncakeStore")
-class MooncakeStorageManager(KVStorageManager):
-    """Storage manager for MooncakeStorage backend."""
+@TransferQueueStorageManagerFactory.register("RayStore")
+class RayStorageManager(KVStorageManager):
+    """Storage manager for Ray-RDT backend."""
 
     def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
-        logger.warning(
-            "MooncakeStore backend doesn't support key update (upsert) for now. "
-            "You must delete the key before updating it. "
-            "Refer to https://github.com/kvcache-ai/Mooncake/issues/1645 for details."
-        )
-
-        config["client_name"] = "MooncakeStoreClient"
-        super().__init__(controller_info, config)
+        config = (config or {}).copy()
+        if config.get("client_name") not in (None, "RayStorageClient"):
+            raise ValueError(f"RayStorageManager only supports 'RayStorageClient', got: {config.get('client_name')}")
+        super().__init__(controller_info, {**config, "client_name": "RayStorageClient"})

@@ -117,6 +117,9 @@ test = [
 yuanrong = [
     "openyuanrong-datasystem"
 ]
+mooncake = [
+    "mooncake-transfer-engine"
+]
 
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]
@@ -126,5 +129,6 @@ yuanrong = [
 # This is the rough equivalent of package_data={'': ['version/*']}
 [tool.setuptools.package-data]
 transfer_queue = [
-  "version/*",
+    "version/*",
+    "*.yaml"
 ]

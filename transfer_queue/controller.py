@@ -25,26 +25,27 @@ from threading import Lock, Thread
 from typing import Any, Optional
 from uuid import uuid4
 
+import numpy as np
 import ray
 import torch
 import zmq
-from ray.util import get_node_ip_address
+from omegaconf import DictConfig
 from torch import Tensor
 
 from transfer_queue.metadata import (
     BatchMeta,
-    FieldMeta,
-    SampleMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
-from transfer_queue.utils.enum_utils import ProductionStatus, TransferQueueRole
+from transfer_queue.utils.enum_utils import TransferQueueRole
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
     create_zmq_socket,
+    format_zmq_address,
     get_free_port,
+    get_node_ip_address_raw,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,6 @@ TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GE
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
 # determine consumption status even before producers have generated the samples.
-TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
 
 class PartitionIndexManager:
@@ -192,6 +192,134 @@ class PartitionIndexManager:
 
 
 @dataclass
+class FieldMeta:
+    """
+    Single source of truth for one field's metadata in a partition.
+
+    Field-level attributes (dtype/shape/is_nested/is_non_tensor) are shared across all samples, O(1) storage.
+    Sample-level attributes (per_sample_shapes) are only needed for nested tensors,
+    indexed by global_idx, O(B_nested) storage.
+    """
+
+    global_indexes: set[int] = field(default_factory=set)
+    dtype: Optional[Any] = None
+    shape: Optional[tuple] = None  # None when is_nested=True
+    is_nested: Optional[bool] = None
+    is_non_tensor: Optional[bool] = None
+
+    per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
+
+    # TODO: FieldMeta needs to be refactored to prevent these complicated and fragile logics
+    def update(self, incoming: dict[str, Any], incoming_global_indexes: list[int]) -> None:
+        """Update this field's metadata from an incoming schema dict.
+
+        Encapsulates dtype consistency check, shape conflict detection,
+        and automatic is_nested inference.
+
+        Args:
+            incoming: Schema dict with optional keys:
+                      global_indexes, dtype, shape, is_nested, is_non_tensor, per_sample_shapes
+            incoming_global_indexes: global indexes of the input meta
+        Raises:
+            ValueError: If incoming dtype conflicts with existing dtype.
+        """
+        # dtype consistency check
+        new_dtype = incoming.get("dtype")
+        if new_dtype is not None:
+            if self.dtype is None:
+                self.dtype = new_dtype
+            elif self.dtype != new_dtype:
+                raise ValueError(
+                    f"dtype mismatch: existing={self.dtype}, incoming={new_dtype}. "
+                    f"All batches for the same field must have the same dtype."
+                )
+
+        new_is_nested = incoming.get("is_nested")
+        new_is_non_tensor = incoming.get("is_non_tensor")
+
+        if new_is_nested:
+            new_per_sample_shapes = incoming.get("per_sample_shapes", None)
+            if new_per_sample_shapes is None:
+                raise ValueError("Receiving a nested field without 'per_sample_shapes'!")
+            if self.is_nested is not None and not self.is_nested:
+                # new input is nested, but original is regular tensor.
+                # We need to write old shape into per_sample_shapes
+                assert self.shape is not None
+                for gi in self.global_indexes:
+                    self.per_sample_shapes[gi] = self.shape
+                self.is_nested = True
+                self.shape = None
+
+            # Update newly provided per_sample_shapes
+            self.per_sample_shapes.update(new_per_sample_shapes)
+
+        else:
+            if not new_is_non_tensor:
+                # newly input is regular tensor
+                new_shape = incoming.get("shape", None)
+                if new_shape is None:
+                    raise ValueError("Receiving a regular tensor without 'shape'!")
+                if self.is_nested:
+                    # we need to update incoming shape into per_sample_shapes
+                    for gi in incoming_global_indexes:
+                        self.per_sample_shapes[gi] = new_shape
+                else:
+                    if self.is_non_tensor is not None and not self.is_non_tensor:
+                        # original data is also regular tensor
+                        assert self.shape is not None
+                        if self.shape != new_shape:
+                            for gi in self.global_indexes:
+                                self.per_sample_shapes[gi] = self.shape
+                            for gi in incoming_global_indexes:
+                                self.per_sample_shapes[gi] = new_shape
+
+                            self.shape = None
+                            self.is_nested = True
+
+        self.global_indexes.update(incoming_global_indexes)
+
+    def remove_samples(self, indexes: list[int]):
+        """Remove sample-level data for the given indexes."""
+        for idx in indexes:
+            self.per_sample_shapes.pop(idx, None)
+            self.global_indexes.discard(idx)
+
+        # After removing samples, check if we can update is_nested and shape
+        if len(self.global_indexes) == 0:
+            # If no samples remain, fully reset field-level metadata.
+            self.is_nested = None
+            self.is_non_tensor = None
+            self.shape = None
+            self.dtype = None
+            self.per_sample_shapes.clear()
+        else:
+            if self.is_nested:
+                # Check if all remaining shapes are the same
+                remaining_shapes = set(
+                    tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
+                )
+                if len(remaining_shapes) == 1:
+                    # All remaining samples have the same shape - update to non-nested
+                    self.is_nested = False
+                    self.shape = next(iter(remaining_shapes))
+                    # Clear per-sample shapes since we are no longer nested
+                    self.per_sample_shapes.clear()
+
+    def to_batch_schema(self, batch_global_indexes: list[int]) -> dict[str, Any]:
+        """Export as a BatchMeta.field_schema-compatible dict for generate_batch_meta."""
+        schema = {
+            "dtype": self.dtype,
+            "shape": self.shape,
+            "is_nested": self.is_nested,
+            "is_non_tensor": self.is_non_tensor,
+        }
+        if self.is_nested and self.per_sample_shapes:
+            schema["per_sample_shapes"] = [self.per_sample_shapes.get(gi) for gi in batch_global_indexes]
+
+        return schema
+
+
+@dataclass
 class DataPartitionStatus:
     """
     Robust status information for a data partition with dynamic expansion support.
@@ -206,6 +334,7 @@ class DataPartitionStatus:
 
     # Production status tensor - dynamically expandable
     # Values: 0 = not produced, 1 = ready for consumption
+    TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
     production_status: Tensor = torch.zeros(TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
 
@@ -213,7 +342,7 @@ class DataPartitionStatus:
     # Each tensor tracks which samples have been consumed by that task
     consumption_status: dict[str, Tensor] = field(default_factory=dict)
 
-    # Sample metadata
+    # Global indexes
     global_indexes: set[int] = field(
         default_factory=set
     )  # set of global indexes that have been added to this partition
@@ -224,13 +353,17 @@ class DataPartitionStatus:
 
     # Metadata
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
-    field_dtypes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: dtype}
-    field_shapes: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {field: shape}
+    # O(F) columnar field metadata: field_name -> FieldMeta
+    field_metadata: dict[str, FieldMeta] = field(default_factory=dict)
     field_custom_backend_meta: dict[int, dict[str, Any]] = field(
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
     # User-defined metadata that may not apply to field level
     custom_meta: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {}
+
+    # User-defined Keys
+    keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
+    revert_keys_mapping: dict[int, str] = field(default_factory=dict)  # global_idx -> key
 
     # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
     # No need to strictly lock for every read/write operation since freshness is not critical.
@@ -371,19 +504,21 @@ class DataPartitionStatus:
         self,
         global_indices: list[int],
         field_names: list[str],
-        dtypes: Optional[dict[int, dict[str, Any]]],
-        shapes: Optional[dict[int, dict[str, Any]]],
+        field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
         Handles dynamic expansion of both samples and fields.
 
+        Note: field_names is derived from field_schema.keys() internally.
+        The parameter is kept for backward compatibility but ignored;
+        callers should ensure field_schema contains all intended fields.
+
         Args:
             global_indices: List of sample indices to update
-            field_names: List of field names to mark as produced
-            dtypes: Optional per-sample field dtype information
-            shapes: Optional per-sample field shape information
+            field_names: List of field names (ignored; derived from field_schema.keys())
+            field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional per-sample per-field
                 custom metadata provided by storage backend
 
@@ -391,32 +526,36 @@ class DataPartitionStatus:
             True if update was successful, False on error
         """
         try:
+            # Derive field_names from field_schema to guarantee consistency
+            field_names = list(field_schema.keys())
+
             # Determine required capacity
             max_sample_idx = max(global_indices) if global_indices else -1
             required_samples = max_sample_idx + 1
 
-            # Ensure we have enough rows
             with self.data_status_lock:
+                # Ensure we have enough rows
                 self.ensure_samples_capacity(required_samples)
 
             # Register new fields if needed
-            new_fields = [field for field in field_names if field not in self.field_name_mapping]
+            new_fields = [f for f in field_names if f not in self.field_name_mapping]
             if new_fields:
                 # Add new fields to mapping
-                for field in new_fields:
-                    self.field_name_mapping[field] = len(self.field_name_mapping)
+                for f in new_fields:
+                    self.field_name_mapping[f] = len(self.field_name_mapping)
 
                 required_fields = len(self.field_name_mapping)
                 with self.data_status_lock:
                     self.ensure_fields_capacity(required_fields)
 
-            # Update production status
-            if self.production_status is not None and global_indices and field_names:
-                field_indices = [self.field_name_mapping.get(field) for field in field_names]
-                self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
+            with self.data_status_lock:
+                # Update production status
+                if self.production_status is not None and global_indices and field_names:
+                    field_indices = [self.field_name_mapping.get(f) for f in field_names]
+                    self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
-            self._update_field_metadata(global_indices, dtypes, shapes, custom_backend_meta)
+            self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
@@ -429,66 +568,33 @@ class DataPartitionStatus:
 
     def _update_field_metadata(
         self,
-        global_indices: list[int],
-        dtypes: Optional[dict[int, dict[str, Any]]],
-        shapes: Optional[dict[int, dict[str, Any]]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]],
+        global_indexes: list[int],
+        field_schema: dict[str, dict[str, Any]],
+        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ):
-        """Update field dtype and shape metadata."""
-        if not global_indices:
+        """Update field metadata from columnar field_schema."""
+        if not global_indexes:
             return
 
-        # Validate lengths only for provided mappings
-        if dtypes and len(global_indices) != len(dtypes):
-            raise ValueError(f"`global_indices` {len(global_indices)} and `dtypes` {len(dtypes)} length mismatch.")
-        if shapes and len(global_indices) != len(shapes):
-            raise ValueError(f"`global_indices` {len(global_indices)} and `shapes` {len(shapes)} length mismatch.")
-        if custom_backend_meta and len(global_indices) != len(custom_backend_meta):
-            raise ValueError(
-                f"`global_indices` {len(global_indices)} and `custom_backend_meta` {len(custom_backend_meta)} "
-                f"length mismatch."
-            )
+        for field_name, meta in field_schema.items():
+            if field_name not in self.field_metadata:
+                self.field_metadata[field_name] = FieldMeta(
+                    global_indexes=set(global_indexes),
+                    dtype=meta.get("dtype"),
+                    shape=meta.get("shape"),
+                    is_nested=meta.get("is_nested", False),
+                    is_non_tensor=meta.get("is_non_tensor", False),
+                    per_sample_shapes=meta.get("per_sample_shapes", {}),
+                )
+            else:
+                self.field_metadata[field_name].update(meta, global_indexes)
 
-        # Extract values for each provided mapping; if a mapping is absent, use Nones
-        if dtypes:
-            dtype_value = itemgetter(*global_indices)(dtypes)
-            if not isinstance(dtype_value, tuple):
-                dtype_value = (dtype_value,)
-        else:
-            dtype_value = tuple([None] * len(global_indices))
-
-        if shapes:
-            shape_value = itemgetter(*global_indices)(shapes)
-            if not isinstance(shape_value, tuple):
-                shape_value = (shape_value,)
-        else:
-            shape_value = tuple([None] * len(global_indices))
-
+        # custom_backend_meta remains row-oriented storage
         if custom_backend_meta:
-            custom_backend_meta_value = itemgetter(*global_indices)(custom_backend_meta)
-            if not isinstance(custom_backend_meta_value, tuple):
-                custom_backend_meta_value = (custom_backend_meta_value,)
-        else:
-            custom_backend_meta_value = tuple([None] * len(global_indices))
-
-        for i, global_idx in enumerate(global_indices):
-            # Only create and update dtype mapping if a dtype value was provided
-            if dtype_value[i] is not None:
-                if global_idx not in self.field_dtypes:
-                    self.field_dtypes[global_idx] = {}
-                self.field_dtypes[global_idx].update(dtype_value[i])
-
-            # Only create and update shape mapping if a shape value was provided
-            if shape_value[i] is not None:
-                if global_idx not in self.field_shapes:
-                    self.field_shapes[global_idx] = {}
-                self.field_shapes[global_idx].update(shape_value[i])
-
-            # Only create and update custom_backend_meta mapping if a custom_backend_meta value was provided
-            if custom_backend_meta_value[i] is not None:
+            for global_idx, per_field_meta in custom_backend_meta.items():
                 if global_idx not in self.field_custom_backend_meta:
                     self.field_custom_backend_meta[global_idx] = {}
-                self.field_custom_backend_meta[global_idx].update(custom_backend_meta_value[i])
+                self.field_custom_backend_meta[global_idx].update(per_field_meta)
 
     def mark_consumed(self, task_name: str, global_indices: list[int]):
         """
@@ -535,16 +641,42 @@ class DataPartitionStatus:
                 self.consumption_status[task_name] = torch.zeros(0, dtype=torch.int8)
 
         # Get consumption status for requested task
-        consumption_status = self.consumption_status[task_name]
-
         partition_global_index = torch.tensor(
             sorted(self.global_indexes | self.pre_allocated_global_indexes), dtype=torch.long
         )
 
         if mask:
-            consumption_status = consumption_status[partition_global_index]
-
+            if partition_global_index.numel() == 0:
+                empty_status = self.consumption_status[task_name].new_zeros(0)
+                return partition_global_index, empty_status
+            with self.data_status_lock:
+                self.ensure_samples_capacity(max(partition_global_index) + 1)
+            consumption_status = self.consumption_status[task_name][partition_global_index]
+        else:
+            consumption_status = self.consumption_status[task_name]
         return partition_global_index, consumption_status
+
+    def reset_consumption(self, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a specific task or all tasks.
+
+        This allows the same data to be re-consumed without clearing the actual data.
+        Useful for debugging scenarios where the same rollout data needs to be
+        trained multiple times.
+        Args:
+            task_name: Name of the task to reset consumption for.
+                      If None, resets consumption status for all tasks.
+        """
+        if task_name is not None:
+            # Reset specific task
+            if task_name in self.consumption_status:
+                self.consumption_status[task_name].zero_()
+                logger.debug(f"Reset consumption status for task '{task_name}' in partition {self.partition_id}")
+        else:
+            # Reset all tasks
+            for name, status_tensor in self.consumption_status.items():
+                status_tensor.zero_()
+            logger.debug(f"Reset consumption status for all tasks in partition {self.partition_id}")
 
     # ==================== Production Status Interface ====================
     def get_production_status_for_fields(
@@ -637,13 +769,12 @@ class DataPartitionStatus:
 
     # ==================== Metadata Methods ====================
 
-    def get_field_dtype(self, global_index: int, field_name: str) -> Optional[Any]:
-        """Get dtype for a specific sample and field."""
-        return self.field_dtypes.get(global_index, {}).get(field_name)
-
-    def get_field_shape(self, global_index: int, field_name: str) -> Optional[Any]:
-        """Get shape for a specific sample and field."""
-        return self.field_shapes.get(global_index, {}).get(field_name)
+    def get_field_schema(
+        self, field_names: list[str], batch_global_indexes: list[int] | None = None
+    ) -> dict[str, dict[str, Any]]:
+        """Return field_schema from the FieldMeta store."""
+        gi = batch_global_indexes or []
+        return {f: self.field_metadata[f].to_batch_schema(gi) for f in field_names if f in self.field_metadata}
 
     def get_field_custom_backend_meta(
         self, global_indices: list[int], field_names: list[str]
@@ -797,17 +928,42 @@ class DataPartitionStatus:
                     consumption_tensor[indexes_to_release] = 0
 
             self.global_indexes.difference_update(indexes_to_release)
+
+            empty_fields = []
+            for field_name, field_meta in self.field_metadata.items():
+                field_meta.remove_samples(indexes_to_release)
+                if len(field_meta.global_indexes) == 0:
+                    empty_fields.append(field_name)
+            if len(self.global_indexes) == 0:
+                # clear the whole field_meta if the whole partition is empty
+                self.field_metadata.clear()
+            else:
+                # only clear empty fields
+                for field_name in empty_fields:
+                    self.field_metadata.pop(field_name)
             for idx in indexes_to_release:
-                self.field_dtypes.pop(idx, None)
-                self.field_shapes.pop(idx, None)
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)
+
+                if idx in self.revert_keys_mapping:
+                    self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
+                    self.revert_keys_mapping.pop(idx, None)
 
         except Exception as e:
             logger.error(
                 f"Error clearing data for partition {self.partition_id}: {e}. "
                 f"Attempted to clear global_indexes: {indexes_to_release}"
             )
+
+    def kv_retrieve_indexes(self, keys: list[str]) -> list[int | None]:
+        """Translate the user-specified keys to global_indexes"""
+        global_indexes = [self.keys_mapping.get(k, None) for k in keys]
+        return global_indexes
+
+    def kv_retrieve_keys(self, global_indexes: list[int]) -> list[str | None]:
+        """Translate the global_indexes to keys"""
+        keys = [self.revert_keys_mapping.get(idx, None) for idx in global_indexes]
+        return keys
 
 
 @ray.remote(num_cpus=1)
@@ -857,6 +1013,7 @@ class TransferQueueController:
 
         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
         self.polling_mode = polling_mode
+        self.tq_config = None  # global config for TransferQueue system
 
         # Initialize ZMQ sockets for communication
         self._init_zmq_socket()
@@ -893,6 +1050,8 @@ class TransferQueueController:
         Returns:
             True if partition was created successfully, False if it already exists
         """
+        TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
+
         if partition_id in self.partitions:
             logger.warning(f"Partition {partition_id} already exists")
             return False
@@ -947,28 +1106,27 @@ class TransferQueueController:
 
     # ==================== Partition Index Management API ====================
 
-    def get_partition_index_range(self, partition: DataPartitionStatus) -> list[int]:
+    def get_partition_index_range(self, partition_id: str) -> list[int]:
         """
         Get all indexes for a specific partition.
 
         Args:
-            partition: Partition identifier
+            partition_id: Partition identifier
 
         Returns:
             List of indexes allocated to the partition
         """
-        return self.index_manager.get_indexes_for_partition(partition)
+        # Note: This includes the pre-allocated global_indexes for the partition.
+        # i.e., partition.global_indexes + partition.pre_allocated_global_indexes
+        return self.index_manager.get_indexes_for_partition(partition_id)
 
     # ==================== Data Production API ====================
 
-    # TODO: Modify dtypes & shapes to be required
     def update_production_status(
         self,
         partition_id: str,
         global_indexes: list[int],
-        field_names: list[str],
-        dtypes: Optional[dict[int, dict[str, Any]]],
-        shapes: Optional[dict[int, dict[str, Any]]],
+        field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
@@ -978,20 +1136,19 @@ class TransferQueueController:
         Args:
             partition_id: ID of the partition
             global_indexes: List of sample indices to update
-            field_names: List of field names to mark as produced
-            dtypes: Optional per-sample field dtype information
-            shapes: Optional per-sample field shape information
+            field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional custom backend metadata
 
         Returns:
             True if update was successful, False otherwise
         """
+        field_names = list(field_schema.keys())
         partition = self._get_partition(partition_id)
         if not partition:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, dtypes, shapes, custom_backend_meta)
+        success = partition.update_production_status(global_indexes, field_names, field_schema, custom_backend_meta)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1120,30 +1277,31 @@ class TransferQueueController:
                 self.create_partition(partition_id)
 
             partition = self._get_partition(partition_id)
-            if data_fields:
-                # This is called during put_data call without providing metadata.
-                # try to use pre-allocated global index first
+            if data_fields is None:
+                raise RuntimeError("Must provide data_fields for inserting new data")
 
-                if batch_size is None:
-                    raise ValueError("must provide batch_size for inserting new data")
+            # This is called during put_data call without providing metadata.
+            # try to use pre-allocated global index first
 
-                assert partition is not None
-                batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
+            if batch_size is None:
+                raise ValueError("must provide batch_size for inserting new data")
 
-                if len(batch_global_indexes) < batch_size:
-                    new_global_indexes = self.index_manager.allocate_indexes(
-                        partition_id, count=(batch_size - len(batch_global_indexes))
-                    )
-                    batch_global_indexes.extend(new_global_indexes)
+            assert partition is not None
+            batch_global_indexes = partition.activate_pre_allocated_indexes(batch_size)
 
-            else:
-                # TODO: separate this "clear" related logic into a separated mode
-                # clear metadata call passes empty data_fields
-                batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
+            if len(batch_global_indexes) < batch_size:
+                new_global_indexes = self.index_manager.allocate_indexes(
+                    partition_id, count=(batch_size - len(batch_global_indexes))
+                )
+                batch_global_indexes.extend(new_global_indexes)
+
+            # register global_indexes in partition
+            partition.global_indexes.update(batch_global_indexes)
+
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
 
-        assert task_name is not None
         if mode == "fetch":
+            assert task_name is not None
             # Find ready samples within current data partition and package into BatchMeta when reading
 
             if batch_size is None:
@@ -1157,41 +1315,62 @@ class TransferQueueController:
 
                 if len(ready_for_consume_indexes) < batch_size:
                     if self.polling_mode:
-                        logger.debug(
-                            f"[{self.controller_id}]: Not enough data for task {task_name} in partition {partition_id}."
-                            f" Required: {batch_size}, Available: {len(ready_for_consume_indexes)}."
-                            f" Returning None due to polling mode."
+                        sampling_config = sampling_config or {}
+                        states = self.sampler._states.get(partition_id, {}).get(task_name, {})
+                        dp_rank = sampling_config.get("dp_rank", None)
+                        batch_index = sampling_config.get("batch_index", None)
+
+                        # Return cached result if available
+                        if dp_rank is not None and dp_rank in states and batch_index in states[dp_rank]:
+                            break
+                        else:
+                            logger.debug(
+                                f"[{self.controller_id}]: Not enough data for task {task_name} in "
+                                f"partition {partition_id}. Required: {batch_size}, "
+                                f"Available: {len(ready_for_consume_indexes)}."
+                                f" Returning None due to polling mode."
+                            )
+                            return BatchMeta.empty()
+                    else:
+                        logger.warning(
+                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
+                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
                         )
-                        return BatchMeta.empty()
+                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
                     if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
                         raise TimeoutError(
                             f"Timeout while waiting for sufficient data for task {task_name}. "
                             f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
                         )
-                    logger.warning(
-                        f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                        f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                        f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                        f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
-                    )
-                    time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
                 else:
                     break
 
             batch_global_indexes, consumed_indexes = self.sampler(
                 ready_for_consume_indexes,
                 batch_size,
+                partition=self._get_partition(partition_id),
                 **(sampling_config or {}),
                 **kwargs,
             )
 
-            # Check if we got valid results from the sampler
-            if len(batch_global_indexes) != batch_size:
+            # Check if we got valid results from the sampler.
+            # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
+            # batches per DP rank, so we only check for empty results.
+            if len(batch_global_indexes) == 0:
+                if self.polling_mode:
+                    return BatchMeta.empty()
                 raise RuntimeError(
-                    f"Sampler returned insufficient samples. Please check the sampler logic. "
+                    f"Sampler returned no samples. Please check the sampler logic. "
                     f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
                     f"after sampling: {len(batch_global_indexes)}"
                 )
+
+            # Mark samples as consumed if in fetch mode
+            if consumed_indexes:
+                partition = self.partitions[partition_id]
+                partition.mark_consumed(task_name, consumed_indexes)
 
         elif mode == "force_fetch":
             batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
@@ -1199,11 +1378,6 @@ class TransferQueueController:
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
-
-        # Mark samples as consumed if in fetch mode
-        if mode == "fetch" and consumed_indexes:
-            partition = self.partitions[partition_id]
-            partition.mark_consumed(task_name, consumed_indexes)
 
         return metadata
 
@@ -1247,6 +1421,8 @@ class TransferQueueController:
         """
         Generate BatchMeta for specific samples in a partition.
 
+        O(F) optimized version that uses field_schema instead of per-sample metadata.
+
         This function is responsible only for metadata generation and does not
         modify consumption state. State management is handled by the calling function.
 
@@ -1269,55 +1445,56 @@ class TransferQueueController:
         if mode not in ["fetch", "insert", "force_fetch"]:
             raise ValueError(f"Invalid mode: {mode}")
 
-        # Generate sample metadata
-        samples = []
-        for global_index in batch_global_indexes:
-            fields = {}
+        batch_size = len(batch_global_indexes)
+
+        field_schema = partition.get_field_schema(data_fields, batch_global_indexes)
+
+        # In insert mode, create placeholder schema for unregistered fields so that
+        # metadata.field_names is complete and update_production_status() can recognize them.
+        if mode == "insert":
             for field_name in data_fields:
-                # Determine production status
-                if mode == "fetch":
-                    production_status = ProductionStatus.READY_FOR_CONSUME
-                    dtype = partition.get_field_dtype(global_index, field_name)
-                    shape = partition.get_field_shape(global_index, field_name)
-                elif mode == "insert":
-                    production_status = ProductionStatus.NOT_PRODUCED
-                    dtype = None
-                    shape = None
-                elif mode == "force_fetch":
-                    field_index = partition.field_name_mapping.get(field_name)
-                    if (
-                        field_index is not None
-                        and partition.production_status is not None
-                        and partition.production_status[global_index, field_index] == 1
-                    ):
-                        production_status = ProductionStatus.NOT_PRODUCED
-                        dtype = partition.get_field_dtype(global_index, field_name)
-                        shape = partition.get_field_shape(global_index, field_name)
-                    else:
-                        production_status = ProductionStatus.NOT_PRODUCED
-                        dtype = None
-                        shape = None
+                if field_name not in field_schema:
+                    field_schema[field_name] = {
+                        "dtype": None,
+                        "shape": None,
+                        "is_nested": False,
+                        "is_non_tensor": False,
+                    }
 
-                fields[field_name] = FieldMeta(
-                    name=field_name,
-                    dtype=dtype,
-                    shape=shape,
-                    production_status=production_status,
-                )
+        if mode == "fetch":
+            production_status = np.ones(batch_size, dtype=np.int8)
+        elif mode == "insert":
+            production_status = np.zeros(batch_size, dtype=np.int8)
+        else:  # force_fetch
+            production_status = np.zeros(batch_size, dtype=np.int8)
+            if partition.production_status is not None and data_fields:
+                field_indices = [
+                    partition.field_name_mapping.get(field_name)
+                    for field_name in data_fields
+                    if field_name in partition.field_name_mapping
+                ]
+                if field_indices:
+                    for i, global_idx in enumerate(batch_global_indexes):
+                        if global_idx < partition.production_status.shape[0]:
+                            sample_status = partition.production_status[global_idx, field_indices]
+                            if torch.all(sample_status == 1):
+                                production_status[i] = 1
 
-            sample = SampleMeta(
-                partition_id=partition_id,
-                global_index=global_index,
-                fields=fields,
-            )
-            samples.append(sample)
-
-        custom_meta = partition.get_custom_meta(batch_global_indexes)
+        custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
 
-        batch_meta = BatchMeta(samples=samples)
-        batch_meta.update_custom_meta(custom_meta)
-        batch_meta._custom_backend_meta.update(custom_backend_meta)
+        # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
+        custom_meta_list = [custom_meta_dict.get(global_index, {}) for global_index in batch_global_indexes]
+        custom_backend_meta_list = [custom_backend_meta.get(global_index, {}) for global_index in batch_global_indexes]
+
+        batch_meta = BatchMeta(
+            global_indexes=batch_global_indexes,
+            partition_ids=[partition_id] * batch_size,
+            field_schema=field_schema,
+            production_status=production_status,
+            custom_meta=custom_meta_list,
+            _custom_backend_meta=custom_backend_meta_list,
+        )
         return batch_meta
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
@@ -1333,13 +1510,32 @@ class TransferQueueController:
 
         partition = self._get_partition(partition_id)
         if not partition:
-            raise ValueError(f"Partition {partition_id} not found")
+            logger.warning(f"Try to clear an non-existent partition {partition_id}!")
+            return
 
         global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
         partition.clear_data(global_indexes_range, clear_consumption)
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
         self.sampler.clear_cache(partition_id)
+
+    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None):
+        """
+        Reset consumption status for a partition without clearing the actual data.
+
+        This allows the same data to be re-consumed, useful for debugging scenarios
+        where the same rollout data needs to be trained multiple times.
+        Args:
+            partition_id: ID of the partition to reset consumption for
+            task_name: Name of the task to reset. If None, resets all tasks.
+
+        """
+        logger.debug(f"[{self.controller_id}]: Resetting consumption for partition {partition_id}, task={task_name}")
+        partition = self._get_partition(partition_id)
+        if not partition:
+            logger.warning(f"Try to reset consumption of an non-existent partition {partition_id}!")
+            return
+        partition.reset_consumption(task_name)
 
     def clear_meta(
         self,
@@ -1390,34 +1586,151 @@ class TransferQueueController:
             # Release the specific indexes from index manager
             self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
 
+    def kv_retrieve_meta(
+        self,
+        keys: list[str],
+        partition_id: str,
+        create: bool = False,
+    ) -> BatchMeta:
+        """
+        Retrieve BatchMeta from the controller using a list of keys.
+
+        Args:
+            keys: List of keys to retrieve from the controller
+            partition_id: Partition id to retrieve from the controller
+            create: Whether to register new keys if not found.
+
+        Returns:
+            metadata: BatchMeta of the requested keys
+        """
+
+        logger.debug(f"[{self.controller_id}]: Retrieve keys {keys} in partition {partition_id}")
+
+        partition = self._get_partition(partition_id)
+
+        if partition is None:
+            if not create:
+                logger.warning(f"Partition {partition_id} were not found in controller!")
+                return BatchMeta.empty()
+            else:
+                self.create_partition(partition_id)
+                partition = self._get_partition(partition_id)
+
+        assert partition is not None
+        global_indexes = partition.kv_retrieve_indexes(keys)
+
+        none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
+        if len(none_indexes) > 0:
+            if not create:
+                logger.error(f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}!")
+                return BatchMeta.empty()
+            else:
+                # create non-exist keys
+                batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
+
+                if len(batch_global_indexes) < len(none_indexes):
+                    new_global_indexes = self.index_manager.allocate_indexes(
+                        partition_id, count=(len(none_indexes) - len(batch_global_indexes))
+                    )
+                    batch_global_indexes.extend(new_global_indexes)
+
+                # register global_indexes in partition
+                partition.global_indexes.update(batch_global_indexes)
+
+                # register key-global_indexes mapping in partition
+                for i in range(len(none_indexes)):
+                    global_indexes[none_indexes[i]] = batch_global_indexes[i]
+                    partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
+                    partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+
+                with partition.data_status_lock:
+                    partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
+
+        verified_global_indexes = [idx for idx in global_indexes if idx is not None]
+        assert len(verified_global_indexes) == len(keys)
+
+        # must fetch fields that the requested samples all have
+        col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
+            verified_global_indexes
+        )
+        data_fields = []
+        for field_name, col_idx in partition.field_name_mapping.items():
+            if col_idx < len(col_mask) and col_mask[col_idx]:
+                data_fields.append(field_name)
+
+        metadata = self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+
+        return metadata
+
+    def kv_retrieve_keys(
+        self,
+        global_indexes: list[int],
+        partition_id: str,
+    ) -> list[Optional[str]]:
+        """
+        Retrieve keys from the controller using a list of global_indexes.
+
+        Args:
+            global_indexes: List of global_indexes to retrieve keys from the controller
+            partition_id: Partition id to retrieve from the controller
+
+        Returns:
+            metadata: BatchMeta of the requested keys
+        """
+
+        logger.debug(f"[{self.controller_id}]: Retrieve global_indexes {global_indexes} in partition {partition_id}")
+
+        partition = self._get_partition(partition_id)
+
+        if partition is None:
+            logger.warning(f"Partition {partition_id} were not found in controller!")
+            return []
+
+        assert partition is not None
+        keys = partition.kv_retrieve_keys(global_indexes)
+
+        none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
+        if len(none_indexes) > 0:
+            logger.error(
+                f"Key for global_index {[keys[i] for i in none_indexes]} were not found in partition {partition_id}!"
+            )
+            return []
+
+        return keys
+
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
-        self._node_ip = get_node_ip_address()
+        self._node_ip = get_node_ip_address_raw()
 
         while True:
             try:
-                self._handshake_socket_port = get_free_port()
-                self._request_handle_socket_port = get_free_port()
-                self._data_status_update_socket_port = get_free_port()
+                self._handshake_socket_port = get_free_port(ip=self._node_ip)
+                self._request_handle_socket_port = get_free_port(ip=self._node_ip)
+                self._data_status_update_socket_port = get_free_port(ip=self._node_ip)
 
                 self.handshake_socket = create_zmq_socket(
                     ctx=self.zmq_context,
                     socket_type=zmq.ROUTER,
+                    ip=self._node_ip,
                 )
-                self.handshake_socket.bind(f"tcp://{self._node_ip}:{self._handshake_socket_port}")
+                self.handshake_socket.bind(format_zmq_address(self._node_ip, self._handshake_socket_port))
 
                 self.request_handle_socket = create_zmq_socket(
                     ctx=self.zmq_context,
                     socket_type=zmq.ROUTER,
+                    ip=self._node_ip,
                 )
-                self.request_handle_socket.bind(f"tcp://{self._node_ip}:{self._request_handle_socket_port}")
+                self.request_handle_socket.bind(format_zmq_address(self._node_ip, self._request_handle_socket_port))
 
                 self.data_status_update_socket = create_zmq_socket(
                     ctx=self.zmq_context,
                     socket_type=zmq.ROUTER,
+                    ip=self._node_ip,
                 )
-                self.data_status_update_socket.bind(f"tcp://{self._node_ip}:{self._data_status_update_socket_port}")
+                self.data_status_update_socket.bind(
+                    format_zmq_address(self._node_ip, self._data_status_update_socket_port)
+                )
 
                 break
             except zmq.ZMQError:
@@ -1447,7 +1760,7 @@ class TransferQueueController:
 
             if self.handshake_socket in socks:
                 try:
-                    messages = self.handshake_socket.recv_multipart()
+                    messages = self.handshake_socket.recv_multipart(copy=False)
                     identity = messages.pop(0)
                     serialized_msg = messages
                     request_msg = ZMQMessage.deserialize(serialized_msg)
@@ -1516,7 +1829,7 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
-            messages = self.request_handle_socket.recv_multipart()
+            messages = self.request_handle_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
@@ -1531,7 +1844,7 @@ class TransferQueueController:
                         partition_id=params["partition_id"],
                         mode=params.get("mode", "fetch"),
                         task_name=params.get("task_name"),
-                        sampling_config=params.get("sampling_config"),
+                        sampling_config=params.get("sampling_config", {}),
                     )
 
                     response_msg = ZMQMessage.create(
@@ -1545,12 +1858,18 @@ class TransferQueueController:
                 with perf_monitor.measure(op_type="GET_PARTITION_META"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
+                    partition = self._get_partition(partition_id)
+                    if partition is not None:
+                        partition_data_fields = list(partition.field_name_mapping.keys())
 
-                    metadata = self.get_metadata(
-                        data_fields=[],
-                        partition_id=partition_id,
-                        mode="insert",
-                    )
+                        metadata = self.get_metadata(
+                            data_fields=partition_data_fields,
+                            partition_id=partition_id,
+                            mode="force_fetch",
+                        )
+                    else:
+                        metadata = None
+
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.GET_PARTITION_META_RESPONSE,
                         sender_id=self.controller_id,
@@ -1624,6 +1943,36 @@ class TransferQueueController:
                         },
                     )
 
+            elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
+                with perf_monitor.measure(op_type="RESET_CONSUMPTION"):
+                    # Handle reset consumption status request
+                    params = request_msg.body
+                    partition_id = params["partition_id"]
+                    task_name = params.get("task_name")  # Optional
+                    try:
+                        self.reset_consumption(partition_id, task_name)
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": True,
+                                "message": f"Consumption reset for partition {partition_id}",
+                            },
+                        )
+                    except Exception as e:
+                        response_msg = ZMQMessage.create(
+                            request_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
+                            sender_id=self.controller_id,
+                            receiver_id=request_msg.sender_id,
+                            body={
+                                "partition_id": partition_id,
+                                "success": False,
+                                "message": str(e),
+                            },
+                        )
+
             elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
                 with perf_monitor.measure(op_type="GET_PRODUCTION"):
                     # Handle production status checks
@@ -1655,6 +2004,65 @@ class TransferQueueController:
                         body={"partition_ids": partition_ids},
                     )
 
+            elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_META:
+                with perf_monitor.measure(op_type="KV_RETRIEVE_META"):
+                    params = request_msg.body
+                    keys = params["keys"]
+                    partition_id = params["partition_id"]
+                    create = params["create"]
+
+                    metadata = self.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.KV_RETRIEVE_META_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={"metadata": metadata},
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_KEYS:
+                with perf_monitor.measure(op_type="KV_RETRIEVE_KEYS"):
+                    params = request_msg.body
+                    global_indexes = params["global_indexes"]
+                    partition_id = params["partition_id"]
+
+                    keys = self.kv_retrieve_keys(global_indexes=global_indexes, partition_id=partition_id)
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={"keys": keys},
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.KV_LIST:
+                with perf_monitor.measure(op_type="KV_LIST"):
+                    params = request_msg.body
+                    partition_id = params["partition_id"]
+                    if partition_id is None:
+                        partition_id = list(self.partitions.keys())
+                    else:
+                        partition_id = [partition_id]
+
+                    message = "success"
+                    partition_info = {}
+                    for pid in partition_id:
+                        partition = self._get_partition(pid)
+                        if partition:
+                            keys = list(partition.keys_mapping.keys())
+                            single_partition_info = {
+                                k: partition.custom_meta.get(partition.keys_mapping[k], {}) for k in keys
+                            }
+                            partition_info[pid] = single_partition_info
+                        else:
+                            # this only happens when params["partition_id"] is not None
+                            message = f"partition {pid} does not exist"
+
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.KV_LIST_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={"partition_info": partition_info, "message": message},
+                    )
+
             self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
 
     def _update_data_status(self):
@@ -1664,7 +2072,7 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
-            messages = self.data_status_update_socket.recv_multipart()
+            messages = self.data_status_update_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
@@ -1678,9 +2086,7 @@ class TransferQueueController:
                     success = self.update_production_status(
                         partition_id=partition_id,
                         global_indexes=message_data.get("global_indexes", []),
-                        field_names=message_data.get("fields", []),
-                        dtypes=message_data.get("dtypes", {}),
-                        shapes=message_data.get("shapes", {}),
+                        field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
 
@@ -1702,3 +2108,35 @@ class TransferQueueController:
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""
         return self.zmq_server_info
+
+    def store_config(self, conf: DictConfig) -> None:
+        """Store the global config of TransferQueue."""
+        self.tq_config = conf
+
+    def get_config(self) -> DictConfig:
+        """Retrieve the global config of TransferQueue."""
+        return self.tq_config
+
+    def register_sampler(
+        self,
+        sampler: BaseSampler | type[BaseSampler] = SequentialSampler,
+    ) -> None:
+        """
+        Register a sampler instance or subclass after the controller is initialized.
+
+        Args:
+            sampler: Sampler instance or sampler class to use for data sampling.
+                    - If a BaseSampler instance is provided, it will be used directly
+                    - If a BaseSampler subclass is provided, it will be instantiated
+                    - Defaults to SequentialSampler for simple sequential sampling
+                    - Example: sampler=GRPOGroupNSampler() (instance)
+                    - Example: sampler=SequentialSampler (class)
+        """
+        if isinstance(sampler, BaseSampler):
+            self.sampler = sampler
+        elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
+            self.sampler = sampler()
+        else:
+            raise TypeError(
+                f"sampler {getattr(sampler, '__name__', repr(sampler))} must be an instance or subclass of BaseSampler"
+            )
