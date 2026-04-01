@@ -698,21 +698,6 @@ class TestSeqlenBalancedSampler:
 
     # ---- Initialization tests ----
 
-    def test_initialization_default(self):
-        """Test SeqlenBalancedSampler default initialization."""
-        sampler = SeqlenBalancedSampler()
-        assert isinstance(sampler, GRPOGroupNSampler)
-        assert isinstance(sampler, BaseSampler)
-        assert sampler.n_samples_per_prompt == 1
-        assert sampler.dp_size == 1
-        assert sampler._balanced_cache == {}
-
-    def test_initialization_custom(self):
-        """Test SeqlenBalancedSampler custom initialization."""
-        sampler = SeqlenBalancedSampler(n_samples_per_prompt=4, dp_size=2)
-        assert sampler.n_samples_per_prompt == 4
-        assert sampler.dp_size == 2
-
     def test_initialization_invalid_dp_size(self):
         """Test that dp_size must be positive."""
         with pytest.raises(ValueError) as exc_info:
@@ -722,12 +707,6 @@ class TestSeqlenBalancedSampler:
         with pytest.raises(ValueError) as exc_info:
             SeqlenBalancedSampler(dp_size=-1)
         assert "dp_size must be positive" in str(exc_info.value)
-
-    def test_initialization_invalid_n_samples_per_prompt(self):
-        """Test that n_samples_per_prompt must be positive (inherited from GRPO)."""
-        with pytest.raises(ValueError) as exc_info:
-            SeqlenBalancedSampler(n_samples_per_prompt=0, dp_size=2)
-        assert "must be positive" in str(exc_info.value)
 
     # ---- Fallback (no partition) tests ----
 

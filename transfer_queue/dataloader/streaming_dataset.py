@@ -16,13 +16,14 @@
 import logging
 import os
 import time
+import uuid
 from typing import Callable, Iterator
 
 from omegaconf import DictConfig
 from tensordict import TensorDict
 from torch.utils.data import IterableDataset
 
-from transfer_queue.interface import get_client, init
+from transfer_queue.client import TransferQueueClient
 from transfer_queue.metadata import BatchMeta
 
 TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL = float(
@@ -156,13 +157,23 @@ class StreamingDataset(IterableDataset):
         super().__init__()
 
     def _create_client(self):
-        """Create and initialize a TransferQueue client.
+        """Create and initialize a TransferQueue client directly from config.
 
-        This method initializes the TransferQueueClient with the provided configuration.
+        This method creates a ``TransferQueueClient`` using the ZMQ address and
+        storage backend information already present in ``self.config``.  It
+        intentionally does **not** call ``tq.init()`` because that relies on Ray
+        internally (``ray.get_actor`` / ``ray.get``), which is **unsafe in
+        forked subprocesses** spawned by PyTorch DataLoader (``num_workers > 0``).
+        Creating the client directly via ZMQ avoids this issue.
         """
+        client_id = f"StreamingDataset_{uuid.uuid4().hex[:8]}"
 
-        init(self.config)
-        self._tq_client = get_client()
+        controller_info = self.config.controller.zmq_info
+        storage_backend = self.config.backend.storage_backend
+        backend_config = self.config.backend[storage_backend]
+
+        self._tq_client = TransferQueueClient(client_id, controller_info)
+        self._tq_client.initialize_storage_manager(manager_type=storage_backend, config=backend_config)
 
     def __iter__(self) -> Iterator[tuple[TensorDict, BatchMeta]]:
         """Iterate over the dataset, yielding batches of data.
@@ -171,7 +182,8 @@ class StreamingDataset(IterableDataset):
 
         - **False (default — streaming mode)**: The iterator runs as an
           infinite stream, continuously polling TransferQueue for new data.
-          It will block (with a 1-second sleep) when no data is available and
+          It will sleep for `TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL` seconds
+          (default=1) when no data is available and
           resume once new batches are produced.  This is the standard mode for
           online / streaming training pipelines where producers feed data
           indefinitely.
