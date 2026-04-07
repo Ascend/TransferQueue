@@ -387,24 +387,38 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         """
         Pack a list of per-sample values into a batched container.
 
-        For tensor values, this performs a memory copy via stacking or nested tensor creation.
-        Non-tensor values are grouped into a ``NonTensorStack`` without copying.
+        For pure tensor lists (no None), this performs a memory copy via stacking
+        or nested tensor creation. Mixed types, non-tensor values, or lists
+        containing None placeholders are grouped into a ``NonTensorStack``.
+
+        Args:
+            values: List of per-sample values to pack. May contain None for
+                unfilled batch positions.
+
+        Returns:
+            A stacked ``torch.Tensor`` (or nested tensor) when all values are
+            tensors, otherwise a ``NonTensorStack``.
+
+        Raises:
+            ValueError: If *values* is empty.
         """
         if not values:
             raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
-        if any(v is None for v in values):
-            raise ValueError("_pack_field_values received None in values list; some batch positions were not filled")
-        if all(isinstance(v, torch.Tensor) for v in values):
-            if all(v.shape == values[0].shape for v in values):
-                return torch.stack(values)
-            try:
-                return torch.nested.as_nested_tensor(values, layout=torch.jagged)
-            except (RuntimeError, TypeError) as e:
-                logger.warning(
-                    f"Failed to pack nested tensor with jagged layout. "
-                    f"Falling back to strided layout. Detailed error: {e}"
-                )
-                return torch.nested.as_nested_tensor(values, layout=torch.strided)
+        non_none = [v for v in values if v is not None]
+        if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
+            if not any(v is None for v in values):
+                # Pure tensor list — try stacking / nested tensor
+                if all(v.shape == values[0].shape for v in values):
+                    return torch.stack(values)
+                try:
+                    return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+                except (RuntimeError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to pack nested tensor with jagged layout. "
+                        f"Falling back to strided layout. Detailed error: {e}"
+                    )
+                    return torch.nested.as_nested_tensor(values, layout=torch.strided)
+            # Mixed tensor + None — cannot stack, fall through to NonTensorStack
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
