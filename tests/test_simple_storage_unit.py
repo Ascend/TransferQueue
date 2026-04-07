@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
 import time
-from pathlib import Path
 
 import pytest
 import ray
@@ -23,12 +21,8 @@ import tensordict
 import torch
 import zmq
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.storage.simple_backend import SimpleStorageUnit  # noqa: E402
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType  # noqa: E402
+from transfer_queue.storage.simple_backend import SimpleStorageUnit
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
 class MockStorageClient:

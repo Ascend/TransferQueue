@@ -36,14 +36,12 @@ class YuanrongStorageManager(KVStorageManager):
     """Storage manager for Yuanrong backend."""
 
     def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
-        host = config.get("host", None)
         port = config.get("port", None)
         client_name = config.get("client_name", None)
 
-        if host is None or not isinstance(host, str):
-            raise ValueError("Missing or invalid 'host' in config")
         if port is None or not isinstance(port, int):
             raise ValueError("Missing or invalid 'port' in config")
+
         if client_name is None:
             logger.info("Missing 'client_name' in config, using default value('YuanrongStorageClient')")
             config["client_name"] = "YuanrongStorageClient"

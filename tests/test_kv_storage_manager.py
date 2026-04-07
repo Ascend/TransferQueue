@@ -13,20 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
-import sys
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import torch
 from tensordict import TensorDict
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.metadata import BatchMeta  # noqa: E402
-from transfer_queue.storage.managers.base import KVStorageManager  # noqa: E402
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.base import KVStorageManager
 
 
 def get_meta(data, global_indexes=None):

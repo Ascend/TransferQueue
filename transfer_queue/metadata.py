@@ -169,7 +169,7 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
                     f"expected batch_size[0]={batch_size}, got value.shape[0]={value.shape[0]}"
                 )
             if len(value.shape) == 1:
-                logger.warning(f"Receiving 1D tensor for field '{field_name}'. Unsqueeze the last dimension.")
+                logger.info(f"Receiving 1D tensor for field '{field_name}'. Unsqueeze the last dimension.")
                 value = value.unsqueeze(-1)
             first_item = value[0]
         else:
@@ -203,12 +203,8 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
     return field_schema
 
 
-@dataclass
 class BatchMeta:
-    """Records the metadata of a batch of data samples with optimized field-level schema.
-
-    This is the O(BxF) optimized version that stores field metadata at the field level
-    instead of per-sample, reducing storage from O(B*F) to O(F).
+    """Metadata of a batch of data samples.
 
     Attributes:
         global_indexes: List of global sample indices in this batch.
@@ -220,24 +216,42 @@ class BatchMeta:
         _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
     """
 
-    global_indexes: list[int]
-    partition_ids: list[str]
-    # field-level metadata: {field_name: {dtype, shape, is_nested, is_non_tensor}}
-    field_schema: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
-    # vectorized production status matrix
-    production_status: np.ndarray = dataclasses.field(default=None, repr=False)  # type: ignore[assignment]
-    extra_info: dict[str, Any] = dataclasses.field(default_factory=dict)
-    # user-defined meta for each sample (sample-level), list aligned with global_indexes
-    custom_meta: list[dict[str, Any]] = dataclasses.field(default_factory=list)
-    # internal meta for different storage backends (per-sample per-field level), list aligned with global_indexes
-    _custom_backend_meta: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    __slots__ = (
+        "global_indexes",
+        "partition_ids",
+        "field_schema",
+        "production_status",
+        "extra_info",
+        "custom_meta",
+        "_custom_backend_meta",
+        "_size",
+        "_field_names",
+        "_is_ready",
+    )
 
-    def __post_init__(self):
-        """Initialize all computed properties during initialization"""
-        self.global_indexes = list(self.global_indexes)
-        self.partition_ids = list(self.partition_ids)
-        self.field_schema = {k: dict(v) for k, v in self.field_schema.items()}
-        self.extra_info = dict(self.extra_info)
+    def __init__(
+        self,
+        global_indexes: list[int],
+        partition_ids: list[str],
+        field_schema: Optional[dict[str, dict[str, Any]]] = None,
+        production_status: Optional[np.ndarray] = None,
+        extra_info: Optional[dict[str, Any]] = None,
+        custom_meta: Optional[list[dict[str, Any]]] = None,
+        _custom_backend_meta: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
+        if field_schema is None:
+            field_schema = {}
+        if extra_info is None:
+            extra_info = {}
+        if custom_meta is None:
+            custom_meta = []
+        if _custom_backend_meta is None:
+            _custom_backend_meta = []
+
+        self.global_indexes = list(global_indexes)
+        self.partition_ids = list(partition_ids)
+        self.field_schema = {k: dict(v) for k, v in field_schema.items()}
+        self.extra_info = dict(extra_info)
 
         # Validation
         if len(self.global_indexes) != len(self.partition_ids):
@@ -248,8 +262,8 @@ class BatchMeta:
 
         batch_size = len(self.global_indexes)
 
-        if self.production_status is not None:
-            self.production_status = np.array(self.production_status, dtype=np.int8, copy=True)
+        if production_status is not None:
+            self.production_status = np.array(production_status, dtype=np.int8, copy=True)
 
             if len(self.production_status) != batch_size:
                 raise ValueError(f"production_status length {len(self.production_status)} != batch_size {batch_size}")
@@ -272,32 +286,40 @@ class BatchMeta:
         self._is_ready = is_ready
 
         # Validate or initialize columnar custom_meta / _custom_backend_meta
-        if not self.custom_meta:
-            self.custom_meta = [{} for _ in range(batch_size)]
+        if not custom_meta:
+            self.custom_meta: list[dict[str, Any]] = [{} for _ in range(batch_size)]
         else:
-            self.custom_meta = [dict(d) for d in self.custom_meta]
+            self.custom_meta = [dict(d) for d in custom_meta]
             if len(self.custom_meta) != batch_size:
                 raise ValueError(f"custom_meta length {len(self.custom_meta)} != batch_size {batch_size}")
-        if not self._custom_backend_meta:
-            self._custom_backend_meta = [{} for _ in range(batch_size)]
+        if not _custom_backend_meta:
+            self._custom_backend_meta: list[dict[str, Any]] = [{} for _ in range(batch_size)]
         else:
-            self._custom_backend_meta = [dict(d) for d in self._custom_backend_meta]
+            self._custom_backend_meta = [dict(d) for d in _custom_backend_meta]
             if len(self._custom_backend_meta) != batch_size:
                 raise ValueError(
                     f"_custom_backend_meta length {len(self._custom_backend_meta)} != batch_size {batch_size}"
                 )
 
-    def __setstate__(self, state):
-        """Restore instance from pickle/Ray deserialization.
+    def __getstate__(self):
+        """Serialize for pickle/Ray.
 
-        Python dataclass pickle skips __init__/__post_init__, so the
-        .copy() guard for production_status is bypassed.  Ray Arrow
-        zero-copy deserialization produces read-only numpy arrays.
-        This method ensures writability after deserialization.
+        Returns tuple of slot values to ensure proper reconstruction.
         """
-        self.__dict__.update(state)
-        if isinstance(self.production_status, np.ndarray) and not self.production_status.flags.writeable:
-            self.production_status = self.production_status.copy()
+        return tuple(getattr(self, slot) for slot in self.__slots__)
+
+    def __setstate__(self, state):
+        """Deserialize from pickle/Ray.
+
+        Ray Arrow zero-copy deserialization produces read-only numpy
+        arrays. This method ensures production_status is writable after
+        deserialization.
+        """
+        for slot, value in zip(self.__slots__, state, strict=False):
+            # Ray Arrow zero-copy produces read-only numpy arrays
+            if slot == "production_status" and isinstance(value, np.ndarray) and not value.flags.writeable:
+                value = value.copy()
+            setattr(self, slot, value)
 
     @property
     def size(self) -> int:

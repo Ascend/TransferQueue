@@ -38,18 +38,18 @@ class MockDsTensorClient:
     def init(self):
         pass
 
-    def dev_mset(self, keys, values):
+    def mset_d2h(self, keys, values):
         for k, v in zip(keys, values, strict=True):
             assert v.device.type == "npu"
             self.storage[k] = v
 
-    def dev_mget(self, keys, out_tensors):
+    def mget_h2d(self, keys, out_tensors):
         for i, k in enumerate(keys):
             # Note: If key is missing, tensor remains unchanged (mock limitation)
             if k in self.storage:
                 out_tensors[i].copy_(self.storage[k])
 
-    def dev_delete(self, keys):
+    def delete(self, keys):
         for k in keys:
             self.storage.pop(k, None)
 
@@ -108,10 +108,17 @@ def mock_yr_datasystem():
     # - sys.modules: Redirects 'import yr' to our mocks
     # - YUANRONG_DATASYSTEM_IMPORTED: Forces the existence check to True so initialize the client successfully
     # - datasystem: Direct attribute patch for the module
+    # - find_reachable_host: Mock host detection to avoid real network checks
+    def mock_find_reachable_host(port, timeout=1.0):
+        return "127.0.0.1"
+
     with (
         mock.patch.dict("sys.modules", {"yr": yr_mock, "yr.datasystem": ds_mock}),
         mock.patch("transfer_queue.storage.clients.yuanrong_client.YUANRONG_DATASYSTEM_IMPORTED", True, create=True),
         mock.patch("transfer_queue.storage.clients.yuanrong_client.datasystem", ds_mock),
+        mock.patch(
+            "transfer_queue.storage.clients.yuanrong_client.find_reachable_host", side_effect=mock_find_reachable_host
+        ),
     ):
         yield
 

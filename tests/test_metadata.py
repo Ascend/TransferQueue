@@ -15,18 +15,11 @@
 
 """Unit tests for TransferQueue metadata module - Columnar BatchMeta + KVBatchMeta."""
 
-import sys
-from pathlib import Path
-
 import numpy as np
 import pytest
 import torch
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.metadata import BatchMeta, KVBatchMeta  # noqa: E402
+from transfer_queue.metadata import BatchMeta, KVBatchMeta
 
 # ==============================================================================
 # Columnar BatchMeta Tests
@@ -242,9 +235,14 @@ class TestBatchMetaColumnar:
         """
         batch = self._make_batch()
         # Simulate pickle round-trip with Arrow zero-copy (read-only array)
-        state = batch.__dict__.copy()
-        state["production_status"] = state["production_status"].copy()
-        state["production_status"].flags.writeable = False
+
+        state = batch.__getstate__()
+        # Convert tuple to list for modification
+        state = list(state)
+        slot_idx = list(BatchMeta.__slots__).index("production_status")
+        state[slot_idx] = state[slot_idx].copy()
+        state[slot_idx].flags.writeable = False
+        state = tuple(state)
 
         restored = BatchMeta.__new__(BatchMeta)
         restored.__setstate__(state)

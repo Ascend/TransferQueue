@@ -1,0 +1,60 @@
+# This workflow runs the SimpleStorage performance test
+name: Performance Test
+
+on:
+  push:
+    branches:
+      - main
+      - v0.*
+  pull_request:
+    branches:
+      - main
+      - v0.*
+
+jobs:
+  perftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -e .
+    - name: Start Ray cluster
+      run: |
+        # Get the host IP
+        HOST_IP=$(hostname -I | awk '{print $1}')
+        echo "Host IP: $HOST_IP"
+        # Start Ray with node resource
+        ray start --head --resources="{\"node:$HOST_IP\":1}"
+        ray status
+    - name: Run SimpleStorage performance test
+      run: |
+        # Get the host IP
+        HOST_IP=$(hostname -I | awk '{print $1}')
+        echo "Host IP: $HOST_IP"
+        # Run the perftest with small batch size for quick test
+        cd scripts/performance_test
+        python perftest.py \
+          --backend_config=../../transfer_queue/config.yaml \
+          --device=cpu \
+          --global_batch_size=128 \
+          --field_num=4 \
+          --seq_len=1024 \
+          --head_node_ip=$HOST_IP \
+          --output_csv=results.csv
+    - name: Stop Ray cluster
+      run: |
+        ray stop
+      if: always()

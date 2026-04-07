@@ -15,20 +15,18 @@
 
 """Unit tests for TransferQueue samplers."""
 
-import sys
-from pathlib import Path
 from typing import Any
 
 import pytest
 
-# Setup path
-parent_dir = Path(__file__).resolve().parent.parent
-sys.path.append(str(parent_dir))
-
-from transfer_queue.sampler import BaseSampler  # noqa: E402
-from transfer_queue.sampler.grpo_group_n_sampler import GRPOGroupNSampler  # noqa: E402
-from transfer_queue.sampler.rank_aware_sampler import RankAwareSampler  # noqa: E402
-from transfer_queue.sampler.sequential_sampler import SequentialSampler  # noqa: E402
+from transfer_queue.sampler import BaseSampler
+from transfer_queue.sampler.grpo_group_n_sampler import GRPOGroupNSampler
+from transfer_queue.sampler.rank_aware_sampler import RankAwareSampler
+from transfer_queue.sampler.seqlen_balanced_sampler import (
+    SeqlenBalancedSampler,
+    get_seqlen_balanced_partitions,
+)
+from transfer_queue.sampler.sequential_sampler import SequentialSampler
 
 
 class TestBaseSampler:
@@ -684,12 +682,460 @@ class TestRankAwareSampler:
         assert consumed == [0, 1]
 
 
+class TestSeqlenBalancedSampler:
+    """Test cases for SeqlenBalancedSampler."""
+
+    # ---- Helper: mock partition object ----
+
+    class MockPartition:
+        """Minimal mock for DataPartitionStatus providing get_custom_meta."""
+
+        def __init__(self, custom_meta: dict[int, dict]):
+            self._custom_meta = custom_meta
+
+        def get_custom_meta(self, global_indices: list[int]) -> dict[int, dict]:
+            return {idx: self._custom_meta.get(idx, {}) for idx in global_indices}
+
+    # ---- Initialization tests ----
+
+    def test_initialization_invalid_dp_size(self):
+        """Test that dp_size must be positive."""
+        with pytest.raises(ValueError) as exc_info:
+            SeqlenBalancedSampler(dp_size=0)
+        assert "dp_size must be positive" in str(exc_info.value)
+
+        with pytest.raises(ValueError) as exc_info:
+            SeqlenBalancedSampler(dp_size=-1)
+        assert "dp_size must be positive" in str(exc_info.value)
+
+    # ---- Fallback (no partition) tests ----
+
+    def test_fallback_equal_split_no_partition(self):
+        """Test fallback equal-split when no partition is provided."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 2  # per-DP → global = 4
+
+        sampled_0, consumed_0 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+        sampled_1, consumed_1 = sampler.sample(
+            ready_indexes,
+            batch_size,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=1,
+            batch_index=0,
+        )
+
+        # Together they should cover all 4 indexes without overlap
+        assert len(sampled_0) == 2
+        assert len(sampled_1) == 2
+        assert set(sampled_0 + sampled_1) == {0, 1, 2, 3}
+        assert sampled_0 == consumed_0
+        assert sampled_1 == consumed_1
+
+    def test_fallback_single_dp(self):
+        """Test dp_size=1 returns all samples to rank 0."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=2, dp_size=1)
+        ready_indexes = [0, 1, 2, 3]
+        batch_size = 4  # per-DP = global = 4
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            batch_size,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        assert sampled == [0, 1, 2, 3]
+        assert consumed == [0, 1, 2, 3]
+
+    # ---- Balanced partitioning with mock partition ----
+
+    def test_balanced_partitioning_with_custom_meta(self):
+        """Test that samples are balanced by total_lengths across DP ranks."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
+        ready_indexes = [0, 1, 2, 3]
+        # Sample 0 and 1 are long, sample 2 and 3 are short
+        partition = self.MockPartition(
+            {
+                0: {"total_lengths": 100},
+                1: {"total_lengths": 100},
+                2: {"total_lengths": 10},
+                3: {"total_lengths": 10},
+            }
+        )
+
+        sampled_0, _ = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+            partition=partition,
+        )
+        sampled_1, _ = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=1,
+            batch_index=0,
+            partition=partition,
+        )
+
+        # All indexes should be covered
+        all_sampled = sorted(sampled_0 + sampled_1)
+        assert all_sampled == [0, 1, 2, 3]
+
+        # KK should pair one long with one short per rank for balance
+        def total_len(indices):
+            lengths = {0: 100, 1: 100, 2: 10, 3: 10}
+            return sum(lengths[i] for i in indices)
+
+        diff = abs(total_len(sampled_0) - total_len(sampled_1))
+        # Perfect balance: each rank gets one 100 + one 10 = 110, diff = 0
+        assert diff == 0
+
+    def test_balanced_partitioning_group_level(self):
+        """Test balanced partitioning at group level (n_samples_per_prompt > 1)."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=2, dp_size=2)
+        # 4 groups of 2: [0,1], [2,3], [4,5], [6,7]
+        ready_indexes = list(range(8))
+        partition = self.MockPartition(
+            {
+                0: {"total_lengths": 50},
+                1: {"total_lengths": 50},  # group0 total=100
+                2: {"total_lengths": 5},
+                3: {"total_lengths": 5},  # group1 total=10
+                4: {"total_lengths": 50},
+                5: {"total_lengths": 50},  # group2 total=100
+                6: {"total_lengths": 5},
+                7: {"total_lengths": 5},  # group3 total=10
+            }
+        )
+
+        sampled_0, _ = sampler.sample(
+            ready_indexes,
+            4,  # per-DP batch=4, global=8
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+            partition=partition,
+        )
+        sampled_1, _ = sampler.sample(
+            ready_indexes,
+            4,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=1,
+            batch_index=0,
+            partition=partition,
+        )
+
+        # Each rank should get 4 samples (2 groups)
+        assert len(sampled_0) == 4
+        assert len(sampled_1) == 4
+        assert set(sampled_0 + sampled_1) == set(range(8))
+
+        # Group integrity: each group's samples stay together
+        for rank_samples in [sampled_0, sampled_1]:
+            for s in rank_samples:
+                partner = s ^ 1  # pairs: (0,1), (2,3), (4,5), (6,7)
+                if s % 2 == 0:
+                    assert partner in rank_samples, f"Group broken: {s} without {partner}"
+
+    # ---- Caching tests ----
+
+    def test_caching_returns_same_result(self):
+        """Test that repeated calls with same key return cached result."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
+        ready_indexes = [0, 1, 2, 3]
+
+        sampled_first, _ = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+        sampled_second, _ = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        assert sampled_first == sampled_second
+
+    def test_different_batch_index_not_cached(self):
+        """Test that different batch_index produces different cache keys."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=1)
+        ready_indexes_b0 = [0, 1, 2, 3]
+        ready_indexes_b1 = [4, 5, 6, 7]
+
+        sampled_b0, _ = sampler.sample(
+            ready_indexes_b0,
+            4,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+        sampled_b1, _ = sampler.sample(
+            ready_indexes_b1,
+            4,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=1,
+        )
+
+        assert sampled_b0 == [0, 1, 2, 3]
+        assert sampled_b1 == [4, 5, 6, 7]
+
+    def test_states_cache_populated_for_all_ranks(self):
+        """Test that _states cache is populated for all dp_ranks on first call."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=3)
+        ready_indexes = list(range(6))
+
+        sampler.sample(
+            ready_indexes,
+            2,  # per-DP=2, global=6
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        # All 3 ranks should have cached state
+        states = sampler._states["p0"]["task"]
+        for rank_i in range(3):
+            assert rank_i in states
+            assert 0 in states[rank_i]
+            cached_sampled, cached_consumed = states[rank_i][0]
+            assert len(cached_sampled) == 2
+            assert cached_sampled == cached_consumed
+
+    # ---- clear_cache tests ----
+
+    def test_clear_cache(self):
+        """Test clear_cache removes both _states and _balanced_cache."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
+        ready_indexes = [0, 1, 2, 3]
+
+        sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        assert len(sampler._balanced_cache) > 0
+        assert "p0" in sampler._states
+
+        sampler.clear_cache("p0")
+
+        assert all(k[0] != "p0" for k in sampler._balanced_cache)
+        assert "p0" not in sampler._states
+
+    def test_clear_cache_only_affects_target_partition(self):
+        """Test clear_cache only removes the specified partition."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=1)
+
+        sampler.sample(
+            [0, 1],
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+        sampler.sample(
+            [2, 3],
+            2,
+            task_name="task",
+            partition_id="p1",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        sampler.clear_cache("p0")
+
+        assert "p0" not in sampler._states
+        assert "p1" in sampler._states
+        assert any(k[0] == "p1" for k in sampler._balanced_cache)
+
+    # ---- Edge cases ----
+
+    def test_insufficient_ready_indexes(self):
+        """Test behavior when not enough ready indexes for global batch."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=2, dp_size=2)
+        ready_indexes = [0, 1]  # Only 1 group, need 2 (global_batch = 4)
+
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        assert sampled == []
+        assert consumed == []
+
+    def test_dp_rank_out_of_range(self):
+        """Test behavior when dp_rank >= dp_size (returns empty)."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=2)
+        ready_indexes = [0, 1, 2, 3]
+
+        # First call to populate cache
+        sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+        # dp_rank=5 is out of range
+        sampled, consumed = sampler.sample(
+            ready_indexes,
+            2,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=5,
+            batch_index=0,
+        )
+
+        assert sampled == []
+        assert consumed == []
+
+    def test_call_method(self):
+        """Test that __call__ method works correctly."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=1, dp_size=1)
+        ready_indexes = [0, 1, 2, 3]
+
+        sampled, consumed = sampler(
+            ready_indexes,
+            4,
+            task_name="task",
+            partition_id="p0",
+            dp_rank=0,
+            batch_index=0,
+        )
+
+        assert sampled == [0, 1, 2, 3]
+        assert consumed == [0, 1, 2, 3]
+
+    def test_batch_size_not_divisible_by_n_samples_per_prompt(self):
+        """Test that batch_size must be divisible by n_samples_per_prompt (inherited)."""
+        sampler = SeqlenBalancedSampler(n_samples_per_prompt=4, dp_size=2)
+        ready_indexes = list(range(20))
+
+        with pytest.raises(ValueError) as exc_info:
+            sampler.sample(
+                ready_indexes,
+                3,  # per-DP=3, global=6, 6 % 4 != 0
+                task_name="task",
+                partition_id="p0",
+                dp_rank=0,
+                batch_index=0,
+            )
+
+        assert "must be a multiple of n_samples_per_prompt" in str(exc_info.value)
+
+
+class TestKarmarkarKarp:
+    """Test cases for karmarkar_karp and get_seqlen_balanced_partitions utilities."""
+
+    def test_equal_size_basic(self):
+        """Test equal-size partitioning with balanced inputs."""
+        seqlens = [10, 20, 30, 40]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=True)
+
+        assert len(partitions) == 2
+        assert all(len(p) == 2 for p in partitions)
+        # All indices covered
+        assert sorted(sum(partitions, [])) == [0, 1, 2, 3]
+
+    def test_equal_size_balance_quality(self):
+        """Test that KK produces well-balanced partitions."""
+        seqlens = [100, 90, 50, 10, 5, 1]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=True)
+
+        sums = [sum(seqlens[i] for i in p) for p in partitions]
+        # Difference should be small relative to total
+        assert abs(sums[0] - sums[1]) <= max(seqlens)
+
+    def test_unequal_size(self):
+        """Test variable-size partitioning."""
+        seqlens = [100, 10, 10, 10, 10]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=False)
+
+        assert len(partitions) == 2
+        assert sorted(sum(partitions, [])) == [0, 1, 2, 3, 4]
+
+    def test_single_partition(self):
+        """Test with k_partitions=1 returns all items."""
+        seqlens = [10, 20, 30]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=1, equal_size=False)
+
+        assert len(partitions) == 1
+        assert sorted(partitions[0]) == [0, 1, 2]
+
+    def test_equal_size_assertion_error(self):
+        """Test that equal_size raises when items not divisible by k."""
+        seqlens = [10, 20, 30]
+        with pytest.raises(AssertionError):
+            get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=True)
+
+    def test_too_few_items(self):
+        """Test that too few items raises AssertionError."""
+        seqlens = [10]
+        with pytest.raises(AssertionError):
+            get_seqlen_balanced_partitions(seqlens, k_partitions=3, equal_size=False)
+
+    def test_three_way_partition(self):
+        """Test 3-way partitioning."""
+        seqlens = [100, 80, 60, 40, 20, 10]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=3, equal_size=True)
+
+        assert len(partitions) == 3
+        assert all(len(p) == 2 for p in partitions)
+        assert sorted(sum(partitions, [])) == [0, 1, 2, 3, 4, 5]
+
+    def test_identical_seqlens(self):
+        """Test with all identical sequence lengths."""
+        seqlens = [50, 50, 50, 50]
+        partitions = get_seqlen_balanced_partitions(seqlens, k_partitions=2, equal_size=True)
+
+        sums = [sum(seqlens[i] for i in p) for p in partitions]
+        assert sums[0] == sums[1] == 100
+
+
 class TestSamplerIntegration:
     """Integration tests for samplers."""
 
     def test_samplers_implement_base_interface(self):
         """Test that all samplers properly implement BaseSampler interface."""
-        samplers = [SequentialSampler(), GRPOGroupNSampler()]
+        samplers = [SequentialSampler(), GRPOGroupNSampler(), SeqlenBalancedSampler()]
 
         for sampler in samplers:
             # Test that they are instances of BaseSampler
@@ -703,7 +1149,19 @@ class TestSamplerIntegration:
 
     def test_samplers_return_consistent_types(self):
         """Test that all samplers return consistent tuple types."""
-        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(n_samples_per_prompt=2), {})]
+        samplers = [
+            (SequentialSampler(), {}),
+            (GRPOGroupNSampler(n_samples_per_prompt=2), {}),
+            (
+                SeqlenBalancedSampler(n_samples_per_prompt=2, dp_size=1),
+                {
+                    "task_name": "task",
+                    "partition_id": "test",
+                    "dp_rank": 0,
+                    "batch_index": 0,
+                },
+            ),
+        ]
 
         ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]
         batch_size = 4

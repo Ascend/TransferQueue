@@ -220,3 +220,6 @@ __marimo__/
 
 #MacOS
 **/.DS_Store
+
+# Perftest
+scripts/performance_test/results/

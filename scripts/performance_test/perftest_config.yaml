@@ -20,7 +20,7 @@ backend:
     # Total number of samples
     total_storage_size: 100000
     # Number of distributed storage units for SimpleStorage backend
-    num_data_storage_units: 2
+    num_data_storage_units: 16
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
@@ -34,12 +34,12 @@ backend:
     master_server_address: localhost:50051
     # Address of local host. Set to "" to use Ray IP as local host address
     local_hostname: ""
-    # Protocol for transmission. Choose from: tcp, rdma. (default: tcp)
-    protocol: tcp
-    # Memory segment size in bytes for mounting (default: 4GB)
-    global_segment_size: 4294967296
-    # Local buffer size in bytes (default: 1GB)
-    local_buffer_size: 1073741824
+    # Protocol for transmission. Choose from: tcp, rdma. (default: rdma)
+    protocol: rdma
+    # Memory segment size in bytes for mounting
+    global_segment_size: 86294967296
+    # Local buffer size in bytes
+    local_buffer_size: 86294967296
     # Network device name. Set to "" to let Mooncake to auto-picks devices
     device_name: ""
 
@@ -48,10 +48,7 @@ backend:
 
   # For Yuanrong:
   Yuanrong:
-    # Whether to let TQ automatically start etcd and datasystem services
-    auto_init: True
-    # etcd service address (used to start etcd when auto_init=true)
-    etcd_address: "127.0.0.1:2379"
-    # datasystem worker host and port (used to start dscli when auto_init=true)
-    host: "127.0.0.1"
+    # Port of local yuanrong datasystem worker
     port: 31501
+    # If enable npu transport
+    enable_yr_npu_transport: true

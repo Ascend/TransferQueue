@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 
 class BaseSampler(ABC):
@@ -74,6 +74,43 @@ class BaseSampler(ABC):
 
     def __call__(self, *args: Any, **kwargs: Any) -> tuple[list[int], list[int]]:
         return self.sample(*args, **kwargs)
+
+    def has_cached_result(
+        self,
+        partition_id: str,
+        task_name: str,
+        sampling_config: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Check whether the sampler has a cached sampling result for the given context.
+
+        This is used by the controller in polling mode to determine if a previously
+        computed sampling result is already available, so that it can skip waiting
+        for more data and directly proceed to return the cached result.
+
+        The check is based on the ``_states`` cache structure:
+        ``_states[partition_id][task_name][dp_rank][batch_index]``.
+
+        Args:
+            partition_id: The partition identifier.
+            task_name: The consumer task name.
+            sampling_config: Optional sampling configuration dict that may contain
+                ``dp_rank`` and ``batch_index`` keys used to locate the cached result.
+
+        Returns:
+            True if a cached result exists for the specified
+            ``(partition_id, task_name, dp_rank, batch_index)`` combination,
+            False otherwise. Also returns False if ``dp_rank`` is not provided
+            in ``sampling_config``.
+        """
+        sampling_config = sampling_config or {}
+        dp_rank = sampling_config.get("dp_rank", None)
+        batch_index = sampling_config.get("batch_index", None)
+
+        if dp_rank is None:
+            return False
+
+        states = self._states.get(partition_id, {}).get(task_name, {})
+        return dp_rank in states and batch_index in states[dp_rank]
 
     def clear_cache(self, partition_id: str):
         """Clear cached states.

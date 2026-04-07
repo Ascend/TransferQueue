@@ -23,7 +23,7 @@ TransferQueue is a high-performance data storage and transfer module with panora
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/tq_arch.png?raw=true" width="70%">
 </p>
 
-TransferQueue offers **fine-grained, sub-sample-level** data management and **load-balancing** (on the way) capabilities, serving as a data gateway that decouples explicit data dependencies across computational tasks. This enables a divide-and-conquer approach, significantly simplifies the algorithm controller design.
+TransferQueue offers **fine-grained, sub-sample-level** data management and **load-balancing** capabilities. It serves as a data gateway that decouples explicit data dependencies across computational tasks, enabling a divide-and-conquer approach that significantly simplifies algorithm controller design.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/main_func.png?raw=true" width="100%">
@@ -31,26 +31,26 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
 
 <h2 id="updates">🔄 Updates</h2>
 
- - **Feb 8, 2026**: 🔥 The initialization and usage is greatly simplified by high-level APIs [PR#26](https://github.com/Ascend/TransferQueue/pull/26), [PR#28](https://github.com/Ascend/TransferQueue/pull/28). You can now use a Redis-style API to take advantage of most of the advanced features provided by TransferQueue!
- - **Jan 28, 2026**: We experimentally introduce `StreamingDataLoader` interface for fully-streamed production-consumption pipeline. Refer to our [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for details.
- - **Dec 30, 2025**: **TransferQueue x verl** integration is tested with the DAPO algorithm at scale **(64 nodes, 1024 cards)**. It significantly optimizes host memory utilization and accelerates data transfers. Stay tuned for more details!
+ - **Feb 8, 2026**: 🔥 Initialization and usage are greatly simplified by high-level APIs [PR#26](https://github.com/Ascend/TransferQueue/pull/26), [PR#28](https://github.com/Ascend/TransferQueue/pull/28). You can now use a Redis-style API to take advantage of most of the advanced features provided by TransferQueue!
+ - **Jan 28, 2026**: We experimentally introduce the `StreamingDataLoader` interface for a fully-streamed production-consumption pipeline. Refer to our [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for details.
+ - **Dec 30, 2025**: **TransferQueue x verl** integration has been tested with the DAPO algorithm at scale **(64 nodes, 1024 cards)**. It significantly optimizes host memory utilization and accelerates data transfers. Stay tuned for more details!
  - **Dec 20, 2025**: 🔥 The official [tutorial](https://github.com/Ascend/TransferQueue/tree/main/tutorial) is released! Feel free to check it out.
- - **Nov 10, 2025**: We disentangle the data retrieval logic from TransferQueueController [PR#101](https://github.com/TransferQueue/TransferQueue/pull/101). Now you can implement your own `Sampler` to control how to consume the data.
+ - **Nov 10, 2025**: We disentangled the data retrieval logic from TransferQueueController [PR#101](https://github.com/TransferQueue/TransferQueue/pull/101). Now you can implement your own `Sampler` to customize data consumption.
  - **Nov 5, 2025**: We provide a `KVStorageManager` that simplifies the integration with KV-based storage backends [PR#96](https://github.com/TransferQueue/TransferQueue/pull/96). The first available KV-based backend is [Yuanrong](https://gitcode.com/openeuler/yuanrong-datasystem).
- - **Nov 4, 2025**: Data partition capability is available in [PR#98](https://github.com/TransferQueue/TransferQueue/pull/98). Now you can define logical data partitions to manage your train/val/test datasets.
- - **Oct 25, 2025**: We make storage backends pluggable in [PR#66](https://github.com/TransferQueue/TransferQueue/pull/66). You can try to integrate your own storage backend with TransferQueue now!
+ - **Nov 4, 2025**: Data partitioning capability is available in [PR#98](https://github.com/TransferQueue/TransferQueue/pull/98). Now you can define logical data partitions to manage your train/val/test datasets.
+ - **Oct 25, 2025**: Storage backends are now pluggable in [PR#66](https://github.com/TransferQueue/TransferQueue/pull/66). You can try to integrate your own storage backend with TransferQueue now!
  - **Oct 21, 2025**: Official integration into verl is ready [verl/pulls/3649](https://github.com/volcengine/verl/pull/3649). Following PRs will optimize the single controller architecture by fully decoupling data & control flows.
- - **July 22, 2025**: We present a series of Chinese blogs on <a href="https://zhuanlan.zhihu.com/p/1930244241625449814">Zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/1933259599953232589">2</a>.
- - **July 21, 2025**: We started an RFC on verl community [verl/RFC#2662](https://github.com/volcengine/verl/discussions/2662).
- - **July 2, 2025**: We publish the paper [AsyncFlow](https://arxiv.org/abs/2507.01663).
+ - **July 22, 2025**: We published a series of Chinese blog posts on <a href="https://zhuanlan.zhihu.com/p/1930244241625449814">Zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/1933259599953232589">2</a>.
+ - **July 21, 2025**: We initiated an RFC in the verl community [verl/RFC#2662](https://github.com/volcengine/verl/discussions/2662).
+ - **July 2, 2025**: We published the paper [AsyncFlow](https://arxiv.org/abs/2507.01663).
 
 <h2 id="components">🧩 Components</h2>
 
 ### Control Plane: Panoramic Data Management
 
-In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. When all the required data fields are ready (i.e., written to the `TransferQueueStorageManager`), we know that this data sample can be consumed by downstream tasks.
+In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. Once all required data fields are ready (i.e., written to the `TransferQueueStorageManager`), the data sample can be consumed by downstream tasks.
 
-For consumption status, we record the consumption records for each computational task (e.g., `generate_sequences`, `compute_log_prob`, etc.). Therefore, even when different computation tasks require the same data field, they can consume the data independently without interfering with each other.
+We also track the consumption history for each computational task (e.g., `generate_sequences`, `compute_log_prob`, etc.). Therefore, even when different computational tasks require the same data field, they can consume the data independently without interfering with each other.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/control_plane.png?raw=true" width="70%">
@@ -58,11 +58,11 @@ For consumption status, we record the consumption records for each computational
 
 To make the data retrieval process more customizable, we provide a `Sampler` class that allows users to define their own data retrieval and consumption logic. Refer to the [Customize](#customize) section for details.
 
-> In the future, we plan to support **load-balancing** and **dynamic batching** capabilities in the control plane. Additionally, we will support data management for disaggregated frameworks where each rank manages the data retrieval by itself, rather than coordinated by a single controller.
+> **load-balancing** capabilities are experimentally supported in the control plane. This design enables us to offload some data management capabilities from single controller. Refer to [#PR70](https://github.com/Ascend/TransferQueue/pull/70) for details.
 
 ### Data Plane: Distributed Data Storage
 
-In the data plane, we provide a pluggable design that enables TransferQueue to integrate with different storage backends according to user requirements.
+In the data plane, we utilize a pluggable design, enabling TransferQueue to integrate with different storage backends based on user requirements.
 
 Specifically, we provide a `TransferQueueStorageManager` abstraction class that defines the core APIs as follows:
 
@@ -70,13 +70,13 @@ Specifically, we provide a `TransferQueueStorageManager` abstraction class that 
 - `async def get_data(self, metadata: BatchMeta) -> TensorDict`
 - `async def clear_data(self, metadata: BatchMeta) -> None`
 
-This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your own storage backend. Refer to the [Customize](#customize) section for details.
+This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.
 
 Currently, we support the following storage backends:
 
-- SimpleStorage: A basic CPU memory storage with minimal data format constraints and easy usability.
+- SimpleStorage: A basic CPU memory storage with minimal data format constraints and ease of use.
 - [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) (beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
-- [MooncakeStore](https://github.com/kvcache-ai/Mooncake) (alpha, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
+- [MooncakeStore](https://github.com/kvcache-ai/Mooncake) (beta, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
 - [RayRDT](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
 
 Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Each storage unit can be deployed on a separate node, allowing for distributed data management.
@@ -86,7 +86,7 @@ Among them, `SimpleStorageUnit` serves as our default storage backend, coordinat
 - Each row corresponds to a training sample, assigned a unique index within the corresponding global batch.
 - Each column represents the input/output data fields for computational tasks.
 
-This data structure design is motivated by the computational characteristics of the post-training process, where each training sample is generated in a relayed manner across task pipelines. It provides an accurate addressing capability, which allows fine-grained, concurrent data read/write operations in a streaming manner.
+This data structure design is motivated by the computational characteristics of the post-training process, where each training sample is generated in a relayed manner across task pipelines. It provides precise addressing capabilities, enabling fine-grained, concurrent data read/write operations in a streaming manner.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/data_plane.png?raw=true" width="70%">
@@ -103,36 +103,38 @@ This data structure design is motivated by the computational characteristics of 
 
 #### Key-Value based API
 
-To simplify the usage of TransferQueue, we have provided a Redis-style high-level API that can enjoy most of the advanced features provided by TransferQueue ([PR#28](https://github.com/Ascend/TransferQueue/pull/28)).
+To simplify the usage of TransferQueue, we provide a Redis-style high-level API that exposes most of its advanced features ([PR#28](https://github.com/Ascend/TransferQueue/pull/28)).
 
 **Methods**
 
-- **(async_)kv_put**: Insert/Update a multi-column sample by key, with optional metadata tag
-- **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batch
-- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields)
-- **(async_)kv_list**: List keys and tags (metadata) in a partition
-- **(async_)kv_clear**: Remove key-value pairs from storage
+- **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
+- **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
+- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
+- **(async_)kv_list**: List keys and tags (metadata) in a partition.
+- **(async_)kv_clear**: Remove key-value pairs from storage.
 
 **Key Features**
 
-- **Redis-style Semantics**: Familiar KV interface (Put/Get/List) for zero learning curve
-- **Fine-grained Access**: Update or retrieve specific fields (columns) within a key (row) without full op.
-- **Partition Isolation**: Logical separation of storage namespaces
-- **Metadata Tags**: Lightweight metadata for status tracking
-- **Pluggable Backends**: Supports multiple backends
+- **Redis-style Semantics**: Familiar KV interface (Put/Get/List) for a zero learning curve.
+- **Fine-grained Access**: Update or retrieve specific fields (columns) within a key (row) without requiring a full-row operation.
+- **Partition Isolation**: Logical separation of storage namespaces.
+- **Metadata Tags**: Lightweight metadata for status tracking.
+- **Pluggable Backends**: Supports multiple backends.
+
+Refer to [tutorials/basic.ipynb](https://github.com/Ascend/TransferQueue/blob/main/tutorial/basic.ipynb) and [tutorials/02_kv_interface.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/02_kv_interface.py) for detailed usage examples.
 
 #### StreamingDataLoader API
 
 Designed as a drop-in replacement for the standard PyTorch `DataLoader`, this API allows each rank to automatically consume data without single-controller intervention.
 
-In this scenario, `TransferQueueController` serves as a side-controller for data dispatching, with user-defined `Sampler` class to organize dataflow.
+In this scenario, `TransferQueueController` serves as a side-controller for data dispatching, with a user-defined `Sampler` class to organize the dataflow.
 It encapsulates the complex scheduling and data transfer logic required for various parallelism strategies, seamlessly integrating TransferQueue into existing training workflows and simplifying the development of disaggregated frameworks.
 
-See [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for more details.
+See the [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for more details.
 
 #### Low-Level Native API
 
-The native interface of TransferQueue are implemented in `TransferQueueClient`. It offers maximum flexibility through native, atomic operations.
+The native interfaces of TransferQueue are implemented in `TransferQueueClient`. It offers maximum flexibility through native, atomic operations.
 
 Developers can leverage `TransferQueueClient` directly to implement advanced features that require fine-grained control and fully streamed data scheduling, as illustrated in the following tutorials:
 - [tutorial/03_metadata_concepts.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/03_metadata_concepts.py)
@@ -145,19 +147,14 @@ Developers can leverage `TransferQueueClient` directly to implement advanced fea
 ### Collocated Example
 
 #### verl
-The primary motivation for integrating TransferQueue to verl now is to **alleviate the data transfer bottleneck of the single controller `RayPPOTrainer`**. Currently, all `DataProto` objects must be routed through `RayPPOTrainer`, resulting in a single point bottleneck of the whole post-training system.
+The primary motivation for integrating TransferQueue into verl is to **alleviate the data transfer bottleneck of the single controller `RayPPOTrainer`**. Currently, all `DataProto` objects must be routed through `RayPPOTrainer`, resulting in a single-point bottleneck for the entire post-training system.
 
-![verl_dataflow_DataProto](https://github.com/TransferQueue/community_doc/blob/main/docs/verl_workflow.jpeg?raw=true)
+<p align="center">
+  <img src="https://raw.githubusercontent.com/wuxibin89/verl/refs/heads/wuxibin/doc_images/docs/_static/transfer_queue.png" width="100%">
+</p>
 
-Leveraging TransferQueue, we separate experience data transfer from metadata dispatch by
+Official integration with verl is available at [verl/pulls/5401](https://github.com/verl-project/verl/pull/5401), with the design doc at [[RFC] PPOTrainer with TransferQueue Integration](https://github.com/verl-project/verl/issues/5400). You may also refer to our [recipe](https://github.com/Ascend/TransferQueue/blob/main/recipe/simple_use_case/single_controller_demo.py), where we mimic verl usage in a high-level manner. 
 
-- Replacing `DataProto` with `BatchMeta` (metadata) and `TensorDict` (actual data) structures
-- Preserving verl's original Dispatch/Collect logic via BatchMeta (maintaining single-controller debuggability)
-- Accelerating data transfer by TransferQueue's distributed storage units
-
-![verl_dataflow_TransferQueue](https://github.com/TransferQueue/community_doc/blob/main/docs/verl_workflow_with_tq.jpeg?raw=true)
-
-You may refer to the [recipe](https://github.com/Ascend/TransferQueue/tree/dev/recipe/simple_use_case), where we mimic the verl usage in both async & sync scenarios. Official integration to verl is also available now at [verl/pulls/3649](https://github.com/volcengine/verl/pull/3649) (with subsequent PRs to further optimize the integration).
 
 ### Disaggregated Example
 
@@ -212,15 +209,21 @@ pip install TransferQueue
 
 <h2 id="performance">📊 Performance</h2>
 
+### Simple Case: Regular Tensor Only
 <p align="center">
-  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_0.1.1.dev2.png?raw=true" width="100%">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.6.png?raw=true" width="100%">
 </p>
 
-> Note: The above benchmark for TransferQueue is based on our naive `SimpleStorage` backend. By introducing high-performance storage backends and optimizing serialization/deserialization, we expect to achieve even better performance. Warmly welcome contributions from the community!
+### Complex Case: Regular Tensor + NestedTensor + NonTensor
+<p align="center">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.6.png?raw=true" width="100%">
+</p>
 
-For detailed performance benchmarks, please refer to [this blog](https://www.yuque.com/haomingzi-lfse7/hlx5g0/tml8ke0zkgn6roey?singleDoc#).
+> Note: Optimization for MooncakeStore and other backends are still in process. Warmly welcome contributions from the community!
 
-We also provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/hlx5g0/ydbwgo5k2umaag78?singleDoc#) that demonstrates **768 concurrent clients writing 1.4 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss, achieving 80% bandwidth.
+For detailed performance benchmarks, please refer to [this blog](https://www.yuque.com/haomingzi-lfse7/lhp4el/tml8ke0zkgn6roey?singleDoc#).
+
+We also provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mt0vedqy7c337pgg?singleDoc#) that demonstrates more than **8192 concurrent clients writing 2 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss.
 
 <h2 id="customize"> 🛠️ Customize TransferQueue</h2>
 

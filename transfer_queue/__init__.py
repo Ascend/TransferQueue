@@ -19,6 +19,7 @@ from .client import TransferQueueClient
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
     async_kv_batch_get,
+    async_kv_batch_get_by_meta,
     async_kv_batch_put,
     async_kv_clear,
     async_kv_list,
@@ -27,6 +28,7 @@ from .interface import (
     get_client,
     init,
     kv_batch_get,
+    kv_batch_get_by_meta,
     kv_batch_put,
     kv_clear,
     kv_list,
@@ -36,6 +38,7 @@ from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
 from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
 from .sampler.rank_aware_sampler import RankAwareSampler
+from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
 
 __all__ = (
@@ -46,11 +49,13 @@ __all__ = (
         "kv_put",
         "kv_batch_put",
         "kv_batch_get",
+        "kv_batch_get_by_meta",
         "kv_list",
         "kv_clear",
         "async_kv_put",
         "async_kv_batch_put",
         "async_kv_batch_get",
+        "async_kv_batch_get_by_meta",
         "async_kv_list",
         "async_kv_clear",
         "KVBatchMeta",
@@ -72,6 +77,7 @@ __all__ = (
         "GRPOGroupNSampler",
         "SequentialSampler",
         "RankAwareSampler",
+        "SeqlenBalancedSampler",
     ]
 )
 

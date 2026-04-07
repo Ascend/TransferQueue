@@ -16,7 +16,10 @@
 import logging
 import math
 import os
+import shutil
+import socket
 import subprocess
+import tempfile
 import time
 from importlib import resources
 from typing import Any, Optional
@@ -30,6 +33,7 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
+from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.simple_backend import SimpleStorageUnit
@@ -85,7 +89,6 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                     placement_group=storage_placement_group,
                     placement_group_bundle_index=storage_unit_rank,
                     name=f"TransferQueueStorageUnit#{storage_unit_rank}",
-                    lifetime="detached",
                 ).remote(
                     storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
                 )
@@ -102,28 +105,44 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                 check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
                 if check.returncode == 0:
                     pids = check.stdout.strip().replace("\n", ", ")
-                    logging.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
+                    logger.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
 
                     result = os.system('pkill -f "[m]ooncake_master"')
                     if result == 0:
-                        logging.info("Successfully killed existing mooncake_master processes.")
+                        logger.info("Successfully killed existing mooncake_master processes.")
                     else:
                         raise RuntimeError(f"Failed to kill existing mooncake_master processes (exit code: {result}).")
 
-                raw_address = conf.backend.MooncakeStore.metadata_server
-                if "://" not in raw_address:
-                    raw_address = "//" + raw_address
+                # process metadata_server
+                metadata_server_raw_address = conf.backend.MooncakeStore.metadata_server
+                if "://" not in metadata_server_raw_address:
+                    metadata_server_raw_address = "//" + metadata_server_raw_address
 
-                parsed = urlparse(raw_address)
+                metadata_server_parsed = urlparse(metadata_server_raw_address)
 
-                if not parsed.hostname or parsed.port is None:
+                if not metadata_server_parsed.hostname or metadata_server_parsed.port is None:
                     raise ValueError(
                         f"Invalid metadata_server '{conf.backend.MooncakeStore.metadata_server}'. "
                         f"Host and port are required (e.g., host:port)."
                     )
 
-                metadata_server_host = parsed.hostname
-                metadata_server_port = str(parsed.port)
+                metadata_server_host = metadata_server_parsed.hostname
+                metadata_server_port = str(metadata_server_parsed.port)
+
+                # process master_server
+                master_server_raw_address = conf.backend.MooncakeStore.master_server_address
+                if "://" not in master_server_raw_address:
+                    master_server_raw_address = "//" + master_server_raw_address
+
+                master_server_parsed = urlparse(master_server_raw_address)
+
+                if not master_server_parsed.hostname or master_server_parsed.port is None:
+                    raise ValueError(
+                        f"Invalid master_server_address '{conf.backend.MooncakeStore.master_server_address}'. "
+                        f"Host and port are required (e.g., host:port)."
+                    )
+
+                master_server_port = str(master_server_parsed.port)
 
                 cmd = [
                     "mooncake_master",
@@ -135,6 +154,7 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                     "--allow_evict_soft_pinned_objects=false",
                     f"--http_metadata_server_host={metadata_server_host}",
                     f"--http_metadata_server_port={metadata_server_port}",
+                    f"--rpc_port={master_server_port}",
                 ]
 
                 log_file_path = "/tmp/mooncake_master.log"
@@ -167,6 +187,129 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         f"Output:\n{error_msg}"
                     )
                 _TRANSFER_QUEUE_STORAGE["MooncakeStore"] = process
+        if conf.backend.storage_backend == "Yuanrong":
+            if conf.backend.Yuanrong.auto_init:
+                etcd_process = None
+                etcd_data_dir = None
+                worker_address = None
+                if not shutil.which("etcd"):
+                    raise RuntimeError(
+                        "etcd executable not found in PATH. Please install etcd and make sure it's in the PATH."
+                    )
+                if not shutil.which("dscli"):
+                    raise RuntimeError(
+                        "dscli executable not found in PATH. Please run `pip install openyuanrong-datasystem`."
+                    )
+                try:
+                    # ========== Start etcd ==========
+                    etcd_address = "127.0.0.1:2379"
+                    try:
+                        etcd_address = conf.backend.Yuanrong.etcd_address
+                    except Exception:
+                        pass
+
+                    # Assume host:port format
+                    parts = etcd_address.split(":")
+                    if len(parts) != 2:
+                        raise ValueError(f"Invalid etcd_address format: {etcd_address}. Expected host:port")
+                    host = parts[0]
+                    port = int(parts[1])
+
+                    # Create temporary data directory
+                    etcd_data_dir = tempfile.mkdtemp(prefix="tq_etcd_")
+                    logger.info(f"Starting etcd with data directory: {etcd_data_dir}")
+
+                    cmd = [
+                        "etcd",
+                        f"--data-dir={etcd_data_dir}",
+                        f"--listen-client-urls=http://{host}:{port}",
+                        f"--advertise-client-urls=http://{host}:{port}",
+                    ]
+
+                    etcd_process = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                        bufsize=1,
+                        universal_newlines=True,
+                        start_new_session=True,
+                    )
+                    time.sleep(3)  # Wait for etcd to start
+
+                    if etcd_process.poll() is None:
+                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        sock.settimeout(2)
+                        result = sock.connect_ex((host, port))
+                        sock.close()
+                        if result != 0:
+                            raise RuntimeError(f"etcd process started but not listening on {host}:{port}")
+                    else:
+                        raise RuntimeError(f"etcd exited immediately with return code {etcd_process.returncode}")
+
+                    logger.info(f"etcd started, PID: {etcd_process.pid}")
+                    time.sleep(2)
+
+                    # ========== Start datasystem worker ==========
+                    # Assume host:port format
+                    worker_host = conf.backend.Yuanrong.host
+                    worker_port = conf.backend.Yuanrong.port
+                    worker_address = worker_host + ":" + str(worker_port)
+
+                    cmd = [
+                        "dscli",
+                        "start",
+                        "-w",
+                        "--worker_address",
+                        worker_address,
+                        "--etcd_address",
+                        etcd_address,
+                    ]
+
+                    try:
+                        ds_result = subprocess.run(
+                            cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=True,
+                            timeout=90,
+                        )
+                    except subprocess.TimeoutExpired as err:
+                        raise RuntimeError(f"dscli start timed out: {err}") from err
+                    # Wait for dscli to start and exit (it starts worker and exits)
+                    if ds_result.returncode == 0 and "[  OK  ]" in ds_result.stdout:
+                        logger.info(f"dscli started Yuanrong datasystem worker at {worker_address} successfully.")
+
+                    else:
+                        raise RuntimeError(
+                            f"Failed to start datasystem worker at {worker_address}. "
+                            f"Return code: {ds_result.returncode}, Output: {ds_result.stdout}"
+                        )
+
+                    # Store processes and data directory
+                    _TRANSFER_QUEUE_STORAGE["Yuanrong"] = {
+                        "etcd": etcd_process,
+                        "etcd_data_dir": etcd_data_dir,
+                        "worker_address": worker_address,
+                        "etcd_address": etcd_address,
+                    }
+                    logger.info("Yuanrong backend (etcd + datasystem) started successfully.")
+
+                except Exception as e:
+                    # Clean up on failure
+                    if etcd_process is not None and etcd_process.poll() is None:
+                        etcd_process.terminate()
+                        try:
+                            etcd_process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            etcd_process.kill()
+                            etcd_process.wait()
+                    if etcd_data_dir is not None:
+                        try:
+                            shutil.rmtree(etcd_data_dir, ignore_errors=True)
+                        except Exception:
+                            pass
+                    raise RuntimeError(f"Failed to start Yuanrong backend: {e}") from e
     return conf
 
 
@@ -202,7 +345,7 @@ def _init_from_existing() -> bool:
 
 
 # ==================== Initialization API ====================
-def init(conf: Optional[DictConfig] = None) -> None:
+def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     """Initialize the TransferQueue system.
 
     This function sets up the TransferQueue controller, distributed storage, and client.
@@ -217,6 +360,8 @@ def init(conf: Optional[DictConfig] = None) -> None:
               the default config from 'config.yaml'. This is only used for first-time
               initializing. When connecting to an existing controller, this parameter
               is ignored.
+    Returns:
+        The merged configuration dictionary.
 
     Raises:
         ValueError: If config is not valid or required configuration keys are missing.
@@ -234,7 +379,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
         >>> data = tq.get_data(metadata)
     """
     if _init_from_existing():
-        return
+        return conf
 
     # First-time initialize TransferQueue
     logger.info("No TransferQueueController found. Starting first-time initialization...")
@@ -272,7 +417,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
-        return
+        return final_conf
 
     controller_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
@@ -286,6 +431,7 @@ def init(conf: Optional[DictConfig] = None) -> None:
 
     # create client
     _maybe_create_transferqueue_client(final_conf)
+    return final_conf
 
 
 def close():
@@ -328,6 +474,52 @@ def close():
                                 logger.info("Successfully removed all existing keys in mooncake_master.")
                         except Exception:
                             pass
+                elif key == "Yuanrong":
+                    # Stop etcd process and clean up data directory, stop datasystem worker via dscli
+                    if isinstance(value, dict):
+                        etcd_process = value.get("etcd")
+                        etcd_data_dir = value.get("etcd_data_dir")
+                        worker_address = value.get("worker_address")
+
+                        # Stop etcd if running
+                        if etcd_process is not None and etcd_process.poll() is None:
+                            etcd_process.terminate()
+                            try:
+                                etcd_process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                etcd_process.kill()
+                                etcd_process.wait()
+
+                        # Clean up etcd data directory
+                        if etcd_data_dir is not None and os.path.exists(etcd_data_dir):
+                            try:
+                                shutil.rmtree(etcd_data_dir, ignore_errors=True)
+                                logger.info(f"Cleaned up etcd data directory: {etcd_data_dir}")
+                            except Exception as e:
+                                logger.warning(f"Failed to clean up etcd data directory {etcd_data_dir}: {e}")
+
+                        # Stop datasystem worker via dscli command
+                        if worker_address:
+                            try:
+                                result = subprocess.run(
+                                    ["dscli", "stop", "--worker_address", worker_address],
+                                    timeout=90,
+                                    capture_output=True,
+                                )
+                                if result.returncode == 0:
+                                    logger.info(f"Stopped datasystem worker at {worker_address} via dscli stop")
+                                else:
+                                    error_msg = (result.stderr or result.stdout or b"").decode()
+                                    logger.warning(
+                                        f"Failed to stop datasystem worker at {worker_address}. "
+                                        f"Return code: {result.returncode}, Error: {error_msg}"
+                                    )
+                            except subprocess.TimeoutExpired as err:
+                                logger.warning(f"dscli stop timed out for {worker_address}: {err}")
+                            except Exception as e:
+                                logger.warning(f"Failed to stop datasystem worker via dscli: {e}")
+                    else:
+                        logger.warning(f"Unexpected Yuanrong storage value: {value}")
                 else:
                     logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
 
@@ -359,7 +551,7 @@ def kv_put(
     partition_id: str,
     fields: Optional[TensorDict | dict[str, Any]] = None,
     tag: Optional[dict[str, Any]] = None,
-) -> None:
+) -> KVBatchMeta:
     """Put a single key-value pair to TransferQueue.
 
     This is a convenience method for putting data using a user-specified key
@@ -372,7 +564,13 @@ def kv_put(
         fields: Data fields to store. Can be a TensorDict or a dict of tensors.
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
+                If not provided, will only update the newly given tag to the key.
         tag: Optional metadata tag to associate with the key
+
+    Returns:
+        KVBatchMeta: Metadata containing the key, tags, partition_id, and fields.
+                     The `fields` attribute includes all fields stored for this sample,
+                     including any new fields written by this put operation.
 
     Raises:
         ValueError: If neither fields nor tag is provided
@@ -384,12 +582,13 @@ def kv_put(
         >>> import torch
         >>> tq.init()
         >>> # Put with both fields and tag
-        >>> tq.kv_put(
+        >>> meta = tq.kv_put(
         ...     key="sample_1",
         ...     partition_id="train",
         ...     fields={"input_ids": torch.tensor([1, 2, 3])},
         ...     tag={"score": 0.95}
         ... )
+        >>> print(meta.fields)  # ['input_ids']
     """
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of `fields` or `tag`.")
@@ -420,18 +619,28 @@ def kv_put(
                     batch[field_name] = NonTensorStack(value)
             fields = TensorDict(batch, batch_size=[1])
         elif not isinstance(fields, TensorDict):
-            raise ValueError("field can only be dict or TensorDict")
+            raise ValueError("`fields` can only be dict or TensorDict")
 
-        # custom_meta (tag) will be put to controller through the internal put process
-        tq_client.put(fields, batch_meta)
+        # After put, batch_meta.field_names will include the new fields written by user
+        batch_meta = tq_client.put(fields, batch_meta)
     else:
-        # directly update custom_meta (tag) to controller
+        # Directly update custom_meta (tag) to controller
         tq_client.set_custom_meta(batch_meta)
+
+    fields_to_return = batch_meta.field_names
+
+    return KVBatchMeta(
+        keys=[key],
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=fields_to_return,
+        extra_info=batch_meta.extra_info,
+    )
 
 
 def kv_batch_put(
     keys: list[str], partition_id: str, fields: Optional[TensorDict] = None, tags: Optional[list[dict[str, Any]]] = None
-) -> None:
+) -> KVBatchMeta:
     """Put multiple key-value pairs to TransferQueue in batch.
 
     This method stores multiple key-value pairs in a single operation, which is more
@@ -440,8 +649,14 @@ def kv_batch_put(
     Args:
         keys: List of user-specified keys for the data
         partition_id: Logical partition to store the data in
-        fields: TensorDict containing data for all keys. Must have batch_size == len(keys)
+        fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
+                If not provided, will only update the newly given tags to the keys.
         tags: List of metadata tags, one for each key
+
+    Returns:
+        KVBatchMeta: Metadata containing the keys, tags, partition_id, and fields.
+                     The `fields` attribute includes all fields stored for these samples,
+                     including any new fields written by this put operation.
 
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
@@ -458,7 +673,8 @@ def kv_batch_put(
         ...     "attention_mask": torch.ones(3, 10),
         ... }, batch_size=3)
         >>> tags = [{"score": 0.9}, {"score": 0.85}, {"score": 0.95}]
-        >>> tq.kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
+        >>> meta = tq.kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
+        >>> print(meta.fields)  # ['input_ids', 'attention_mask']
     """
 
     if fields is None and tags is None:
@@ -481,20 +697,88 @@ def kv_batch_put(
         )
 
     # 2. register the user-specified tags to BatchMeta
-    if tags:
+    if tags is not None:
         if len(tags) != len(keys):
             raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         batch_meta.update_custom_meta(tags)
 
     # 3. put data
     if fields is not None:
-        tq_client.put(fields, batch_meta)
+        # After put, batch_meta.field_names will include the new fields written by user
+        batch_meta = tq_client.put(fields, batch_meta)
     else:
-        # directly update custom_meta (tags) to controller
+        # Directly update custom_meta (tags) to controller
         tq_client.set_custom_meta(batch_meta)
 
+    fields_to_return = batch_meta.field_names
 
-def kv_batch_get(keys: list[str] | str, partition_id: str, fields: Optional[list[str] | str] = None) -> TensorDict:
+    return KVBatchMeta(
+        keys=keys,
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=fields_to_return,
+        extra_info=batch_meta.extra_info,
+    )
+
+
+def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+    """Get data from TransferQueue using KVBatchMeta.
+
+    This is a convenience method for retrieving data using KVBatchMeta returned
+    from a previous put operation. It extracts the keys and partition_id from
+    the metadata to fetch the corresponding data.
+
+    Args:
+        meta: KVBatchMeta object returned from a previous put operation (e.g., kv_put,
+              kv_batch_put). It contains keys, partition_id, and fields information.
+        select_fields: Optional field(s) to retrieve, which overrides the fields
+                       recorded in the given KVBatchMeta. If None, uses all fields
+                       from meta.fields. Can be a single field name (str) or a list
+                       of field names.
+
+    Returns:
+        TensorDict with the requested data
+
+    Raises:
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
+        ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> # First put some data
+        >>> keys = ["sample_1", "sample_2", "sample_3"]
+        >>> fields = TensorDict({
+        ...     "input_ids": torch.randn(3, 10),
+        ...     "attention_mask": torch.ones(3, 10),
+        ... }, batch_size=3)
+        >>> meta = tq.kv_batch_put(keys=keys, partition_id="train", fields=fields)
+        >>> # Then retrieve it using the returned metadata
+        >>> data = tq.kv_batch_get_by_meta(meta)
+    """
+    if meta.partition_id is None:
+        raise ValueError("Must provide partition_id in the input KVBatchMeta.")
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch: Optional[list[str]] = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+
+        assert fields_to_fetch is not None
+        if meta.fields is None or any(f not in meta.fields for f in fields_to_fetch):
+            raise ValueError(
+                f"Some fields assigned in select_fields not found in the metadata. "
+                f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
+            )
+    else:
+        fields_to_fetch = meta.fields
+    return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
+
+
+def kv_batch_get(
+    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
+) -> TensorDict:
     """Get data from TransferQueue using user-specified keys.
 
     This is a convenience method for retrieving data using keys instead of indexes.
@@ -502,14 +786,14 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, fields: Optional[list
     Args:
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
-        fields: Optional field(s) to retrieve. If None, retrieves all fields
+        select_fields: Optional field(s) to retrieve. If None, retrieves all fields
 
     Returns:
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
@@ -520,7 +804,7 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, fields: Optional[list
         >>> data = tq.kv_batch_get(
         ...     keys=["sample_1", "sample_2"],
         ...     partition_id="train",
-        ...     fields="input_ids"
+        ...     select_fields="input_ids"
         ... )
     """
     tq_client = _maybe_create_transferqueue_client()
@@ -528,15 +812,18 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, fields: Optional[list
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size == 0:
-        raise RuntimeError("keys or partition were not found!")
+        raise ValueError("keys or partition were not found!")
 
-    if fields is not None:
-        if isinstance(fields, str):
-            fields = [fields]
-        batch_meta = batch_meta.select_fields(fields)
+    fields_to_fetch: list[str] | None
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+        batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
-        raise RuntimeError("Some fields are not ready in all the requested keys!")
+        raise ValueError("Some fields are not ready in all the requested keys!")
 
     data = tq_client.get_data(batch_meta)
     return data
@@ -618,7 +905,7 @@ async def async_kv_put(
     partition_id: str,
     fields: Optional[TensorDict | dict[str, Any]] = None,
     tag: Optional[dict[str, Any]] = None,
-) -> None:
+) -> KVBatchMeta:
     """Asynchronously put a single key-value pair to TransferQueue.
 
     This is a convenience method for putting data using a user-specified key
@@ -631,7 +918,13 @@ async def async_kv_put(
         fields: Data fields to store. Can be a TensorDict or a dict of tensors.
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
+                If not provided, will only update the newly given tag to the key.
         tag: Optional metadata tag to associate with the key
+
+    Returns:
+        KVBatchMeta: Metadata containing the key, tags, partition_id, and fields.
+                     The `fields` attribute includes all fields stored for this sample,
+                     including any new fields written by this put operation.
 
     Raises:
         ValueError: If neither fields nor tag is provided
@@ -643,12 +936,13 @@ async def async_kv_put(
         >>> import torch
         >>> tq.init()
         >>> # Put with both fields and tag
-        >>> await tq.async_kv_put(
+        >>> meta = await tq.async_kv_put(
         ...     key="sample_1",
         ...     partition_id="train",
         ...     fields={"input_ids": torch.tensor([1, 2, 3])},
         ...     tag={"score": 0.95}
-        ... ))
+        ... )
+        >>> print(meta.fields)  # ['input_ids']
     """
 
     if fields is None and tag is None:
@@ -663,7 +957,7 @@ async def async_kv_put(
         raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match with input `key` size of 1!")
 
     # 2. register the user-specified tag to BatchMeta
-    if tag:
+    if tag is not None:
         batch_meta.update_custom_meta([tag])
 
     # 3. put data
@@ -680,18 +974,28 @@ async def async_kv_put(
                     batch[field_name] = NonTensorStack(value)
             fields = TensorDict(batch, batch_size=[1])
         elif not isinstance(fields, TensorDict):
-            raise ValueError("field can only be dict or TensorDict")
+            raise ValueError("`fields` can only be dict or TensorDict")
 
-        # custom_meta (tag) will be put to controller through the put process
-        await tq_client.async_put(fields, batch_meta)
+        # After put, batch_meta.field_names will include the new fields written by user
+        batch_meta = await tq_client.async_put(fields, batch_meta)
     else:
-        # directly update custom_meta (tag) to controller
+        # Directly update custom_meta (tag) to controller
         await tq_client.async_set_custom_meta(batch_meta)
+
+    fields_to_return = batch_meta.field_names
+
+    return KVBatchMeta(
+        keys=[key],
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=fields_to_return,
+        extra_info=batch_meta.extra_info,
+    )
 
 
 async def async_kv_batch_put(
     keys: list[str], partition_id: str, fields: Optional[TensorDict] = None, tags: Optional[list[dict[str, Any]]] = None
-) -> None:
+) -> KVBatchMeta:
     """Asynchronously put multiple key-value pairs to TransferQueue in batch.
 
     This method stores multiple key-value pairs in a single operation, which is more
@@ -700,8 +1004,14 @@ async def async_kv_batch_put(
     Args:
         keys: List of user-specified keys for the data
         partition_id: Logical partition to store the data in
-        fields: TensorDict containing data for all keys. Must have batch_size == len(keys)
+        fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
+                If not provided, will only update the newly given tags to the keys.
         tags: List of metadata tags, one for each key
+
+    Returns:
+        KVBatchMeta: Metadata containing the keys, tags, partition_id, and fields.
+                     The `fields` attribute includes all fields stored for these samples,
+                     including any new fields written by this put operation.
 
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
@@ -717,7 +1027,8 @@ async def async_kv_batch_put(
         ...     "attention_mask": torch.ones(3, 10),
         ... }, batch_size=3)
         >>> tags = [{"score": 0.9}, {"score": 0.85}, {"score": 0.95}]
-        >>> await tq.async_kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
+        >>> meta = await tq.async_kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
+        >>> print(meta.fields)  # ['input_ids', 'attention_mask']
     """
 
     if fields is None and tags is None:
@@ -747,14 +1058,82 @@ async def async_kv_batch_put(
 
     # 3. put data
     if fields is not None:
-        await tq_client.async_put(fields, batch_meta)
+        # After put, batch_meta.field_names will include the new fields written by user
+        batch_meta = await tq_client.async_put(fields, batch_meta)
     else:
-        # directly update custom_meta (tags) to controller
+        # Directly update custom_meta (tags) to controller
         await tq_client.async_set_custom_meta(batch_meta)
+
+    fields_to_return = batch_meta.field_names
+
+    return KVBatchMeta(
+        keys=keys,
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=fields_to_return,
+        extra_info=batch_meta.extra_info,
+    )
+
+
+async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+    """Asynchronously get data from TransferQueue using KVBatchMeta.
+
+    This is a convenience method for retrieving data using KVBatchMeta returned
+    from a previous put operation. It extracts the keys and partition_id from
+    the metadata to fetch the corresponding data.
+
+    Args:
+        meta: KVBatchMeta object returned from a previous put operation (e.g., async_kv_put,
+              async_kv_batch_put). It contains keys, partition_id, and fields information.
+        select_fields: Optional field(s) to retrieve, which overrides the fields
+                       recorded in the given KVBatchMeta. If None, uses all fields
+                       from meta.fields. Can be a single field name (str) or a list
+                       of field names.
+
+    Returns:
+        TensorDict with the requested data
+
+    Raises:
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
+        ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> # First put some data
+        >>> keys = ["sample_1", "sample_2", "sample_3"]
+        >>> fields = TensorDict({
+        ...     "input_ids": torch.randn(3, 10),
+        ...     "attention_mask": torch.ones(3, 10),
+        ... }, batch_size=3)
+        >>> meta = await tq.async_kv_batch_put(keys=keys, partition_id="train", fields=fields)
+        >>> # Then retrieve it using the returned metadata
+        >>> data = await tq.async_kv_batch_get_by_meta(meta)
+    """
+    if meta.partition_id is None:
+        raise ValueError("Must provide partition_id in the input KVBatchMeta.")
+
+    fields_to_fetch: list[str] | None
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+
+        assert fields_to_fetch is not None
+        if meta.fields is None or any(f not in meta.fields for f in fields_to_fetch):
+            raise ValueError(
+                f"Some fields assigned in select_fields not found in the metadata. "
+                f"Assigned: {fields_to_fetch}; Fields in KVBatchMeta: {meta.fields}."
+            )
+    else:
+        fields_to_fetch = meta.fields
+    return await async_kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
 
 
 async def async_kv_batch_get(
-    keys: list[str] | str, partition_id: str, fields: Optional[list[str] | str] = None
+    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
 ) -> TensorDict:
     """Asynchronously get data from TransferQueue using user-specified keys.
 
@@ -763,14 +1142,14 @@ async def async_kv_batch_get(
     Args:
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
-        fields: Optional field(s) to retrieve. If None, retrieves all fields
+        select_fields: Optional field(s) to retrieve. If None, retrieves all fields
 
     Returns:
         TensorDict with the requested data
 
     Raises:
-        RuntimeError: If keys or partition are not found
-        RuntimeError: If empty fields exist in any key (sample)
+        ValueError: If keys or partition are not found
+        ValueError: If empty fields exist in any key (sample)
 
     Example:
         >>> import transfer_queue as tq
@@ -781,7 +1160,7 @@ async def async_kv_batch_get(
         >>> data = await tq.async_kv_batch_get(
         ...     keys=["sample_1", "sample_2"],
         ...     partition_id="train",
-        ...     fields="input_ids"
+        ...     select_fields="input_ids"
         ... )
     """
     tq_client = _maybe_create_transferqueue_client()
@@ -789,15 +1168,17 @@ async def async_kv_batch_get(
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size == 0:
-        raise RuntimeError("keys or partition were not found!")
+        raise ValueError("keys or partition were not found!")
 
-    if fields is not None:
-        if isinstance(fields, str):
-            fields = [fields]
-        batch_meta = batch_meta.select_fields(fields)
+    if select_fields is not None:
+        if isinstance(select_fields, str):
+            fields_to_fetch = [select_fields]
+        else:
+            fields_to_fetch = select_fields
+        batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
-        raise RuntimeError("Some fields are not ready in all the requested keys!")
+        raise ValueError("Some fields are not ready in all the requested keys!")
 
     data = await tq_client.async_get_data(batch_meta)
     return data

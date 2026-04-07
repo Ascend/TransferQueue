@@ -195,6 +195,8 @@ def update_worker(
         partition_id="train",  # Data partition to consume from
         task_name="update_task",  # Unique task identifier
         dp_rank=dp_rank,
+        should_check_consumption_status=False,  # Streaming mode: iterate indefinitely until externally stopped.
+        # Set True only when you want the iterator to stop after ALL samples are consumed.
     )
     print(f"[Update Worker@{rank_id}] StreamingDataset created successfully")
 
@@ -229,6 +231,13 @@ def update_worker(
         if step >= max_steps:
             print(f"[Update Worker@{rank_id}] Reached max steps ({max_steps}), stopping...")
             break
+
+    # Explicitly delete the dataloader to terminate worker subprocesses.
+    # In streaming mode (should_check_consumption_status=False), the dataset's
+    # __iter__ runs indefinitely in DataLoader worker processes. Without explicit
+    # cleanup, these subprocesses would hang waiting for more data, preventing
+    # the Ray actor from returning.
+    del dataloader
 
     print(f"[Update Worker@{rank_id}] Completed {step} steps, consumed {len(consumed_ids)} samples")
 

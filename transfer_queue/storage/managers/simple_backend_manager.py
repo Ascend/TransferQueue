@@ -209,17 +209,70 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
     def _select_by_positions(field_data, positions: list[int]):
         """Slice a single field's data by non-contiguous batch positions.
 
-        Handles four data types:
-        - Nested tensors: unbind → select → return as list
-        - NonTensorStack: tolist → select → re-wrap
-        - list: direct index selection via itemgetter
-        - Regular tensors / numpy arrays: fancy indexing
+        This method optimizes selection to minimize memory overhead and network fragmentation:
+        - Nested tensors: Unbinds into a list of views (end-to-end zero-copy).
+        - Regular tensors (step == 1): Returns a contiguous slice (end-to-end zero-copy).
+        - Regular tensors (step > 1): Returns a strided view (shares storage). Note that
+          downstream serialization will force a `.contiguous()` copy, but slicing is still
+          faster than `index_select` and the peak memory period is reduced.
+        - Regular tensors (irregular): Falls back to `index_select` to assemble a single
+          contiguous tensor, preventing excessive ZMQ multipart frames.
+        - NonTensorStack: tolist → select → re-wrap.
+        - List: Direct index selection via `itemgetter`.
+        - Numpy arrays / Others: Advanced indexing (memory copy).
         """
-        if isinstance(field_data, torch.Tensor) and field_data.is_nested:
-            unbound = field_data.unbind()
-            getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
-            selected = getter(unbound)
-            return list(selected)
+
+        n = len(positions)
+        if n == 0:
+            raise ValueError("No positions specified for selection.")
+
+        # --- Handle PyTorch Tensors ---
+        if isinstance(field_data, torch.Tensor):
+            if field_data.is_nested:
+                # Nested tensors cannot be directly sliced into a single tensor view.
+                # Unbinding and selecting returns a list of individual views (zero-copy),
+                # which is acceptable for nested structures.
+                unbound = field_data.unbind()
+                getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
+                selected = getter(unbound)
+                return list(selected)
+            else:
+                # --- Smart Slicing for Regular Tensors ---
+                # Goal: Return a single underlying memory view (zero-copy) to avoid both
+                # memory allocation overhead and downstream ZMQ frame fragmentation.
+
+                # Case 1: Single element selection (returns a single-row view)
+                if n == 1:
+                    # Single element is natively contiguous
+                    return field_data[positions[0] : positions[0] + 1]
+
+                # Case 2: Check if positions form a constant-stride sequence
+                step = positions[1] - positions[0]
+                is_constant_stride = True
+                for i in range(2, n):
+                    if positions[i] - positions[i - 1] != step:
+                        is_constant_stride = False
+                        break
+
+                # If perfectly regular (e.g., [0, 2, 4]), use Python slicing to get a view
+                if is_constant_stride and step > 0:
+                    # Note:
+                    # A strided slice (step > 1) creates a non-contiguous view.
+                    # While it shares storage here, the downstream MsgpackEncoder will force
+                    # a .contiguous() copy before extracting the buffer. However, this pure
+                    # Python slicing is still more efficient than falling back to index_select,
+                    # and it reduces memory peak period.
+                    return field_data[positions[0] : positions[-1] + 1 : step]
+
+                # Case 3: Fallback for irregular indices (Typically this will not happen!)
+                # We intentionally accept a memory copy here to assemble a single contiguous
+                # tensor. Returning a list of individual views for irregular indices would
+                # generate excessive multipart ZMQ frames, severely degrading network performance.
+                else:
+                    idx_tensor = torch.tensor(positions, device=field_data.device)
+                    return torch.index_select(field_data, dim=0, index=idx_tensor)
+
+        # --- Handle Non-Tensor Types ---
         elif isinstance(field_data, NonTensorStack):
             items = field_data.tolist()
             getter = itemgetter(*positions) if len(positions) > 1 else lambda seq: (seq[positions[0]],)
@@ -344,7 +397,14 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         if all(isinstance(v, torch.Tensor) for v in values):
             if all(v.shape == values[0].shape for v in values):
                 return torch.stack(values)
-            return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            try:
+                return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            except (RuntimeError, TypeError) as e:
+                logger.warning(
+                    f"Failed to pack nested tensor with jagged layout. "
+                    f"Falling back to strided layout. Detailed error: {e}"
+                )
+                return torch.nested.as_nested_tensor(values, layout=torch.strided)
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
