@@ -125,7 +125,7 @@ def mock_yr_datasystem():
 
 @pytest.fixture
 def config():
-    return {"host": "127.0.0.1", "port": 12345, "enable_yr_npu_optimization": True}
+    return {"worker_port": 12345, "enable_yr_npu_optimization": True}
 
 
 def assert_tensors_equal(a: torch.Tensor, b: torch.Tensor):

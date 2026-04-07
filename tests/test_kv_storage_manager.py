@@ -57,8 +57,7 @@ def test_data():
     cfg = {
         "controller_info": MagicMock(),
         "client_name": "YuanrongStorageClient",
-        "host": "127.0.0.1",
-        "port": 31501,
+        "worker_port": 31501,
         "device_id": 0,
     }
     global_indexes = [8, 9, 10]

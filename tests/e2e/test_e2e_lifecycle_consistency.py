@@ -80,8 +80,8 @@ BACKEND_CONFIGS = {
         "backend": {
             "storage_backend": "Yuanrong",
             "Yuanrong": {
-                "host": "127.0.0.1",
-                "port": 31501,
+                "worker_port": 31501,
+                "metastore_port": 2379,
             },
         },
     },
@@ -102,11 +102,12 @@ def backend_name():
     """Get the backend name from environment variable.
 
     Environment variables:
-        TQ_TEST_BACKEND: Backend name (SimpleStorage or MooncakeStore)
+        TQ_TEST_BACKEND: Backend name (SimpleStorage, MooncakeStore, or Yuanrong)
 
     To run tests for a specific backend:
         TQ_TEST_BACKEND=SimpleStorage pytest tests/e2e/test_e2e_lifecycle_consistency.py
         TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_e2e_lifecycle_consistency.py
+        TQ_TEST_BACKEND=Yuanrong pytest tests/e2e/test_e2e_lifecycle_consistency.py
     """
     return os.environ.get("TQ_TEST_BACKEND", "SimpleStorage")
 

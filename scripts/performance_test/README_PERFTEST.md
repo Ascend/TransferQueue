@@ -64,8 +64,11 @@ backend:
 backend:
   storage_backend: Yuanrong
   Yuanrong:
-    port: 31501
+    auto_init: True
+    worker_port: 31501
+    metastore_port: 2379
     enable_yr_npu_transport: true
+    worker_args: "--shared_memory_size_mb 65536 --remote_h2d_device_ids 0 --enable_huge_tlb true"
 ```
 
 For Yuanrong backend, writer runs on the head node and reader runs on the worker node. `--worker_node_ip` is required.

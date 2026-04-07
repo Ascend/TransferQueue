@@ -43,3 +43,7 @@ jobs:
         pkill -f "[m]ooncake_master" || true
         TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_kv_interface_e2e.py
         pkill -f "[m]ooncake_master" || true
+    - name: Run Yuanrong Backend Specific E2E Tests
+      run: |
+        TQ_TEST_BACKEND=Yuanrong pytest tests/e2e/test_e2e_lifecycle_consistency.py
+        TQ_TEST_BACKEND=Yuanrong pytest tests/e2e/test_kv_interface_e2e.py

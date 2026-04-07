@@ -1,7 +1,7 @@
 
 # OpenYuanrong-Datasystem Integration for TransferQueue
 
-> Last updated: 01/26/2026 
+> Last updated: 04/17/2026 
 
 ## 🎉 Overview
 
@@ -58,27 +58,7 @@ pip install openyuanrong-datasystem
 dscli -h
 ```
 
-#### 3. Install etcd
-
-OpenYuanrong-datasystem relies on etcd for cluster coordination. 
-Download and install etcd from the official releases: [ETCD GitHub Releases](https://github.com/etcd-io/etcd/releases)
-
-```bash
-# Example for Linux ARM64 (adjust for your architecture)
-# Unpack and install etcd
-ETCD_VERSION = "v3.6.5" # Replace with the desired version
-tar -xvf etcd-${ETCD_VERSION}-linux-arm64.tar.gz
-cd etcd-${ETCD_VERSION}-linux-arm64
-
-# Copy the executable file to the system path
-sudo cp etcd etcdctl /usr/local/bin/
-
-# Verify installation
-etcd --version
-etcdctl version
-```
-
-#### 4. (Optional) Install CANN and torch-npu
+#### 3. (Optional) Install CANN and torch-npu
 
 If you have NPU devices and want to accelerate the transmission of NPU tensor, 
 you can install **Ascend-cann-toolkit** and **torch-npu**.
@@ -106,19 +86,36 @@ pip install torch-npu==2.8.0
 Next, we will provide deployment and code examples for single-node scenarios.
 For multi-node scenarios, please refer to [Appendix B](#B-deploy-multi-node-datasystem-for-multi-node-training-and-inference-scenarios).
 
-Unlike using TransferQueue with its default backend, integrating OpenYuanrong-Datasystem requires **pre-launching** the datasystem services before running your Python application.
-
 #### Deployment
-```bash
-# Deploy etcd (for example, port 2379)
-etcd --listen-client-urls http://0.0.0.0:2379 \
-     --advertise-client-urls http://localhost:2379 &
 
-# Deploy datasystem
-dscli start -w --worker_address "127.0.0.1:31501" --etcd_address "127.0.0.1:2379"
+TransferQueue will automatically initialize the Yuanrong backend when `auto_init: True` is set. TransferQueue will:
+- Create placement groups to ensure workers are spread across Ray nodes
+- Launch YuanrongWorkerActor on each node to start datasystem workers
+- Set up metastore service on the head node
+
+Configuration example:
+```yaml
+backend:
+  storage_backend: Yuanrong
+  Yuanrong:
+    auto_init: True
+    worker_port: 31501
+    metastore_port: 2379
+    enable_yr_npu_transport: true
+    worker_args: "--shared_memory_size_mb 8192 --remote_h2d_device_ids 0 --enable_huge_tlb true"
 ```
 
-Once the datasystem is up, you can run your TransferQueue + Datasystem application.
+Configuration options:
+- `auto_init`: Whether to automatically initialize Yuanrong backend. Currently only `True` is supported.
+- `worker_port`: Port for Yuanrong datasystem worker on each node.
+- `metastore_port`: Port for metastore service on the head node.
+- `enable_yr_npu_transport`: Enable NPU transport for high-performance device-to-device data transfer.
+- `worker_args`: Additional arguments passed to `dscli start` command:
+  - `--shared_memory_size_mb`: Shared memory size in MB for datasystem worker.
+  - `--remote_h2d_device_ids`: Enable RH2D (Remote Host-to-Device) for efficient cross-node data transfer. Specify NPU device IDs as comma-separated values (e.g., `0,1,2,3`).
+  - `--enable_huge_tlb`: Enable huge page memory, required for >21GB shared memory on Ascend 910B.
+
+Once the configuration is set, you can run your TransferQueue + Datasystem application directly.
 
 #### Demo
 You can associate `TransferQueueClient` with `YuanrongStorageManager` through the configuration dictionary when initializing the TransferQueue. 
@@ -137,7 +134,7 @@ from transfer_queue import (
 config_str = """
   manager_type: YuanrongStorageManager
   client_name: YuanrongStorageClient
-  port: 31501
+  worker_port: 31501
 """
 dict_conf = OmegaConf.create(config_str, flags={"allow_objects": True})
 ```
@@ -198,13 +195,7 @@ print("output: ", output)
 
 
 #### Shut down datasystem:
-```bash
-# shutdown datasystem on the node
-dscli stop --worker_address "127.0.0.1:31501"
-
-# shutdown etcd
-pkill -f etcd || true
-```
+TransferQueue automatically handles cleanup when calling `tq.close()`, which stops all Yuanrong datasystem workers gracefully.
 
 ### Datasystem Logs
 
@@ -251,57 +242,46 @@ If you need to uninstall, execute:
 ```
 
 ### B: Deploy multi-node datasystem for multi-node training and inference scenarios
-We can use etcd to connect to a datasystem backend across multiple nodes. 
-Let's take two nodes (for instance, 10.170.27.24 and 10.170.27.33) as an example.
 
-#### Start etcd on head node
+TransferQueue automatically initializes Yuanrong datasystem workers across all Ray cluster nodes. Just set `auto_init: True` in the configuration and TransferQueue will handle the multi-node deployment.
 
+Let's take two nodes (for instance, 192.168.0.1 and 192.168.0.2) as an example.
+
+#### Deploy ray
 ```bash
-# For example, using the port 2379 of head node
-etcd \
-  --name etcd-single \
-  --data-dir /tmp/etcd-data \
-  --listen-client-urls http://10.170.27.24:2379 \
-  --advertise-client-urls http://10.170.27.24:2379 \
-  --listen-peer-urls http://10.170.27.24:2380 \
-  --initial-advertise-peer-urls http://10.170.27.24:2380 \
-  --initial-cluster etcd-single=http://10.170.27.24:2380 &
+# on head node
+ray start --head --resources='{"node:192.168.0.1": 1}'
+
+# on worker node (assume ray port of head_node is 6379)
+ray start --address="192.168.0.1:6379" --resources='{"node:192.168.0.2": 1}'
 ```
 
+#### Configuration
 
-#### Deploy multi-nodes datasystem
-On each node, you need to connect to the etcd service on the head node using your local node's IP address.
-```bash
-#on head node
-dscli start -w --worker_address "10.170.27.24:31501" --etcd_address "10.170.27.24:2379"
+TransferQueue will detect all Ray nodes and deploy datasystem workers automatically:
+```yaml
+backend:
+  storage_backend: Yuanrong
+  Yuanrong:
+    auto_init: True
+    worker_port: 31501
+    metastore_port: 2379
+    enable_yr_npu_transport: true
+    worker_args: "--shared_memory_size_mb 65536 --remote_h2d_device_ids 0 --enable_huge_tlb true"
 ```
-
-```bash
-#on work node
-dscli start -w --worker_address "10.170.27.33:31501" --etcd_address "10.170.27.24:2379"
-```
-Now you can use datasystem on head-node and work-node.
 
 > For more detailed deployment instructions, please refer to [yuanrong documents](https://gitcode.com/openeuler/yuanrong-datasystem/blob/master/README.md#%E9%83%A8%E7%BD%B2-openyuanrong-datasystem).
 > The configuration parameters for deploying the data system can refer [dscli config](https://gitcode.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/deployment/dscli.md#%E9%85%8D%E7%BD%AE%E9%A1%B9%E8%AF%B4%E6%98%8E).
 
 There is a demo with multi-node scenarios as fellow.
 
-#### Deploy ray
-```bash
-# on head node
-ray start --head --resources='{"node:10.170.27.24": 1}'
-
-# on worker node (assume ray port of head_node is 6379)
-ray start --address="10.170.27.24:6379" --resources='{"node:10.170.27.33": 1}'
-```
-
 #### Run demo
-In the demo below, we use ray actors to implement distributed deployment of processes. 
+In the demo below, we use ray actors to implement distributed deployment of processes.
 The actor writer writes data to the head node, and the actor reader reads data from the worker nodes.
 ```python
 from omegaconf import OmegaConf
 from tensordict import TensorDict
+import transfer_queue as tq
 from transfer_queue import (
     TransferQueueClient,
     TransferQueueController,
@@ -312,10 +292,10 @@ import ray
 
 ########################################################################
 # Please set up Ray cluster before running this script
-# e.g. ray start --head --resources='{"node:127.0.0.1": 1}'
+# e.g. ray start --head --resources='{"node:192.168.0.1": 1}'
 ########################################################################
-HEAD_NODE_IP = "10.170.27.24"  # Replace with your head node IP
-WORKER_NODE_IP = "10.170.27.33"  # Replace with your worker node IP
+HEAD_NODE_IP = "192.168.0.1"  # Replace with your head node IP
+WORKER_NODE_IP = "192.168.0.2"  # Replace with your worker node IP
 
 
 def initialize_controller():
@@ -357,10 +337,12 @@ class TransferQueueClientActor:
 
 
 def main():
+    tq.init()
+
     config_str = """
         manager_type: YuanrongStorageManager
         client_name: YuanrongStorageClient
-        port: 31501
+        worker_port: 31501
     """
     dict_conf = OmegaConf.create(config_str, flags={"allow_objects": True})
     # It is important to pay attention to the controller's lifecycle.
@@ -386,6 +368,8 @@ def main():
         task_name="generate_sequences",
     )
     output = ray.get(output)
+
+    tq.close()
 
 if __name__ == "__main__":
     main()

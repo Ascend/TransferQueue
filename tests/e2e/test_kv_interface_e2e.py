@@ -94,6 +94,18 @@ BACKEND_CONFIGS = {
             },
         },
     },
+    "Yuanrong": {
+        "controller": {
+            "polling_mode": True,
+        },
+        "backend": {
+            "storage_backend": "Yuanrong",
+            "Yuanrong": {
+                "worker_port": 31501,
+                "metastore_port": 2379,
+            },
+        },
+    },
 }
 
 
@@ -112,11 +124,12 @@ def backend_name():
     """Get the backend name from environment variable.
 
     Environment variables:
-        TQ_TEST_BACKEND: Backend name (SimpleStorage or MooncakeStore)
+        TQ_TEST_BACKEND: Backend name (SimpleStorage, MooncakeStore, or Yuanrong)
 
     To run tests for a specific backend:
         TQ_TEST_BACKEND=SimpleStorage pytest tests/e2e/test_kv_interface_e2e.py
         TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_kv_interface_e2e.py
+        TQ_TEST_BACKEND=Yuanrong pytest tests/e2e/test_kv_interface_e2e.py
     """
     return os.environ.get("TQ_TEST_BACKEND", "SimpleStorage")
 

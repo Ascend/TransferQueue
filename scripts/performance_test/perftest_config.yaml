@@ -48,7 +48,17 @@ backend:
 
   # For Yuanrong:
   Yuanrong:
-    # Port of local yuanrong datasystem worker
-    port: 31501
+    # Whether to let TQ automatically init yuanrong
+    auto_init: True
+    # Datasystem worker port
+    worker_port: 31501
+    # Metastore service port
+    metastore_port: 2379
     # If enable npu transport
     enable_yr_npu_transport: true
+    # Additional config for yuanrong worker.
+    # Recommended options for NPU environments:
+    #   --remote_h2d_device_ids       Enable RH2D for efficient cross-node data transfer. Specify NPU device IDs (comma-separated).
+    #   --enable_huge_tlb             Enable huge page memory to improve performance. Required for >21GB shared memory on 910B.
+    # Example: "--shared_memory_size_mb 16384 --remote_h2d_device_ids 0,1,2,3 --enable_huge_tlb true"
+    worker_args: "--shared_memory_size_mb 65536 --remote_h2d_device_ids 0 --enable_huge_tlb true"

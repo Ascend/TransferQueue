@@ -25,7 +25,7 @@ from transfer_queue.storage.clients.yuanrong_client import YuanrongStorageClient
 
 class Test(unittest.TestCase):
     def setUp(self):
-        self.cfg = {"host": "127.0.0.1", "port": 31501, "device_id": 0}
+        self.cfg = {"worker_port": 31501, "device_id": 0}
 
     @pytest.mark.skipif(find_spec("datasystem") is None, reason="datasystem is not available")
     def test_create_client(self):

@@ -16,10 +16,7 @@
 import logging
 import math
 import os
-import shutil
-import socket
 import subprocess
-import tempfile
 import time
 from importlib import resources
 from typing import Any, Optional
@@ -38,6 +35,10 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.simple_backend import SimpleStorageUnit
 from transfer_queue.utils.common import get_placement_group
+from transfer_queue.utils.yuanrong_utils import (
+    cleanup_yuanrong_resources,
+    initialize_yuanrong_backend,
+)
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = logging.getLogger(__name__)
@@ -187,129 +188,8 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         f"Output:\n{error_msg}"
                     )
                 _TRANSFER_QUEUE_STORAGE["MooncakeStore"] = process
-        if conf.backend.storage_backend == "Yuanrong":
-            if conf.backend.Yuanrong.auto_init:
-                etcd_process = None
-                etcd_data_dir = None
-                worker_address = None
-                if not shutil.which("etcd"):
-                    raise RuntimeError(
-                        "etcd executable not found in PATH. Please install etcd and make sure it's in the PATH."
-                    )
-                if not shutil.which("dscli"):
-                    raise RuntimeError(
-                        "dscli executable not found in PATH. Please run `pip install openyuanrong-datasystem`."
-                    )
-                try:
-                    # ========== Start etcd ==========
-                    etcd_address = "127.0.0.1:2379"
-                    try:
-                        etcd_address = conf.backend.Yuanrong.etcd_address
-                    except Exception:
-                        pass
-
-                    # Assume host:port format
-                    parts = etcd_address.split(":")
-                    if len(parts) != 2:
-                        raise ValueError(f"Invalid etcd_address format: {etcd_address}. Expected host:port")
-                    host = parts[0]
-                    port = int(parts[1])
-
-                    # Create temporary data directory
-                    etcd_data_dir = tempfile.mkdtemp(prefix="tq_etcd_")
-                    logger.info(f"Starting etcd with data directory: {etcd_data_dir}")
-
-                    cmd = [
-                        "etcd",
-                        f"--data-dir={etcd_data_dir}",
-                        f"--listen-client-urls=http://{host}:{port}",
-                        f"--advertise-client-urls=http://{host}:{port}",
-                    ]
-
-                    etcd_process = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True,
-                        start_new_session=True,
-                    )
-                    time.sleep(3)  # Wait for etcd to start
-
-                    if etcd_process.poll() is None:
-                        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        sock.settimeout(2)
-                        result = sock.connect_ex((host, port))
-                        sock.close()
-                        if result != 0:
-                            raise RuntimeError(f"etcd process started but not listening on {host}:{port}")
-                    else:
-                        raise RuntimeError(f"etcd exited immediately with return code {etcd_process.returncode}")
-
-                    logger.info(f"etcd started, PID: {etcd_process.pid}")
-                    time.sleep(2)
-
-                    # ========== Start datasystem worker ==========
-                    # Assume host:port format
-                    worker_host = conf.backend.Yuanrong.host
-                    worker_port = conf.backend.Yuanrong.port
-                    worker_address = worker_host + ":" + str(worker_port)
-
-                    cmd = [
-                        "dscli",
-                        "start",
-                        "-w",
-                        "--worker_address",
-                        worker_address,
-                        "--etcd_address",
-                        etcd_address,
-                    ]
-
-                    try:
-                        ds_result = subprocess.run(
-                            cmd,
-                            stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT,
-                            text=True,
-                            timeout=90,
-                        )
-                    except subprocess.TimeoutExpired as err:
-                        raise RuntimeError(f"dscli start timed out: {err}") from err
-                    # Wait for dscli to start and exit (it starts worker and exits)
-                    if ds_result.returncode == 0 and "[  OK  ]" in ds_result.stdout:
-                        logger.info(f"dscli started Yuanrong datasystem worker at {worker_address} successfully.")
-
-                    else:
-                        raise RuntimeError(
-                            f"Failed to start datasystem worker at {worker_address}. "
-                            f"Return code: {ds_result.returncode}, Output: {ds_result.stdout}"
-                        )
-
-                    # Store processes and data directory
-                    _TRANSFER_QUEUE_STORAGE["Yuanrong"] = {
-                        "etcd": etcd_process,
-                        "etcd_data_dir": etcd_data_dir,
-                        "worker_address": worker_address,
-                        "etcd_address": etcd_address,
-                    }
-                    logger.info("Yuanrong backend (etcd + datasystem) started successfully.")
-
-                except Exception as e:
-                    # Clean up on failure
-                    if etcd_process is not None and etcd_process.poll() is None:
-                        etcd_process.terminate()
-                        try:
-                            etcd_process.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            etcd_process.kill()
-                            etcd_process.wait()
-                    if etcd_data_dir is not None:
-                        try:
-                            shutil.rmtree(etcd_data_dir, ignore_errors=True)
-                        except Exception:
-                            pass
-                    raise RuntimeError(f"Failed to start Yuanrong backend: {e}") from e
+        if conf.backend.storage_backend == "Yuanrong" and conf.backend.Yuanrong.auto_init:
+            _TRANSFER_QUEUE_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
     return conf
 
 
@@ -335,6 +215,7 @@ def _init_from_existing() -> bool:
         conf = ray.get(_TRANSFER_QUEUE_CONTROLLER.get_config.remote())
         if conf is not None:
             _maybe_create_transferqueue_client(conf)
+
             logger.info("TransferQueueClient initialized.")
             return True
 
@@ -475,51 +356,7 @@ def close():
                         except Exception:
                             pass
                 elif key == "Yuanrong":
-                    # Stop etcd process and clean up data directory, stop datasystem worker via dscli
-                    if isinstance(value, dict):
-                        etcd_process = value.get("etcd")
-                        etcd_data_dir = value.get("etcd_data_dir")
-                        worker_address = value.get("worker_address")
-
-                        # Stop etcd if running
-                        if etcd_process is not None and etcd_process.poll() is None:
-                            etcd_process.terminate()
-                            try:
-                                etcd_process.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                etcd_process.kill()
-                                etcd_process.wait()
-
-                        # Clean up etcd data directory
-                        if etcd_data_dir is not None and os.path.exists(etcd_data_dir):
-                            try:
-                                shutil.rmtree(etcd_data_dir, ignore_errors=True)
-                                logger.info(f"Cleaned up etcd data directory: {etcd_data_dir}")
-                            except Exception as e:
-                                logger.warning(f"Failed to clean up etcd data directory {etcd_data_dir}: {e}")
-
-                        # Stop datasystem worker via dscli command
-                        if worker_address:
-                            try:
-                                result = subprocess.run(
-                                    ["dscli", "stop", "--worker_address", worker_address],
-                                    timeout=90,
-                                    capture_output=True,
-                                )
-                                if result.returncode == 0:
-                                    logger.info(f"Stopped datasystem worker at {worker_address} via dscli stop")
-                                else:
-                                    error_msg = (result.stderr or result.stdout or b"").decode()
-                                    logger.warning(
-                                        f"Failed to stop datasystem worker at {worker_address}. "
-                                        f"Return code: {result.returncode}, Error: {error_msg}"
-                                    )
-                            except subprocess.TimeoutExpired as err:
-                                logger.warning(f"dscli stop timed out for {worker_address}: {err}")
-                            except Exception as e:
-                                logger.warning(f"Failed to stop datasystem worker via dscli: {e}")
-                    else:
-                        logger.warning(f"Unexpected Yuanrong storage value: {value}")
+                    cleanup_yuanrong_resources(value)
                 else:
                     logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
 

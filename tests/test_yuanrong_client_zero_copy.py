@@ -46,7 +46,7 @@ class TestYuanrongKVClientZCopy:
 
     @pytest.fixture
     def storage_client(self, mock_kv_client):
-        return GeneralKVClientAdapter({"host": "127.0.0.1", "port": 31501})
+        return GeneralKVClientAdapter({"worker_port": 31501})
 
     def test_mset_mget_p2p(self, storage_client, mocker):
         # Mock serialization/deserialization
