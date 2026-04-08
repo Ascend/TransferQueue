@@ -542,7 +542,7 @@ class TestPackFieldValues:
     def test_uniform_tensors_to_stack(self):
         """Same-shape tensors → torch.stack."""
         values = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
-        result = AsyncSimpleStorageManager._pack_field_values(values)
+        result = AsyncSimpleStorageManager._pack_field_values(values)  # type: ignore[attr-defined]
         assert isinstance(result, torch.Tensor)
         assert not result.is_nested
         assert result.shape == (2, 2)
@@ -550,13 +550,37 @@ class TestPackFieldValues:
     def test_variable_length_tensors_to_nested(self):
         """Different-shape tensors → nested tensor."""
         values = [torch.tensor([1.0]), torch.tensor([2.0, 3.0])]
-        result = AsyncSimpleStorageManager._pack_field_values(values)
+        result = AsyncSimpleStorageManager._pack_field_values(values)  # type: ignore[attr-defined]
         assert isinstance(result, torch.Tensor)
         assert result.is_nested
 
     def test_non_tensors_to_nontensorstack(self):
         """Non-tensor values → NonTensorStack."""
         values = ["hello", "world"]
-        result = AsyncSimpleStorageManager._pack_field_values(values)
+        result = AsyncSimpleStorageManager._pack_field_values(values)  # type: ignore[attr-defined]
         assert isinstance(result, NonTensorStack)
         assert result.tolist() == ["hello", "world"]
+
+    def test_mixed_tensors_and_none_to_nontensorstack(self):
+        """Mixed tensor + None values should stay as NonTensorStack (no stacking)."""
+        t0 = torch.tensor([1.0, 2.0])
+        t2 = torch.tensor([3.0, 4.0])
+        values = [t0, None, t2]
+
+        result = AsyncSimpleStorageManager._pack_field_values(values)  # type: ignore[attr-defined]
+
+        assert isinstance(result, NonTensorStack)
+        unpacked = result.tolist()
+        assert len(unpacked) == 3
+        assert torch.equal(unpacked[0], t0)
+        assert unpacked[1] is None
+        assert torch.equal(unpacked[2], t2)
+
+    def test_all_none_to_nontensorstack(self):
+        """All-None values should be preserved in NonTensorStack."""
+        values = [None, None]
+
+        result = AsyncSimpleStorageManager._pack_field_values(values)  # type: ignore[attr-defined]
+
+        assert isinstance(result, NonTensorStack)
+        assert result.tolist() == [None, None]

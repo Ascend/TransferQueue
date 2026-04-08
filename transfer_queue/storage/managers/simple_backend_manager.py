@@ -406,7 +406,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
         non_none = [v for v in values if v is not None]
         if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
-            if not any(v is None for v in values):
+            if len(non_none) == len(values):
                 # Pure tensor list — try stacking / nested tensor
                 if all(v.shape == values[0].shape for v in values):
                     return torch.stack(values)
