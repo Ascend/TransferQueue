@@ -31,7 +31,7 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
 
 <h2 id="updates">🔄 Updates</h2>
 
-- **April 10, 2026**: 🔥 TransferQueue is now officially integrated into [verl](https://github.com/verl-project/verl/pull/5401)! <span style="color: #FF0000;">**We achieved an end-to-end performance gain of **49.1%** for multi-modal post-training on a 128 × H100 GPU cluster!**</span> Refer to [our blog](https://www.yuque.com/haomingzi-lfse7/lhp4el/gm8mkpfu83luuhxg?singleDoc#) for more details.
+- **April 10, 2026**: 🔥 TransferQueue is now officially integrated into [verl](https://github.com/verl-project/verl/pull/5401)! <span style="color: #FF0000;">**We achieved an end-to-end performance gain of 49.1% for multi-modal post-training on a 128 × H100 GPU cluster!**</span> Refer to [our blog](https://www.yuque.com/haomingzi-lfse7/lhp4el/gm8mkpfu83luuhxg?singleDoc#) for more details.
  - **Feb 8, 2026**: 🔥 Initialization and usage are greatly simplified by high-level APIs [PR#26](https://github.com/Ascend/TransferQueue/pull/26), [PR#28](https://github.com/Ascend/TransferQueue/pull/28). You can now use a Redis-style API to take advantage of most of the advanced features provided by TransferQueue!
  - **Jan 28, 2026**: We experimentally introduce the `StreamingDataLoader` interface for a fully-streamed production-consumption pipeline. Refer to our [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for details.
  - **Dec 30, 2025**: **TransferQueue x verl** integration has been tested with the DAPO algorithm at scale **(64 nodes, 1024 cards)**. It significantly optimizes host memory utilization and accelerates data transfers. Stay tuned for more details!
@@ -40,7 +40,7 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
  - **Nov 5, 2025**: We provide a `KVStorageManager` that simplifies the integration with KV-based storage backends [PR#96](https://github.com/TransferQueue/TransferQueue/pull/96). The first available KV-based backend is [Yuanrong](https://gitcode.com/openeuler/yuanrong-datasystem).
  - **Nov 4, 2025**: Data partitioning capability is available in [PR#98](https://github.com/TransferQueue/TransferQueue/pull/98). Now you can define logical data partitions to manage your train/val/test datasets.
  - **Oct 25, 2025**: Storage backends are now pluggable in [PR#66](https://github.com/TransferQueue/TransferQueue/pull/66). You can try to integrate your own storage backend with TransferQueue now!
- - **Oct 21, 2025**: Early integration with verl is ready [verl/pulls/3649](https://github.com/volcengine/verl/pull/3649). Following PRs will optimize the single controller architecture by fully decoupling data & control flows.
+ - **Oct 21, 2025**: Early integration with verl is ready [verl/pull/3649](https://github.com/volcengine/verl/pull/3649). Following PRs will optimize the single controller architecture by fully decoupling data & control flows.
  - **July 22, 2025**: We published a series of Chinese blog posts on <a href="https://zhuanlan.zhihu.com/p/1930244241625449814">Zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/1933259599953232589">2</a>.
  - **July 21, 2025**: We initiated an RFC in the verl community [verl/RFC#2662](https://github.com/volcengine/verl/discussions/2662).
  - **July 2, 2025**: We published the paper [AsyncFlow](https://arxiv.org/abs/2507.01663).
@@ -154,7 +154,7 @@ The primary motivation for integrating TransferQueue into verl is to **alleviate
   <img src="https://raw.githubusercontent.com/wuxibin89/verl/refs/heads/wuxibin/doc_images/docs/_static/transfer_queue.png" width="100%">
 </p>
 
-Official integration with verl is available at [verl/pulls/5401](https://github.com/verl-project/verl/pull/5401), with the design doc at [[RFC] PPOTrainer with TransferQueue Integration](https://github.com/verl-project/verl/issues/5400). You may also refer to our [recipe](https://github.com/Ascend/TransferQueue/blob/main/recipe/simple_use_case/single_controller_demo.py), where we mimic verl usage in a high-level manner. 
+Official integration with verl is available at [verl/pull/5401](https://github.com/verl-project/verl/pull/5401), with the design doc at [[RFC] PPOTrainer with TransferQueue Integration](https://github.com/verl-project/verl/issues/5400). You may also refer to our [recipe](https://github.com/Ascend/TransferQueue/blob/main/recipe/simple_use_case/single_controller_demo.py), where we mimic verl usage in a high-level manner. 
 
 
 ### Disaggregated Example
