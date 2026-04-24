@@ -429,6 +429,23 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     ray.get(_TRANSFER_QUEUE_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
 
+    # start Prometheus metrics exporter if enabled
+    metrics_enabled = final_conf.get("metrics", {}).get("enabled", False)
+    if not metrics_enabled:
+        # Also check environment variable as a convenience override
+        metrics_enabled = os.environ.get("TQ_METRICS_ENABLED", "false").lower() == "true"
+    if metrics_enabled:
+        metrics_endpoint = ray.get(_TRANSFER_QUEUE_CONTROLLER.start_metrics.remote())
+        final_conf.metrics.endpoint = metrics_endpoint
+        # Update stored config so other processes can discover the endpoint
+        ray.get(_TRANSFER_QUEUE_CONTROLLER.store_config.remote(final_conf))
+        # Register storage units for metrics collection (SimpleStorage only)
+        if final_conf.backend.storage_backend == "SimpleStorage":
+            storage_zmq_info = final_conf.backend.SimpleStorage.get("zmq_info")
+            if storage_zmq_info:
+                ray.get(_TRANSFER_QUEUE_CONTROLLER.register_storage_units_for_metrics.remote(storage_zmq_info))
+        logger.info(f"Prometheus metrics endpoint: http://{metrics_endpoint}/metrics")
+
     # create client
     _maybe_create_transferqueue_client(final_conf)
     return final_conf
@@ -543,6 +560,31 @@ def close():
         ray.kill(controller)
     except Exception:
         pass
+
+
+# ==================== Metrics API ====================
+def get_metrics_endpoint() -> Optional[str]:
+    """Return the Prometheus metrics endpoint address (``host:port``), or *None* if metrics are disabled.
+
+    Works from any process — the endpoint is stored in the Controller's config
+    so that processes joining via ``_init_from_existing()`` can discover it too.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init({"metrics": {"enabled": True}})
+        >>> endpoint = tq.get_metrics_endpoint()
+        >>> print(endpoint)   # e.g. "10.0.1.42:38271"
+        >>> # Use endpoint to register Prometheus scrape target
+    """
+    global _TRANSFER_QUEUE_CONTROLLER
+    if _TRANSFER_QUEUE_CONTROLLER is None:
+        _init_from_existing()
+    if _TRANSFER_QUEUE_CONTROLLER is None:
+        return None
+    conf = ray.get(_TRANSFER_QUEUE_CONTROLLER.get_config.remote())
+    if conf is None:
+        return None
+    return conf.get("metrics", {}).get("endpoint", None)
 
 
 # ==================== High-Level KV Interface API ====================

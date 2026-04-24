@@ -26,6 +26,7 @@ from .interface import (
     async_kv_put,
     close,
     get_client,
+    get_metrics_endpoint,
     init,
     kv_batch_get,
     kv_batch_get_by_meta,
@@ -46,6 +47,7 @@ __all__ = (
         # High-Level KV Interface
         "init",
         "close",
+        "get_metrics_endpoint",
         "kv_put",
         "kv_batch_put",
         "kv_batch_get",
