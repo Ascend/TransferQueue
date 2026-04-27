@@ -1,0 +1,22 @@
+controller:
+  sampler: SequentialSampler
+  polling_mode: False
+  zmq_info: null
+
+backend:
+  storage_backend: MooncakeStore
+
+  MooncakeStore:
+    auto_init: true
+    metadata_server: localhost:50050
+    master_server_address: localhost:50051
+    local_hostname: ""
+    protocol: rdma
+    global_segment_size: 86294967296
+    local_buffer_size: 86294967296
+    device_name: ""
+    # GDR (GPU Direct RDMA): bypass CPU staging for GPU tensors
+    use_gdr: false
+    # Target GPU device for GDR GET path (null = use current CUDA device)
+    gdr_target_device: null
+    gdr_buffer_size: 1073741824

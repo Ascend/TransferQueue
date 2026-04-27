@@ -42,6 +42,15 @@ backend:
     local_buffer_size: 1073741824
     # Network device name. Set to "" to let Mooncake to auto-picks devices
     device_name: ""
+    # GDR (GPU Direct RDMA): bypass CPU staging for GPU tensors.
+    # Requires nvidia_peermem kernel module and CUDA-enabled mooncake build.
+    use_gdr: false
+    # Target GPU device for GDR GET path (null = use current CUDA device)
+    gdr_target_device: null
+    # Size of the pre-registered GPU staging buffer in bytes (default: 1GB).
+    # Tensors are D2D-copied into this buffer before RDMA to avoid per-tensor
+    # ibv_reg_mr overhead. Increase if single tensors exceed this size.
+    gdr_buffer_size: 1073741824
 
   # For RayStore:
   RayStore:
