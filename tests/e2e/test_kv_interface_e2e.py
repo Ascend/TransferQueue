@@ -212,7 +212,6 @@ class TestKVPutE2E:
         expected = torch.tensor([[1, 2, 3, 4]])  # unsqueezed
         assert_tensor_equal(retrieved["data"], expected)
 
-        # delete the key (MooncakeStore does not support updating existing key, so we need to clear it before next test)
         tq_api.kv_clear(keys=key, partition_id=partition_id)
 
     def test_kv_put_with_tensordict_fields(self, controller, tq_api):
