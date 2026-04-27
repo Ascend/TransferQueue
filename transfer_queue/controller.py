@@ -1027,6 +1027,10 @@ class TransferQueueController:
         # Connected storage managers tracking
         self._connected_storage_managers: set[str] = set()
 
+        # Prometheus metrics exporter (lazy-initialized when enabled)
+        self._metrics = None
+        self._metrics_endpoint: str = ""
+
         # Start background processing threads
         self._start_process_handshake()
         self._start_process_update_data_status()
@@ -1824,13 +1828,15 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+
             messages = self.request_handle_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
 
             if request_msg.request_type == ZMQRequestType.GET_META:
-                with perf_monitor.measure(op_type="GET_META"):
+                with monitor.measure(op_type="GET_META"):
                     params = request_msg.body
 
                     metadata = self.get_metadata(
@@ -1850,7 +1856,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_PARTITION_META:
-                with perf_monitor.measure(op_type="GET_PARTITION_META"):
+                with monitor.measure(op_type="GET_PARTITION_META"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
                     partition = self._get_partition(partition_id)
@@ -1872,7 +1878,7 @@ class TransferQueueController:
                         body={"metadata": metadata},
                     )
             elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
-                with perf_monitor.measure(op_type="SET_CUSTOM_META"):
+                with monitor.measure(op_type="SET_CUSTOM_META"):
                     params = request_msg.body
                     partition_custom_meta = params["partition_custom_meta"]
 
@@ -1886,7 +1892,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_META:
-                with perf_monitor.measure(op_type="CLEAR_META"):
+                with monitor.measure(op_type="CLEAR_META"):
                     params = request_msg.body
                     global_indexes = params["global_indexes"]
                     partition_ids = params["partition_ids"]
@@ -1901,7 +1907,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_PARTITION:
-                with perf_monitor.measure(op_type="CLEAR_PARTITION"):
+                with monitor.measure(op_type="CLEAR_PARTITION"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
 
@@ -1914,7 +1920,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_CONSUMPTION:
-                with perf_monitor.measure(op_type="GET_CONSUMPTION"):
+                with monitor.measure(op_type="GET_CONSUMPTION"):
                     # Handle consumption status checks
                     params = request_msg.body
 
@@ -1939,7 +1945,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
-                with perf_monitor.measure(op_type="RESET_CONSUMPTION"):
+                with monitor.measure(op_type="RESET_CONSUMPTION"):
                     # Handle reset consumption status request
                     params = request_msg.body
                     partition_id = params["partition_id"]
@@ -1969,7 +1975,7 @@ class TransferQueueController:
                         )
 
             elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
-                with perf_monitor.measure(op_type="GET_PRODUCTION"):
+                with monitor.measure(op_type="GET_PRODUCTION"):
                     # Handle production status checks
                     params = request_msg.body
 
@@ -1989,7 +1995,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_LIST_PARTITIONS:
-                with perf_monitor.measure(op_type="GET_LIST_PARTITIONS"):
+                with monitor.measure(op_type="GET_LIST_PARTITIONS"):
                     # Handle list partitions request
                     partition_ids = self.list_partitions()
                     response_msg = ZMQMessage.create(
@@ -2000,7 +2006,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_META:
-                with perf_monitor.measure(op_type="KV_RETRIEVE_META"):
+                with monitor.measure(op_type="KV_RETRIEVE_META"):
                     params = request_msg.body
                     keys = params["keys"]
                     partition_id = params["partition_id"]
@@ -2015,7 +2021,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_KEYS:
-                with perf_monitor.measure(op_type="KV_RETRIEVE_KEYS"):
+                with monitor.measure(op_type="KV_RETRIEVE_KEYS"):
                     params = request_msg.body
                     global_indexes = params["global_indexes"]
                     partition_id = params["partition_id"]
@@ -2029,7 +2035,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_LIST:
-                with perf_monitor.measure(op_type="KV_LIST"):
+                with monitor.measure(op_type="KV_LIST"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
                     if partition_id is None:
@@ -2067,13 +2073,15 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+
             messages = self.data_status_update_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
 
             if request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
-                with perf_monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
+                with monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
                     message_data = request_msg.body
                     partition_id = message_data.get("partition_id")
 
@@ -2135,3 +2143,33 @@ class TransferQueueController:
             raise TypeError(
                 f"sampler {getattr(sampler, '__name__', repr(sampler))} must be an instance or subclass of BaseSampler"
             )
+
+    # ==================== Metrics API ====================
+
+    def start_metrics(self) -> str:
+        """Initialize and start the Prometheus metrics exporter.
+
+        This creates a ``TQMetricsExporter``, starts an HTTP ``/metrics``
+        endpoint and a background collection thread.  The method is safe
+        to call multiple times -- subsequent calls return the existing endpoint.
+
+        Returns:
+            The metrics endpoint address in ``host:port`` format.
+        """
+        if self._metrics is not None:
+            return self._metrics_endpoint
+        from transfer_queue.metrics import TQMetricsExporter
+
+        self._metrics = TQMetricsExporter(self)
+        self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip)
+        logger.info(f"[{self.controller_id}]: Prometheus metrics exporter started on {self._metrics_endpoint}")
+        return self._metrics_endpoint
+
+    def register_storage_units_for_metrics(self, storage_unit_infos: dict) -> None:
+        """Register storage unit ZMQ endpoints so the metrics collector can query them.
+
+        Args:
+            storage_unit_infos: Mapping of storage unit names/IDs to ``ZMQServerInfo``.
+        """
+        if self._metrics is not None:
+            self._metrics.register_storage_units(storage_unit_infos)
