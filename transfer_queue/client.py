@@ -17,7 +17,7 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import torch
 import zmq
@@ -36,7 +36,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    dynamic_zmq_socket,
+    with_zmq_socket,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,10 +51,10 @@ if not logger.hasHandlers():
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
 # Pre-bound decorator for controller socket operations.
-_controller_socket = dynamic_zmq_socket(
+with_controller_socket = with_zmq_socket(
     "request_handle_socket",
-    owner_id_attr="client_id",
-    server_attr="_controller",
+    get_identity=lambda self: self.client_id,
+    get_peer=lambda self, target: self._controller,
 )
 
 
@@ -104,7 +104,7 @@ class AsyncTransferQueueClient:
         )
 
     # ==================== Basic API ====================
-    @_controller_socket
+    @with_controller_socket
     async def async_get_meta(
         self,
         data_fields: list[str],
@@ -194,7 +194,7 @@ class AsyncTransferQueueClient:
                 f"{response_msg.body.get('message', 'Unknown error')}"
             )
 
-    @_controller_socket
+    @with_controller_socket
     async def async_set_custom_meta(
         self,
         metadata: BatchMeta,
@@ -494,7 +494,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"Error in clear_samples operation: {str(e)}") from e
 
-    @_controller_socket
+    @with_controller_socket
     async def _clear_meta_in_controller(self, metadata: BatchMeta, socket=None):
         """Clear metadata in the controller.
 
@@ -520,7 +520,7 @@ class AsyncTransferQueueClient:
         if response_msg.request_type != ZMQRequestType.CLEAR_META_RESPONSE:
             raise RuntimeError("Failed to clear samples metadata in controller.")
 
-    @_controller_socket
+    @with_controller_socket
     async def _get_partition_meta(self, partition_id: str, socket=None) -> BatchMeta:
         """Get metadata required for the whole partition from controller.
 
@@ -550,7 +550,7 @@ class AsyncTransferQueueClient:
 
         return response_msg.body["metadata"]
 
-    @_controller_socket
+    @with_controller_socket
     async def _clear_partition_in_controller(self, partition_id, socket=None):
         """Clear the whole partition in the controller.
 
@@ -577,7 +577,7 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"Failed to clear partition {partition_id} in controller.")
 
     # ==================== Status Query API ====================
-    @_controller_socket
+    @with_controller_socket
     async def async_get_consumption_status(
         self,
         task_name: str,
@@ -640,7 +640,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_consumption_status: {str(e)}") from e
 
-    @_controller_socket
+    @with_controller_socket
     async def async_get_production_status(
         self,
         data_fields: list[str],
@@ -772,7 +772,7 @@ class AsyncTransferQueueClient:
             return False
         return torch.all(production_status == 1).item()
 
-    @_controller_socket
+    @with_controller_socket
     async def async_reset_consumption(
         self,
         partition_id: str,
@@ -834,7 +834,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in reset_consumption: {str(e)}") from e
 
-    @_controller_socket
+    @with_controller_socket
     async def async_get_partition_list(
         self,
         socket: Optional[zmq.asyncio.Socket] = None,
@@ -880,7 +880,7 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in get_partition_list: {str(e)}") from e
 
     # ==================== KV Interface API ====================
-    @_controller_socket
+    @with_controller_socket
     async def async_kv_retrieve_meta(
         self,
         keys: list[str] | str,
@@ -946,7 +946,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_retrieve_keys: {str(e)}") from e
 
-    @_controller_socket
+    @with_controller_socket
     async def async_kv_retrieve_keys(
         self,
         global_indexes: list[int] | int,
@@ -1009,7 +1009,7 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_retrieve_indexes: {str(e)}") from e
 
-    @_controller_socket
+    @with_controller_socket
     async def async_kv_list(
         self,
         partition_id: Optional[str] = None,
