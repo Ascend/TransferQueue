@@ -351,11 +351,11 @@ def with_zmq_socket(
                 raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
 
             context = zmq.asyncio.Context()
-            address = format_zmq_address(server_info.ip, port)
-            identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-            sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
-
+            sock = None
             try:
+                address = format_zmq_address(server_info.ip, port)
+                identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
+                sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
                 sock.connect(address)
                 if timeout is not None:
                     sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
@@ -363,10 +363,13 @@ def with_zmq_socket(
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
             finally:
-                try:
-                    if not sock.closed:
-                        sock.close(linger=-1)
-                finally:
+                if sock is not None:
+                    try:
+                        if not sock.closed:
+                            sock.close(linger=-1)
+                    finally:
+                        context.term()
+                else:
                     context.term()
 
         return wrapper
