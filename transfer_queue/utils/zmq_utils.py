@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 import socket
 import time
 from dataclasses import dataclass
@@ -29,16 +27,10 @@ import zmq.asyncio
 from ray.util import get_node_ip_address
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, TransferQueueRole
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import decode, encode
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 
 bytestr: TypeAlias = bytes | bytearray | memoryview

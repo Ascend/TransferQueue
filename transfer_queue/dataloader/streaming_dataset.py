@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
 import time
 import uuid
@@ -25,19 +24,13 @@ from torch.utils.data import IterableDataset
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.utils.logging_utils import get_logger
 
 TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL = float(
     os.environ.get("TQ_STREAMING_DATASET_EMPTY_BATCH_SLEEP_INTERVAL", 1)
 )  # in seconds
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 
 class StreamingDataset(IterableDataset):

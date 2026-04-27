@@ -15,7 +15,6 @@
 
 import asyncio
 import itertools
-import logging
 import os
 import time
 import weakref
@@ -34,16 +33,10 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 # ZMQ timeouts (in seconds) and retry configurations
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))

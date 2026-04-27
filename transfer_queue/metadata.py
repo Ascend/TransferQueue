@@ -16,8 +16,6 @@
 import copy
 import dataclasses
 import itertools
-import logging
-import os
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -27,14 +25,9 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+from transfer_queue.utils.logging_utils import get_logger
 
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------

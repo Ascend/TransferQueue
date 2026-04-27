@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import logging
 import os
 import threading
 from typing import Any, Callable, Optional
@@ -32,6 +31,7 @@ from transfer_queue.storage import (
     TransferQueueStorageManagerFactory,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -39,14 +39,7 @@ from transfer_queue.utils.zmq_utils import (
     with_zmq_socket,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import math
 import os
 import subprocess
@@ -35,14 +34,14 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.simple_backend import SimpleStorageUnit
 from transfer_queue.utils.common import get_placement_group
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import (
     cleanup_yuanrong_resources,
     initialize_yuanrong_backend,
 )
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 _TRANSFER_QUEUE_CLIENT: Any = None
 _TRANSFER_QUEUE_STORAGE: Any = None

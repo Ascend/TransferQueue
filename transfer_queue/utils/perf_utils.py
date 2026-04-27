@@ -13,20 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.INFO))
+from transfer_queue.utils.logging_utils import get_logger
 
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__, default_level="INFO")
 
 TQ_PERF_LOG_FLUSH_INTERVAL = float(os.environ.get("TQ_PERF_LOG_FLUSH_INTERVAL", 300))  # in seconds
 

@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 import struct
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
@@ -25,11 +23,11 @@ from torch import Tensor
 
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import _decoder, _encoder
 from transfer_queue.utils.yuanrong_utils import find_reachable_host
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+logger = get_logger(__name__)
 
 
 YUANRONG_DATASYSTEM_IMPORTED: bool = True

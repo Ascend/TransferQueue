@@ -13,18 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-import os
 from enum import Enum
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+from transfer_queue.utils.logging_utils import get_logger
 
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 
 class ExplicitEnum(str, Enum):

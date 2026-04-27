@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
 import time
 import weakref
@@ -26,6 +25,7 @@ import zmq
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -37,14 +37,7 @@ from transfer_queue.utils.zmq_utils import (
     get_node_ip_address_raw,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler (for Ray Actor subprocess)
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))

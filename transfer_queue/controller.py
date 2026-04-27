@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import copy
-import logging
 import os
 import time
 from collections import defaultdict
@@ -37,6 +36,7 @@ from transfer_queue.metadata import (
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -48,14 +48,7 @@ from transfer_queue.utils.zmq_utils import (
     get_node_ip_address_raw,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler (for Ray Actor subprocess)
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))

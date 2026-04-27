@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import logging
 import os
 import warnings
 from collections import defaultdict
@@ -30,6 +29,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import TransferQueueStorageManager
 from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -37,14 +37,7 @@ from transfer_queue.utils.zmq_utils import (
     with_zmq_socket,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
-
-# Ensure logger has a handler
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
+logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
