@@ -18,7 +18,7 @@ import os
 import time
 from contextlib import contextmanager
 from threading import Thread
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 import psutil
@@ -32,9 +32,6 @@ from transfer_queue.utils.zmq_utils import (
     create_zmq_socket,
     format_zmq_address,
 )
-
-if TYPE_CHECKING:
-    from transfer_queue.controller import TransferQueueController
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.INFO))
@@ -50,17 +47,27 @@ TQ_METRICS_STORAGE_TIMEOUT = int(os.environ.get("TQ_METRICS_STORAGE_TIMEOUT", 5)
 
 
 class TQMetricsExporter:
-    """Prometheus metrics exporter embedded in TransferQueueController.
+    """Prometheus metrics exporter for TransferQueue.
 
     Exposes an HTTP ``/metrics`` endpoint for Prometheus scraping and periodically
-    collects internal statistics from the Controller (in-process) and from
-    SimpleStorageUnit instances (via ZMQ ``GET_METRICS`` requests).
+    updates Prometheus gauges from a *snapshot* dict pushed by the controller.
+
+    **Decoupling strategy** — the exporter never accesses controller internals
+    directly.  Instead, the controller calls ``update_controller_snapshot()``
+    periodically (from its own thread) to hand over a plain ``dict`` that the
+    background collection thread reads.  This eliminates:
+
+    * Lock contention between the metrics thread and controller request threads.
+    * Risk of reading tensors that are being resized concurrently.
+
+    Storage-unit metrics are still collected via ZMQ (already process-isolated).
 
     Lifecycle:
         1. Created by ``TransferQueueController.start_metrics()`` when metrics are enabled.
         2. ``start()`` launches the HTTP server and a background collection thread.
-        3. The collection thread calls ``collect_controller_metrics`` and
-           ``collect_storage_metrics`` every ``TQ_METRICS_COLLECT_INTERVAL`` seconds.
+        3. The controller calls ``update_controller_snapshot()`` on its own cadence.
+        4. The collection thread calls ``collect_controller_metrics`` (reads snapshot)
+           and ``collect_storage_metrics`` every ``TQ_METRICS_COLLECT_INTERVAL`` seconds.
 
     Environment variables:
         TQ_METRICS_PORT              HTTP port for /metrics (default 0 = auto-assign free port)
@@ -68,8 +75,7 @@ class TQMetricsExporter:
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
 
-    def __init__(self, controller: "TransferQueueController"):
-        self._controller = controller
+    def __init__(self):
         self._start_time = time.time()
         self._process = psutil.Process()
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
@@ -78,6 +84,11 @@ class TQMetricsExporter:
         self._known_partition_ids: set[str] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
         self._metrics_endpoint: str = ""
+
+        # Plain-dict snapshot pushed by the controller via update_controller_snapshot().
+        # Dict reference assignment is atomic under the GIL, so no lock is needed.
+        self._controller_snapshot: dict[str, Any] = {}
+
         self.registry = CollectorRegistry()
         self._define_metrics()
 
@@ -158,30 +169,49 @@ class TQMetricsExporter:
     def measure(self, op_type: str):
         """Context manager that records request count and latency for *op_type*.
 
+        Prometheus errors are caught and logged so that metrics failures never
+        block or crash the controller's request processing loop.
+
         Usage::
 
             with metrics.measure("GET_META"):
                 result = self.get_metadata(...)
         """
-        self.request_total.labels(op_type=op_type).inc()
+        try:
+            self.request_total.labels(op_type=op_type).inc()
+        except Exception:
+            logger.debug(f"Metrics: failed to increment counter for {op_type}", exc_info=True)
         start = time.perf_counter()
         try:
             yield
         except Exception:
-            self.request_errors_total.labels(op_type=op_type).inc()
+            try:
+                self.request_errors_total.labels(op_type=op_type).inc()
+            except Exception:
+                logger.debug(f"Metrics: failed to increment error counter for {op_type}", exc_info=True)
             raise
         finally:
             elapsed = time.perf_counter() - start
-            self.request_duration.labels(op_type=op_type).observe(elapsed)
+            try:
+                self.request_duration.labels(op_type=op_type).observe(elapsed)
+            except Exception:
+                logger.debug(f"Metrics: failed to observe duration for {op_type}", exc_info=True)
 
     def register_storage_units(self, storage_unit_infos: dict[str, ZMQServerInfo]) -> None:
         """Register SimpleStorageUnit ZMQ endpoints for metrics collection."""
         self._storage_unit_infos.update(storage_unit_infos)
         logger.info(f"Metrics exporter registered {len(storage_unit_infos)} storage units")
 
+    def update_controller_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Replace the controller metrics snapshot (called from the controller thread).
+
+        The snapshot is a plain dict with no references to live controller objects,
+        so the metrics thread can read it without risk of concurrent mutation.
+        """
+        self._controller_snapshot = snapshot
+
     def collect_controller_metrics(self) -> None:
-        """Collect metrics from the Controller's in-memory state."""
-        ctrl = self._controller
+        """Update Prometheus gauges from the latest controller snapshot."""
 
         # Process-level
         self.controller_uptime.set(time.time() - self._start_time)
@@ -190,15 +220,13 @@ class TQMetricsExporter:
         except Exception:
             pass
 
-        # Partition-level — iterate over a snapshot to avoid RuntimeError
-        # if partitions dict is mutated concurrently.
-        partitions_snapshot = list(ctrl.partitions.items())
-        current_pids = {pid for pid, _ in partitions_snapshot}
+        snapshot = self._controller_snapshot
+        partitions = snapshot.get("partitions", {})
+        current_pids = set(partitions.keys())
         current_consumption_labels: set[tuple[str, str]] = set()
         self.partitions_total.set(len(current_pids))
 
-        for pid, partition in partitions_snapshot:
-            stats = partition.get_statistics()
+        for pid, stats in partitions.items():
             self.partition_samples.labels(partition_id=pid).set(stats["total_samples_num"])
             self.partition_production_progress.labels(partition_id=pid).set(stats.get("production_progress", 0))
 
@@ -227,8 +255,8 @@ class TQMetricsExporter:
         self._known_consumption_labels = current_consumption_labels
 
         # Index manager
-        self.global_index_allocated.set(len(ctrl.index_manager.allocated_indexes))
-        self.global_index_reusable.set(len(ctrl.index_manager.reusable_indexes))
+        self.global_index_allocated.set(snapshot.get("global_index_allocated", 0))
+        self.global_index_reusable.set(snapshot.get("global_index_reusable", 0))
 
     def collect_storage_metrics(self) -> None:
         """Query each registered SimpleStorageUnit for metrics via ZMQ."""

@@ -2146,6 +2146,43 @@ class TransferQueueController:
 
     # ==================== Metrics API ====================
 
+    def _build_metrics_snapshot(self) -> dict:
+        """Build a plain-dict snapshot of controller state for the metrics exporter.
+
+        The snapshot contains only primitive / dict values — no references to
+        live controller objects — so the metrics thread can read it safely.
+        """
+        partitions_data: dict = {}
+        for pid, partition in list(self.partitions.items()):
+            try:
+                stats = partition.get_statistics()
+                partitions_data[pid] = {
+                    "total_samples_num": stats["total_samples_num"],
+                    "production_progress": stats.get("production_progress", 0),
+                    "consumption_statistics": {
+                        task_name: {"consumption_progress": cstats.get("consumption_progress", 0)}
+                        for task_name, cstats in stats.get("consumption_statistics", {}).items()
+                    },
+                }
+            except Exception:
+                pass
+
+        return {
+            "partitions": partitions_data,
+            "global_index_allocated": len(self.index_manager.allocated_indexes),
+            "global_index_reusable": len(self.index_manager.reusable_indexes),
+        }
+
+    def _push_metrics_snapshot(self) -> None:
+        """Push a fresh metrics snapshot to the exporter (called from controller threads)."""
+        if self._metrics is None:
+            return
+        try:
+            snapshot = self._build_metrics_snapshot()
+            self._metrics.update_controller_snapshot(snapshot)
+        except Exception as e:
+            logger.debug(f"[{self.controller_id}]: Failed to push metrics snapshot: {e}")
+
     def start_metrics(self) -> str:
         """Initialize and start the Prometheus metrics exporter.
 
@@ -2160,10 +2197,26 @@ class TransferQueueController:
             return self._metrics_endpoint
         from transfer_queue.metrics import TQMetricsExporter
 
-        self._metrics = TQMetricsExporter(self)
+        self._metrics = TQMetricsExporter()
         self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip)
+        # Launch a daemon thread that periodically pushes controller state
+        # snapshots to the exporter, keeping them process-isolated.
+        self._metrics_snapshot_thread = Thread(
+            target=self._metrics_snapshot_loop,
+            name="TQMetricsSnapshotThread",
+            daemon=True,
+        )
+        self._metrics_snapshot_thread.start()
         logger.info(f"[{self.controller_id}]: Prometheus metrics exporter started on {self._metrics_endpoint}")
         return self._metrics_endpoint
+
+    def _metrics_snapshot_loop(self) -> None:
+        """Periodically push a metrics snapshot to the exporter."""
+        from transfer_queue.metrics import TQ_METRICS_COLLECT_INTERVAL
+
+        while True:
+            self._push_metrics_snapshot()
+            time.sleep(TQ_METRICS_COLLECT_INTERVAL)
 
     def register_storage_units_for_metrics(self, storage_unit_infos: dict) -> None:
         """Register storage unit ZMQ endpoints so the metrics collector can query them.

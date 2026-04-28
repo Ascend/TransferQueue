@@ -16,7 +16,6 @@
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -32,54 +31,35 @@ pytestmark = pytest.mark.skipif(not _HAS_DEPS, reason="prometheus_client / psuti
 
 
 # ---------------------------------------------------------------------------
-# Helpers — lightweight fakes that satisfy TQMetricsExporter without Ray
+# Helpers — build snapshot dicts that TQMetricsExporter.update_controller_snapshot expects
 # ---------------------------------------------------------------------------
 
 
-def _make_fake_partition(
-    partition_id: str,
+def _make_partition_snapshot(
     total_samples: int = 10,
-    total_fields: int = 2,
-    allocated_samples: int = 16,
     produced_ratio: float = 0.5,
     consumption: dict | None = None,
-):
-    """Return an object that mimics ``DataPartitionStatus.get_statistics()``."""
+) -> dict:
+    """Return a partition snapshot dict."""
     consumption_stats = {}
     if consumption:
         for task, progress in consumption.items():
-            consumption_stats[task] = {
-                "consumed_samples": int(total_samples * progress),
-                "consumption_progress": progress,
-            }
+            consumption_stats[task] = {"consumption_progress": progress}
 
-    stats = {
-        "partition_id": partition_id,
-        "created_at": time.time(),
+    return {
         "total_samples_num": total_samples,
-        "total_fields_num": total_fields,
-        "allocated_samples_num": allocated_samples,
-        "allocated_fields_num": total_fields,
-        "registered_tasks": list((consumption or {}).keys()),
-        "produced_samples": int(total_samples * produced_ratio),
         "production_progress": produced_ratio,
-        "field_statistics": {},
         "consumption_statistics": consumption_stats,
     }
 
-    partition = MagicMock()
-    partition.get_statistics.return_value = stats
-    return partition
 
-
-def _make_fake_controller(partitions=None, allocated=10, reusable=2):
-    """Return a lightweight stand-in for ``TransferQueueController``."""
-    ctrl = SimpleNamespace()
-    ctrl.partitions = partitions or {}
-    ctrl.index_manager = SimpleNamespace()
-    ctrl.index_manager.allocated_indexes = set(range(allocated))
-    ctrl.index_manager.reusable_indexes = list(range(reusable))
-    return ctrl
+def _make_snapshot(partitions=None, allocated=10, reusable=2) -> dict:
+    """Return a controller metrics snapshot dict."""
+    return {
+        "partitions": partitions or {},
+        "global_index_allocated": allocated,
+        "global_index_reusable": reusable,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -90,8 +70,7 @@ def _make_fake_controller(partitions=None, allocated=10, reusable=2):
 class TestMetricDefinitions:
     def test_all_metrics_are_registered(self):
         """Verify that all expected metric families exist in the exporter's registry."""
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         expected_prefixes = [
             "tq_controller_uptime_seconds",
@@ -123,9 +102,9 @@ class TestMetricDefinitions:
 
 class TestControllerMetricsCollection:
     def test_collect_empty_controller(self):
-        """Collect metrics from a controller with no partitions — should not raise."""
-        ctrl = _make_fake_controller(partitions={}, allocated=0, reusable=0)
-        exporter = TQMetricsExporter(ctrl)
+        """Collect metrics from an empty snapshot — should not raise."""
+        exporter = TQMetricsExporter()
+        exporter.update_controller_snapshot(_make_snapshot(partitions={}, allocated=0, reusable=0))
         exporter.collect_controller_metrics()
 
         assert exporter.partitions_total._value.get() == 0
@@ -134,15 +113,12 @@ class TestControllerMetricsCollection:
 
     def test_collect_with_partitions(self):
         """Partition-level metrics are populated correctly."""
-        p1 = _make_fake_partition(
-            "train_0", total_samples=20, produced_ratio=0.8, consumption={"gen": 0.5}
-        )
-        p2 = _make_fake_partition(
-            "train_1", total_samples=10, produced_ratio=1.0, consumption={"gen": 1.0, "train": 0.3}
-        )
-        ctrl = _make_fake_controller(partitions={"train_0": p1, "train_1": p2}, allocated=30, reusable=5)
+        p1 = _make_partition_snapshot(total_samples=20, produced_ratio=0.8, consumption={"gen": 0.5})
+        p2 = _make_partition_snapshot(total_samples=10, produced_ratio=1.0, consumption={"gen": 1.0, "train": 0.3})
+        snapshot = _make_snapshot(partitions={"train_0": p1, "train_1": p2}, allocated=30, reusable=5)
 
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
+        exporter.update_controller_snapshot(snapshot)
         exporter.collect_controller_metrics()
 
         assert exporter.partitions_total._value.get() == 2
@@ -163,8 +139,8 @@ class TestControllerMetricsCollection:
 
     def test_uptime_increases(self):
         """Controller uptime should be positive after collection."""
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
+        exporter.update_controller_snapshot(_make_snapshot())
         time.sleep(0.05)
         exporter.collect_controller_metrics()
         assert exporter.controller_uptime._value.get() > 0
@@ -177,8 +153,7 @@ class TestControllerMetricsCollection:
 
 class TestMeasureContextManager:
     def test_measure_records_count_and_duration(self):
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         with exporter.measure("GET_META"):
             time.sleep(0.01)
@@ -192,8 +167,7 @@ class TestMeasureContextManager:
         assert hist._sum.get() > 0
 
     def test_measure_records_errors(self):
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         with pytest.raises(ValueError):
             with exporter.measure("BAD_OP"):
@@ -204,8 +178,7 @@ class TestMeasureContextManager:
         assert exporter.request_total.labels(op_type="BAD_OP")._value.get() == 1.0
 
     def test_multiple_ops_tracked_independently(self):
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         for _ in range(3):
             with exporter.measure("GET_META"):
@@ -226,15 +199,13 @@ class TestMeasureContextManager:
 class TestStorageMetricsCollection:
     def test_collect_with_no_storage_units(self):
         """No storage units registered — collect should be a no-op."""
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
         # Should not raise
         exporter.collect_storage_metrics()
 
     def test_storage_metrics_populated_on_success(self):
         """Verify storage gauges are set when _query_storage_unit returns data."""
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         fake_su_info = MagicMock()
         fake_su_info.id = "SU_001"
@@ -259,8 +230,7 @@ class TestStorageMetricsCollection:
 
     def test_storage_metrics_handles_query_failure(self):
         """If a storage unit query fails, other units should still be collected."""
-        ctrl = _make_fake_controller()
-        exporter = TQMetricsExporter(ctrl)
+        exporter = TQMetricsExporter()
 
         su1 = MagicMock()
         su1.id = "SU_001"
