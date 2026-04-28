@@ -71,32 +71,11 @@ class StorageUnitData:
         self.storage_size = storage_size
         # Track active global_index keys for O(1) capacity checks
         self._active_keys: set = set()
-        # Incremental data memory tracking (bytes)
-        self._data_memory_bytes: int = 0
 
     @property
     def active_key_count(self) -> int:
         """Number of active keys currently stored."""
         return len(self._active_keys)
-
-    @property
-    def data_memory_bytes(self) -> int:
-        """Estimated data memory usage in bytes."""
-        return self._data_memory_bytes
-
-    @staticmethod
-    def _estimate_val_size(val) -> int:
-        """Estimate the memory footprint of a single stored value."""
-        try:
-            import torch
-
-            if isinstance(val, torch.Tensor):
-                return val.nelement() * val.element_size()
-        except ImportError:
-            pass
-        if hasattr(val, "nbytes"):
-            return val.nbytes
-        return 0
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Get data by global index keys.
@@ -144,11 +123,7 @@ class StorageUnitData:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
-                old_val = field_dict.get(key)
-                if old_val is not None:
-                    self._data_memory_bytes -= self._estimate_val_size(old_val)
                 field_dict[key] = val
-                self._data_memory_bytes += self._estimate_val_size(val)
         self._active_keys.update(global_indexes)
 
     def clear(self, keys: list[int]) -> None:
@@ -159,9 +134,7 @@ class StorageUnitData:
         """
         for f in self.field_data:
             for key in keys:
-                val = self.field_data[f].pop(key, None)
-                if val is not None:
-                    self._data_memory_bytes -= self._estimate_val_size(val)
+                self.field_data[f].pop(key, None)
         self._active_keys -= set(keys)
 
 
@@ -205,9 +178,6 @@ class SimpleStorageUnit:
         self.put_get_socket: Optional[zmq.Socket] = None
         self.proxy_thread: Optional[Thread] = None
         self.worker_thread: Optional[Thread] = None
-
-        self._op_counts: dict[str, int] = {"PUT_DATA": 0, "GET_DATA": 0, "CLEAR_DATA": 0}
-        self._sample_counts: dict[str, int] = {"PUT_DATA": 0, "GET_DATA": 0, "CLEAR_DATA": 0}
 
         self._init_zmq_socket()
         self._start_process_put_get()
@@ -331,15 +301,12 @@ class SimpleStorageUnit:
                     if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
                         with perf_monitor.measure(op_type="PUT_DATA"):
                             response_msg = self._handle_put(request_msg)
-                        self._op_counts["PUT_DATA"] += 1
                     elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
                         with perf_monitor.measure(op_type="GET_DATA"):
                             response_msg = self._handle_get(request_msg)
-                        self._op_counts["GET_DATA"] += 1
                     elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with perf_monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
-                        self._op_counts["CLEAR_DATA"] += 1
                     elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                         response_msg = self._handle_get_metrics()
                     else:
@@ -390,7 +357,6 @@ class SimpleStorageUnit:
             ):
                 self.storage_data.put_data(field_data, global_indexes)
 
-            self._sample_counts["PUT_DATA"] += len(global_indexes)
             # After put operation finish, send a message to the client
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.PUT_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -428,7 +394,6 @@ class SimpleStorageUnit:
             ):
                 result_data = self.storage_data.get_data(fields, global_indexes)
 
-            self._sample_counts["GET_DATA"] += len(global_indexes)
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
@@ -469,7 +434,6 @@ class SimpleStorageUnit:
             ):
                 self.storage_data.clear(global_indexes)
 
-            self._sample_counts["CLEAR_DATA"] += len(global_indexes)
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
@@ -491,7 +455,7 @@ class SimpleStorageUnit:
 
         Returns:
             ZMQMessage containing storage capacity, active keys, field count,
-            process RSS memory, and estimated data memory usage.
+            and process RSS memory.
         """
         try:
             process_rss = psutil.Process().memory_info().rss
@@ -502,11 +466,7 @@ class SimpleStorageUnit:
             "storage_unit_id": self.storage_unit_id,
             "capacity": self.storage_unit_size,
             "active_keys": self.storage_data.active_key_count,
-            "fields_count": len(self.storage_data.field_data),
             "process_rss_bytes": process_rss,
-            "data_memory_bytes": self.storage_data.data_memory_bytes,
-            "op_counts": dict(self._op_counts),
-            "sample_counts": dict(self._sample_counts),
         }
 
         return ZMQMessage.create(

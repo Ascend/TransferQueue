@@ -431,9 +431,6 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
 
     # start Prometheus metrics exporter if enabled
     metrics_enabled = final_conf.get("metrics", {}).get("enabled", False)
-    if not metrics_enabled:
-        # Also check environment variable as a convenience override
-        metrics_enabled = os.environ.get("TQ_METRICS_ENABLED", "false").lower() == "true"
     if metrics_enabled:
         metrics_endpoint = ray.get(_TRANSFER_QUEUE_CONTROLLER.start_metrics.remote())
         final_conf.metrics.endpoint = metrics_endpoint
