@@ -28,7 +28,7 @@ try:
 except (ImportError, OSError):
     _HAS_DEPS = False
 
-pytestmark = pytest.mark.skipif(not _HAS_DEPS, reason="torch / CUDA dependencies unavailable")
+pytestmark = pytest.mark.skipif(not _HAS_DEPS, reason="prometheus_client / psutil / pyzmq dependencies unavailable")
 
 
 # ---------------------------------------------------------------------------
@@ -98,8 +98,6 @@ class TestMetricDefinitions:
             "tq_controller_memory_rss_bytes",
             "tq_partitions_total",
             "tq_partition_samples_total",
-            "tq_partition_fields_total",
-            "tq_partition_allocated_samples",
             "tq_partition_production_progress",
             "tq_partition_consumption_progress",
             "tq_global_index_allocated_total",
@@ -110,9 +108,7 @@ class TestMetricDefinitions:
             "tq_storage_capacity_total",
             "tq_storage_active_keys_total",
             "tq_storage_utilization_ratio",
-            "tq_storage_fields_total",
             "tq_storage_memory_rss_bytes",
-            "tq_storage_data_memory_bytes",
         ]
 
         registered = {m.name for m in exporter.registry.collect()}
@@ -250,9 +246,7 @@ class TestStorageMetricsCollection:
                 "storage_unit_id": "SU_001",
                 "capacity": 1000,
                 "active_keys": 250,
-                "fields_count": 3,
                 "process_rss_bytes": 512 * 1024 * 1024,
-                "data_memory_bytes": 256 * 1024 * 1024,
             }
         )
 
@@ -261,9 +255,7 @@ class TestStorageMetricsCollection:
         assert exporter.storage_capacity.labels(storage_unit_id="SU_001")._value.get() == 1000
         assert exporter.storage_active_keys.labels(storage_unit_id="SU_001")._value.get() == 250
         assert exporter.storage_utilization.labels(storage_unit_id="SU_001")._value.get() == 0.25
-        assert exporter.storage_fields.labels(storage_unit_id="SU_001")._value.get() == 3
         assert exporter.storage_memory_rss.labels(storage_unit_id="SU_001")._value.get() == 512 * 1024 * 1024
-        assert exporter.storage_data_memory.labels(storage_unit_id="SU_001")._value.get() == 256 * 1024 * 1024
 
     def test_storage_metrics_handles_query_failure(self):
         """If a storage unit query fails, other units should still be collected."""
@@ -289,7 +281,6 @@ class TestStorageMetricsCollection:
                 "active_keys": 100,
                 "fields_count": 2,
                 "process_rss_bytes": 100 * 1024 * 1024,
-                "data_memory_bytes": 50 * 1024 * 1024,
             }
 
         exporter._query_storage_unit = mock_query
