@@ -433,6 +433,7 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     metrics_enabled = final_conf.get("metrics", {}).get("enabled", False)
     if metrics_enabled:
         metrics_endpoint = ray.get(_TRANSFER_QUEUE_CONTROLLER.start_metrics.remote())
+        final_conf.metrics.enabled = True
         final_conf.metrics.endpoint = metrics_endpoint
         # Update stored config so other processes can discover the endpoint
         ray.get(_TRANSFER_QUEUE_CONTROLLER.store_config.remote(final_conf))
