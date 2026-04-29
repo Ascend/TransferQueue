@@ -1,6 +1,10 @@
 # This is the default configuration of TransferQueue. Users may modify the default value
 # and use transfer_queue.init(conf) to overwrite the config entries.
 
+# Prometheus metrics exporter.
+metrics:
+  enabled: false
+
 controller:
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
   sampler: SequentialSampler

@@ -20,6 +20,7 @@ from threading import Event, Thread
 from typing import Any, Optional
 from uuid import uuid4
 
+import psutil
 import ray
 import zmq
 
@@ -63,6 +64,11 @@ class StorageUnitData:
         self.storage_size = storage_size
         # Track active global_index keys for O(1) capacity checks
         self._active_keys: set = set()
+
+    @property
+    def active_key_count(self) -> int:
+        """Number of active keys currently stored."""
+        return len(self._active_keys)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Get data by global index keys.
@@ -108,8 +114,9 @@ class StorageUnitData:
                 )
             if f not in self.field_data:
                 self.field_data[f] = {}
+            field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
-                self.field_data[f][key] = val
+                field_dict[key] = val
         self._active_keys.update(global_indexes)
 
     def clear(self, keys: list[int]) -> None:
@@ -293,6 +300,8 @@ class SimpleStorageUnit:
                     elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with perf_monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
+                    elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+                        response_msg = self._handle_get_metrics()
                     else:
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
@@ -477,6 +486,31 @@ class SimpleStorageUnit:
                 },
             )
         return response_msg
+
+    def _handle_get_metrics(self) -> ZMQMessage:
+        """Handle GET_METRICS request by returning storage unit statistics.
+
+        Returns:
+            ZMQMessage containing storage capacity, active keys, field count,
+            and process RSS memory.
+        """
+        try:
+            process_rss = psutil.Process().memory_info().rss
+        except Exception:
+            process_rss = 0
+
+        metrics = {
+            "storage_unit_id": self.storage_unit_id,
+            "capacity": self.storage_unit_size,
+            "active_keys": self.storage_data.active_key_count,
+            "process_rss_bytes": process_rss,
+        }
+
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.METRICS_RESPONSE,
+            sender_id=self.storage_unit_id,
+            body=metrics,
+        )
 
     @staticmethod
     def _shutdown_resources(

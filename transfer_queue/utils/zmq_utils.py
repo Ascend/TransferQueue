@@ -98,6 +98,10 @@ class ZMQRequestType(ExplicitEnum):
     KV_LIST = "KV_LIST"
     KV_LIST_RESPONSE = "KV_LIST_RESPONSE"
 
+    # METRICS
+    GET_METRICS = "GET_METRICS"
+    METRICS_RESPONSE = "METRICS_RESPONSE"
+
 
 class ZMQServerInfo:
     """
