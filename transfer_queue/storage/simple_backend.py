@@ -129,7 +129,7 @@ class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
 
     This class represents a storage unit that can store data in a 2D structure
-    (samples × data fields) and provides ZMQ-based communication for put/get/clear operations.
+    (samples, data_fields) and provides ZMQ-based communication for put/get/clear operations.
 
     Note: We use Ray decorator (@ray.remote) only for initialization purposes.
     We do NOT use Ray's .remote() call capabilities - the storage unit runs

@@ -43,40 +43,38 @@ from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
 
-_TRANSFER_QUEUE_CLIENT: Any = None
-_TRANSFER_QUEUE_STORAGE: Any = None
-_TRANSFER_QUEUE_CONTROLLER: Any = None
+_TQ_CLIENT: Any = None
+_TQ_STORAGE: Any = None
+_TQ_CONTROLLER: Any = None
 
 
-def _maybe_create_transferqueue_client(
-    conf: Optional[DictConfig] = None,
-) -> TransferQueueClient:
-    global _TRANSFER_QUEUE_CLIENT
-    if _TRANSFER_QUEUE_CLIENT is None:
+def _maybe_create_tq_client(conf: Optional[DictConfig] = None) -> TransferQueueClient:
+    global _TQ_CLIENT
+    if _TQ_CLIENT is None:
         if conf is None:
             _init_from_existing()
-            assert _TRANSFER_QUEUE_CLIENT is not None, (
+            assert _TQ_CLIENT is not None, (
                 "TransferQueueController has not been initialized yet. Please call init() first."
             )
-            return _TRANSFER_QUEUE_CLIENT
+            return _TQ_CLIENT
 
         pid = os.getpid()
-        _TRANSFER_QUEUE_CLIENT = TransferQueueClient(
+        _TQ_CLIENT = TransferQueueClient(
             client_id=f"TransferQueueClient_{pid}", controller_info=conf.controller.zmq_info
         )
 
-        backend_name = conf.backend.storage_backend
+        # backend = conf.storage.backend
+        name = conf.backend.storage_backend
+        _TQ_CLIENT.initialize_storage_manager(manager_type=name, config=conf.backend[name])
 
-        _TRANSFER_QUEUE_CLIENT.initialize_storage_manager(manager_type=backend_name, config=conf.backend[backend_name])
-
-    return _TRANSFER_QUEUE_CLIENT
+    return _TQ_CLIENT
 
 
-def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
-    global _TRANSFER_QUEUE_STORAGE
-
-    if _TRANSFER_QUEUE_STORAGE is None:
-        _TRANSFER_QUEUE_STORAGE = {}
+# TODO(hz): Adopt registry pattern to manage storage backends for better scalability.
+def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
+    global _TQ_STORAGE
+    if _TQ_STORAGE is None:
+        _TQ_STORAGE = {}
         if conf.backend.storage_backend == "SimpleStorage":
             # initialize SimpleStorageUnit
             simple_storage_handles = {}
@@ -98,7 +96,7 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
             storage_zmq_info = process_zmq_server_info(simple_storage_handles)
             backend_name = conf.backend.storage_backend
             conf.backend[backend_name].zmq_info = storage_zmq_info
-            _TRANSFER_QUEUE_STORAGE["SimpleStorage"] = simple_storage_handles
+            _TQ_STORAGE["SimpleStorage"] = simple_storage_handles
         if conf.backend.storage_backend == "MooncakeStore":
             if conf.backend.MooncakeStore.auto_init:
                 # Try to kill existing mooncake_master processes before starting a new one to avoid potential conflicts
@@ -186,9 +184,9 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         f"mooncake_master exited with error. Check {log_file_path} for detailed logs. "
                         f"Output:\n{error_msg}"
                     )
-                _TRANSFER_QUEUE_STORAGE["MooncakeStore"] = process
+                _TQ_STORAGE["MooncakeStore"] = process
         if conf.backend.storage_backend == "Yuanrong" and conf.backend.Yuanrong.auto_init:
-            _TRANSFER_QUEUE_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
+            _TQ_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
     return conf
 
 
@@ -198,10 +196,10 @@ def _init_from_existing() -> bool:
     Returns:
         True if successfully initialized from existing controller, False otherwise.
     """
-    global _TRANSFER_QUEUE_CONTROLLER
+    global _TQ_CONTROLLER
     try:
-        if _TRANSFER_QUEUE_CONTROLLER is None:
-            _TRANSFER_QUEUE_CONTROLLER = ray.get_actor("TransferQueueController")
+        if _TQ_CONTROLLER is None:
+            _TQ_CONTROLLER = ray.get_actor("TransferQueueController")
 
     except ValueError:
         logger.info("Called _init_from_existing() but TransferQueueController has not been initialized yet.")
@@ -211,10 +209,9 @@ def _init_from_existing() -> bool:
 
     conf = None
     while conf is None:
-        conf = ray.get(_TRANSFER_QUEUE_CONTROLLER.get_config.remote())
+        conf = ray.get(_TQ_CONTROLLER.get_config.remote())
         if conf is not None:
-            _maybe_create_transferqueue_client(conf)
-
+            _maybe_create_tq_client(conf)
             logger.info("TransferQueueClient initialized.")
             return True
 
@@ -231,20 +228,15 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     This function sets up the TransferQueue controller, distributed storage, and client.
     It should be called once at the beginning of the program before any data operations.
 
-    If a controller already exists (e.g., initialized by another process), this function
-    will retrieve the config from existing controller and initialize the TransferQueueClient.
-    In this case, the `conf` parameter will be ignored.
+    If a controller already exists, reuse it and only initialize the client;
+    the provided `conf` will be ignored in this case.
 
     Args:
-        conf: Optional configuration dictionary. If provided, it will be merged with
-              the default config from 'config.yaml'. This is only used for first-time
-              initializing. When connecting to an existing controller, this parameter
-              is ignored.
+        conf: Optional custom config merged with default `config.yaml`.
+              Only takes effect on first-time initialization, ignored when attaching
+              to an existing controller.
     Returns:
         The merged configuration dictionary.
-
-    Raises:
-        ValueError: If config is not valid or required configuration keys are missing.
 
     Example:
         >>> # In process 0, node A
@@ -261,36 +253,29 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     if _init_from_existing():
         return conf
 
-    # First-time initialize TransferQueue
     logger.info("No TransferQueueController found. Starting first-time initialization...")
 
-    # create config
     final_conf = OmegaConf.create({}, flags={"allow_objects": True})
     default_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
 
-    # create controller
+    # TODO(hz): support load custom sampler class from external modules.
     try:
         sampler = final_conf.controller.sampler
         if isinstance(sampler, BaseSampler):
-            # user pass a pre-initialized sampler instance
             sampler = sampler
         elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
-            # user pass a sampler class
             sampler = sampler()
         elif isinstance(sampler, str):
-            # user pass a sampler name str
-            # try to convert as sampler class
             sampler = globals()[final_conf.controller.sampler]
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
 
     try:
-        # Ray will make sure actor with same name can only be created once
-        global _TRANSFER_QUEUE_CONTROLLER
-        _TRANSFER_QUEUE_CONTROLLER = TransferQueueController.options(name="TransferQueueController").remote(  # type: ignore[attr-defined]
+        global _TQ_CONTROLLER
+        _TQ_CONTROLLER = TransferQueueController.options(name="TransferQueueController").remote(  # type: ignore[attr-defined]
             sampler=sampler, polling_mode=final_conf.controller.polling_mode
         )
         logger.info("TransferQueueController has been created.")
@@ -299,18 +284,15 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
         _init_from_existing()
         return final_conf
 
-    controller_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_CONTROLLER)
+    controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
 
-    # create distributed storage backends
-    final_conf = _maybe_create_transferqueue_storage(final_conf)
+    final_conf = _maybe_create_tq_storage(final_conf)
 
-    # store the config into controller
-    ray.get(_TRANSFER_QUEUE_CONTROLLER.store_config.remote(final_conf))
+    ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
 
-    # create client
-    _maybe_create_transferqueue_client(final_conf)
+    _maybe_create_tq_client(final_conf)
     return final_conf
 
 
@@ -321,17 +303,14 @@ def close():
     - Closing the client and its associated resources
     - Cleaning up distributed storage (only for the process that initialized it)
     - Killing the controller actor
-
-    Note:
-        This function should be called when the TransferQueue system is no longer needed.
     """
-    global _TRANSFER_QUEUE_CLIENT
-    global _TRANSFER_QUEUE_STORAGE
-    global _TRANSFER_QUEUE_CONTROLLER
+    global _TQ_CLIENT
+    global _TQ_STORAGE
+    global _TQ_CONTROLLER
 
     try:
-        if _TRANSFER_QUEUE_STORAGE:
-            for key, value in _TRANSFER_QUEUE_STORAGE.items():
+        if _TQ_STORAGE:
+            for key, value in _TQ_STORAGE.items():
                 if key == "SimpleStorage":
                     # only the process that do first-time init can clean the distributed storage
                     for storage in value.values():
@@ -345,9 +324,9 @@ def close():
                             f"Consider manually killing the mooncake_master."
                         )
 
-                    if _TRANSFER_QUEUE_CLIENT:
+                    if _TQ_CLIENT:
                         try:
-                            ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
+                            ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
                             if ret < 0:
                                 logger.error("Failed to remove existing keys in mooncake_master.")
                             else:
@@ -357,28 +336,25 @@ def close():
                 elif key == "Yuanrong":
                     cleanup_yuanrong_resources(value)
                 else:
-                    logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
+                    logger.warning(f"close for _TQ_STORAGE with key {key} is not supported for now.")
 
-        _TRANSFER_QUEUE_STORAGE = None
+        _TQ_STORAGE = None
     except Exception:
         pass
 
-    if _TRANSFER_QUEUE_CLIENT:
-        _TRANSFER_QUEUE_CLIENT.close()
-        _TRANSFER_QUEUE_CLIENT = None
-
-    if _TRANSFER_QUEUE_CONTROLLER:
+    if _TQ_CLIENT:
         try:
-            ray.kill(_TRANSFER_QUEUE_CONTROLLER)
+            _TQ_CLIENT.close()
         except Exception:
             pass
-        _TRANSFER_QUEUE_CONTROLLER = None
+        _TQ_CLIENT = None
 
-    try:
-        controller = ray.get_actor("TransferQueueController")
-        ray.kill(controller)
-    except Exception:
-        pass
+    if _TQ_CONTROLLER:
+        try:
+            ray.kill(_TQ_CONTROLLER)
+        except Exception:
+            pass
+        _TQ_CONTROLLER = None
 
 
 # ==================== High-Level KV Interface API ====================
@@ -440,7 +416,7 @@ def kv_put(
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of `fields` or `tag`.")
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = tq_client.kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -547,7 +523,7 @@ def kv_batch_put(
             f"batch_size {fields.batch_size[0]}"
         )
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
@@ -668,7 +644,7 @@ def kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
@@ -724,7 +700,7 @@ def kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
         >>> for pid, keys in all_partitions.items():
         >>>     print(f"Partition: {pid}, Key count: {len(keys)}")
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     partition_info = tq_client.kv_list(partition_id)
 
@@ -753,7 +729,7 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     if isinstance(keys, str):
         keys = [keys]
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
@@ -820,7 +796,7 @@ async def async_kv_put(
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of fields or tag.")
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -926,7 +902,7 @@ async def async_kv_batch_put(
             f"batch_size {fields.batch_size[0]}"
         )
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
@@ -1049,7 +1025,7 @@ async def async_kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
@@ -1105,7 +1081,7 @@ async def async_kv_list(partition_id: Optional[str] = None) -> dict[str, dict[st
         >>> for pid, keys in all_partitions.items():
         >>>     print(f"Partition: {pid}, Key count: {len(keys)}")
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     partition_info = await tq_client.async_kv_list(partition_id)
 
@@ -1134,7 +1110,7 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
     if isinstance(keys, str):
         keys = [keys]
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
@@ -1145,6 +1121,5 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
 # For low-level API support, please refer to transfer_queue/client.py for details.
 def get_client():
     """Get a TransferQueueClient for using low-level API"""
-    if _TRANSFER_QUEUE_CLIENT is None:
-        raise RuntimeError("Please initialize the TransferQueue first by calling `tq.init()`!")
-    return _TRANSFER_QUEUE_CLIENT
+    assert _TQ_CLIENT is not None, ("Please initialize the TransferQueue first by calling `tq.init()`!")
+    return _TQ_CLIENT

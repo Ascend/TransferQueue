@@ -32,9 +32,10 @@ from torch.utils.data import DataLoader, Dataset
 
 import transfer_queue as tq
 from transfer_queue import KVBatchMeta
+from transfer_queue.utils.logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
+
+logger = get_logger(__name__)
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 os.environ["RAY_DEBUG"] = "1"

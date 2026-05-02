@@ -369,9 +369,7 @@ def with_zmq_socket(
     return decorator
 
 
-def process_zmq_server_info(
-    handlers: dict[Any, Any] | Any,
-):  # noqa: UP007
+def process_zmq_server_info(handlers: dict[Any, Any] | Any):
     """Extract ZMQ server information from handler objects.
 
     Args:
