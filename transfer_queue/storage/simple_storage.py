@@ -17,7 +17,7 @@ import os
 import time
 import weakref
 from threading import Event, Thread
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 import ray
@@ -160,10 +160,10 @@ class SimpleStorageUnit:
         self._shutdown_event = Event()
 
         # Placeholder for zmq_context, proxy_thread and worker_threads
-        self.zmq_context: Optional[zmq.Context] = None
-        self.put_get_socket: Optional[zmq.Socket] = None
-        self.proxy_thread: Optional[Thread] = None
-        self.worker_thread: Optional[Thread] = None
+        self.zmq_context: zmq.Context | None = None
+        self.put_get_socket: zmq.Socket | None = None
+        self.proxy_thread: Thread | None = None
+        self.worker_thread: Thread | None = None
 
         self._init_zmq_socket()
         self._start_process_put_get()
@@ -481,10 +481,10 @@ class SimpleStorageUnit:
     @staticmethod
     def _shutdown_resources(
         shutdown_event: Event,
-        worker_thread: Optional[Thread],
-        proxy_thread: Optional[Thread],
-        zmq_context: Optional[zmq.Context],
-        put_get_socket: Optional[zmq.Socket],
+        worker_thread: Thread | None,
+        proxy_thread: Thread | None,
+        zmq_context: zmq.Context | None,
+        put_get_socket: zmq.Socket | None,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")

@@ -18,7 +18,7 @@ import os
 import subprocess
 import time
 from importlib import resources
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import ray
@@ -49,7 +49,7 @@ _TRANSFER_QUEUE_CONTROLLER: Any = None
 
 
 def _maybe_create_transferqueue_client(
-    conf: Optional[DictConfig] = None,
+    conf: DictConfig | None = None,
 ) -> TransferQueueClient:
     global _TRANSFER_QUEUE_CLIENT
     if _TRANSFER_QUEUE_CLIENT is None:
@@ -225,7 +225,7 @@ def _init_from_existing() -> bool:
 
 
 # ==================== Initialization API ====================
-def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
+def init(conf: DictConfig | None = None) -> DictConfig | None:
     """Initialize the TransferQueue system.
 
     This function sets up the TransferQueue controller, distributed storage, and client.
@@ -385,9 +385,9 @@ def close():
 def kv_put(
     key: str,
     partition_id: str,
-    fields: Optional[TensorDict | dict[str, Any]] = None,
-    tag: Optional[dict[str, Any]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | dict[str, Any] | None = None,
+    tag: dict[str, Any] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Put a single key-value pair to TransferQueue.
 
@@ -488,9 +488,9 @@ def kv_put(
 def kv_batch_put(
     keys: list[str],
     partition_id: str,
-    fields: Optional[TensorDict] = None,
-    tags: Optional[list[dict[str, Any]]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | None = None,
+    tags: list[dict[str, Any]] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Put multiple key-value pairs to TransferQueue in batch.
 
@@ -582,7 +582,7 @@ def kv_batch_put(
     )
 
 
-def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | None = None) -> TensorDict:
     """Get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
@@ -622,7 +622,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | 
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
     if select_fields is not None:
         if isinstance(select_fields, str):
-            fields_to_fetch: Optional[list[str]] = [select_fields]
+            fields_to_fetch: list[str] | None = [select_fields]
         else:
             fields_to_fetch = select_fields
 
@@ -637,9 +637,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | 
     return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
 
 
-def kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
-) -> TensorDict:
+def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None) -> TensorDict:
     """Get data from TransferQueue using user-specified keys.
 
     This is a convenience method for retrieving data using keys instead of indexes.
@@ -690,7 +688,7 @@ def kv_batch_get(
     return data
 
 
-def kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     """List all keys and their metadata in one or all partitions.
 
     Args:
@@ -764,9 +762,9 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
 async def async_kv_put(
     key: str,
     partition_id: str,
-    fields: Optional[TensorDict | dict[str, Any]] = None,
-    tag: Optional[dict[str, Any]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | dict[str, Any] | None = None,
+    tag: dict[str, Any] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put a single key-value pair to TransferQueue.
 
@@ -868,9 +866,9 @@ async def async_kv_put(
 async def async_kv_batch_put(
     keys: list[str],
     partition_id: str,
-    fields: Optional[TensorDict] = None,
-    tags: Optional[list[dict[str, Any]]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | None = None,
+    tags: list[dict[str, Any]] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put multiple key-value pairs to TransferQueue in batch.
 
@@ -961,7 +959,7 @@ async def async_kv_batch_put(
     )
 
 
-async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | None = None) -> TensorDict:
     """Asynchronously get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
@@ -1019,7 +1017,7 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[
 
 
 async def async_kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
+    keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None
 ) -> TensorDict:
     """Asynchronously get data from TransferQueue using user-specified keys.
 
@@ -1070,7 +1068,7 @@ async def async_kv_batch_get(
     return data
 
 
-async def async_kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+async def async_kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     """Asynchronously list all keys and their metadata in one or all partitions.
 
     Args:

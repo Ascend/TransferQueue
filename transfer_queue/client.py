@@ -16,7 +16,7 @@
 import asyncio
 import os
 import threading
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 import zmq
@@ -104,9 +104,9 @@ class AsyncTransferQueueClient:
         batch_size: int,
         partition_id: str,
         mode: str = "fetch",
-        task_name: Optional[str] = None,
-        sampling_config: Optional[dict[str, Any]] = None,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        task_name: str | None = None,
+        sampling_config: dict[str, Any] | None = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously fetch data metadata from the controller via ZMQ.
 
@@ -191,7 +191,7 @@ class AsyncTransferQueueClient:
     async def async_set_custom_meta(
         self,
         metadata: BatchMeta,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """
         Asynchronously send custom metadata to the controller.
@@ -264,9 +264,9 @@ class AsyncTransferQueueClient:
     async def async_put(
         self,
         data: TensorDict,
-        metadata: Optional[BatchMeta] = None,
-        partition_id: Optional[str] = None,
-        data_parser: Optional[Callable[[Any], Any]] = None,
+        metadata: BatchMeta | None = None,
+        partition_id: str | None = None,
+        data_parser: Callable[[Any], Any] | None = None,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
 
@@ -575,8 +575,8 @@ class AsyncTransferQueueClient:
         self,
         task_name: str,
         partition_id: str,
-        socket: Optional[zmq.asyncio.Socket] = None,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> tuple[Tensor | None, Tensor | None]:
         """Get consumption status for current partition in a specific task.
 
         Args:
@@ -638,8 +638,8 @@ class AsyncTransferQueueClient:
         self,
         data_fields: list[str],
         partition_id: str,
-        socket: Optional[zmq.asyncio.Socket] = None,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> tuple[Tensor | None, Tensor | None]:
         """Get production status for specific data fields and partition.
 
         Args:
@@ -769,8 +769,8 @@ class AsyncTransferQueueClient:
     async def async_reset_consumption(
         self,
         partition_id: str,
-        task_name: Optional[str] = None,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        task_name: str | None = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> bool:
         """Asynchronously reset consumption status for a partition.
 
@@ -830,7 +830,7 @@ class AsyncTransferQueueClient:
     @with_controller_socket
     async def async_get_partition_list(
         self,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> list[str]:
         """Asynchronously fetch the list of partition ids from the controller.
 
@@ -879,7 +879,7 @@ class AsyncTransferQueueClient:
         keys: list[str] | str,
         partition_id: str,
         create: bool = False,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta from the controller using user-specified keys.
 
@@ -944,7 +944,7 @@ class AsyncTransferQueueClient:
         self,
         global_indexes: list[int] | int,
         partition_id: str,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> list[str]:
         """Asynchronously retrieve keys according to global_indexes from the controller.
 
@@ -1005,8 +1005,8 @@ class AsyncTransferQueueClient:
     @with_controller_socket
     async def async_kv_list(
         self,
-        partition_id: Optional[str] = None,
-        socket: Optional[zmq.asyncio.Socket] = None,
+        partition_id: str | None = None,
+        socket: zmq.asyncio.Socket | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Asynchronously retrieve keys and custom_meta from the controller for one or all partitions.
 
@@ -1145,8 +1145,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         batch_size: int,
         partition_id: str,
         mode: str = "fetch",
-        task_name: Optional[str] = None,
-        sampling_config: Optional[dict[str, Any]] = None,
+        task_name: str | None = None,
+        sampling_config: dict[str, Any] | None = None,
     ) -> BatchMeta:
         """Synchronously fetch data metadata from the controller via ZMQ.
 
@@ -1234,9 +1234,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def put(
         self,
         data: TensorDict,
-        metadata: Optional[BatchMeta] = None,
-        partition_id: Optional[str] = None,
-        data_parser: Optional[Callable[[Any], Any]] = None,
+        metadata: BatchMeta | None = None,
+        partition_id: str | None = None,
+        data_parser: Callable[[Any], Any] | None = None,
     ) -> BatchMeta:
         """Synchronously write data to storage units based on metadata.
 
@@ -1356,7 +1356,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self,
         task_name: str,
         partition_id: str,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    ) -> tuple[Tensor | None, Tensor | None]:
         """Synchronously get consumption status for a specific task and partition.
 
         Args:
@@ -1384,7 +1384,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self,
         data_fields: list[str],
         partition_id: str,
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    ) -> tuple[Tensor | None, Tensor | None]:
         """Synchronously get production status for specific data fields and partition.
 
         Args:
@@ -1454,7 +1454,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._check_production_status(data_fields=data_fields, partition_id=partition_id)
 
-    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None) -> bool:
+    def reset_consumption(self, partition_id: str, task_name: str | None = None) -> bool:
         """Synchronously reset consumption status for a partition.
 
         This allows the same data to be re-consumed, useful for debugging scenarios
@@ -1540,7 +1540,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
     def kv_list(
         self,
-        partition_id: Optional[str] = None,
+        partition_id: str | None = None,
     ) -> dict[str, dict[str, Any]]:
         """Synchronously retrieve keys and custom_meta from the controller for one or all partitions.
 

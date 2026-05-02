@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
 
 import torch
 from tensordict import TensorDict
@@ -80,7 +79,7 @@ class StreamingDataLoader(torch.utils.data.DataLoader):
         pin_memory: bool = False,
         worker_init_fn=None,
         multiprocessing_context=None,
-        prefetch_factor: Optional[int] = None,
+        prefetch_factor: int | None = None,
         persistent_workers: bool = False,
         pin_memory_device: str = "",
     ):

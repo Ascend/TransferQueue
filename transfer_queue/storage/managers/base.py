@@ -21,7 +21,7 @@ import warnings
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from uuid import uuid4
 
 import ray
@@ -60,9 +60,9 @@ class StorageManager(ABC):
         self.controller_info = controller_info
 
         # Handshake socket is sync (used only during initialization)
-        self.controller_handshake_socket: Optional[zmq.Socket] = None
+        self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context: Optional[zmq.asyncio.Context] = None
+        self.zmq_context: zmq.asyncio.Context | None = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -190,7 +190,7 @@ class StorageManager(ABC):
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -301,7 +301,7 @@ class StorageManager(ABC):
 
     @abstractmethod
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Put data into the storage backend.
@@ -432,7 +432,7 @@ class KVStorageManager(StorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
-        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
+        self._multi_threads_executor: ThreadPoolExecutor | None = None
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
@@ -477,7 +477,7 @@ class KVStorageManager(StorageManager):
         return results
 
     @staticmethod
-    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
+    def _shutdown_executor(thread_executor: ThreadPoolExecutor | None) -> None:
         """
         A static method to ensure no strong reference to 'self' is held within the
         finalizer's callback, enabling proper garbage collection.
@@ -618,7 +618,7 @@ class KVStorageManager(StorageManager):
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Store tensor data in the backend storage and notify the controller.

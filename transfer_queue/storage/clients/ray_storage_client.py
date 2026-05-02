@@ -14,7 +14,7 @@
 # limitations under the License.
 
 import itertools
-from typing import Any, Optional
+from typing import Any
 
 import ray
 import torch
@@ -61,7 +61,7 @@ class RayStorageClient(StorageKVClient):
         except ValueError:
             self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
 
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """
         Store tensors to remote storage.
         Args:

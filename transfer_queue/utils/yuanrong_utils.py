@@ -19,7 +19,7 @@ import os
 import shutil
 import socket
 import subprocess
-from typing import Any, Optional
+from typing import Any
 
 import ray
 from omegaconf import DictConfig
@@ -101,7 +101,7 @@ def check_port_connectivity(host: str, port: int, timeout: float = 2.0) -> bool:
         return False
 
 
-def find_reachable_host(port: int, timeout: float = 1.0) -> Optional[str]:
+def find_reachable_host(port: int, timeout: float = 1.0) -> str | None:
     """Find a reachable local host IP address for given port.
 
     Tries all local IP addresses in order and returns the first one
@@ -126,7 +126,7 @@ def find_reachable_host(port: int, timeout: float = 1.0) -> Optional[str]:
     return None
 
 
-def _parse_remote_h2d_device_ids(worker_args: str) -> Optional[str]:
+def _parse_remote_h2d_device_ids(worker_args: str) -> str | None:
     """Parse --remote_h2d_device_ids parameter from worker_args string.
 
     Args:

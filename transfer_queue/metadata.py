@@ -19,7 +19,7 @@ import itertools
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -221,11 +221,11 @@ class BatchMeta:
         self,
         global_indexes: list[int],
         partition_ids: list[str],
-        field_schema: Optional[dict[str, dict[str, Any]]] = None,
-        production_status: Optional[np.ndarray] = None,
-        extra_info: Optional[dict[str, Any]] = None,
-        custom_meta: Optional[list[dict[str, Any]]] = None,
-        _custom_backend_meta: Optional[list[dict[str, Any]]] = None,
+        field_schema: dict[str, dict[str, Any]] | None = None,
+        production_status: np.ndarray | None = None,
+        extra_info: dict[str, Any] | None = None,
+        custom_meta: list[dict[str, Any]] | None = None,
+        _custom_backend_meta: list[dict[str, Any]] | None = None,
     ) -> None:
         if field_schema is None:
             field_schema = {}
@@ -785,7 +785,7 @@ class BatchMeta:
         self._custom_backend_meta = [self._custom_backend_meta[i] for i in indices]
 
     @classmethod
-    def empty(cls, extra_info: Optional[dict[str, Any]] = None) -> "BatchMeta":
+    def empty(cls, extra_info: dict[str, Any] | None = None) -> "BatchMeta":
         """Create an empty BatchMeta with no samples.
 
         Args:
@@ -828,13 +828,13 @@ class KVBatchMeta:
     tags: list[dict] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch
-    partition_id: Optional[str] = None
+    partition_id: str | None = None
 
     # [optional] fields of each sample
-    fields: Optional[list[str]] = None
+    fields: list[str] | None = None
 
     # [optional] external information for batch-level information
-    extra_info: Optional[dict[str, Any]] = dataclasses.field(default_factory=dict)
+    extra_info: dict[str, Any] | None = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Validate all the variables"""

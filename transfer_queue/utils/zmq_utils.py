@@ -17,7 +17,7 @@ import socket
 import time
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, Optional, TypeAlias
+from typing import Any, Callable, TypeAlias
 from uuid import uuid4
 
 import psutil
@@ -146,7 +146,7 @@ class ZMQMessage:
         request_type: ZMQRequestType,
         sender_id: str,
         body: dict[str, Any],
-        receiver_id: Optional[str] = None,
+        receiver_id: str | None = None,
     ) -> "ZMQMessage":
         """Create ZMQMessage."""
         return cls(
@@ -253,7 +253,7 @@ def create_zmq_socket(
     ctx: zmq.Context,
     socket_type: Any,
     ip: str,
-    identity: Optional[bytestr] = None,
+    identity: bytestr | None = None,
 ) -> zmq.Socket:
     """Create ZMQ socket.
 
@@ -299,9 +299,9 @@ def with_zmq_socket(
     socket_name: str,
     *,
     get_identity: Callable[[Any], str],
-    get_peer: Callable[[Any, Optional[str]], ZMQServerInfo],
-    resolve_target: Optional[Callable[[tuple, dict], Optional[str]]] = None,
-    timeout: Optional[int] = None,
+    get_peer: Callable[[Any, str | None], ZMQServerInfo],
+    resolve_target: Callable[[tuple, dict], str | None] | None = None,
+    timeout: int | None = None,
 ):
     """Create a reusable async decorator for request sockets.
 
@@ -330,7 +330,7 @@ def with_zmq_socket(
             if owner_id is None:
                 raise RuntimeError("get_identity returned None")
 
-            target_name: Optional[str] = None
+            target_name: str | None = None
             if resolve_target is not None:
                 target_name = resolve_target(args, kwargs)
 

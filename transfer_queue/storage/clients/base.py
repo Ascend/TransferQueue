@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 
 class StorageKVClient(ABC):
@@ -32,7 +32,7 @@ class StorageKVClient(ABC):
         self.config = config
 
     @abstractmethod
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """
         Store key-value pairs in the storage backend.
         Args:

@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 
 class BaseSampler(ABC):
@@ -79,7 +79,7 @@ class BaseSampler(ABC):
         self,
         partition_id: str,
         task_name: str,
-        sampling_config: Optional[dict[str, Any]] = None,
+        sampling_config: dict[str, Any] | None = None,
     ) -> bool:
         """Check whether the sampler has a cached sampling result for the given context.
 

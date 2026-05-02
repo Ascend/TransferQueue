@@ -62,7 +62,7 @@ class StorageStrategy(ABC):
         """Check if this strategy can retrieve data with given tag."""
 
     @abstractmethod
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Retrieve values by keys; kwargs may include shapes/dtypes."""
 
     @abstractmethod
@@ -144,7 +144,7 @@ class NPUTensorKVClientAdapter(StorageStrategy):
         """Matches 'DsTensorClient' Strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Fetch NPU tensors using pre-allocated empty buffers."""
         shapes = kwargs.get("shapes", None)
         dtypes = kwargs.get("dtypes", None)
@@ -251,7 +251,7 @@ class GeneralKVClientAdapter(StorageStrategy):
         """Matches 'KVClient' strategy tag."""
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
-    def get(self, keys: list[str], **kwargs) -> list[Optional[Any]]:
+    def get(self, keys: list[str], **kwargs) -> list[Any | None]:
         """Retrieve and deserialize objects in batches."""
         results = []
         for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
@@ -433,9 +433,9 @@ class YuanrongStorageClient(StorageKVClient):
     def get(
         self,
         keys: list[str],
-        shapes: Optional[list[Any]] = None,
-        dtypes: Optional[list[Any]] = None,
-        custom_backend_meta: Optional[list[str]] = None,
+        shapes: list[Any] | None = None,
+        dtypes: list[Any] | None = None,
+        custom_backend_meta: list[str] | None = None,
     ) -> list[Any]:
         """Retrieves multiple values from remote storage with expected metadata.
 
@@ -475,7 +475,7 @@ class YuanrongStorageClient(StorageKVClient):
                 results[original_index] = value
         return results
 
-    def clear(self, keys: list[str], custom_backend_meta: Optional[list[str]] = None) -> None:
+    def clear(self, keys: list[str], custom_backend_meta: list[str] | None = None) -> None:
         """Deletes multiple keys from remote storage.
 
         Args:

@@ -15,7 +15,7 @@
 
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -168,9 +168,9 @@ class MooncakeStoreClient(StorageKVClient):
     def get(
         self,
         keys: list[str],
-        shapes: Optional[list[Any]] = None,
-        dtypes: Optional[list[Any]] = None,
-        custom_backend_meta: Optional[list[str]] = None,
+        shapes: list[Any] | None = None,
+        dtypes: list[Any] | None = None,
+        custom_backend_meta: list[str] | None = None,
     ) -> list[Any]:
         """Get multiple key-value pairs from MooncakeStore.
 
@@ -258,7 +258,7 @@ class MooncakeStoreClient(StorageKVClient):
 
         return results, indexes
 
-    def clear(self, keys: list[str], custom_backend_meta: Optional[list[Any]] = None) -> None:
+    def clear(self, keys: list[str], custom_backend_meta: list[Any] | None = None) -> None:
         """Deletes multiple keys from MooncakeStore.
 
         Args:
