@@ -188,7 +188,10 @@ class ZMQMessage:
 
 
 class ZMQServerTransport:
-    """Unified management of ZMQ Router Sockets, port binding, daemon threads, and message I/O."""
+    """Unified ZMQ transport abstraction for Controller / StorageUnit.
+    Encapsulates socket creation, binding, inproc endpoint, daemon thread,
+    ZMQ proxy lifecycle, and unified resource cleanup.
+    """
 
     def __init__(self, node_ip: str, ctx: zmq.Context | None = None):
         self.node_ip = node_ip
@@ -196,8 +199,9 @@ class ZMQServerTransport:
         self.sockets: dict[str, zmq.Socket] = {}
         self.ports: dict[str, int] = {}
         self.threads: list[threading.Thread] = []
+        self.inproc_addrs: dict[str, str] = {}
 
-    def create_router_socket(self, socket_name: str) -> None:
+    def create_router_socket(self, name: str) -> None:
         """Create a ROUTER-type socket, automatically retrying port binding."""
         while True:
             try:
@@ -208,14 +212,49 @@ class ZMQServerTransport:
                     ip=self.node_ip,
                 )
                 sock.bind(format_zmq_address(self.node_ip, port))
-                self.sockets[socket_name] = sock
-                self.ports[socket_name] = port
+                self.sockets[name] = sock
+                self.ports[name] = port
                 return
             except zmq.ZMQError:
-                logger.warning(f"ZMQ bind {socket_name} failed, retrying...")
+                logger.warning(f"ZMQ bind {name} failed, retrying...")
 
-    def get_socket(self, socket_name: str) -> zmq.Socket:
-        return self.sockets[socket_name]
+    def create_router_proxy(self, name: str) -> None:
+        """Create a ROUTER-DEALER proxy: frontend ROUTER + backend DEALER + zmq.proxy thread.
+
+        The ROUTER socket accepts external TCP connections; the DEALER backend is
+        bound to an inproc address so that worker threads can connect locally.
+        zmq.proxy() forwards messages between the two sockets in C layer (zero-copy).
+
+        Workers should connect to the inproc address via ``get_inproc_addr(name)``.
+        """
+        self.create_router_socket(name)
+
+        inproc_addr = f"inproc://proxy_{name}_{uuid4().hex[:8]}"
+        backend = create_zmq_socket(self.zmq_ctx, zmq.DEALER, self.node_ip)
+        backend.bind(inproc_addr)
+
+        backend_name = f"{name}_backend"
+        self.sockets[backend_name] = backend
+        self.inproc_addrs[name] = inproc_addr
+
+        frontend = self.sockets[name]
+
+        def _proxy_loop():
+            try:
+                zmq.proxy(frontend, backend)
+            except zmq.ContextTerminated:
+                logger.info(f"ZMQ Proxy '{name}' stopped gracefully (Context Terminated)")
+            except Exception as e:
+                logger.error(f"ZMQ Proxy '{name}' unexpected error: {e}")
+
+        self.start_daemon_thread(target=_proxy_loop, name=f"ZMQProxy-{name}")
+
+    def get_socket(self, name: str) -> zmq.Socket:
+        return self.sockets[name]
+
+    def get_inproc_addr(self, name: str) -> str:
+        """Get the inproc address for workers to connect to a proxy socket."""
+        return self.inproc_addrs[name]
 
     def start_daemon_thread(self, target, name: str) -> None:
         t = threading.Thread(target=target, name=name, daemon=True)
