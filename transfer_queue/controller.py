@@ -27,7 +27,6 @@ from uuid import uuid4
 import numpy as np
 import ray
 import torch
-import zmq
 from omegaconf import DictConfig
 from torch import Tensor
 
@@ -1040,51 +1039,44 @@ class TransferQueueController:
         )
 
     def _wait_connection(self):
-        """Wait for storage instances to complete handshake with retransmission support."""
+        """Wait for storage instances to complete handshake."""
         handshake_socket = self._transport.get_socket("handshake_socket")
-        poller = zmq.Poller()
-        poller.register(handshake_socket, zmq.POLLIN)
 
         logger.debug(f"Controller {self.controller_id} started waiting for storage connections...")
 
         while True:
-            socks = dict(poller.poll(1000))
+            try:
+                messages = handshake_socket.recv_multipart(copy=False)
+                identity = messages.pop(0)
+                serialized_msg = messages
+                request_msg = ZMQMessage.deserialize(serialized_msg)
 
-            if handshake_socket in socks:
-                try:
-                    messages = handshake_socket.recv_multipart(copy=False)
-                    identity = messages.pop(0)
-                    serialized_msg = messages
-                    request_msg = ZMQMessage.deserialize(serialized_msg)
+                if request_msg.request_type == ZMQRequestType.HANDSHAKE:
+                    storage_manager_id = request_msg.sender_id
 
-                    if request_msg.request_type == ZMQRequestType.HANDSHAKE:
-                        storage_manager_id = request_msg.sender_id
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.HANDSHAKE_ACK,
+                        sender_id=self.controller_id,
+                        body={},
+                    ).serialize()
+                    handshake_socket.send_multipart([identity, *response_msg])
 
-                        # Always send ACK for HANDSHAKE
-                        response_msg = ZMQMessage.create(
-                            request_type=ZMQRequestType.HANDSHAKE_ACK,
-                            sender_id=self.controller_id,
-                            body={},
-                        ).serialize()
-                        handshake_socket.send_multipart([identity, *response_msg])
+                    if storage_manager_id not in self._connected_storage_managers:
+                        self._connected_storage_managers.add(storage_manager_id)
+                        storage_manager_type = request_msg.body.get("storage_manager_type", "Unknown")
+                        logger.debug(
+                            f"[{self.controller_id}]: received handshake from "
+                            f"storage manager {storage_manager_id} (type: {storage_manager_type}). "
+                            f"Total connected: {len(self._connected_storage_managers)}"
+                        )
+                    else:
+                        logger.debug(
+                            f"[{self.controller_id}]: received duplicate handshake from "
+                            f"storage manager {storage_manager_id}. Resending ACK."
+                        )
 
-                        # Track new connections
-                        if storage_manager_id not in self._connected_storage_managers:
-                            self._connected_storage_managers.add(storage_manager_id)
-                            storage_manager_type = request_msg.body.get("storage_manager_type", "Unknown")
-                            logger.debug(
-                                f"[{self.controller_id}]: received handshake from "
-                                f"storage manager {storage_manager_id} (type: {storage_manager_type}). "
-                                f"Total connected: {len(self._connected_storage_managers)}"
-                            )
-                        else:
-                            logger.debug(
-                                f"[{self.controller_id}]: received duplicate handshake from "
-                                f"storage manager {storage_manager_id}. Resending ACK."
-                            )
-
-                except Exception as e:
-                    logger.error(f"[{self.controller_id}]: error processing handshake: {e}")
+            except Exception as e:
+                logger.error(f"[{self.controller_id}]: error processing handshake: {e}")
 
     def _process_request(self):
         """Main request processing loop - adapted for partition-based operations."""
@@ -1701,7 +1693,6 @@ class TransferQueueController:
 
         elif mode == "force_fetch":
             batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
-            consumed_indexes = []
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)

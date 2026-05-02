@@ -188,10 +188,7 @@ class ZMQMessage:
 
 
 class ZMQServerTransport:
-    """Unified ZMQ transport abstraction for Controller / StorageUnit.
-    Encapsulates socket creation, binding, inproc endpoint, daemon thread,
-    ZMQ proxy lifecycle, and unified resource cleanup.
-    """
+    """Unified management of ZMQ Router Sockets, port binding, daemon threads, and message I/O."""
 
     def __init__(self, node_ip: str, ctx: zmq.Context | None = None):
         self.node_ip = node_ip
