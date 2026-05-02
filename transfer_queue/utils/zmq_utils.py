@@ -104,9 +104,7 @@ class ZMQRequestType(ExplicitEnum):
 
 
 class ZMQServerInfo:
-    """
-    TransferQueue server info class.
-    """
+    """TransferQueue server info class."""
 
     def __init__(self, role: Role, id: str, ip: str, ports: dict[str, int]):
         self.role = role
@@ -133,9 +131,7 @@ class ZMQServerInfo:
 
 @dataclass
 class ZMQMessage:
-    """
-    ZMQMessage class for TransferQueue communication.
-    """
+    """ZMQMessage class for TransferQueue communication."""
 
     request_type: ZMQRequestType
     sender_id: str
@@ -192,10 +188,7 @@ class ZMQMessage:
 
 
 class ZMQServerTransport:
-    """Unified ZMQ transport abstraction for Controller / StorageUnit.
-    Encapsulates socket creation, binding, inproc endpoint, daemon thread,
-    ZMQ proxy lifecycle, and unified resource cleanup.
-    """
+    """Unified management of ZMQ Router Sockets, port binding, daemon threads, and message I/O."""
 
     def __init__(self, node_ip: str, ctx: zmq.Context | None = None):
         self.node_ip = node_ip
@@ -222,17 +215,20 @@ class ZMQServerTransport:
                 logger.warning(f"ZMQ bind {name} failed, retrying...")
 
     def get_socket(self, name: str) -> zmq.Socket:
+        """Get ZMQ socket by name."""
         return self.sockets[name]
 
     def start_daemon_thread(self, target, name: str) -> None:
+        """Start a daemon thread with the given target functions."""
         t = threading.Thread(target=target, name=name, daemon=True)
         t.start()
         self.threads.append(t)
 
-    def build_server_info(self, role: Role, server_id: str) -> ZMQServerInfo:
+    def build_server_info(self, role: Role, id: str) -> ZMQServerInfo:
+        """Build ZMQServerInfo."""
         return ZMQServerInfo(
             role=role,
-            id=server_id,
+            id=id,
             ip=self.node_ip,
             ports=self.ports,
         )
