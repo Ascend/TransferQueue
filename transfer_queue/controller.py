@@ -1874,6 +1874,8 @@ class TransferQueueController:
                     partition_ids = params["partition_ids"]
 
                     self.clear_meta(global_indexes, partition_ids)
+                    if self._metrics is not None:
+                        self._metrics.record_samples("CLEAR_META", len(global_indexes))
 
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.CLEAR_META_RESPONSE,
@@ -2060,14 +2062,17 @@ class TransferQueueController:
                 with monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
                     message_data = request_msg.body
                     partition_id = message_data.get("partition_id")
+                    global_indexes = message_data.get("global_indexes", [])
 
                     # Update production status
                     success = self.update_production_status(
                         partition_id=partition_id,
-                        global_indexes=message_data.get("global_indexes", []),
+                        global_indexes=global_indexes,
                         field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
+                    if self._metrics is not None:
+                        self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
 
                     if success:
                         logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")

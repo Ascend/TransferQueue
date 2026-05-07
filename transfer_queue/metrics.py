@@ -145,6 +145,12 @@ class TQMetricsExporter:
             ["op_type"],
             registry=r,
         )
+        self.request_samples_total = Counter(
+            "tq_controller_request_samples_total",
+            "Total number of samples processed per operation type",
+            ["op_type"],
+            registry=r,
+        )
 
         # ---- Storage unit metrics ----
         self.storage_capacity = Gauge(
@@ -194,6 +200,13 @@ class TQMetricsExporter:
                 self.request_duration.labels(op_type=op_type).observe(elapsed)
             except Exception:
                 logger.debug(f"Metrics: failed to observe duration for {op_type}", exc_info=True)
+
+    def record_samples(self, op_type: str, count: int) -> None:
+        """Record the number of samples processed in a single operation."""
+        try:
+            self.request_samples_total.labels(op_type=op_type).inc(count)
+        except Exception:
+            logger.debug(f"Metrics: failed to record samples for {op_type}", exc_info=True)
 
     def register_storage_units(self, storage_unit_infos: dict[str, ZMQServerInfo]) -> None:
         """Register SimpleStorageUnit ZMQ endpoints for metrics collection."""
