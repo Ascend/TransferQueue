@@ -122,6 +122,7 @@ Steps:
 | `tq_controller_request_total` | Counter | `op_type` | Total requests processed |
 | `tq_controller_request_duration_seconds` | Histogram | `op_type` | Request latency (buckets: 1ms–5s) |
 | `tq_controller_request_errors_total` | Counter | `op_type` | Total request errors |
+| `tq_controller_request_samples_total` | Counter | `op_type` | Total samples processed per operation (for batch-aware accounting) |
 
 ### Storage Unit Metrics
 
@@ -143,7 +144,7 @@ The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.j
 | **Controller Overview** | Uptime, RSS Memory, Active Partitions, Indexes Allocated, Reusable Indexes |
 | **Request Throughput & Latency** | Request Rate (ops/s), Latency P50/P99 |
 | **Partition Status** | Samples per Partition, Production Progress, Consumption Progress |
-| **Storage Units** | Utilization Bar Gauge, Active Keys, Capacity vs Active Keys, RSS Memory |
+| **Storage Units** | Utilization Bar Gauge, Active Keys, Capacity vs Active Keys, RSS Memory, Produced vs Cleared Samples/s, Active Keys Delta |
 
 ### Template Variables
 
@@ -156,6 +157,41 @@ The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.j
 
 - **Storage Utilization**: Green < 70%, Yellow 70–90%, Red > 90%
 - **Controller RSS Memory**: Green < 2GB, Yellow 2–4GB, Red > 4GB
+
+## Detecting Leaks: Produced vs Cleared
+
+A common concern is whether consumed samples are being properly cleared from storage. The dashboard provides two panels for this:
+
+### Produced vs Cleared Samples (per second)
+
+Compares the **actual sample count** (not request count) between production and consumption:
+
+- `rate(tq_controller_request_samples_total{op_type="NOTIFY_DATA_UPDATE"})` — samples produced/s
+- `rate(tq_controller_request_samples_total{op_type="CLEAR_META"})` — samples cleared/s
+
+> **Why sample count, not request rate?** A single `CLEAR_META` request can batch-clear hundreds of samples. Comparing request rates would be misleading.
+
+| Observation | Meaning |
+|-------------|---------|
+| Two lines track closely | Production/consumption balanced, no leak |
+| Produced consistently > Cleared | Samples accumulating — potential leak |
+| Cleared spikes after Produced plateau | Batch consumer pattern (normal) |
+
+### Active Keys Delta
+
+Shows `sum(tq_storage_active_keys_total)` over time:
+
+| Observation | Meaning |
+|-------------|---------|
+| Stable or oscillating | Healthy steady-state |
+| Monotonically increasing | Leak — keys are never freed |
+| Approaching capacity | Imminent storage exhaustion |
+
+### Quick Troubleshooting
+
+1. **Active Keys rising?** → Check "Produced vs Cleared Samples" — is CLEAR keeping up?
+2. **CLEAR rate is zero?** → Consumer is not calling `clear_samples()` / `clear_partition()`
+3. **CLEAR rate > 0 but keys still rising?** → Check Consumption Progress — is the consumer actually finishing before clearing?
 
 ## Integration with `IntervalPerfMonitor`
 
