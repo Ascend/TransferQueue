@@ -309,8 +309,9 @@
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "title": "PUT vs CLEAR Rate (per second)",
       "targets": [
-        { "expr": "sum(rate(tq_controller_request_total{op_type=~\"PUT_DATA|NOTIFY_DATA_UPDATE\"}[$__rate_interval]))", "legendFormat": "PUT (produce)" },
-        { "expr": "sum(rate(tq_controller_request_total{op_type=\"CLEAR_DATA\"}[$__rate_interval]))", "legendFormat": "CLEAR (consume)" }
+        { "expr": "sum(rate(tq_controller_request_total{op_type=\"NOTIFY_DATA_UPDATE\"}[$__rate_interval]))", "legendFormat": "PUT (produce → controller)" },
+        { "expr": "sum(rate(tq_controller_request_total{op_type=~\"CLEAR_META|CLEAR_PARTITION\"}[$__rate_interval]))", "legendFormat": "CLEAR (consume → controller)" },
+        { "expr": "sum(rate(tq_controller_request_total{op_type=\"GET_CONSUMPTION\"}[$__rate_interval]))", "legendFormat": "GET_CONSUMPTION" }
       ],
       "type": "timeseries"
     },
