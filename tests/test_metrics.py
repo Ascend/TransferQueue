@@ -39,6 +39,7 @@ def _make_partition_snapshot(
     total_samples: int = 10,
     produced_ratio: float = 0.5,
     consumption: dict | None = None,
+    tasks: list | None = None,
 ) -> dict:
     """Return a partition snapshot dict."""
     consumption_stats = {}
@@ -46,9 +47,13 @@ def _make_partition_snapshot(
         for task, progress in consumption.items():
             consumption_stats[task] = {"consumption_progress": progress}
 
+    # Build per-task production statistics
+    task_list = tasks or list((consumption or {}).keys())
+    production_stats = {task: {"production_progress": produced_ratio} for task in task_list}
+
     return {
         "total_samples_num": total_samples,
-        "production_progress": produced_ratio,
+        "production_statistics": production_stats,
         "consumption_statistics": consumption_stats,
     }
 
@@ -127,12 +132,17 @@ class TestControllerMetricsCollection:
 
         # Check partition-level gauges
         assert exporter.partition_samples.labels(partition_id="train_0")._value.get() == 20
-        assert exporter.partition_production_progress.labels(partition_id="train_0")._value.get() == 0.8
+        assert exporter.partition_production_progress.labels(
+            partition_id="train_0", task_name="gen"
+        )._value.get() == 0.8
         assert exporter.partition_consumption_progress.labels(
             partition_id="train_0", task_name="gen"
         )._value.get() == 0.5
 
         assert exporter.partition_samples.labels(partition_id="train_1")._value.get() == 10
+        assert exporter.partition_production_progress.labels(
+            partition_id="train_1", task_name="gen"
+        )._value.get() == 1.0
         assert exporter.partition_consumption_progress.labels(
             partition_id="train_1", task_name="train"
         )._value.get() == 0.3

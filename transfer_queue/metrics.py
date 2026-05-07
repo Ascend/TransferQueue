@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import os
 import time
 from contextlib import contextmanager
@@ -23,8 +22,9 @@ from uuid import uuid4
 
 import psutil
 import zmq
-from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram, start_http_server
+from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -33,15 +33,8 @@ from transfer_queue.utils.zmq_utils import (
     format_zmq_address,
 )
 
-logger = logging.getLogger(__name__)
-logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.INFO))
+logger = get_logger(__name__)
 
-if not logger.hasHandlers():
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(name)s - %(message)s"))
-    logger.addHandler(handler)
-
-TQ_METRICS_PORT = int(os.environ.get("TQ_METRICS_PORT", 0))
 TQ_METRICS_COLLECT_INTERVAL = int(os.environ.get("TQ_METRICS_COLLECT_INTERVAL", 10))
 TQ_METRICS_STORAGE_TIMEOUT = int(os.environ.get("TQ_METRICS_STORAGE_TIMEOUT", 5))
 
@@ -70,7 +63,6 @@ class TQMetricsExporter:
            and ``collect_storage_metrics`` every ``TQ_METRICS_COLLECT_INTERVAL`` seconds.
 
     Environment variables:
-        TQ_METRICS_PORT              HTTP port for /metrics (default 0 = auto-assign free port)
         TQ_METRICS_COLLECT_INTERVAL  Collection interval in seconds (default 10)
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
@@ -82,6 +74,7 @@ class TQMetricsExporter:
         self._zmq_ctx: zmq.Context | None = None
         self._zmq_sockets: dict[str, zmq.Socket] = {}
         self._known_partition_ids: set[str] = set()
+        self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
         self._metrics_endpoint: str = ""
 
@@ -91,6 +84,11 @@ class TQMetricsExporter:
 
         self.registry = CollectorRegistry()
         self._define_metrics()
+
+    @property
+    def endpoint(self) -> str:
+        """The metrics HTTP endpoint address in ``host:port`` format."""
+        return self._metrics_endpoint
 
     def _define_metrics(self) -> None:
         r = self.registry
@@ -109,7 +107,7 @@ class TQMetricsExporter:
         self.partition_production_progress = Gauge(
             "tq_partition_production_progress",
             "Production progress ratio (0.0-1.0)",
-            ["partition_id"],
+            ["partition_id", "task_name"],
             registry=r,
         )
         self.partition_consumption_progress = Gauge(
@@ -226,9 +224,16 @@ class TQMetricsExporter:
         current_consumption_labels: set[tuple[str, str]] = set()
         self.partitions_total.set(len(current_pids))
 
+        current_production_labels: set[tuple[str, str]] = set()
+
         for pid, stats in partitions.items():
             self.partition_samples.labels(partition_id=pid).set(stats["total_samples_num"])
-            self.partition_production_progress.labels(partition_id=pid).set(stats.get("production_progress", 0))
+
+            for task_name, pstats in stats.get("production_statistics", {}).items():
+                self.partition_production_progress.labels(partition_id=pid, task_name=task_name).set(
+                    pstats.get("production_progress", 0)
+                )
+                current_production_labels.add((pid, task_name))
 
             for task_name, cstats in stats.get("consumption_statistics", {}).items():
                 self.partition_consumption_progress.labels(partition_id=pid, task_name=task_name).set(
@@ -238,20 +243,22 @@ class TQMetricsExporter:
 
         # Prune stale partition labels
         for stale_pid in self._known_partition_ids - current_pids:
-            for metric in (
-                self.partition_samples,
-                self.partition_production_progress,
-            ):
-                try:
-                    metric.remove(stale_pid)
-                except (KeyError, ValueError):
-                    pass
+            try:
+                self.partition_samples.remove(stale_pid)
+            except (KeyError, ValueError):
+                pass
+        for stale_pair in self._known_production_labels - current_production_labels:
+            try:
+                self.partition_production_progress.remove(*stale_pair)
+            except (KeyError, ValueError):
+                pass
         for stale_pair in self._known_consumption_labels - current_consumption_labels:
             try:
                 self.partition_consumption_progress.remove(*stale_pair)
             except (KeyError, ValueError):
                 pass
         self._known_partition_ids = current_pids
+        self._known_production_labels = current_production_labels
         self._known_consumption_labels = current_consumption_labels
 
         # Index manager
@@ -329,19 +336,39 @@ class TQMetricsExporter:
                 sock.close(linger=0)
             return None
 
-    def start(self, node_ip: str = "0.0.0.0") -> str:
+    def start(self, node_ip: str = "0.0.0.0", port: int = 0) -> str:
         """Start the HTTP /metrics server and the background collection thread.
 
-        When ``TQ_METRICS_PORT`` is ``0`` (the default), the OS assigns a free
-        port automatically — the actual port is read back from the server socket.
+        When *port* is ``0`` (the default), the OS assigns a free port
+        automatically — the actual port is read back from the server socket.
 
         Args:
-            node_ip: The IP address of the node hosting the Controller Actor.
+            node_ip: The IP address of the node hosting the process.
+            port: HTTP port for the /metrics endpoint.
 
         Returns:
             The metrics endpoint address in ``host:port`` format.
         """
-        httpd, _ = start_http_server(TQ_METRICS_PORT, registry=self.registry)
+        # prometheus_client.start_http_server returns None in some versions,
+        # so we replicate its internal logic to obtain the server object.
+        from wsgiref.simple_server import make_server
+
+        from prometheus_client.exposition import (
+            ThreadingWSGIServer,
+            _SilentHandler,
+            _get_best_family,
+            make_wsgi_app,
+        )
+
+        class _TmpServer(ThreadingWSGIServer):
+            pass
+
+        _TmpServer.address_family, addr = _get_best_family(node_ip, port)
+        app = make_wsgi_app(self.registry)
+        httpd = make_server(addr, port, app, _TmpServer, handler_class=_SilentHandler)
+        t = Thread(target=httpd.serve_forever, name="TQMetricsHTTPServer", daemon=True)
+        t.start()
+
         actual_port = httpd.server_address[1]
         self._metrics_endpoint = f"{node_ip}:{actual_port}"
         logger.info(f"TQ Metrics HTTP server started on {self._metrics_endpoint}")

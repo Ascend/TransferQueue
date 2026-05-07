@@ -172,6 +172,8 @@ class SimpleStorageUnit:
         self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
 
+        self._metrics = None
+
         self._init_zmq_socket()
         self._start_process_put_get()
 
@@ -265,6 +267,7 @@ class SimpleStorageUnit:
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
 
         while not self._shutdown_event.is_set():
+            monitor = self._metrics if self._metrics is not None else perf_monitor
             try:
                 socks = dict(poller.poll(TQ_STORAGE_POLLER_TIMEOUT * 1000))
             except zmq.error.ContextTerminated:
@@ -292,13 +295,13 @@ class SimpleStorageUnit:
 
                     # Process request
                     if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="PUT_DATA"):
+                        with monitor.measure(op_type="PUT_DATA"):
                             response_msg = self._handle_put(request_msg)
                     elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="GET_DATA"):
+                        with monitor.measure(op_type="GET_DATA"):
                             response_msg = self._handle_get(request_msg)
                     elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="CLEAR_DATA"):
+                        with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
                     elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                         response_msg = self._handle_get_metrics()
@@ -541,6 +544,27 @@ class SimpleStorageUnit:
             proxy_thread.join(timeout=5)
 
         logger.info("SimpleStorageUnit resources shutdown complete.")
+
+    def start_metrics(self, port: int = 0) -> str:
+        """Initialize and start the Prometheus metrics exporter for this storage unit.
+
+        When enabled, replaces ``IntervalPerfMonitor`` for request latency/throughput
+        tracking with Prometheus counters and histograms.
+
+        Args:
+            port: HTTP port for the /metrics endpoint (0 = auto-assign).
+
+        Returns:
+            The metrics endpoint address in ``host:port`` format.
+        """
+        if self._metrics is not None:
+            return self._metrics.endpoint
+        from transfer_queue.metrics import TQMetricsExporter
+
+        self._metrics = TQMetricsExporter()
+        endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
+        logger.info(f"[{self.storage_unit_id}]: Prometheus metrics exporter started on {endpoint}")
+        return endpoint
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get the ZMQ server information for this storage unit.

@@ -1,0 +1,164 @@
+
+# Prometheus Metrics & Grafana Dashboard
+
+> Last updated: 05/07/2026
+
+## Overview
+
+TransferQueue provides built-in Prometheus metrics exporting for both the **Controller** and **SimpleStorageUnit** processes. When enabled, each process exposes an HTTP `/metrics` endpoint that can be scraped by Prometheus, and a pre-built Grafana dashboard is provided for visualization.
+
+## Quick Start
+
+### 1. Enable Metrics in Config
+
+```yaml
+metrics:
+  enabled: true
+  port: 0  # 0 = auto-assign free port; set a fixed port for production
+```
+
+Or pass via `init()`:
+
+```python
+import transfer_queue as tq
+
+tq.init({
+    "metrics": {
+        "enabled": True,
+        "port": 9090,
+    }
+})
+```
+
+### 2. Discover the Endpoint
+
+```python
+endpoint = tq.get_metrics_endpoint()
+print(f"http://{endpoint}/metrics")
+```
+
+### 3. Import Grafana Dashboard
+
+Import the pre-built dashboard JSON into your Grafana instance:
+
+**[`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.json)**
+
+Steps:
+1. Open Grafana → Dashboards → Import
+2. Upload the JSON file or paste its content
+3. Select your Prometheus datasource
+4. Done
+
+## Configuration
+
+| Config Key | Default | Description |
+|------------|---------|-------------|
+| `metrics.enabled` | `false` | Enable/disable the metrics exporter |
+| `metrics.port` | `0` | HTTP port for `/metrics` endpoint (0 = OS auto-assign) |
+
+| Environment Variable | Default | Description |
+|---------------------|---------|-------------|
+| `TQ_METRICS_COLLECT_INTERVAL` | `10` | Background collection interval (seconds) |
+| `TQ_METRICS_STORAGE_TIMEOUT` | `5` | ZMQ timeout for storage unit queries (seconds) |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Controller Process                                             │
+│                                                                 │
+│  TransferQueueController                                        │
+│       │                                                         │
+│       │── snapshot push (every 10s) ──▶ TQMetricsExporter       │
+│       │                                    │                    │
+│       │                                    ├─ HTTP /metrics ◀── Prometheus
+│       │                                    │                    │
+│       │                                    └─ ZMQ GET_METRICS   │
+│       │                                         │               │
+└───────┼─────────────────────────────────────────┼───────────────┘
+        │                                         │
+        ▼                                         ▼
+┌───────────────────┐                   ┌───────────────────┐
+│ SimpleStorageUnit │                   │ SimpleStorageUnit │
+│                   │                   │                   │
+│ TQMetricsExporter │                   │ TQMetricsExporter │
+│   HTTP /metrics ◀─┼── Prometheus      │   HTTP /metrics   │
+└───────────────────┘                   └───────────────────┘
+```
+
+- **Controller** pushes plain-dict snapshots to its exporter (no lock contention).
+- **Storage Units** each run their own exporter for request latency/throughput tracking.
+- The Controller exporter also queries storage units via ZMQ for capacity/utilization metrics.
+
+## Metrics Reference
+
+### Controller Process Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_controller_uptime_seconds` | Gauge | — | Controller process uptime |
+| `tq_controller_memory_rss_bytes` | Gauge | — | Controller RSS memory |
+
+### Partition Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_partitions_total` | Gauge | — | Number of active partitions |
+| `tq_partition_samples_total` | Gauge | `partition_id` | Samples per partition |
+| `tq_partition_production_progress` | Gauge | `partition_id`, `task_name` | Production progress (0.0–1.0) |
+| `tq_partition_consumption_progress` | Gauge | `partition_id`, `task_name` | Consumption progress (0.0–1.0) |
+
+### Index Manager Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_global_index_allocated_total` | Gauge | — | Total allocated global indexes |
+| `tq_global_index_reusable_total` | Gauge | — | Reusable global indexes |
+
+### Request Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_controller_request_total` | Counter | `op_type` | Total requests processed |
+| `tq_controller_request_duration_seconds` | Histogram | `op_type` | Request latency (buckets: 1ms–5s) |
+| `tq_controller_request_errors_total` | Counter | `op_type` | Total request errors |
+
+### Storage Unit Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_storage_capacity_total` | Gauge | `storage_unit_id` | Max storage capacity |
+| `tq_storage_active_keys_total` | Gauge | `storage_unit_id` | Active keys in storage |
+| `tq_storage_utilization_ratio` | Gauge | `storage_unit_id` | Utilization (active/capacity) |
+| `tq_storage_memory_rss_bytes` | Gauge | `storage_unit_id` | Storage process RSS memory |
+
+## Grafana Dashboard
+
+The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.json)) includes:
+
+### Panels
+
+| Section | Panels |
+|---------|--------|
+| **Controller Overview** | Uptime, RSS Memory, Active Partitions, Indexes Allocated, Reusable Indexes |
+| **Request Throughput & Latency** | Request Rate (ops/s), Latency P50/P99 |
+| **Partition Status** | Samples per Partition, Production Progress, Consumption Progress |
+| **Storage Units** | Utilization Bar Gauge, Active Keys, Capacity vs Active Keys, RSS Memory |
+
+### Template Variables
+
+| Variable | Description |
+|----------|-------------|
+| `datasource` | Prometheus datasource selector |
+| `task_name` | Filter Production/Consumption Progress panels by task |
+
+### Thresholds
+
+- **Storage Utilization**: Green < 70%, Yellow 70–90%, Red > 90%
+- **Controller RSS Memory**: Green < 2GB, Yellow 2–4GB, Red > 4GB
+
+## Integration with `IntervalPerfMonitor`
+
+When metrics are **disabled** (default), both the Controller and SimpleStorageUnit use `IntervalPerfMonitor` — a lightweight logger-based fallback that prints aggregated stats every 5 minutes.
+
+When metrics are **enabled**, `TQMetricsExporter` replaces the perf monitor transparently (same `measure(op_type=...)` interface), providing Prometheus-native counters and histograms instead of log-based summaries.

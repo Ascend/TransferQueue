@@ -4,6 +4,7 @@
 # Prometheus metrics exporter.
 metrics:
   enabled: false
+  port: 0  # HTTP port for /metrics endpoint (0 = auto-assign free port)
 
 controller:
   # User-defined sampler. User can pass sampler instance to overwrite this string config.

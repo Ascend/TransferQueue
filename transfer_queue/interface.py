@@ -299,9 +299,10 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     logger.info(f"TransferQueue config: {final_conf}")
 
     # start Prometheus metrics exporter if enabled
-    metrics_enabled = final_conf.get("metrics", {}).get("enabled", False)
-    if metrics_enabled:
-        metrics_endpoint = ray.get(_TQ_CONTROLLER.start_metrics.remote())
+    metrics_conf = final_conf.get("metrics", {})
+    if metrics_conf.get("enabled", False):
+        metrics_port = metrics_conf.get("port", 0)
+        metrics_endpoint = ray.get(_TQ_CONTROLLER.start_metrics.remote(port=metrics_port))
         final_conf.metrics.enabled = True
         final_conf.metrics.endpoint = metrics_endpoint
         # Update stored config so other processes can discover the endpoint
@@ -311,6 +312,10 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             storage_zmq_info = final_conf.backend.SimpleStorage.get("zmq_info")
             if storage_zmq_info:
                 ray.get(_TQ_CONTROLLER.register_storage_units_for_metrics.remote(storage_zmq_info))
+            # Start metrics exporter on each storage unit
+            if _TQ_STORAGE and "SimpleStorage" in _TQ_STORAGE:
+                futures = [handle.start_metrics.remote(port=0) for handle in _TQ_STORAGE["SimpleStorage"].values()]
+                ray.get(futures)
         logger.info(f"Prometheus metrics endpoint: http://{metrics_endpoint}/metrics")
 
     _maybe_create_tq_client(final_conf)

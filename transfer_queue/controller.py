@@ -2132,9 +2132,15 @@ class TransferQueueController:
         for pid, partition in list(self.partitions.items()):
             try:
                 stats = partition.get_statistics()
+                # Build per-task production statistics from registered tasks
+                production_statistics: dict = {}
+                for task_name in stats.get("registered_tasks", []):
+                    production_statistics[task_name] = {
+                        "production_progress": stats.get("production_progress", 0),
+                    }
                 partitions_data[pid] = {
                     "total_samples_num": stats["total_samples_num"],
-                    "production_progress": stats.get("production_progress", 0),
+                    "production_statistics": production_statistics,
                     "consumption_statistics": {
                         task_name: {"consumption_progress": cstats.get("consumption_progress", 0)}
                         for task_name, cstats in stats.get("consumption_statistics", {}).items()
@@ -2159,12 +2165,15 @@ class TransferQueueController:
         except Exception as e:
             logger.debug(f"[{self.controller_id}]: Failed to push metrics snapshot: {e}")
 
-    def start_metrics(self) -> str:
+    def start_metrics(self, port: int = 0) -> str:
         """Initialize and start the Prometheus metrics exporter.
 
         This creates a ``TQMetricsExporter``, starts an HTTP ``/metrics``
         endpoint and a background collection thread.  The method is safe
         to call multiple times -- subsequent calls return the existing endpoint.
+
+        Args:
+            port: HTTP port for the /metrics endpoint (0 = auto-assign).
 
         Returns:
             The metrics endpoint address in ``host:port`` format.
@@ -2174,7 +2183,7 @@ class TransferQueueController:
         from transfer_queue.metrics import TQMetricsExporter
 
         self._metrics = TQMetricsExporter()
-        self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip)
+        self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
         # Launch a daemon thread that periodically pushes controller state
         # snapshots to the exporter, keeping them process-isolated.
         self._metrics_snapshot_thread = Thread(
