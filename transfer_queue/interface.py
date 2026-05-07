@@ -18,7 +18,7 @@ import os
 import subprocess
 import time
 from importlib import resources
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 import ray
