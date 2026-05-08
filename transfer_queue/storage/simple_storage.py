@@ -517,19 +517,17 @@ class SimpleStorageUnit:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
                     duration_sum = hist._sum.get()
-                    # Count is the sum of all bucket increments
-                    duration_count = sum(b.get() for b in hist._buckets)
-                    # Compute quantiles from histogram buckets
-                    p50 = self._quantile_from_histogram(hist, 0.50)
-                    p99 = self._quantile_from_histogram(hist, 0.99)
+                    # Build cumulative counts once, reuse for total and quantiles
+                    cumulative_counts = self._cumulative_bucket_counts(hist)
+                    duration_count = cumulative_counts[-1] if cumulative_counts else 0
                     op_stats[op_type] = {
                         "request_count": counter._value.get(),
                         "latency_avg": duration_sum / duration_count if duration_count > 0 else 0,
-                        "latency_p50": p50,
-                        "latency_p99": p99,
+                        "latency_p50": self._quantile_from_cumulative(hist, cumulative_counts, 0.50),
+                        "latency_p99": self._quantile_from_cumulative(hist, cumulative_counts, 0.99),
                     }
-                except Exception:
-                    pass
+                except (AttributeError, TypeError, ZeroDivisionError) as e:
+                    logger.debug(f"[{self.storage_unit_id}]: Failed to extract metrics for {op_type}: {e}")
             if op_stats:
                 metrics["op_stats"] = op_stats
 
@@ -540,23 +538,22 @@ class SimpleStorageUnit:
         )
 
     @staticmethod
-    def _quantile_from_histogram(hist, q: float) -> float:
-        """Estimate a quantile from a prometheus_client Histogram instance.
-
-        Uses linear interpolation within the bucket that contains the target
-        observation, matching Prometheus server's histogram_quantile() logic.
-
-        Note: prometheus_client stores per-bucket increments (non-cumulative)
-        internally. We accumulate them to get cumulative counts for interpolation.
-        """
-        # Build cumulative counts from non-cumulative bucket values
+    def _cumulative_bucket_counts(hist) -> list[float]:
+        """Build cumulative counts from a prometheus_client Histogram's non-cumulative buckets."""
         cumulative = 0.0
-        cumulative_counts = []
+        counts = []
         for bucket in hist._buckets:
             cumulative += bucket.get()
-            cumulative_counts.append(cumulative)
+            counts.append(cumulative)
+        return counts
 
-        total = cumulative
+    @staticmethod
+    def _quantile_from_cumulative(hist, cumulative_counts: list[float], q: float) -> float:
+        """Estimate a quantile using pre-computed cumulative bucket counts.
+
+        Uses linear interpolation matching Prometheus histogram_quantile() logic.
+        """
+        total = cumulative_counts[-1] if cumulative_counts else 0
         if total == 0:
             return 0.0
         target = q * total
@@ -564,12 +561,10 @@ class SimpleStorageUnit:
         prev_cumulative = 0.0
         for bound, cum_count in zip(hist._upper_bounds, cumulative_counts):
             if cum_count >= target:
-                # Linear interpolation within this bucket
                 fraction = (target - prev_cumulative) / (cum_count - prev_cumulative) if cum_count > prev_cumulative else 0
                 return prev_bound + (bound - prev_bound) * fraction
             prev_bound = bound
             prev_cumulative = cum_count
-        # All observations are in the +Inf bucket
         return prev_bound
 
     @staticmethod

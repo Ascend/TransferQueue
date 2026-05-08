@@ -421,21 +421,21 @@ class TQMetricsExporter:
         self._metrics_endpoint = f"{node_ip}:{actual_port}"
         logger.info(f"TQ Metrics HTTP server started on {self._metrics_endpoint}")
 
-        self._collect_thread = Thread(
-            target=self._collect_loop,
-            name="TQMetricsCollectorThread",
-            daemon=True,
-        )
-        self._collect_thread.start()
+        if self._role == "controller":
+            self._collect_thread = Thread(
+                target=self._collect_loop,
+                name="TQMetricsCollectorThread",
+                daemon=True,
+            )
+            self._collect_thread.start()
         return self._metrics_endpoint
 
     def _collect_loop(self) -> None:
-        """Background loop that periodically collects all metrics."""
+        """Background loop that periodically collects controller and storage metrics."""
         while True:
             try:
-                if self._role == "controller":
-                    self.collect_controller_metrics()
-                    self.collect_storage_metrics()
+                self.collect_controller_metrics()
+                self.collect_storage_metrics()
             except Exception as e:
                 logger.error(f"Metrics collection error: {e}")
             time.sleep(TQ_METRICS_COLLECT_INTERVAL)
