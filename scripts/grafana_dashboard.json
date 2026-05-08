@@ -311,7 +311,7 @@
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "title": "Storage Request Rate (per second)",
       "targets": [
-        { "expr": "sum by (op_type) (rate(tq_storage_request_total{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "{{ op_type }}" }
+        { "expr": "sum by (op_type) (rate(tq_storage_request_count{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "{{ op_type }}" }
       ],
       "type": "timeseries"
     },
@@ -329,7 +329,7 @@
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "title": "Storage Request Latency P${quantile:csv}",
       "targets": [
-        { "expr": "histogram_quantile($quantile, sum by (op_type, le) (rate(tq_storage_request_duration_seconds_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p{{quantile}} {{ op_type }}" }
+        { "expr": "histogram_quantile($quantile, sum by (op_type, le) (rate(tq_storage_request_duration_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p{{quantile}} {{ op_type }}" }
       ],
       "repeat": "quantile",
       "repeatDirection": "h",
@@ -408,22 +408,18 @@
       },
       {
         "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "definition": "label_values(tq_storage_request_count, op_type)",
         "hide": 0,
         "includeAll": true,
         "label": "Op Type",
         "multi": true,
         "name": "op_type",
-        "options": [
-          { "selected": true, "text": "All", "value": "$__all" },
-          { "selected": false, "text": "PUT_DATA", "value": "PUT_DATA" },
-          { "selected": false, "text": "GET_DATA", "value": "GET_DATA" },
-          { "selected": false, "text": "CLEAR_DATA", "value": "CLEAR_DATA" },
-          { "selected": false, "text": "GET_META", "value": "GET_META" },
-          { "selected": false, "text": "CLEAR_META", "value": "CLEAR_META" },
-          { "selected": false, "text": "NOTIFY_DATA_UPDATE", "value": "NOTIFY_DATA_UPDATE" }
-        ],
-        "query": "PUT_DATA,GET_DATA,CLEAR_DATA,GET_META,CLEAR_META,NOTIFY_DATA_UPDATE",
-        "type": "custom"
+        "options": [],
+        "query": "label_values(tq_storage_request_count, op_type)",
+        "refresh": 2,
+        "sort": 1,
+        "type": "query"
       },
       {
         "current": { "selected": true, "text": ["0.50", "0.99"], "value": ["0.50", "0.99"] },

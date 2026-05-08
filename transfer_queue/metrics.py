@@ -178,27 +178,30 @@ class TQMetricsExporter:
         )
 
         # ---- Storage request metrics (collected via ZMQ, exposed as gauges) ----
-        self.storage_request_total = Gauge(
-            "tq_storage_request_total",
+        # NOTE: Avoid _total/_bucket/_sum/_count suffixes on Gauge metrics —
+        # Prometheus reserves these for Counter/Histogram types and will
+        # report type conflicts that break label_values() queries.
+        self.storage_request_count = Gauge(
+            "tq_storage_request_count",
             "Total requests processed by storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
-        self.storage_request_duration_seconds_bucket = Gauge(
-            "tq_storage_request_duration_seconds_bucket",
+        self.storage_request_duration_bucket = Gauge(
+            "tq_storage_request_duration_bucket",
             "Histogram bucket for storage request duration",
             ["storage_unit_id", "op_type", "le"],
             registry=r,
         )
-        self.storage_request_duration_seconds_sum = Gauge(
-            "tq_storage_request_duration_seconds_sum",
+        self.storage_request_duration_sum = Gauge(
+            "tq_storage_request_duration_sum",
             "Sum of request durations in storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
-        self.storage_request_duration_seconds_count = Gauge(
-            "tq_storage_request_duration_seconds_count",
-            "Count of request durations in storage unit",
+        self.storage_request_duration_num = Gauge(
+            "tq_storage_request_duration_num",
+            "Count of observed request durations in storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
@@ -338,17 +341,17 @@ class TQMetricsExporter:
 
                 # Per-operation request stats
                 for op_type, op_data in metrics.get("op_stats", {}).items():
-                    self.storage_request_total.labels(
+                    self.storage_request_count.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("request_count", 0))
-                    self.storage_request_duration_seconds_sum.labels(
+                    self.storage_request_duration_sum.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("duration_sum", 0))
-                    self.storage_request_duration_seconds_count.labels(
+                    self.storage_request_duration_num.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("duration_count", 0))
                     for le, count in op_data.get("duration_buckets", {}).items():
-                        self.storage_request_duration_seconds_bucket.labels(
+                        self.storage_request_duration_bucket.labels(
                             storage_unit_id=label, op_type=op_type, le=le
                         ).set(count)
             except Exception as e:
