@@ -319,7 +319,7 @@ class DataCentricWorkerPipelineDemo:
         batch = make_prompt_batch(step, self.config)
         sample_ids = batch["sample_id"].view(-1).tolist()
         meta = self.tq_client.put(batch, partition_id=partition_id)
-        logger.info(f"[driver] step={step} prompt put -> partition={partition_id}, sample_ids={sample_ids}, fields={list(meta.field_names)}")
+        logger.info(f"step={step} prompt put -> partition={partition_id}, sample_ids={sample_ids}, fields={list(meta.field_names)}")
 
     def _wait_complete(self, step: int) -> None:
         while True:
@@ -327,7 +327,7 @@ class DataCentricWorkerPipelineDemo:
             done_workers = ray.get(self.tracker.get_done_workers.remote(step))
 
             active_counts = {stage: count for stage, count in counts.items() if count > 0}
-            logger.info(f"[driver] step={step} status -> counts={active_counts}, done_workers={done_workers}")
+            logger.info(f"step={step} status -> counts={active_counts}, done_workers={done_workers}")
 
             all_workers_done = (
                 done_workers.get("rollout", 0) >= self.config.num_rollout_workers
@@ -370,7 +370,7 @@ class DataCentricWorkerPipelineDemo:
             self._wait_complete(step)
             ray.get(sync_weights.remote(step, self.config.weight_sync_seconds))
             self.tq_client.clear_partition(f"{self.config.partition_prefix}_{step}")
-            logger.info(f"[driver] step={step} cleared partition={self.config.partition_prefix}_{step}")
+            logger.info(f"step={step} cleared partition={self.config.partition_prefix}_{step}")
 
         ray.get(refs)
         logger.info("demo done!")
