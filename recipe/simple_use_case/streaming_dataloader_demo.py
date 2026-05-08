@@ -264,7 +264,6 @@ class DemoConfig:
     rollout_sleep_seconds: float
     stage_sleep_seconds: float
     weight_sync_seconds: float
-    empty_poll_log_interval: int
     num_data_storage_units: int
     seed: int
 
@@ -397,7 +396,6 @@ def main() -> None:
     parser.add_argument("--rollout-sleep-seconds", type=float, default=0.30)
     parser.add_argument("--stage-sleep-seconds", type=float, default=0.15)
     parser.add_argument("--weight-sync-seconds", type=float, default=0.20)
-    parser.add_argument("--empty-poll-log-interval", type=int, default=20)
     parser.add_argument("--num-data-storage-units", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260410)
     args = parser.parse_args()
@@ -419,7 +417,6 @@ def main() -> None:
         rollout_sleep_seconds=args.rollout_sleep_seconds,
         stage_sleep_seconds=args.stage_sleep_seconds,
         weight_sync_seconds=args.weight_sync_seconds,
-        empty_poll_log_interval=args.empty_poll_log_interval,
         num_data_storage_units=args.num_data_storage_units,
         seed=args.seed,
     )
