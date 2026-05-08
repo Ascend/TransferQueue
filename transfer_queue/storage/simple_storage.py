@@ -494,7 +494,7 @@ class SimpleStorageUnit:
         """Handle GET_METRICS request by returning storage unit statistics.
 
         Returns:
-            ZMQMessage containing storage capacity, active keys, field count,
+            ZMQMessage containing storage unit ID, capacity, active keys,
             and process RSS memory.
         """
         try:

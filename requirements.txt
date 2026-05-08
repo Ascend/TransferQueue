@@ -6,4 +6,4 @@ numpy<2.0.0
 msgspec
 psutil
 omegaconf
-prometheus_client
+prometheus_client>=0.20.0

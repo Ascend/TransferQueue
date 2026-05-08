@@ -362,26 +362,9 @@ class TQMetricsExporter:
         Returns:
             The metrics endpoint address in ``host:port`` format.
         """
-        # prometheus_client.start_http_server returns None in some versions,
-        # so we replicate its internal logic to obtain the server object.
-        from wsgiref.simple_server import make_server
+        from prometheus_client import start_http_server
 
-        from prometheus_client.exposition import (
-            ThreadingWSGIServer,
-            _SilentHandler,
-            _get_best_family,
-            make_wsgi_app,
-        )
-
-        class _TmpServer(ThreadingWSGIServer):
-            pass
-
-        _TmpServer.address_family, addr = _get_best_family(node_ip, port)
-        app = make_wsgi_app(self.registry)
-        httpd = make_server(addr, port, app, _TmpServer, handler_class=_SilentHandler)
-        t = Thread(target=httpd.serve_forever, name="TQMetricsHTTPServer", daemon=True)
-        t.start()
-
+        httpd, _thread = start_http_server(port=port, addr=node_ip, registry=self.registry)
         actual_port = httpd.server_address[1]
         self._metrics_endpoint = f"{node_ip}:{actual_port}"
         logger.info(f"TQ Metrics HTTP server started on {self._metrics_endpoint}")

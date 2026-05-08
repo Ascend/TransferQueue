@@ -2071,10 +2071,9 @@ class TransferQueueController:
                         field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
-                    if self._metrics is not None:
-                        self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
-
                     if success:
+                        if self._metrics is not None:
+                            self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
                         logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
 
                     # Send acknowledgment
@@ -2137,8 +2136,14 @@ class TransferQueueController:
         for pid, partition in list(self.partitions.items()):
             try:
                 stats = partition.get_statistics()
-                # Build per-task production statistics from registered tasks
+                # Build per-task production statistics from registered tasks.
+                # Always emit an "all" entry so production progress is visible
+                # even before any consumer tasks are registered.
                 production_statistics: dict = {}
+                if "production_progress" in stats:
+                    production_statistics["all"] = {
+                        "production_progress": stats["production_progress"],
+                    }
                 for task_name in stats.get("registered_tasks", []):
                     production_statistics[task_name] = {
                         "production_progress": stats.get("production_progress", 0),
