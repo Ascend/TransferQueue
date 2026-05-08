@@ -251,7 +251,6 @@ class DemoConfig:
     partition_prefix: str
     task_name_prefix: str
     num_steps: int
-    pipeline_depth: int
     global_batch_size: int
     micro_batch_size: int
     prompt_length: int
@@ -385,7 +384,6 @@ def main() -> None:
     parser.add_argument("--partition-prefix", type=str, default="autonomous_demo")
     parser.add_argument("--task-name-prefix", type=str, default="autonomous")
     parser.add_argument("--num-steps", type=int, default=3)
-    parser.add_argument("--pipeline-depth", type=int, default=2)
     parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--micro-batch-size", type=int, default=2)
     parser.add_argument("--prompt-length", type=int, default=24)
@@ -408,7 +406,6 @@ def main() -> None:
         partition_prefix=args.partition_prefix,
         task_name_prefix=args.task_name_prefix,
         num_steps=args.num_steps,
-        pipeline_depth=args.pipeline_depth,
         global_batch_size=args.global_batch_size,
         micro_batch_size=args.micro_batch_size,
         prompt_length=args.prompt_length,
