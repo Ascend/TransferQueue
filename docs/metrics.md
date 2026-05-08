@@ -1,7 +1,7 @@
 
 # Prometheus Metrics & Grafana Dashboard
 
-> Last updated: 05/07/2026
+> Last updated: 05/08/2026
 
 ## Overview
 
@@ -70,6 +70,7 @@ Steps:
 │  TransferQueueController                                        │
 │       │                                                         │
 │       │── snapshot push (every 10s) ──▶ TQMetricsExporter       │
+│       │                                  (role="controller")    │
 │       │                                    │                    │
 │       │                                    ├─ HTTP /metrics ◀── Prometheus
 │       │                                    │                    │
@@ -82,13 +83,15 @@ Steps:
 │ SimpleStorageUnit │                   │ SimpleStorageUnit │
 │                   │                   │                   │
 │ TQMetricsExporter │                   │ TQMetricsExporter │
+│ (role="storage")  │                   │ (role="storage")  │
 │   HTTP /metrics ◀─┼── Prometheus      │   HTTP /metrics   │
 └───────────────────┘                   └───────────────────┘
 ```
 
-- **Controller** pushes plain-dict snapshots to its exporter (no lock contention).
-- **Storage Units** each run their own exporter for request latency/throughput tracking.
-- The Controller exporter also queries storage units via ZMQ for capacity/utilization metrics.
+- **Controller** (`role="controller"`) pushes plain-dict snapshots to its exporter (no lock contention). Its exporter also queries storage units via ZMQ for capacity/utilization and per-operation request stats.
+- **Storage Units** (`role="storage"`) each run their own exporter with native Histogram/Counter metrics for request latency/throughput (PUT_DATA, GET_DATA, CLEAR_DATA).
+- **Two scrape paths**: If Prometheus scrapes only the controller endpoint, storage request metrics are available via ZMQ-collected gauges. If Prometheus scrapes each storage unit directly, native histogram data provides more precise quantiles.
+- Metrics are **role-prefixed**: controller uses `tq_controller_request_*`, storage uses `tq_storage_request_*` — no naming conflicts.
 
 ## Metrics Reference
 
@@ -124,7 +127,7 @@ Steps:
 | `tq_controller_request_errors_total` | Counter | `op_type` | Total request errors |
 | `tq_controller_request_samples_total` | Counter | `op_type` | Total samples processed per operation (for batch-aware accounting) |
 
-### Storage Unit Metrics
+### Storage Unit Metrics (collected via ZMQ, exposed on controller)
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -132,6 +135,21 @@ Steps:
 | `tq_storage_active_keys_total` | Gauge | `storage_unit_id` | Active keys in storage |
 | `tq_storage_utilization_ratio` | Gauge | `storage_unit_id` | Utilization (active/capacity) |
 | `tq_storage_memory_rss_bytes` | Gauge | `storage_unit_id` | Storage process RSS memory |
+| `tq_storage_request_count` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
+| `tq_storage_request_duration_bucket` | Gauge | `storage_unit_id`, `op_type`, `le` | Histogram bucket for request duration |
+| `tq_storage_request_duration_sum` | Gauge | `storage_unit_id`, `op_type` | Sum of request durations |
+| `tq_storage_request_duration_num` | Gauge | `storage_unit_id`, `op_type` | Count of observed request durations |
+
+### Storage Unit Native Metrics (exposed on each storage unit's own endpoint)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `tq_storage_request_duration_seconds` | Histogram | `op_type` | Request latency (buckets: 1ms–5s) |
+| `tq_storage_request_total` | Counter | `op_type` | Total requests processed |
+| `tq_storage_request_errors_total` | Counter | `op_type` | Total request errors |
+| `tq_storage_request_samples_total` | Counter | `op_type` | Total samples processed per operation |
+
+> **Note on naming**: The ZMQ-collected gauges on the controller use names without Prometheus reserved suffixes (`_total`, `_bucket`, `_sum`, `_count`) to avoid type metadata conflicts. The storage unit's own endpoint uses standard Counter/Histogram naming conventions.
 
 ## Grafana Dashboard
 
@@ -142,16 +160,18 @@ The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.j
 | Section | Panels |
 |---------|--------|
 | **Controller Overview** | Uptime, RSS Memory, Active Partitions, Indexes Allocated, Reusable Indexes |
-| **Request Throughput & Latency** | Request Rate (ops/s), Latency P50/P99 |
+| **Request Throughput & Latency** | Controller Request Rate (ops/s), Controller Request Latency (repeats per quantile) |
 | **Partition Status** | Samples per Partition, Production Progress, Consumption Progress |
-| **Storage Units** | Utilization Bar Gauge, Active Keys, Capacity vs Active Keys, RSS Memory, Produced vs Cleared Samples/s, Active Keys Delta |
+| **Storage Units** | Utilization Bar Gauge, Active Keys, Capacity vs Active Keys, RSS Memory, Storage Request Rate, Storage Request Latency (repeats per quantile), Produced vs Cleared Samples/s, Active Keys Delta |
 
 ### Template Variables
 
-| Variable | Description |
-|----------|-------------|
-| `datasource` | Prometheus datasource selector |
-| `task_name` | Filter Production/Consumption Progress panels by task |
+| Variable | Type | Description |
+|----------|------|-------------|
+| `datasource` | Datasource | Prometheus datasource selector |
+| `task_name` | Query | Filter Production/Consumption Progress panels by task |
+| `op_type` | Query | Filter request panels by operation (PUT_DATA, GET_DATA, CLEAR_DATA, etc.) |
+| `quantile` | Custom | Select latency percentiles to display (0.50, 0.90, 0.95, 0.99) |
 
 ### Thresholds
 
