@@ -433,8 +433,9 @@ class TQMetricsExporter:
         """Background loop that periodically collects all metrics."""
         while True:
             try:
-                self.collect_controller_metrics()
-                self.collect_storage_metrics()
+                if self._role == "controller":
+                    self.collect_controller_metrics()
+                    self.collect_storage_metrics()
             except Exception as e:
                 logger.error(f"Metrics collection error: {e}")
             time.sleep(TQ_METRICS_COLLECT_INTERVAL)
