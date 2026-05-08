@@ -517,7 +517,8 @@ class SimpleStorageUnit:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
                     duration_sum = hist._sum.get()
-                    duration_count = hist._count.get()
+                    # Count is the sum of all bucket increments
+                    duration_count = sum(b.get() for b in hist._buckets)
                     # Compute quantiles from histogram buckets
                     p50 = self._quantile_from_histogram(hist, 0.50)
                     p99 = self._quantile_from_histogram(hist, 0.99)
@@ -544,21 +545,30 @@ class SimpleStorageUnit:
 
         Uses linear interpolation within the bucket that contains the target
         observation, matching Prometheus server's histogram_quantile() logic.
+
+        Note: prometheus_client stores per-bucket increments (non-cumulative)
+        internally. We accumulate them to get cumulative counts for interpolation.
         """
-        total = hist._count.get()
+        # Build cumulative counts from non-cumulative bucket values
+        cumulative = 0.0
+        cumulative_counts = []
+        for bucket in hist._buckets:
+            cumulative += bucket.get()
+            cumulative_counts.append(cumulative)
+
+        total = cumulative
         if total == 0:
             return 0.0
         target = q * total
         prev_bound = 0.0
-        prev_count = 0.0
-        for bound, bucket in zip(hist._upper_bounds, hist._buckets):
-            curr_count = bucket.get()
-            if curr_count >= target:
+        prev_cumulative = 0.0
+        for bound, cum_count in zip(hist._upper_bounds, cumulative_counts):
+            if cum_count >= target:
                 # Linear interpolation within this bucket
-                fraction = (target - prev_count) / (curr_count - prev_count) if curr_count > prev_count else 0
+                fraction = (target - prev_cumulative) / (cum_count - prev_cumulative) if cum_count > prev_cumulative else 0
                 return prev_bound + (bound - prev_bound) * fraction
             prev_bound = bound
-            prev_count = curr_count
+            prev_cumulative = cum_count
         # All observations are in the +Inf bucket
         return prev_bound
 
