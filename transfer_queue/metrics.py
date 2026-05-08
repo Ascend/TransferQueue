@@ -178,30 +178,30 @@ class TQMetricsExporter:
         )
 
         # ---- Storage request metrics (collected via ZMQ, exposed as gauges) ----
-        # NOTE: Avoid _total/_bucket/_sum/_count suffixes on Gauge metrics —
-        # Prometheus reserves these for Counter/Histogram types and will
-        # report type conflicts that break label_values() queries.
-        self.storage_request_count = Gauge(
-            "tq_storage_request_count",
+        # NOTE: Prometheus reserves _total, _bucket, _sum, _count, _info,
+        # _created suffixes for specific metric types. Using any of these
+        # on a Gauge causes type metadata conflicts that break label_values().
+        self.storage_request_ops = Gauge(
+            "tq_storage_request_ops",
             "Total requests processed by storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
-        self.storage_request_duration_bucket = Gauge(
-            "tq_storage_request_duration_bucket",
-            "Histogram bucket for storage request duration",
+        self.storage_request_latency_bucket = Gauge(
+            "tq_storage_request_latency_bucket",
+            "Histogram bucket for storage request latency",
             ["storage_unit_id", "op_type", "le"],
             registry=r,
         )
-        self.storage_request_duration_sum = Gauge(
-            "tq_storage_request_duration_sum",
-            "Sum of request durations in storage unit",
+        self.storage_request_latency_seconds = Gauge(
+            "tq_storage_request_latency_seconds",
+            "Cumulative request latency in storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
-        self.storage_request_duration_num = Gauge(
-            "tq_storage_request_duration_num",
-            "Count of observed request durations in storage unit",
+        self.storage_request_latency_observations = Gauge(
+            "tq_storage_request_latency_observations",
+            "Number of observed request latencies in storage unit",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
@@ -341,19 +341,19 @@ class TQMetricsExporter:
 
                 # Per-operation request stats
                 for op_type, op_data in metrics.get("op_stats", {}).items():
-                    self.storage_request_count.labels(
+                    self.storage_request_ops.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("request_count", 0))
-                    self.storage_request_duration_sum.labels(
+                    self.storage_request_latency_seconds.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("duration_sum", 0))
-                    self.storage_request_duration_num.labels(
+                    self.storage_request_latency_observations.labels(
                         storage_unit_id=label, op_type=op_type
                     ).set(op_data.get("duration_count", 0))
-                    for le, count in op_data.get("duration_buckets", {}).items():
-                        self.storage_request_duration_bucket.labels(
+                    for le, val in op_data.get("duration_buckets", {}).items():
+                        self.storage_request_latency_bucket.labels(
                             storage_unit_id=label, op_type=op_type, le=le
-                        ).set(count)
+                        ).set(val)
             except Exception as e:
                 logger.warning(f"Failed to collect metrics from storage unit {su_id}: {e}")
 

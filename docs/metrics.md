@@ -135,10 +135,10 @@ Steps:
 | `tq_storage_active_keys_total` | Gauge | `storage_unit_id` | Active keys in storage |
 | `tq_storage_utilization_ratio` | Gauge | `storage_unit_id` | Utilization (active/capacity) |
 | `tq_storage_memory_rss_bytes` | Gauge | `storage_unit_id` | Storage process RSS memory |
-| `tq_storage_request_count` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
-| `tq_storage_request_duration_bucket` | Gauge | `storage_unit_id`, `op_type`, `le` | Histogram bucket for request duration |
-| `tq_storage_request_duration_sum` | Gauge | `storage_unit_id`, `op_type` | Sum of request durations |
-| `tq_storage_request_duration_num` | Gauge | `storage_unit_id`, `op_type` | Count of observed request durations |
+| `tq_storage_request_ops` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
+| `tq_storage_request_latency_bucket` | Gauge | `storage_unit_id`, `op_type`, `le` | Histogram bucket for request latency |
+| `tq_storage_request_latency_seconds` | Gauge | `storage_unit_id`, `op_type` | Cumulative request latency |
+| `tq_storage_request_latency_observations` | Gauge | `storage_unit_id`, `op_type` | Number of observed request latencies |
 
 ### Storage Unit Native Metrics (exposed on each storage unit's own endpoint)
 
