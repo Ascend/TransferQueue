@@ -136,9 +136,9 @@ Steps:
 | `tq_storage_utilization_ratio` | Gauge | `storage_unit_id` | Utilization (active/capacity) |
 | `tq_storage_memory_rss_bytes` | Gauge | `storage_unit_id` | Storage process RSS memory |
 | `tq_storage_request_ops` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
-| `tq_storage_request_latency_bucket` | Gauge | `storage_unit_id`, `op_type`, `le` | Histogram bucket for request latency |
-| `tq_storage_request_latency_seconds` | Gauge | `storage_unit_id`, `op_type` | Cumulative request latency |
-| `tq_storage_request_latency_observations` | Gauge | `storage_unit_id`, `op_type` | Number of observed request latencies |
+| `tq_storage_request_latency_avg` | Gauge | `storage_unit_id`, `op_type` | Average request latency (seconds) |
+| `tq_storage_request_latency_p50` | Gauge | `storage_unit_id`, `op_type` | P50 request latency (seconds) |
+| `tq_storage_request_latency_p99` | Gauge | `storage_unit_id`, `op_type` | P99 request latency (seconds) |
 
 ### Storage Unit Native Metrics (exposed on each storage unit's own endpoint)
 
@@ -149,7 +149,7 @@ Steps:
 | `tq_storage_request_errors_total` | Counter | `op_type` | Total request errors |
 | `tq_storage_request_samples_total` | Counter | `op_type` | Total samples processed per operation |
 
-> **Note on naming**: The ZMQ-collected gauges on the controller use names without Prometheus reserved suffixes (`_total`, `_bucket`, `_sum`, `_count`) to avoid type metadata conflicts. The storage unit's own endpoint uses standard Counter/Histogram naming conventions.
+> **Note on naming**: The ZMQ-collected gauges on the controller avoid all Prometheus reserved suffixes (`_total`, `_bucket`, `_sum`, `_count`, `_info`, `_created`) and the reserved `le` label to prevent type metadata conflicts that break `label_values()` queries. P50/P99 are computed on the storage unit side and sent as pre-calculated values. The storage unit's own endpoint uses standard Counter/Histogram naming conventions.
 
 ## Grafana Dashboard
 
@@ -171,7 +171,6 @@ The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.j
 | `datasource` | Datasource | Prometheus datasource selector |
 | `task_name` | Query | Filter Production/Consumption Progress panels by task |
 | `op_type` | Query | Filter request panels by operation (PUT_DATA, GET_DATA, CLEAR_DATA, etc.) |
-| `quantile` | Custom | Select latency percentiles to display (0.50, 0.90, 0.95, 0.99) |
 
 ### Thresholds
 

@@ -140,13 +140,11 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
       "id": 11,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "title": "Controller Request Latency P${quantile:csv}",
+      "title": "Controller Request Latency P50 / P99",
       "targets": [
-        { "expr": "histogram_quantile($quantile, sum by (op_type, le) (rate(tq_controller_request_duration_seconds_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p{{quantile}} {{ op_type }}" }
+        { "expr": "histogram_quantile(0.50, sum by (op_type, le) (rate(tq_controller_request_duration_seconds_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p50 {{ op_type }}" },
+        { "expr": "histogram_quantile(0.99, sum by (op_type, le) (rate(tq_controller_request_duration_seconds_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p99 {{ op_type }}" }
       ],
-      "repeat": "quantile",
-      "repeatDirection": "h",
-      "maxPerRow": 2,
       "type": "timeseries"
     },
     {
@@ -327,13 +325,11 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 62 },
       "id": 37,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "title": "Storage Request Latency P${quantile:csv}",
+      "title": "Storage Request Latency",
       "targets": [
-        { "expr": "histogram_quantile($quantile, sum by (op_type, le) (rate(tq_storage_request_latency_bucket{op_type=~\"$op_type\"}[$__rate_interval])))", "legendFormat": "p{{quantile}} {{ op_type }}" }
+        { "expr": "tq_storage_request_latency_p50{op_type=~\"$op_type\"}", "legendFormat": "p50 {{ op_type }} ({{ storage_unit_id }})" },
+        { "expr": "tq_storage_request_latency_p99{op_type=~\"$op_type\"}", "legendFormat": "p99 {{ op_type }} ({{ storage_unit_id }})" }
       ],
-      "repeat": "quantile",
-      "repeatDirection": "h",
-      "maxPerRow": 2,
       "type": "timeseries"
     },
     {
@@ -420,22 +416,6 @@
         "refresh": 2,
         "sort": 1,
         "type": "query"
-      },
-      {
-        "current": { "selected": true, "text": ["0.50", "0.99"], "value": ["0.50", "0.99"] },
-        "hide": 0,
-        "includeAll": false,
-        "label": "Quantile",
-        "multi": true,
-        "name": "quantile",
-        "options": [
-          { "selected": true, "text": "0.50", "value": "0.50" },
-          { "selected": true, "text": "0.90", "value": "0.90" },
-          { "selected": false, "text": "0.95", "value": "0.95" },
-          { "selected": true, "text": "0.99", "value": "0.99" }
-        ],
-        "query": "0.50,0.90,0.95,0.99",
-        "type": "custom"
       }
     ]
   },

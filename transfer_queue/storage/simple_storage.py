@@ -516,15 +516,16 @@ class SimpleStorageUnit:
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
-                    # Extract histogram buckets for P50/P99 reconstruction
-                    buckets = {}
-                    for bound, bucket in zip(hist._upper_bounds, hist._buckets):
-                        buckets[str(bound)] = bucket.get()
+                    duration_sum = hist._sum.get()
+                    duration_count = hist._count.get()
+                    # Compute quantiles from histogram buckets
+                    p50 = self._quantile_from_histogram(hist, 0.50)
+                    p99 = self._quantile_from_histogram(hist, 0.99)
                     op_stats[op_type] = {
                         "request_count": counter._value.get(),
-                        "duration_sum": hist._sum.get(),
-                        "duration_count": hist._count.get(),
-                        "duration_buckets": buckets,
+                        "latency_avg": duration_sum / duration_count if duration_count > 0 else 0,
+                        "latency_p50": p50,
+                        "latency_p99": p99,
                     }
                 except Exception:
                     pass
@@ -536,6 +537,30 @@ class SimpleStorageUnit:
             sender_id=self.storage_unit_id,
             body=metrics,
         )
+
+    @staticmethod
+    def _quantile_from_histogram(hist, q: float) -> float:
+        """Estimate a quantile from a prometheus_client Histogram instance.
+
+        Uses linear interpolation within the bucket that contains the target
+        observation, matching Prometheus server's histogram_quantile() logic.
+        """
+        total = hist._count.get()
+        if total == 0:
+            return 0.0
+        target = q * total
+        prev_bound = 0.0
+        prev_count = 0.0
+        for bound, bucket in zip(hist._upper_bounds, hist._buckets):
+            curr_count = bucket.get()
+            if curr_count >= target:
+                # Linear interpolation within this bucket
+                fraction = (target - prev_count) / (curr_count - prev_count) if curr_count > prev_count else 0
+                return prev_bound + (bound - prev_bound) * fraction
+            prev_bound = bound
+            prev_count = curr_count
+        # All observations are in the +Inf bucket
+        return prev_bound
 
     @staticmethod
     def _shutdown_resources(
