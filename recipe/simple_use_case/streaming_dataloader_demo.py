@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import argparse
-import logging
 import os
 import time
 from dataclasses import dataclass
@@ -28,9 +27,9 @@ from tensordict import TensorDict
 import transfer_queue as tq
 from transfer_queue import RankAwareSampler, StreamingDataLoader, StreamingDataset
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.utils.logging_utils import get_logger
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s.%(msecs)03d - %(levelname)s - %(message)s", datefmt="%H:%M:%S")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, default_level="INFO")
 
 STAGE_NAMES = ["rollout", "ref", "actor", "reward", "update"]
 
