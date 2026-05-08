@@ -34,6 +34,10 @@ logger = get_logger(__name__, default_level="INFO")
 STAGE_NAMES = ["rollout", "ref", "actor", "reward", "update"]
 
 
+def emit_worker_log(message: str) -> None:
+    print(message, flush=True)
+
+
 def make_prompt_batch(step: int, config: "DemoConfig") -> TensorDict:
     start_id = step * config.global_batch_size
     generator = torch.Generator().manual_seed(config.seed + step)
@@ -115,10 +119,10 @@ class BaseStageWorker:
         self.worker_name = f"{self.stage_name}-{worker_id}"
 
     def start(self, iteration: int, train_iters: int) -> dict:
-        logger.info(f"[{self.worker_name}] start (iteration={iteration})")
+        emit_worker_log(f"[{self.worker_name}] start (iteration={iteration})")
         for step in range(iteration, train_iters):
             self._run_step(step)
-        logger.info(f"[{self.worker_name}] done")
+        emit_worker_log(f"[{self.worker_name}] done")
         return {"worker": self.worker_name, "stage": self.stage_name}
 
     def _run_step(self, step: int) -> None:
@@ -127,19 +131,19 @@ class BaseStageWorker:
 
         for batch, batch_meta in dataloader:
             sample_ids = batch["sample_id"].view(-1).tolist()
-            logger.info(f"[{self.worker_name}] step={step} consumed sample_ids={sample_ids}")
+            emit_worker_log(f"[{self.worker_name}] step={step} consumed sample_ids={sample_ids}")
 
             output, written_fields = self.compute(batch, batch_meta)
             self.tq_client.put(output, metadata=batch_meta)
 
             count = ray.get(self.tracker.record.remote(self.stage_name, step, len(sample_ids)))
-            logger.info(
+            emit_worker_log(
                 f"[{self.worker_name}] step={step} done -> written_fields={written_fields}, "
                 f"{self.stage_name}_count={count}/{self.cfg_demo.global_batch_size}"
             )
 
         ray.get(self.tracker.record_done.remote(self.stage_name, step))
-        logger.info(f"[{self.worker_name}] step={step} worker_done recorded")
+        emit_worker_log(f"[{self.worker_name}] step={step} worker_done recorded")
 
     def _build_dataloader(self, partition_id: str) -> StreamingDataLoader:
         dataset = StreamingDataset(
@@ -239,9 +243,9 @@ class UpdateWorker(BaseStageWorker):
 
 @ray.remote(num_cpus=0.1)
 def sync_weights(step: int, sleep_s: float) -> dict:
-    logger.info(f"[weight-sync] step={step} start")
+    emit_worker_log(f"[weight-sync] step={step} start")
     time.sleep(sleep_s)
-    logger.info(f"[weight-sync] step={step} done")
+    emit_worker_log(f"[weight-sync] step={step} done")
     return {"step": step}
 
 
@@ -319,7 +323,10 @@ class DataCentricWorkerPipelineDemo:
         batch = make_prompt_batch(step, self.config)
         sample_ids = batch["sample_id"].view(-1).tolist()
         meta = self.tq_client.put(batch, partition_id=partition_id)
-        logger.info(f"step={step} prompt put -> partition={partition_id}, sample_ids={sample_ids}, fields={list(meta.field_names)}")
+        logger.info(
+            f"MAIN | step={step} put prompts: "
+            f"partition={partition_id}, sample_ids={sample_ids}, fields={list(meta.field_names)}"
+        )
 
     def _wait_complete(self, step: int) -> None:
         while True:
@@ -327,7 +334,7 @@ class DataCentricWorkerPipelineDemo:
             done_workers = ray.get(self.tracker.get_done_workers.remote(step))
 
             active_counts = {stage: count for stage, count in counts.items() if count > 0}
-            logger.info(f"step={step} status -> counts={active_counts}, done_workers={done_workers}")
+            logger.info(f"MAIN | step={step} progress: counts={active_counts}, done_workers={done_workers}")
 
             all_workers_done = (
                 done_workers.get("rollout", 0) >= self.config.num_rollout_workers
@@ -345,15 +352,15 @@ class DataCentricWorkerPipelineDemo:
 
     def fit(self) -> list[dict]:
         logger.info("=" * 72)
-        logger.info("TransferQueue StreamingDataLoader Decentralized Inherited Worker Pipeline Demo")
+        logger.info("MAIN | TransferQueue StreamingDataLoader Data-Centric Worker Pipeline Demo")
         logger.info("=" * 72)
         logger.info(
-            f"workers: rollout={self.config.num_rollout_workers}, "
+            f"MAIN | workers: rollout={self.config.num_rollout_workers}, "
             f"ref={self.config.num_ref_workers}, actor={self.config.num_actor_workers}, "
             f"reward={self.config.num_reward_workers}, update={self.config.num_update_workers}"
         )
         logger.info(
-            f"pipeline: num_steps={self.config.num_steps}, "
+            f"MAIN | pipeline: num_steps={self.config.num_steps}, "
             f"global_batch_size={self.config.global_batch_size}, "
             f"micro_batch_size={self.config.micro_batch_size}"
         )
@@ -370,10 +377,10 @@ class DataCentricWorkerPipelineDemo:
             self._wait_complete(step)
             ray.get(sync_weights.remote(step, self.config.weight_sync_seconds))
             self.tq_client.clear_partition(f"{self.config.partition_prefix}_{step}")
-            logger.info(f"step={step} cleared partition={self.config.partition_prefix}_{step}")
+            logger.info(f"MAIN | step={step} clear partition: {self.config.partition_prefix}_{step}")
 
         ray.get(refs)
-        logger.info("demo done!")
+        logger.info("MAIN | demo done!")
         return []
 
 
