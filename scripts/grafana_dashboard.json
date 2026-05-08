@@ -325,7 +325,7 @@
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 62 },
       "id": 37,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "title": "Storage Request Latency",
+      "title": "Storage Request Latency P50 / P99",
       "targets": [
         { "expr": "tq_storage_request_latency_p50{op_type=~\"$op_type\"}", "legendFormat": "p50 {{ op_type }} ({{ storage_unit_id }})" },
         { "expr": "tq_storage_request_latency_p99{op_type=~\"$op_type\"}", "legendFormat": "p99 {{ op_type }} ({{ storage_unit_id }})" }
@@ -403,19 +403,23 @@
         "type": "query"
       },
       {
-        "current": { "selected": true, "text": ["All"], "value": ["$__all"] },
-        "datasource": { "type": "prometheus", "uid": "${datasource}" },
-        "definition": "label_values(tq_storage_request_ops, op_type)",
+        "current": { "selected": true, "text": "All", "value": "$__all" },
         "hide": 0,
         "includeAll": true,
         "label": "Op Type",
         "multi": true,
         "name": "op_type",
-        "options": [],
-        "query": "label_values(tq_storage_request_ops, op_type)",
-        "refresh": 2,
-        "sort": 1,
-        "type": "query"
+        "options": [
+          { "selected": true, "text": "All", "value": "$__all" },
+          { "selected": false, "text": "PUT_DATA", "value": "PUT_DATA" },
+          { "selected": false, "text": "GET_DATA", "value": "GET_DATA" },
+          { "selected": false, "text": "CLEAR_DATA", "value": "CLEAR_DATA" },
+          { "selected": false, "text": "GET_META", "value": "GET_META" },
+          { "selected": false, "text": "CLEAR_META", "value": "CLEAR_META" },
+          { "selected": false, "text": "NOTIFY_DATA_UPDATE", "value": "NOTIFY_DATA_UPDATE" }
+        ],
+        "query": "PUT_DATA,GET_DATA,CLEAR_DATA,GET_META,CLEAR_META,NOTIFY_DATA_UPDATE",
+        "type": "custom"
       }
     ]
   },
