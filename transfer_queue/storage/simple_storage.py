@@ -516,10 +516,15 @@ class SimpleStorageUnit:
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
+                    # Extract histogram buckets for P50/P99 reconstruction
+                    buckets = {}
+                    for bound, bucket in zip(hist._upper_bounds, hist._buckets):
+                        buckets[str(bound)] = bucket.get()
                     op_stats[op_type] = {
                         "request_count": counter._value.get(),
                         "duration_sum": hist._sum.get(),
                         "duration_count": hist._count.get(),
+                        "duration_buckets": buckets,
                     }
                 except Exception:
                     pass
