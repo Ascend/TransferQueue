@@ -67,9 +67,10 @@ class TQMetricsExporter:
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
 
-    def __init__(self):
+    def __init__(self, role: str = "controller"):
         self._start_time = time.time()
         self._process = psutil.Process()
+        self._role = role
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
         self._zmq_ctx: zmq.Context | None = None
         self._zmq_sockets: dict[str, zmq.Socket] = {}
@@ -91,6 +92,40 @@ class TQMetricsExporter:
         return self._metrics_endpoint
 
     def _define_metrics(self) -> None:
+        r = self.registry
+        role = self._role
+
+        # ---- Request latency / throughput (role-prefixed) ----
+        self.request_duration = Histogram(
+            f"tq_{role}_request_duration_seconds",
+            f"{role.capitalize()} request processing duration",
+            ["op_type"],
+            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+            registry=r,
+        )
+        self.request_total = Counter(
+            f"tq_{role}_request_total",
+            f"Total number of requests processed by the {role}",
+            ["op_type"],
+            registry=r,
+        )
+        self.request_errors_total = Counter(
+            f"tq_{role}_request_errors_total",
+            f"Total number of request errors in the {role}",
+            ["op_type"],
+            registry=r,
+        )
+        self.request_samples_total = Counter(
+            f"tq_{role}_request_samples_total",
+            f"Total number of samples processed per operation type in the {role}",
+            ["op_type"],
+            registry=r,
+        )
+
+        if role == "controller":
+            self._define_controller_metrics()
+
+    def _define_controller_metrics(self) -> None:
         r = self.registry
 
         # ---- Controller process metrics ----
@@ -123,33 +158,6 @@ class TQMetricsExporter:
         )
         self.global_index_reusable = Gauge(
             "tq_global_index_reusable_total", "Number of reusable global indexes", registry=r
-        )
-
-        # ---- Controller request latency / throughput ----
-        self.request_duration = Histogram(
-            "tq_controller_request_duration_seconds",
-            "Controller request processing duration",
-            ["op_type"],
-            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
-            registry=r,
-        )
-        self.request_total = Counter(
-            "tq_controller_request_total",
-            "Total number of requests processed by the controller",
-            ["op_type"],
-            registry=r,
-        )
-        self.request_errors_total = Counter(
-            "tq_controller_request_errors_total",
-            "Total number of request errors in the controller",
-            ["op_type"],
-            registry=r,
-        )
-        self.request_samples_total = Counter(
-            "tq_controller_request_samples_total",
-            "Total number of samples processed per operation type",
-            ["op_type"],
-            registry=r,
         )
 
         # ---- Storage unit metrics ----

@@ -495,7 +495,7 @@ class SimpleStorageUnit:
 
         Returns:
             ZMQMessage containing storage unit ID, capacity, active keys,
-            and process RSS memory.
+            process RSS memory, and per-operation request stats.
         """
         try:
             process_rss = psutil.Process().memory_info().rss
@@ -508,6 +508,23 @@ class SimpleStorageUnit:
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
         }
+
+        # Include per-operation stats if Prometheus metrics are enabled
+        if self._metrics is not None:
+            op_stats = {}
+            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
+                try:
+                    hist = self._metrics.request_duration.labels(op_type=op_type)
+                    counter = self._metrics.request_total.labels(op_type=op_type)
+                    op_stats[op_type] = {
+                        "request_count": counter._value.get(),
+                        "duration_sum": hist._sum.get(),
+                        "duration_count": hist._count.get(),
+                    }
+                except Exception:
+                    pass
+            if op_stats:
+                metrics["op_stats"] = op_stats
 
         return ZMQMessage.create(
             request_type=ZMQRequestType.METRICS_RESPONSE,
@@ -561,7 +578,7 @@ class SimpleStorageUnit:
             return self._metrics.endpoint
         from transfer_queue.metrics import TQMetricsExporter
 
-        self._metrics = TQMetricsExporter()
+        self._metrics = TQMetricsExporter(role="storage")
         endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
         logger.info(f"[{self.storage_unit_id}]: Prometheus metrics exporter started on {endpoint}")
         return endpoint
