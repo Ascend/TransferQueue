@@ -301,7 +301,7 @@ def build_tq_config(config: DemoConfig):
     return OmegaConf.merge(base, override)
 
 
-class DecentralizedInheritedWorkerPipelineDemo:
+class DataCentricWorkerPipelineDemo:
     def __init__(self, config: DemoConfig, tq_config):
         self.config = config
         tq.init(tq_config)
@@ -425,7 +425,7 @@ def main() -> None:
 
     ray.init()
     try:
-        demo = DecentralizedInheritedWorkerPipelineDemo(cfg, build_tq_config(cfg))
+        demo = DataCentricWorkerPipelineDemo(cfg, build_tq_config(cfg))
         demo.fit()
     finally:
         tq.close()
