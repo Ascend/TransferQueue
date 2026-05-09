@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
 from threading import Lock, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
@@ -47,6 +47,9 @@ from transfer_queue.utils.zmq_utils import (
     get_free_port,
     get_node_ip_address,
 )
+
+if TYPE_CHECKING:
+    from transfer_queue.metrics import TQMetricsExporter
 
 logger = get_logger(__name__)
 
@@ -1013,7 +1016,7 @@ class TransferQueueController:
         self._connected_storage_managers: set[str] = set()
 
         # Prometheus metrics exporter (lazy-initialized when enabled)
-        self._metrics = None
+        self._metrics: TQMetricsExporter | None = None
         self._metrics_endpoint: str = ""
 
         # Start background processing threads

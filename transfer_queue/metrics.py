@@ -366,7 +366,7 @@ class TQMetricsExporter:
         identity = f"metrics_collector_{uuid4().hex[:8]}".encode()
         sock = create_zmq_socket(self._zmq_ctx, zmq.DEALER, su_info.ip, identity)
         timeout_ms = TQ_METRICS_STORAGE_TIMEOUT * 1000
-        address = format_zmq_address(su_info.ip, su_info.ports.get("put_get_socket"))
+        address = format_zmq_address(su_info.ip, su_info.ports["put_get_socket"])
         sock.connect(address)
         sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
         sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
