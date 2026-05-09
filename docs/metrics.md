@@ -170,7 +170,8 @@ The dashboard ([`scripts/grafana_dashboard.json`](../scripts/grafana_dashboard.j
 |----------|------|-------------|
 | `datasource` | Datasource | Prometheus datasource selector |
 | `task_name` | Query | Filter Production/Consumption Progress panels by task |
-| `op_type` | Query | Filter request panels by operation (PUT_DATA, GET_DATA, CLEAR_DATA, etc.) |
+| `op_type` | Custom | Filter request panels by operation (PUT_DATA, GET_DATA, CLEAR_DATA, etc.) |
+| `quantile` | Custom | Filter latency panels by quantile (p50, p99) |
 
 ### Thresholds
 
