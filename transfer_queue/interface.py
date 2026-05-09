@@ -397,7 +397,6 @@ def get_metrics_endpoint() -> str | None:
         >>> print(endpoint)   # e.g. "10.0.1.42:38271"
         >>> # Use endpoint to register Prometheus scrape target
     """
-    global _TQ_CONTROLLER
     if _TQ_CONTROLLER is None:
         _init_from_existing()
     if _TQ_CONTROLLER is None:
