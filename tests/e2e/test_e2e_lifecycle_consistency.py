@@ -424,11 +424,6 @@ def test_core_consistency(e2e_client):
 def test_cross_shard_complex_update(e2e_client):
     """Cross-shard update: put A + put B, update overlapping region, verify all regions."""
 
-    # FIXME: Add data update test to MooncakeStore after Upsert function is ready
-    #        https://github.com/kvcache-ai/Mooncake/issues/1645
-    if os.environ.get("TQ_TEST_BACKEND", "SimpleStorage") == "MooncakeStore":
-        return
-
     client = e2e_client
     partition_id = "test_cross_shard_update"
     task_name = "cross_shard_task"
