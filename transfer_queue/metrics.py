@@ -104,19 +104,19 @@ class TQMetricsExporter:
             registry=r,
         )
         self.request_total = Counter(
-            f"tq_{role}_request_total",
+            f"tq_{role}_request",
             f"Total number of requests processed by the {role}",
             ["op_type"],
             registry=r,
         )
         self.request_errors_total = Counter(
-            f"tq_{role}_request_errors_total",
+            f"tq_{role}_request_errors",
             f"Total number of request errors in the {role}",
             ["op_type"],
             registry=r,
         )
         self.request_samples_total = Counter(
-            f"tq_{role}_request_samples_total",
+            f"tq_{role}_request_samples",
             f"Total number of samples processed per operation type in the {role}",
             ["op_type"],
             registry=r,
