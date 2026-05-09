@@ -17,7 +17,7 @@ import os
 import time
 import weakref
 from threading import Event, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import psutil
@@ -37,6 +37,9 @@ from transfer_queue.utils.zmq_utils import (
     get_free_port,
     get_node_ip_address,
 )
+
+if TYPE_CHECKING:
+    from transfer_queue.metrics import TQMetricsExporter
 
 logger = get_logger(__name__)
 
@@ -172,7 +175,7 @@ class SimpleStorageUnit:
         self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
 
-        self._metrics = None
+        self._metrics: TQMetricsExporter | None = None
 
         self._init_zmq_socket()
         self._start_process_put_get()
@@ -559,9 +562,11 @@ class SimpleStorageUnit:
         target = q * total
         prev_bound = 0.0
         prev_cumulative = 0.0
-        for bound, cum_count in zip(hist._upper_bounds, cumulative_counts):
+        for bound, cum_count in zip(hist._upper_bounds, cumulative_counts, strict=False):
             if cum_count >= target:
-                fraction = (target - prev_cumulative) / (cum_count - prev_cumulative) if cum_count > prev_cumulative else 0
+                fraction = (
+                    (target - prev_cumulative) / (cum_count - prev_cumulative) if cum_count > prev_cumulative else 0
+                )
                 return prev_bound + (bound - prev_bound) * fraction
             prev_bound = bound
             prev_cumulative = cum_count

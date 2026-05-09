@@ -18,7 +18,7 @@ import os
 import subprocess
 import time
 from importlib import resources
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import ray
@@ -384,7 +384,7 @@ def close():
 
 
 # ==================== Metrics API ====================
-def get_metrics_endpoint() -> Optional[str]:
+def get_metrics_endpoint() -> str | None:
     """Return the Prometheus metrics endpoint address (``host:port``), or *None* if metrics are disabled.
 
     Works from any process — the endpoint is stored in the Controller's config

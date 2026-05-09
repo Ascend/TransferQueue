@@ -17,7 +17,7 @@ import os
 import time
 from contextlib import contextmanager
 from threading import Thread
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 import psutil
@@ -334,25 +334,23 @@ class TQMetricsExporter:
                 active = metrics.get("active_keys", 0)
                 self.storage_capacity.labels(storage_unit_id=label).set(capacity)
                 self.storage_active_keys.labels(storage_unit_id=label).set(active)
-                self.storage_utilization.labels(storage_unit_id=label).set(
-                    active / capacity if capacity > 0 else 0.0
-                )
+                self.storage_utilization.labels(storage_unit_id=label).set(active / capacity if capacity > 0 else 0.0)
                 self.storage_memory_rss.labels(storage_unit_id=label).set(metrics.get("process_rss_bytes", 0))
 
                 # Per-operation request stats
                 for op_type, op_data in metrics.get("op_stats", {}).items():
-                    self.storage_request_ops.labels(
-                        storage_unit_id=label, op_type=op_type
-                    ).set(op_data.get("request_count", 0))
-                    self.storage_request_latency_avg.labels(
-                        storage_unit_id=label, op_type=op_type
-                    ).set(op_data.get("latency_avg", 0))
-                    self.storage_request_latency_p50.labels(
-                        storage_unit_id=label, op_type=op_type
-                    ).set(op_data.get("latency_p50", 0))
-                    self.storage_request_latency_p99.labels(
-                        storage_unit_id=label, op_type=op_type
-                    ).set(op_data.get("latency_p99", 0))
+                    self.storage_request_ops.labels(storage_unit_id=label, op_type=op_type).set(
+                        op_data.get("request_count", 0)
+                    )
+                    self.storage_request_latency_avg.labels(storage_unit_id=label, op_type=op_type).set(
+                        op_data.get("latency_avg", 0)
+                    )
+                    self.storage_request_latency_p50.labels(storage_unit_id=label, op_type=op_type).set(
+                        op_data.get("latency_p50", 0)
+                    )
+                    self.storage_request_latency_p99.labels(storage_unit_id=label, op_type=op_type).set(
+                        op_data.get("latency_p99", 0)
+                    )
             except Exception as e:
                 logger.warning(f"Failed to collect metrics from storage unit {su_id}: {e}")
 
@@ -375,7 +373,7 @@ class TQMetricsExporter:
         self._zmq_sockets[su_id] = sock
         return sock
 
-    def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> Optional[dict[str, Any]]:
+    def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> dict[str, Any] | None:
         """Send a synchronous GET_METRICS request to a single storage unit."""
         try:
             sock = self._get_or_create_socket(su_id, su_info)
