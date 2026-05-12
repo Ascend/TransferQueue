@@ -465,19 +465,29 @@ class TestBatchMetaColumnar:
         with pytest.raises(ValueError, match="partition_ids do not match"):
             batch_a.union(batch_b)
 
-    def test_union_empty_other_returns_self(self):
-        """union with an empty batch returns self."""
+    def test_union_empty_other_returns_copy(self):
+        """union with an empty batch returns a copy, not the original identity."""
         batch = self._make_batch(batch_size=2)
         empty = BatchMeta.empty()
         result = batch.union(empty)
-        assert result is batch
+        assert result is not batch
+        assert result.global_indexes == batch.global_indexes
+        assert result.field_names == batch.field_names
+        # Mutating the result must not affect the original
+        result.extra_info["new_key"] = "new_value"
+        assert "new_key" not in batch.extra_info
 
-    def test_union_empty_self_returns_other(self):
-        """union when self is empty returns other."""
+    def test_union_empty_self_returns_copy(self):
+        """union when self is empty returns a copy, not the original identity."""
         batch = self._make_batch(batch_size=2)
         empty = BatchMeta.empty()
         result = empty.union(batch)
-        assert result is batch
+        assert result is not batch
+        assert result.global_indexes == batch.global_indexes
+        assert result.field_names == batch.field_names
+        # Mutating the result must not affect the original
+        result.extra_info["new_key"] = "new_value"
+        assert "new_key" not in batch.extra_info
 
 
 # ==============================================================================

@@ -544,6 +544,18 @@ class BatchMeta:
             _custom_backend_meta=selected_custom_backend_meta,
         )
 
+    def copy(self) -> "BatchMeta":
+        """Return a deep copy of this BatchMeta."""
+        return BatchMeta(
+            global_indexes=list(self.global_indexes),
+            partition_ids=list(self.partition_ids),
+            field_schema=copy.deepcopy(self.field_schema),
+            production_status=self.production_status.copy(),
+            extra_info=copy.deepcopy(self.extra_info),
+            custom_meta=copy.deepcopy(self.custom_meta),
+            _custom_backend_meta=copy.deepcopy(self._custom_backend_meta),
+        )
+
     def __len__(self) -> int:
         """Return the number of samples in this batch."""
         return self.size
@@ -618,15 +630,17 @@ class BatchMeta:
             other: Another BatchMeta to union with.
 
         Returns:
-            New BatchMeta with unioned fields.
+            A new BatchMeta instance with unioned fields. Even when one side is
+            empty, a copy is returned so callers can safely mutate the result
+            without affecting the original.
 
         Raises:
             ValueError: If global_indexes, or partition_ids do not match.
         """
         if not other or other.size == 0:
-            return self
+            return self.copy()
         if self.size == 0:
-            return other
+            return other.copy()
 
         if self.global_indexes != other.global_indexes:
             raise ValueError(
