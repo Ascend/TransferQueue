@@ -360,6 +360,125 @@ class TestBatchMetaColumnar:
         assert len(restored) == 6
         assert restored.global_indexes == list(range(6))
 
+    def test_union_basic(self):
+        """union merges fields from two batches with identical global_indexes."""
+        batch_a = BatchMeta(
+            global_indexes=[0, 1, 2],
+            partition_ids=["p0", "p0", "p0"],
+            field_schema={
+                "field_a": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.ones(3, dtype=np.int8),
+            custom_meta=[{"a": 1}, {"a": 2}, {"a": 3}],
+        )
+        batch_b = BatchMeta(
+            global_indexes=[0, 1, 2],
+            partition_ids=["p0", "p0", "p0"],
+            field_schema={
+                "field_b": {"dtype": torch.int64, "shape": (4,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.ones(3, dtype=np.int8),
+            custom_meta=[{"b": 10}, {"b": 20}, {"b": 30}],
+        )
+        result = batch_a.union(batch_b)
+        assert result.global_indexes == [0, 1, 2]
+        assert result.partition_ids == ["p0", "p0", "p0"]
+        assert sorted(result.field_names) == ["field_a", "field_b"]
+        assert result.is_ready
+        assert result.custom_meta == [{"a": 1, "b": 10}, {"a": 2, "b": 20}, {"a": 3, "b": 30}]
+
+    def test_union_overlapping_fields(self):
+        """union replaces overlapping fields with other's definitions."""
+        batch_a = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={
+                "field_a": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        batch_b = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={
+                "field_a": {"dtype": torch.int64, "shape": (8,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        result = batch_a.union(batch_b)
+        assert result.field_schema["field_a"]["dtype"] == torch.int64
+        assert result.field_schema["field_a"]["shape"] == (8,)
+
+    def test_union_production_status_and(self):
+        """union conservatively merges production_status via bitwise AND."""
+        batch_a = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={
+                "field_a": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.array([1, 0], dtype=np.int8),
+        )
+        batch_b = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={
+                "field_b": {"dtype": torch.int64, "shape": (4,), "is_nested": False, "is_non_tensor": False},
+            },
+            production_status=np.array([1, 1], dtype=np.int8),
+        )
+        result = batch_a.union(batch_b)
+        assert list(result.production_status) == [1, 0]
+        assert result.is_ready is False
+
+    def test_union_validation_global_index_mismatch(self):
+        """union raises ValueError when global_indexes do not match."""
+        batch_a = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        batch_b = BatchMeta(
+            global_indexes=[1, 2],
+            partition_ids=["p0", "p0"],
+            field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        with pytest.raises(ValueError, match="global_indexes do not match"):
+            batch_a.union(batch_b)
+
+    def test_union_validation_partition_id_mismatch(self):
+        """union raises ValueError when partition_ids do not match."""
+        batch_a = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p0"],
+            field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        batch_b = BatchMeta(
+            global_indexes=[0, 1],
+            partition_ids=["p0", "p1"],
+            field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+            production_status=np.ones(2, dtype=np.int8),
+        )
+        with pytest.raises(ValueError, match="partition_ids do not match"):
+            batch_a.union(batch_b)
+
+    def test_union_empty_other_returns_self(self):
+        """union with an empty batch returns self."""
+        batch = self._make_batch(batch_size=2)
+        empty = BatchMeta.empty()
+        result = batch.union(empty)
+        assert result is batch
+
+    def test_union_empty_self_returns_other(self):
+        """union when self is empty returns other."""
+        batch = self._make_batch(batch_size=2)
+        empty = BatchMeta.empty()
+        result = empty.union(batch)
+        assert result is batch
+
 
 # ==============================================================================
 # KVBatchMeta Tests (all migrated from main with no modification)

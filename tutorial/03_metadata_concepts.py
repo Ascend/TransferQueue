@@ -213,13 +213,14 @@ def demonstrate_batch_meta_operations():
     print(f"✓ Concatenated {len(batch1)} + {len(batch2)} = {len(concatenated)} samples")
     print(f"  Global indexes: {concatenated.global_indexes}")
 
-    # --- 9. union (dedup by global_index) ---
-    print("[Example 9] Unioning batches with overlapping global_indexes...")
+    # --- 9. union (merge fields for same samples) ---
+    print("[Example 9] Unioning batches with same global_indexes but different fields...")
     batch_a = make_batch(list(range(3)), fields=["input_ids", "attention_mask"])
-    batch_b = make_batch(list(range(2, 5)), fields=["input_ids", "attention_mask"])
-    print(f"  BatchA: {batch_a.global_indexes}, BatchB: {batch_b.global_indexes}")
+    batch_b = make_batch(list(range(3)), fields=["attention_mask", "responses"])
+    print(f"  BatchA fields: {batch_a.field_names}, BatchB fields: {batch_b.field_names}")
     unioned = batch_a.union(batch_b)
-    print(f"✓ Unioned: {unioned.global_indexes}  (global_index=2 deduplicated)")
+    print(f"✓ Unioned fields: {unioned.field_names}  (same global_indexes={unioned.global_indexes})")
+    print("  Note: 'attention_mask' was present in both; other's definition is kept.")
 
     # --- 10. Empty BatchMeta ---
     print("[Example 10] Creating an empty BatchMeta...")
@@ -228,8 +229,8 @@ def demonstrate_batch_meta_operations():
 
     print("=" * 80)
     print("concat vs union:")
-    print("  - concat: Combines batches with SAME field structure")
-    print("  - union:  Merges batches, deduplicating by global_index")
+    print("  - concat: Combines batches with SAME field structure (append rows)")
+    print("  - union:  Merges batches with SAME global_indexes (append columns/fields)")
     print("=" * 80)
 
 

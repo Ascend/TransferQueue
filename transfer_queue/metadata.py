@@ -608,31 +608,76 @@ class BatchMeta:
         return chunk_list
 
     def union(self, other: "BatchMeta") -> "BatchMeta":
-        """Return the union of this BatchMeta and another BatchMeta.
-        Samples with global_indexes already present in this batch are ignored from the other batch.
+        """Create a union of this batch's fields with another batch's fields.
+
+        Both batches must have the same global indices and matching partition_ids
+        for all samples. If fields overlap, the fields in this batch will be
+        replaced by the other batch's fields.
 
         Args:
-            other: The other BatchMeta to merge with.
+            other: Another BatchMeta to union with.
 
         Returns:
-            BatchMeta: A new merged BatchMeta.
+            New BatchMeta with unioned fields.
+
+        Raises:
+            ValueError: If global_indexes, or partition_ids do not match.
         """
         if not other or other.size == 0:
             return self
         if self.size == 0:
             return other
 
-        self_indexes = set(self.global_indexes)
-        unique_indices_in_other = [i for i, idx in enumerate(other.global_indexes) if idx not in self_indexes]
+        if self.global_indexes != other.global_indexes:
+            raise ValueError(
+                f"BatchMeta.union: global_indexes do not match. "
+                f"self.global_indexes={self.global_indexes}, "
+                f"other.global_indexes={other.global_indexes}"
+            )
 
-        if not unique_indices_in_other:
-            return self
+        if self.partition_ids != other.partition_ids:
+            raise ValueError(
+                f"BatchMeta.union: partition_ids do not match. "
+                f"self.partition_ids={self.partition_ids}, "
+                f"other.partition_ids={other.partition_ids}"
+            )
 
-        if len(unique_indices_in_other) == other.size:
-            return BatchMeta.concat([self, other])
+        # Merge field_schema: other overrides self on name conflicts
+        merged_field_schema = copy.deepcopy(self.field_schema)
+        for field_name, meta in other.field_schema.items():
+            merged_field_schema[field_name] = copy.deepcopy(meta)
 
-        other_unique = other.select_samples(unique_indices_in_other)
-        return BatchMeta.concat([self, other_unique])
+        # Merge production_status conservatively: both sides must report ready
+        # for the merged sample to be considered ready, since each side may
+        # cover a disjoint subset of fields.
+        merged_production_status = np.bitwise_and(self.production_status, other.production_status)
+
+        # Merge extra_info: other overrides self on key conflicts
+        merged_extra_info = {**self.extra_info, **other.extra_info}
+
+        # Merge custom_meta per sample
+        merged_custom_meta = []
+        for i in range(self.size):
+            merged_cm = copy.deepcopy(self.custom_meta[i])
+            merged_cm.update(copy.deepcopy(other.custom_meta[i]))
+            merged_custom_meta.append(merged_cm)
+
+        # Merge _custom_backend_meta per sample
+        merged_custom_backend_meta = []
+        for i in range(self.size):
+            merged_bm = copy.deepcopy(self._custom_backend_meta[i])
+            merged_bm.update(copy.deepcopy(other._custom_backend_meta[i]))
+            merged_custom_backend_meta.append(merged_bm)
+
+        return BatchMeta(
+            global_indexes=list(self.global_indexes),
+            partition_ids=list(self.partition_ids),
+            field_schema=merged_field_schema,
+            production_status=merged_production_status,
+            extra_info=merged_extra_info,
+            custom_meta=merged_custom_meta,
+            _custom_backend_meta=merged_custom_backend_meta,
+        )
 
     @classmethod
     def concat(cls, data: list["BatchMeta"], validate: bool = True) -> "BatchMeta":
