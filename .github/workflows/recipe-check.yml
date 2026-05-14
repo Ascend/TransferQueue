@@ -37,4 +37,4 @@ jobs:
     - name: Run data-centric pipeline demo
       run: |
         export RAY_DEDUP_LOGS=0
-        python3 recipe/simple_use_case/streaming_decentralized_inherited_worker_pipeline_demo.py
+        python3 recipe/simple_use_case/relax_demo.py
