@@ -412,8 +412,8 @@ class DataCentricPipelineDemo:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--partition-prefix", type=str, default="decentralized_demo")
-    parser.add_argument("--task-name-prefix", type=str, default="decentralized")
+    parser.add_argument("--partition-prefix", type=str, default="relax_demo")
+    parser.add_argument("--task-name-prefix", type=str, default="relax")
     parser.add_argument("--num-steps", type=int, default=3)
     parser.add_argument("--global-batch-size", type=int, default=8)
     parser.add_argument("--micro-batch-size", type=int, default=2)
