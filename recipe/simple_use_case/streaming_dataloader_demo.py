@@ -13,6 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+A simplified data-centric RL workflow demo built with StreamingDataset and
+StreamingDataLoader.
+
+The implementation structure and asynchronous dataflow are inspired by the
+Relax project, while keeping the example intentionally lightweight and focused
+on educational readability. Reference: https://github.com/redai-infra/Relax
+"""
+
 import argparse
 import os
 import time
