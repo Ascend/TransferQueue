@@ -19,6 +19,10 @@ import time
 from dataclasses import dataclass
 from importlib import resources
 
+# Disable Ray's cross-worker log deduplication before importing Ray itself,
+# otherwise many worker-side prints will be folded into "[repeated Nx across cluster]".
+os.environ["RAY_DEDUP_LOGS"] = "0"
+
 import ray
 import torch
 from omegaconf import OmegaConf
@@ -29,13 +33,14 @@ from transfer_queue import RankAwareSampler, StreamingDataLoader, StreamingDatas
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.logging_utils import get_logger
 
-logger = get_logger(__name__, default_level="INFO")
+logger = get_logger("MAIN", default_level="INFO")
 
 STAGE_NAMES = ["rollout", "ref", "actor", "reward", "update"]
 
 
-def emit_worker_log(message: str) -> None:
-    print(message, flush=True)
+def emit_worker_log(message: str, enabled: bool) -> None:
+    if enabled:
+        print(message, flush=True)
 
 
 def make_prompt_batch(step: int, config: "DemoConfig") -> TensorDict:
@@ -119,10 +124,8 @@ class BaseStageWorker:
         self.worker_name = f"{self.stage_name}-{worker_id}"
 
     def start(self, iteration: int, train_iters: int) -> dict:
-        emit_worker_log(f"[{self.worker_name}] start (iteration={iteration})")
         for step in range(iteration, train_iters):
             self._run_step(step)
-        emit_worker_log(f"[{self.worker_name}] done")
         return {"worker": self.worker_name, "stage": self.stage_name}
 
     def _run_step(self, step: int) -> None:
@@ -131,19 +134,22 @@ class BaseStageWorker:
 
         for batch, batch_meta in dataloader:
             sample_ids = batch["sample_id"].view(-1).tolist()
-            emit_worker_log(f"[{self.worker_name}] step={step} consumed sample_ids={sample_ids}")
+            emit_worker_log(
+                f"[{self.worker_name}] step={step} consume: sample_ids={sample_ids}",
+                self.cfg_demo.enable_worker_logs,
+            )
 
             output, written_fields = self.compute(batch, batch_meta)
             self.tq_client.put(output, metadata=batch_meta)
 
             count = ray.get(self.tracker.record.remote(self.stage_name, step, len(sample_ids)))
             emit_worker_log(
-                f"[{self.worker_name}] step={step} done -> written_fields={written_fields}, "
-                f"{self.stage_name}_count={count}/{self.cfg_demo.global_batch_size}"
+                f"[{self.worker_name}] step={step} produce: "
+                f"fields={written_fields}, count={count}/{self.cfg_demo.global_batch_size}",
+                self.cfg_demo.enable_worker_logs,
             )
 
         ray.get(self.tracker.record_done.remote(self.stage_name, step))
-        emit_worker_log(f"[{self.worker_name}] step={step} worker_done recorded")
 
     def _build_dataloader(self, partition_id: str) -> StreamingDataLoader:
         dataset = StreamingDataset(
@@ -243,9 +249,7 @@ class UpdateWorker(BaseStageWorker):
 
 @ray.remote(num_cpus=0.1)
 def sync_weights(step: int, sleep_s: float) -> dict:
-    emit_worker_log(f"[weight-sync] step={step} start")
     time.sleep(sleep_s)
-    emit_worker_log(f"[weight-sync] step={step} done")
     return {"step": step}
 
 
@@ -269,6 +273,7 @@ class DemoConfig:
     weight_sync_seconds: float
     num_data_storage_units: int
     seed: int
+    enable_worker_logs: bool
 
     def validate(self) -> None:
         for name, value in [
@@ -324,7 +329,7 @@ class DataCentricWorkerPipelineDemo:
         sample_ids = batch["sample_id"].view(-1).tolist()
         meta = self.tq_client.put(batch, partition_id=partition_id)
         logger.info(
-            f"MAIN | step={step} put prompts: "
+            f"step={step} | put prompts: "
             f"partition={partition_id}, sample_ids={sample_ids}, fields={list(meta.field_names)}"
         )
 
@@ -334,7 +339,7 @@ class DataCentricWorkerPipelineDemo:
             done_workers = ray.get(self.tracker.get_done_workers.remote(step))
 
             active_counts = {stage: count for stage, count in counts.items() if count > 0}
-            logger.info(f"MAIN | step={step} progress: counts={active_counts}, done_workers={done_workers}")
+            logger.info(f"step={step} | progress: counts={active_counts}, done_workers={done_workers}")
 
             all_workers_done = (
                 done_workers.get("rollout", 0) >= self.config.num_rollout_workers
@@ -352,15 +357,15 @@ class DataCentricWorkerPipelineDemo:
 
     def fit(self) -> list[dict]:
         logger.info("=" * 72)
-        logger.info("MAIN | TransferQueue StreamingDataLoader Data-Centric Worker Pipeline Demo")
+        logger.info("TransferQueue StreamingDataLoader Data-Centric Worker Pipeline Demo")
         logger.info("=" * 72)
         logger.info(
-            f"MAIN | workers: rollout={self.config.num_rollout_workers}, "
+            f"workers | rollout={self.config.num_rollout_workers}, "
             f"ref={self.config.num_ref_workers}, actor={self.config.num_actor_workers}, "
             f"reward={self.config.num_reward_workers}, update={self.config.num_update_workers}"
         )
         logger.info(
-            f"MAIN | pipeline: num_steps={self.config.num_steps}, "
+            f"pipeline | num_steps={self.config.num_steps}, "
             f"global_batch_size={self.config.global_batch_size}, "
             f"micro_batch_size={self.config.micro_batch_size}"
         )
@@ -373,14 +378,18 @@ class DataCentricWorkerPipelineDemo:
         refs.extend(self._start_worker_group(self.update_workers))
 
         for step in range(self.config.num_steps):
+            logger.info("=" * 72)
+            logger.info(f"STEP {step}")
+            logger.info("=" * 72)
             self._put_prompt(step)
             self._wait_complete(step)
+            logger.info(f"step={step} | weight sync: start")
             ray.get(sync_weights.remote(step, self.config.weight_sync_seconds))
+            logger.info(f"step={step} | weight sync: done")
             self.tq_client.clear_partition(f"{self.config.partition_prefix}_{step}")
-            logger.info(f"MAIN | step={step} clear partition: {self.config.partition_prefix}_{step}")
+            logger.info(f"step={step} | clear partition: {self.config.partition_prefix}_{step}")
 
         ray.get(refs)
-        logger.info("MAIN | demo done!")
         return []
 
 
@@ -404,6 +413,7 @@ def main() -> None:
     parser.add_argument("--weight-sync-seconds", type=float, default=0.20)
     parser.add_argument("--num-data-storage-units", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260410)
+    parser.add_argument("--enable-worker-logs", action="store_true")
     args = parser.parse_args()
 
     cfg = DemoConfig(
@@ -425,18 +435,24 @@ def main() -> None:
         weight_sync_seconds=args.weight_sync_seconds,
         num_data_storage_units=args.num_data_storage_units,
         seed=args.seed,
+        enable_worker_logs=args.enable_worker_logs,
     )
     cfg.validate()
 
     os.environ["TQ_PRE_ALLOC_SAMPLE_NUM"] = str(cfg.global_batch_size)
 
+    completed = False
     ray.init()
     try:
         demo = DataCentricWorkerPipelineDemo(cfg, build_tq_config(cfg))
         demo.fit()
+        completed = True
     finally:
         tq.close()
         ray.shutdown()
+
+    if completed:
+        logger.info("demo done!")
 
 
 if __name__ == "__main__":
