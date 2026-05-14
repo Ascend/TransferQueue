@@ -30,7 +30,11 @@ jobs:
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[yuanrong]"
-    - name: Run recipes
+    - name: Run single controller demo
       run: |
         export RAY_DEDUP_LOGS=0
         python3 recipe/simple_use_case/single_controller_demo.py --num-samples 8 --global-batch-size 4 --rollout-agent-num-workers 1
+    - name: Run data-centric pipeline demo
+      run: |
+        export RAY_DEDUP_LOGS=0
+        python3 recipe/simple_use_case/streaming_decentralized_inherited_worker_pipeline_demo.py
