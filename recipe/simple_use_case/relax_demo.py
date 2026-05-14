@@ -319,7 +319,7 @@ def build_tq_config(config: DemoConfig):
     return OmegaConf.merge(base, override)
 
 
-class DataCentricWorkerPipelineDemo:
+class DataCentricPipelineDemo:
     def __init__(self, config: DemoConfig, tq_config):
         self.config = config
         tq.init(tq_config)
@@ -366,7 +366,7 @@ class DataCentricWorkerPipelineDemo:
 
     def fit(self) -> list[dict]:
         logger.info("=" * 72)
-        logger.info("TransferQueue StreamingDataLoader Data-Centric Worker Pipeline Demo")
+        logger.info("TransferQueue StreamingDataLoader Data-Centric Pipeline Demo (Relax-inspired)")
         logger.info("=" * 72)
         logger.info(
             f"workers | rollout={self.config.num_rollout_workers}, "
@@ -453,7 +453,7 @@ def main() -> None:
     completed = False
     ray.init()
     try:
-        demo = DataCentricWorkerPipelineDemo(cfg, build_tq_config(cfg))
+        demo = DataCentricPipelineDemo(cfg, build_tq_config(cfg))
         demo.fit()
         completed = True
     finally:
