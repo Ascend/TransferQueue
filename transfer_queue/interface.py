@@ -145,6 +145,7 @@ def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
 
                 cmd = [
                     "mooncake_master",
+                    "-client_ttl=30",
                     "-default_kv_lease_ttl=999999",
                     "-default_kv_soft_pin_ttl=999999",
                     "--eviction_high_watermark_ratio=1.0",
