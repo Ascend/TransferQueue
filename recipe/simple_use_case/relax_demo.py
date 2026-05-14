@@ -63,7 +63,9 @@ def make_prompt_batch(step: int, config: "DemoConfig") -> TensorDict:
         generator=generator,
         dtype=torch.long,
     )
-    return TensorDict({"sample_id": sample_ids.unsqueeze(-1), "prompt_ids": prompt_ids}, batch_size=config.global_batch_size)
+    return TensorDict(
+        {"sample_id": sample_ids.unsqueeze(-1), "prompt_ids": prompt_ids}, batch_size=config.global_batch_size
+    )
 
 
 def generate_sequences(prompt_ids: torch.Tensor, config: "DemoConfig") -> TensorDict:
@@ -334,11 +336,19 @@ class DataCentricPipelineDemo:
         self.tq_client = tq.get_client()
         self.tracker = ProgressTracker.remote(STAGE_NAMES, config.num_steps)
 
-        self.rollout_workers = [RolloutWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_rollout_workers)]
+        self.rollout_workers = [
+            RolloutWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_rollout_workers)
+        ]
         self.ref_workers = [RefWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_ref_workers)]
-        self.actor_workers = [ActorWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_actor_workers)]
-        self.reward_workers = [RewardWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_reward_workers)]
-        self.update_workers = [UpdateWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_update_workers)]
+        self.actor_workers = [
+            ActorWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_actor_workers)
+        ]
+        self.reward_workers = [
+            RewardWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_reward_workers)
+        ]
+        self.update_workers = [
+            UpdateWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_update_workers)
+        ]
 
     def _put_prompt(self, step: int) -> None:
         partition_id = f"{self.config.partition_prefix}_{step}"
