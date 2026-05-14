@@ -131,6 +131,7 @@ class BaseStageWorker:
         self.worker_id = worker_id
         self.cfg_demo = config
         self.worker_name = f"{self.stage_name}-{worker_id}"
+        self._dataloader: StreamingDataLoader | None = None
 
     def start(self, iteration: int, train_iters: int) -> dict:
         for step in range(iteration, train_iters):
@@ -139,7 +140,7 @@ class BaseStageWorker:
 
     def _run_step(self, step: int) -> None:
         partition_id = f"{self.cfg_demo.partition_prefix}_{step}"
-        dataloader = self._build_dataloader(partition_id)
+        dataloader = self._get_dataloader(partition_id)
 
         for batch, batch_meta in dataloader:
             sample_ids = batch["sample_id"].view(-1).tolist()
@@ -159,6 +160,13 @@ class BaseStageWorker:
             )
 
         ray.get(self.tracker.record_done.remote(self.stage_name, step))
+
+    def _get_dataloader(self, partition_id: str) -> StreamingDataLoader:
+        if self._dataloader is None:
+            self._dataloader = self._build_dataloader(partition_id)
+        else:
+            self._dataloader.step(partition_id)
+        return self._dataloader
 
     def _build_dataloader(self, partition_id: str) -> StreamingDataLoader:
         dataset = StreamingDataset(
