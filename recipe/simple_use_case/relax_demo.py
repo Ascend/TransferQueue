@@ -69,35 +69,39 @@ def make_prompt_batch(step: int, config: "DemoConfig") -> TensorDict:
 
 
 def generate_sequences(prompt_ids: torch.Tensor, config: "DemoConfig") -> TensorDict:
-    batch_size = prompt_ids.size(0)
-    generator = torch.Generator().manual_seed(config.seed + int(prompt_ids.sum().item()))
-    response_ids = torch.randint(
-        0,
-        config.vocab_size,
-        (batch_size, config.response_length),
-        generator=generator,
-        dtype=torch.long,
-    )
+    # This demo focuses on dataflow, so rollout emits placeholder tensors with
+    # the right schema instead of deriving values from the prompt contents.
+    batch_size = len(prompt_ids.unbind())
     return TensorDict(
         {
-            "input_ids": torch.cat([prompt_ids, response_ids], dim=1),
-            "response_ids": response_ids,
-            "response_mask": torch.ones_like(response_ids),
+            "input_ids": torch.zeros(
+                (batch_size, config.prompt_length + config.response_length),
+                dtype=torch.long,
+            ),
+            "response_ids": torch.zeros((batch_size, config.response_length), dtype=torch.long),
+            "response_mask": torch.ones((batch_size, config.response_length), dtype=torch.long),
         },
         batch_size=batch_size,
     )
 
 
 def compute_log_prob(prompt_ids: torch.Tensor, response_ids: torch.Tensor) -> torch.Tensor:
-    return (response_ids.float().mean(dim=1, keepdim=True) - prompt_ids.float().mean(dim=1, keepdim=True)) / 1000.0
+    # Return a stable placeholder score per sample; downstream stages only need
+    # the field shape and dtype to demonstrate the pipeline.
+    batch_size = len(prompt_ids.unbind())
+    return torch.zeros((batch_size, 1), dtype=torch.float32)
 
 
 def compute_reward(response_ids: torch.Tensor) -> torch.Tensor:
-    return response_ids.float().mean(dim=1, keepdim=True) / 1000.0
+    # Reward is also mocked out to keep the example independent from model math.
+    batch_size = len(response_ids.unbind())
+    return torch.zeros((batch_size, 1), dtype=torch.float32)
 
 
 def compute_loss(old_log_prob: torch.Tensor, ref_log_prob: torch.Tensor, advantage: torch.Tensor) -> torch.Tensor:
-    return (old_log_prob - ref_log_prob - advantage).abs()
+    # Update consumes the upstream fields but emits a placeholder loss tensor.
+    batch_size = len(old_log_prob.unbind())
+    return torch.zeros((batch_size, 1), dtype=torch.float32)
 
 
 @ray.remote
@@ -145,7 +149,7 @@ class BaseStageWorker:
         dataloader = self._get_dataloader(partition_id)
 
         for batch, batch_meta in dataloader:
-            sample_ids = batch["sample_id"].view(-1).tolist()
+            sample_ids = [int(sample_id.reshape(-1)[0].item()) for sample_id in batch["sample_id"].unbind()]
             emit_worker_log(
                 f"[{self.worker_name}] step={step} consume: sample_ids={sample_ids}",
                 self.cfg_demo.enable_worker_logs,
@@ -167,6 +171,7 @@ class BaseStageWorker:
         if self._dataloader is None:
             self._dataloader = self._build_dataloader(partition_id)
         else:
+            # Reuse the same dataloader across steps and only advance its partition.
             self._dataloader.step(partition_id)
         return self._dataloader
 
@@ -335,6 +340,7 @@ class DataCentricPipelineDemo:
         tq.init(tq_config)
         self.tq_client = tq.get_client()
         self.tracker = ProgressTracker.remote(STAGE_NAMES, config.num_steps)
+        self._worker_refs: list[ray.ObjectRef] = []
 
         self.rollout_workers = [
             RolloutWorker.remote(tq_config, self.tracker, i, config) for i in range(config.num_rollout_workers)
@@ -362,6 +368,7 @@ class DataCentricPipelineDemo:
 
     def _wait_complete(self, step: int) -> None:
         while True:
+            self._raise_if_worker_failed()
             counts = ray.get(self.tracker.get_counts.remote(step))
             done_workers = ray.get(self.tracker.get_done_workers.remote(step))
 
@@ -378,6 +385,21 @@ class DataCentricPipelineDemo:
             if all_workers_done:
                 return
             time.sleep(0.2)
+
+    def _raise_if_worker_failed(self) -> None:
+        if not self._worker_refs:
+            return
+
+        # Worker exceptions stay attached to their ObjectRefs. The main loop only
+        # sees them once it explicitly ray.get()s a finished ref, so we probe for
+        # ready workers here instead of waiting until the very end of fit().
+        ready_refs, _ = ray.wait(self._worker_refs, num_returns=1, timeout=0)
+        if not ready_refs:
+            return
+
+        ready_ref = ready_refs[0]
+        ray.get(ready_ref)
+        self._worker_refs = [ref for ref in self._worker_refs if ref != ready_ref]
 
     def _start_worker_group(self, workers: list) -> list:
         return [worker.start.remote(0, self.config.num_steps) for worker in workers]
@@ -403,7 +425,10 @@ class DataCentricPipelineDemo:
         refs.extend(self._start_worker_group(self.actor_workers))
         refs.extend(self._start_worker_group(self.reward_workers))
         refs.extend(self._start_worker_group(self.update_workers))
+        self._worker_refs = list(refs)
 
+        # Workers stay alive across the whole run; each training step is modeled
+        # as a fresh partition that carries one batch through the pipeline.
         for step in range(self.config.num_steps):
             logger.info("=" * 72)
             logger.info(f"STEP {step}")
