@@ -37,4 +37,4 @@ jobs:
     - name: Run data-centric pipeline demo
       run: |
         export RAY_DEDUP_LOGS=0
-        python3 recipe/simple_use_case/relax_demo.py --num-steps 1 --global-batch-size 2 --micro-batch-size 1
+        python3 recipe/simple_use_case/relax_demo.py --num-steps 1 --global-batch-size 1 --micro-batch-size 1 --num-rollout-workers 1 --num-ref-workers 1 --num-actor-workers 1 --num-reward-workers 1 --rollout-sleep-seconds 0.01 --stage-sleep-seconds 0.01 --weight-sync-seconds 0.01
