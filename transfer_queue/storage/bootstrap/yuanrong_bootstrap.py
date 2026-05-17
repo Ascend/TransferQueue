@@ -22,7 +22,7 @@ from typing import Any
 import ray
 from omegaconf import DictConfig
 
-from transfer_queue.storage.backends.base import StorageBackendFactory
+from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.utils.yuanrong_utils import get_local_ip_addresses, kill_actors_and_placement_group
 
 logger = logging.getLogger(__name__)
@@ -260,7 +260,7 @@ class YuanrongWorkerActor:
         logger.info(f"Datasystem worker stopped successfully at {self.worker_address}")
 
 
-@StorageBackendFactory.register_backend("Yuanrong")
+@StorageBootstrapProvider.register_provider("Yuanrong")
 def initialize_yuanrong_backend(conf: DictConfig) -> dict[str, Any] | None:
     """Initialize Yuanrong backend with metastore mode.
 

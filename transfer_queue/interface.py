@@ -30,7 +30,7 @@ from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
-from transfer_queue.storage.backends.base import StorageBackendFactory
+from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
@@ -70,15 +70,17 @@ def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
     if _TQ_STORAGE is None:
         _TQ_STORAGE = {}
         backend_name = conf.backend.storage_backend
-        registered_backend_fn = StorageBackendFactory.get_backend(backend_name)
-        if registered_backend_fn:
-            backend_instance = registered_backend_fn(conf)
-            if backend_instance:
-                _TQ_STORAGE[backend_name] = backend_instance
+        provider_fn = StorageBootstrapProvider.get_provider(backend_name)
+        if provider_fn is not None:
+            backend_resources = provider_fn(conf)
+            if backend_resources is not None:
+                _TQ_STORAGE[backend_name] = backend_resources
             else:
-                logger.error(f"Not found available {backend_name} storage backend instance, please check the config.")
+                logger.error(f"Not found available {backend_name} storage resources, please check the config.")
         else:
-            logger.error(f"Storage backend {backend_name} not registered. Please add it to the StorageBackendFactory.")
+            logger.error(
+                f"Storage backend {backend_name} not registered. Please add it to the StorageBootstrapProvider."
+            )
     return conf
 
 

@@ -13,12 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import mooncake_storage, simple_storage, yuanrong_storage  # noqa: F401, I001
-from .base import StorageBackendFactory
-from .simple_storage import SimpleStorageUnit, StorageUnitData
+from . import mooncake_bootstrap, simple_bootstrap, yuanrong_bootstrap  # noqa: F401, I001
+from .provider import StorageBootstrapProvider
 
 __all__ = [
-    "StorageBackendFactory",
-    "SimpleStorageUnit",
-    "StorageUnitData",
+    "StorageBootstrapProvider",
 ]

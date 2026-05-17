@@ -30,7 +30,7 @@ from tensordict.utils import LinkedList
 
 from transfer_queue import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
-from transfer_queue.storage.backends.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_placement_group
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 

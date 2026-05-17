@@ -17,24 +17,24 @@ from functools import wraps
 from typing import Callable
 
 
-class StorageBackendFactory:
-    _backends: dict[str, Callable] = {}
+class StorageBootstrapProvider:
+    _providers: dict[str, Callable] = {}
 
     @classmethod
-    def register_backend(cls, name: str):
-        """Decorator to register storage backend & returns function."""
+    def register_provider(cls, name: str):
+        """Decorator to register storage provider & returns function."""
 
         def decorator(fn):
             @wraps(fn)
             def wrapper(*args, **kwargs):
                 return fn(*args, **kwargs)
 
-            cls._backends[name.lower()] = wrapper
+            cls._providers[name.lower()] = wrapper
             return wrapper
 
         return decorator
 
     @classmethod
-    def get_backend(cls, name: str) -> Callable | None:
-        """Get storage backend function by name."""
-        return cls._backends.get(name.lower(), None)
+    def get_provider(cls, name: str) -> Callable | None:
+        """Get storage provider function by name."""
+        return cls._providers.get(name.lower(), None)

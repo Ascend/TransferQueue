@@ -20,20 +20,20 @@ from urllib.parse import urlparse
 
 from omegaconf import DictConfig
 
-from transfer_queue.storage.backends.base import StorageBackendFactory
+from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 
-@StorageBackendFactory.register_backend("MooncakeStore")
-def initialize_mooncake_backend(conf: DictConfig) -> DictConfig:
+@StorageBootstrapProvider.register_provider("MooncakeStore")
+def initialize_mooncake_backend(conf: DictConfig) -> subprocess.Popen | None:
     """
     Initialize MooncakeStore backend.
     Args:
         conf (DictConfig): Configuration dictionary for the MooncakeStore backend.
     Returns:
-        DictConfig: Initialized configuration dictionary for the MooncakeStore backend.
+        subprocess.Popen | None: Process object for the MooncakeStore backend process.
     Raises:
         ValueError: If the backend is not initialized successfully.
     """

@@ -807,7 +807,7 @@ class TestStorageUnitDataStrict:
 
     def test_put_data_length_mismatch_raises(self):
         """put_data must raise when global_indexes and field values have different lengths."""
-        from transfer_queue.storage.backends.simple_storage import StorageUnitData
+        from transfer_queue.storage.simple_storage import StorageUnitData
 
         sud = StorageUnitData(storage_size=10)
         # 3 indexes but only 2 values — must raise, not silently drop

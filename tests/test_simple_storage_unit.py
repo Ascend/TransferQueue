@@ -21,7 +21,7 @@ import tensordict
 import torch
 import zmq
 
-from transfer_queue.storage.backends.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
@@ -420,7 +420,7 @@ def test_storage_unit_data_direct():
 
 def test_storage_unit_data_capacity_uses_active_keys():
     """Capacity check must use _active_keys, not scan field_data."""
-    from transfer_queue.storage.backends.simple_storage import StorageUnitData
+    from transfer_queue.storage.simple_storage import StorageUnitData
 
     storage = StorageUnitData(storage_size=3)
 
