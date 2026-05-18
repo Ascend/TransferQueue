@@ -261,14 +261,14 @@ class YuanrongWorkerActor:
 
 
 @StorageBootstrapProvider.register_provider("Yuanrong")
-def initialize_yuanrong_backend(conf: DictConfig) -> dict[str, Any] | None:
-    """Initialize Yuanrong backend with metastore mode.
+def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
+    """Initialize Yuanrong storage with metastore mode.
 
-    This function sets up the Yuanrong datasystem workers across all Ray nodes
+    This function sets up the Yuanrong storage datasystem workers across all Ray nodes
     using placement groups and actors.
 
     Args:
-        conf: Configuration containing Yuanrong settings
+        conf: Configuration containing Yuanrong storage settings
 
     Returns:
         Dict containing worker_actors, metastore_address, and placement_group

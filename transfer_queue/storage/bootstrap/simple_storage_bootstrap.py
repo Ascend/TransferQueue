@@ -28,8 +28,8 @@ logger = get_logger(__name__)
 
 
 @StorageBootstrapProvider.register_provider("SimpleStorage")
-def initialize_simple_backend(conf: DictConfig) -> dict[str, Any]:
-    """Initialize Simple backend with metastore mode."""
+def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
+    """Initialize Simple storage with metastore mode."""
 
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units

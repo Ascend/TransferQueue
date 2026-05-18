@@ -18,6 +18,8 @@ from typing import Callable
 
 
 class StorageBootstrapProvider:
+    """Registry for storage backend bootstrap functions."""
+
     _providers: dict[str, Callable] = {}
 
     @classmethod

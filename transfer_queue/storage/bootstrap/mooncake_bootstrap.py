@@ -27,15 +27,15 @@ logger = get_logger(__name__)
 
 
 @StorageBootstrapProvider.register_provider("MooncakeStore")
-def initialize_mooncake_backend(conf: DictConfig) -> subprocess.Popen | None:
+def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | None:
     """
-    Initialize MooncakeStore backend.
+    Initialize Mooncake store backend.
     Args:
-        conf (DictConfig): Configuration dictionary for the MooncakeStore backend.
+        conf (DictConfig): Configuration dictionary for the Mooncake store backend.
     Returns:
-        subprocess.Popen | None: Process object for the MooncakeStore backend process.
+        subprocess.Popen | None: Process object for the Mooncake store backend process.
     Raises:
-        ValueError: If the backend is not initialized successfully.
+        ValueError: If the Mooncake store is not initialized successfully.
     """
     if not conf.backend.MooncakeStore.auto_init:
         return None
