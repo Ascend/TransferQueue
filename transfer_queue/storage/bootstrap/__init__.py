@@ -1,5 +1,5 @@
-# Copyright 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# Copyright 2026 The TransferQueue Team
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from . import mooncake_bootstrap, simple_bootstrap, yuanrong_bootstrap  # noqa: F401, I001
+from . import mooncake_storage_bootstrap, simple_storage_bootstrap, yuanrong_storage_bootstrap  # noqa: F401, I001
 from .provider import StorageBootstrapProvider
 
 __all__ = [
