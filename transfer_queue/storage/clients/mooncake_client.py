@@ -34,10 +34,92 @@ try:
 except ImportError:
     MOONCAKE_STORE_IMPORTED = False
 
+from tensordict import NonTensorData as _NonTensorData
+
 BATCH_SIZE_LIMIT: int = 400
 MAX_WORKER_THREADS = 4
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+
+# Separator joining an original key to a dict sub-key (e.g. "5@mmi::pixel_values").
+_DICT_SUBKEY_SEP: str = "::"
+
+# Sentinel marker key identifying a per-key dict-unpack meta entry.
+_TQ_DICT_UNPACK_KEY: str = "__tq_dict_unpack__"
+
+# Reserved sub-key name for the bundled non-tensor blob (a 1D uint8 tensor that
+# carries pickle bytes of all non-tensor entries of the original dict).
+_TQ_EXTRAS_SUBKEY: str = "__tq_extras__"
+
+
+def _is_dict_unpack_meta(meta: Any) -> bool:
+    """True if value is a dict-unpack meta entry."""
+    return isinstance(meta, dict) and meta.get(_TQ_DICT_UNPACK_KEY) is True
+
+
+def _unwrap_non_tensor(value: Any) -> Any:
+    """Unwrap a tensordict.NonTensorData to the underlying Python object."""
+    if isinstance(value, _NonTensorData):
+        return value.data
+    return value
+
+
+def _dict_has_tensor(value: Any) -> bool:
+    """True if value is a non-empty dict containing at least one tensor."""
+    value = _unwrap_non_tensor(value)
+    return (
+        isinstance(value, dict)
+        and len(value) > 0
+        and any(isinstance(v, torch.Tensor) for v in value.values())
+    )
+
+
+def _expand_dict_slots_fn(
+    keys: list[str],
+    shapes: list[Any],
+    dtypes: list[Any],
+    custom_backend_meta: list[Any],
+) -> tuple[list[str], list[Any], list[Any], list[tuple]]:
+    """Expand dict-unpack slots into a flat list of sub-keys plus instructions
+    for rebuilding each original slot.
+    """
+    flat_keys: list[str] = []
+    flat_shapes: list[Any] = []
+    flat_dtypes: list[Any] = []
+    reconstruct: list[tuple] = []
+    for i, key in enumerate(keys):
+        meta = custom_backend_meta[i]
+        if _is_dict_unpack_meta(meta):
+            tensor_sub_idxs: list[int] = []
+            for sk, sd, ss in zip(
+                meta["tensor_keys"], meta["tensor_dtypes"], meta["tensor_shapes"], strict=True
+            ):
+                flat_keys.append(f"{key}{_DICT_SUBKEY_SEP}{sk}")
+                flat_shapes.append(ss)
+                flat_dtypes.append(sd)
+                tensor_sub_idxs.append(len(flat_keys) - 1)
+            extras_idx = -1
+            extras_size = meta.get("extras_size", 0)
+            if extras_size > 0:
+                flat_keys.append(f"{key}{_DICT_SUBKEY_SEP}{_TQ_EXTRAS_SUBKEY}")
+                flat_shapes.append([extras_size])
+                flat_dtypes.append(torch.uint8)
+                extras_idx = len(flat_keys) - 1
+            reconstruct.append(
+                (
+                    "dict",
+                    list(meta["key_order"]),
+                    list(meta["tensor_keys"]),
+                    tensor_sub_idxs,
+                    extras_idx,
+                )
+            )
+        else:
+            flat_keys.append(key)
+            flat_shapes.append(shapes[i])
+            flat_dtypes.append(dtypes[i])
+            reconstruct.append(("scalar", len(flat_keys) - 1))
+    return flat_keys, flat_shapes, flat_dtypes, reconstruct
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
@@ -98,12 +180,11 @@ class MooncakeStoreClient(StorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
-    def put(self, keys: list[str], values: list[Any]) -> None:
-        """Stores multiple key-value pairs to MooncakeStore.
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
+        """Store key-value pairs in MooncakeStore.
 
-        Args:
-            keys (List[str]): List of unique string identifiers.
-            values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
+        Returns optional per-key backend metadata that ``get`` / ``clear``
+        need later; ``None`` when there is nothing to remember.
         """
 
         if not isinstance(keys, list) or not isinstance(values, list):
@@ -111,15 +192,61 @@ class MooncakeStoreClient(StorageKVClient):
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
 
+        custom_meta: list[Any] = [None] * len(keys)
+        dict_seen: bool = False
+
         tensor_keys = []
         tensor_values = []
         non_tensor_keys = []
         non_tensor_values = []
 
-        for key, value in zip(keys, values, strict=True):
+        for i, (key, value) in enumerate(zip(keys, values, strict=True)):
             if isinstance(value, torch.Tensor):
                 tensor_keys.append(key)
                 tensor_values.append(value)
+            elif _dict_has_tensor(value):
+                # Dict-with-tensor fan-out: avoid the Mooncake bytes pool which
+                # silently returns b"" under MB-scale GET pressure (see
+                # real_client.cpp:2209 "Failed to allocate buffer"). Each
+                # sub-tensor rides the working tensor RDMA path; non-tensor
+                # entries are pickled into one uint8 blob and ride the same
+                # path as another sub-key. The bytes pool is never touched.
+                dict_seen = True
+                raw_dict = _unwrap_non_tensor(value)
+                key_order = list(raw_dict.keys())
+                ts_sub_keys: list[Any] = []
+                ts_sub_tensors: list[Tensor] = []
+                extras: dict[Any, Any] = {}
+                for sk in key_order:
+                    v = raw_dict[sk]
+                    if isinstance(v, torch.Tensor):
+                        ts_sub_keys.append(sk)
+                        ts_sub_tensors.append(v)
+                    else:
+                        extras[sk] = v
+
+                extras_size = 0
+                extras_tensor: Tensor | None = None
+                if extras:
+                    extras_blob = pickle.dumps(extras, protocol=pickle.HIGHEST_PROTOCOL)
+                    extras_tensor = torch.frombuffer(bytearray(extras_blob), dtype=torch.uint8)
+                    extras_size = extras_tensor.numel()
+
+                custom_meta[i] = {
+                    _TQ_DICT_UNPACK_KEY: True,
+                    "key_order": key_order,
+                    "tensor_keys": ts_sub_keys,
+                    "tensor_dtypes": [t.dtype for t in ts_sub_tensors],
+                    "tensor_shapes": [list(t.shape) for t in ts_sub_tensors],
+                    "extras_size": extras_size,
+                }
+
+                for sk, st in zip(ts_sub_keys, ts_sub_tensors, strict=True):
+                    tensor_keys.append(f"{key}{_DICT_SUBKEY_SEP}{sk}")
+                    tensor_values.append(st)
+                if extras_tensor is not None:
+                    tensor_keys.append(f"{key}{_DICT_SUBKEY_SEP}{_TQ_EXTRAS_SUBKEY}")
+                    tensor_values.append(extras_tensor)
             else:
                 non_tensor_keys.append(key)
                 non_tensor_values.append(value)
@@ -139,7 +266,7 @@ class MooncakeStoreClient(StorageKVClient):
             for future in as_completed(futures):
                 future.result()
 
-        return None
+        return custom_meta if dict_seen else None
 
     def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
         """Worker thread for putting batch of tensors to MooncakeStore."""
@@ -246,25 +373,69 @@ class MooncakeStoreClient(StorageKVClient):
         keys: list[str],
         shapes: list[Any] | None = None,
         dtypes: list[Any] | None = None,
-        custom_backend_meta: list[str] | None = None,
+        custom_backend_meta: list[Any] | None = None,
     ) -> list[Any]:
-        """Get multiple key-value pairs from MooncakeStore.
+        """Fetch values for the given keys from MooncakeStore.
 
-        Args:
-            keys: Keys to fetch.
-            shapes: Expected tensor shapes (use [] for scalars).
-            dtypes: Expected dtypes; use None for non-tensor data.
-            custom_backend_meta: Optional custom backend metadata.
-
-        Returns:
-            Retrieved values in the same order as input keys.
+        ``shapes`` and ``dtypes`` describe the expected tensor layout per key
+        (use ``None`` for non-tensor slots). ``custom_backend_meta`` carries
+        per-key metadata returned by ``put``. Returns values in input order.
         """
 
         if shapes is None or dtypes is None:
             raise ValueError("MooncakeStoreClient needs shapes and dtypes for zero-copy transfer.")
         if not (len(keys) == len(shapes) == len(dtypes)):
             raise ValueError("Lengths of keys, shapes, dtypes must match")
+        if custom_backend_meta is not None and len(custom_backend_meta) != len(keys):
+            raise ValueError(
+                f"Length of custom_backend_meta ({len(custom_backend_meta)}) must match keys ({len(keys)})"
+            )
 
+        # Expand dict-of-tensors slots into synthetic sub-keys whose tensors ride
+        # the working tensor RDMA path. ``reconstruct`` records how to fold each
+        # original slot back from the flat fetch result.
+        has_dict = custom_backend_meta is not None and any(
+            _is_dict_unpack_meta(m) for m in custom_backend_meta
+        )
+        if has_dict:
+            flat_keys, flat_shapes, flat_dtypes, reconstruct = _expand_dict_slots_fn(
+                keys, shapes, dtypes, custom_backend_meta
+            )
+        else:
+            flat_keys, flat_shapes, flat_dtypes = list(keys), list(shapes), list(dtypes)
+            reconstruct = None
+
+        flat_results = self._get_flat(flat_keys, flat_shapes, flat_dtypes)
+
+        if reconstruct is None:
+            return flat_results
+
+        n_orig = len(keys)
+        results: list[Any] = [None] * n_orig
+        for orig_i, op in enumerate(reconstruct):
+            if op[0] == "scalar":
+                results[orig_i] = flat_results[op[1]]
+            else:
+                _, key_order, tensor_sub_keys, tensor_sub_idxs, extras_idx = op
+                tensor_map = {
+                    sk: flat_results[j]
+                    for sk, j in zip(tensor_sub_keys, tensor_sub_idxs, strict=True)
+                }
+                if extras_idx >= 0:
+                    extras_tensor = flat_results[extras_idx]
+                    extras_map = pickle.loads(extras_tensor.numpy().tobytes())
+                else:
+                    extras_map = {}
+                results[orig_i] = {
+                    sk: (tensor_map[sk] if sk in tensor_map else extras_map[sk])
+                    for sk in key_order
+                }
+        return results
+
+    def _get_flat(self, keys: list[str], shapes: list[Any], dtypes: list[Any]) -> list[Any]:
+        """Fetch a flat list of keys; tensor slots and non-tensor slots are
+        dispatched to their respective worker paths.
+        """
         tensor_indices = []
         non_tensor_indices = []
 
@@ -426,16 +597,31 @@ class MooncakeStoreClient(StorageKVClient):
         return deserialized_results, indexes
 
     def clear(self, keys: list[str], custom_backend_meta: list[Any] | None = None) -> None:
-        """Deletes multiple keys from MooncakeStore.
-
-        Args:
-            keys (List[str]): List of keys to remove.
-            custom_backend_meta (List[Any], optional): ...
+        """Delete keys from MooncakeStore. If ``custom_backend_meta`` carries
+        any dict-unpack entries, the corresponding sub-keys are also removed.
         """
-        ret_codes = self._store.batch_remove(keys, force=True)
+        if custom_backend_meta is not None and len(custom_backend_meta) != len(keys):
+            raise ValueError(
+                f"Length of custom_backend_meta ({len(custom_backend_meta)}) must match keys ({len(keys)})"
+            )
+
+        if custom_backend_meta is None or not any(_is_dict_unpack_meta(m) for m in custom_backend_meta):
+            expanded_keys = list(keys)
+        else:
+            expanded_keys = []
+            for key, meta in zip(keys, custom_backend_meta, strict=True):
+                if _is_dict_unpack_meta(meta):
+                    for sk in meta["tensor_keys"]:
+                        expanded_keys.append(f"{key}{_DICT_SUBKEY_SEP}{sk}")
+                    if meta.get("extras_size", 0) > 0:
+                        expanded_keys.append(f"{key}{_DICT_SUBKEY_SEP}{_TQ_EXTRAS_SUBKEY}")
+                else:
+                    expanded_keys.append(key)
+
+        ret_codes = self._store.batch_remove(expanded_keys, force=True)
         for i, ret in enumerate(ret_codes):
             if not (ret == 0 or ret == -704):
-                logger.error(f"remove failed for key `{keys[i]}` with error code: {ret}")
+                logger.error(f"remove failed for key `{expanded_keys[i]}` with error code: {ret}")
 
     def close(self):
         """Closes MooncakeStore."""
