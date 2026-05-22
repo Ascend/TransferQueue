@@ -26,41 +26,37 @@ When Yuanrong backend is selected, `YuanrongStorageManager` and `YuanrongStorage
 ## Quick Start
 
 ### Prerequisites
-- **Python Version**: $ \geq 3.10~and \leq 3.11 $
+- **Python Version**: >= 3.10, <= 3.11
 - **Architecture**: aarch64 or x86_64
 
 ### Installation Steps
 
 Follow these steps to build and install:
 
-#### 1. Install Core Dependencies
+#### 1. Install TransferQueue with Yuanrong
 
-Install PyTorch and TransferQueue
+Use the `[yuanrong]` extras to install PyTorch, TransferQueue, and openYuanrong-datasystem in one command:
+
 ```bash
-# Install Torch (matching the version specified for your hardware)
+# Install torch, recommended version: 2.8.0 or higher.
+# Version 2.8.0 is used as an example.
 pip install torch==2.8.0
 
-# Install TransferQueue from pypi
-pip install TransferQueue
-# or install from source code
+# Install from PyPI
+pip install TransferQueue[yuanrong]
+
+# Or install from source
 git clone https://github.com/Ascend/TransferQueue/
 cd TransferQueue
-pip install -r requirements.txt
-python -m build --wheel
-pip install dist/*.whl
+pip install -e ".[yuanrong]"
 ```
 
-#### 2. Install Datasystem
+Verify installation:
 ```bash
-# Install the OpenYuanrong Datasystem package
-pip install openyuanrong-datasystem
-
-# Verify installation by checking for the dscli command-line tool
-dscli -h
+dscli -h  # Check datasystem CLI tool
 ```
 
-
-#### 3. (Required for NPU Transfer) Install CANN and torch-npu
+#### 2. (Optional for NPU Transfer) Install CANN and torch-npu
 
 If you have NPU devices and want to accelerate the transmission of NPU tensor, you need to install **Ascend-cann-toolkit** and **torch-npu**.
 
@@ -68,10 +64,10 @@ Then check whether CANN is already installed:
 
 ```bash
 # For root users
-ll /usr/local/Ascend/ascend-toolkit/latest
+ls /usr/local/Ascend/ascend-toolkit/latest
 
 # For non-root users
-ll ${HOME}/Ascend/ascend-toolkit/latest
+ls ${HOME}/Ascend/ascend-toolkit/latest
 ```
 
 If not installed, and you do need to install it, please skip to [Appendix A](#a-install-cann-for-npu-acceleration).
@@ -86,7 +82,7 @@ pip install torch-npu==2.8.0
 
 After installation, you can run TransferQueue with Yuanrong backend.
 
-First, start a local Ray cluster. Yuanrong backend relies on Ray for distributed management:
+First, start a local Ray cluster. TransferQueue relies on Ray for distributed management:
 ```bash
 ray start --head
 ```
@@ -120,12 +116,13 @@ tq.close()
 
 ## Deployment
 
+Yuanrong datasystem is deployed **per-host** (one worker per node), managing all TransferQueue clients on the same node. It is not a per-client deployment.
+
 When `auto_init: True` is set in the configuration, TransferQueue automatically initializes the Yuanrong backend during `tq.init()`. The deployment process:
 
 1. **Detects Ray cluster nodes** - identifies all alive nodes in the Ray cluster
-2. **Creates placement group** - uses `STRICT_SPREAD` strategy to ensure workers are distributed across nodes
-3. **Launches YuanrongWorkerActor** - creates one actor per node to manage the datasystem worker
-4. **Sets up metastore service** - the head node (driver node) starts the metastore service, other nodes connect as workers
+2. **Launches YuanrongWorkerActor** - creates one actor per node to manage the datasystem worker
+3. **Sets up metastore service** - the head node (driver node) starts the metastore service, other nodes connect as workers
 
 ### Configuration
 
@@ -146,14 +143,14 @@ backend:
 - `metastore_port`: Port for metastore service on the head node.
 - `worker_args`: Additional arguments passed to `dscli start` command:
   - `--shared_memory_size_mb`: Shared memory size in MB for datasystem worker.
-  - `--enable_huge_tlb`: Configure huge page memory to reduce TLB misses and improve memory access efficiency. Note: may cause system memory shortage, kernel OOM, or system instability. Required for >21GB shared memory on Ascend 910B.
+  - `--enable_huge_tlb`: Configure huge page memory to reduce TLB misses and improve memory access efficiency. Note: may cause system memory shortage, kernel OOM, or system instability.  **Please allocate huge pages before starting datasystem** - refer to [Huge Page Guide](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/appendix/hugepage_guide.html).
 
 **NPU Transfer Options:**
 - `enable_yr_npu_transport`: Enable NPU transport for high-performance device-to-device data transfer. Set to `true` when using NPU tensors.
-- `worker_args` (recommended when `enable_yr_npu_transport: true`):
-  - `--remote_h2d_device_ids`: Enable RH2D (Remote Host-to-Device) for efficient cross-node NPU data transfer. Specify NPU device IDs as comma-separated values (e.g., `0,1,2,3`).
+- `worker_args` (**mandatory** when `enable_yr_npu_transport: true`):
+  - `--remote_h2d_device_ids`: Enable RH2D (Remote Host-to-Device) for efficient cross-node NPU data transfer. Specify NPU device IDs as comma-separated values (e.g., `0,1,2,3`). Yuanrong manages all specified devices - to put/get tensors on NPU `X`, device ID `X` must be included in this argument.
 
-> More configuration parameters for deploying the data system can refer to [dscli config](https://gitcode.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/deployment/dscli.md).
+> More configuration parameters for deploying the datasystem can refer to [dscli config](https://gitcode.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/deployment/dscli.md).
 
 ### Multi-Node Deployment
 
@@ -162,12 +159,14 @@ TransferQueue automatically deploys Yuanrong datasystem workers across all Ray c
 #### Deploy Ray Cluster
 
 ```bash
-# On head node
+# On head node (assume IP of head_node is 192.168.0.1)
 ray start --head --resources='{"node:192.168.0.1": 1}'
 
-# On worker node (assume ray port of head_node is 6379)
+# On worker node (assume IP of worker_node is 192.168.0.2)
 ray start --address="192.168.0.1:6379" --resources='{"node:192.168.0.2": 1}'
 ```
+
+The `--resources` parameter defines node-specific resources. It can be used to control Ray actor placement across nodes. For NPU environments, you may also add `--resources='{"NPU": 4}'` or configure `ASCEND_RT_VISIBLE_DEVICES`.
 
 #### Multi-Node Configuration
 
@@ -185,6 +184,8 @@ backend:
 TransferQueue will detect all Ray nodes and deploy datasystem workers automatically.
 
 #### Multi-Node Demo
+
+> **Note**: Before running the demo below, modify `HEAD_NODE_IP` and `WORKER_NODE_IP` to match your actual node IPs.
 
 ```python
 import torch
@@ -311,59 +312,90 @@ Note: In manual startup mode, you need to manage the lifecycle of Yuanrong worke
 
 ## FAQ
 
-### Port Conflict
+### Failed to Start Datasystem Worker
 
-If `worker_port` or `metastore_port` is already in use, initialization will fail:
+If initialization fails with `RuntimeError: Failed to start datasystem worker...`, check the following possible causes:
 
-```
-RuntimeError: Failed to start datasystem worker...
-```
+**1. Port Conflict**
 
-Check port usage:
+Check if `worker_port` or `metastore_port` is already in use:
 ```bash
 netstat -tlnp | grep 31501
 netstat -tlnp | grep 2379
 ```
-
 Solution: Change the port or clean up the occupying process.
 
-> If a TransferQueue task terminates abnormally without calling `tq.close()`, the datasystem will become a defunct process and occupy the port.
+> If a TransferQueue task terminates abnormally without calling `tq.close()`, the datasystem may become a defunct process and occupy the port.
+
+**2. Shared Memory Allocation Failure**
+
+If you encounter an error like:
+```
+Runtime error: failed to mmap shared memory: Cannot allocate memory
+```
+Check the following:
+- Docker container shared memory limit (default is 64MB, may need increase)
+- System available memory for shared memory allocation
+- Huge page configuration if `--enable_huge_tlb true` is enabled
+
+Solution: Increase container shared memory (`--shm-size` flag), or reduce `--shared_memory_size_mb` value.
+
+**3. Proxy Configuration**
+
+HTTP/HTTPS proxy settings may interfere with Yuanrong's internal communication, causing metastore connection timeout errors.
+
+Yuanrong datasystem uses IP addresses directly for internal node communication. If proxy environment variables (`http_proxy`, `https_proxy`, `HTTP_PROXY`, `HTTPS_PROXY`) are set, they may route internal traffic through the proxy instead of direct connections.
+
+Solution:  unset proxy variables before running:
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+```
+
+
 
 ### Residual Worker Process
 
-If the previous run did not close properly, datasystem worker processes may remain:
+If the previous run did not close properly (e.g., task crashed without `tq.close()`), datasystem worker processes may remain:
 
 ```bash
 # Check residual processes
-ps aux | grep dscli
+ps aux | grep datasystem_worker
 
-# Clean up
-dscli stop --worker_address <IP>:31501
-# Or force cleanup
-pkill -f dscli
+# Clean up gracefully
+dscli stop --worker_address <IP>:<PORT>
+
+# Force cleanup (use with caution)
+pkill -f datasystem_worker
 ```
 
 ### Multi-Process Initialization
 
-Each process must call `tq.init()` to obtain a TransferQueue client before using `tq.get_client()`:
-- The first process initializes the TransferQueueController and Yuanrong backend
-- Other processes automatically connect to the existing TransferQueueController
+In multi-process scenarios, each process must call `tq.init()` before using TransferQueue APIs:
+- The first process initializes the `TransferQueueController` and Yuanrong backend
+- Subsequent processes automatically connect to the existing controller
 
-Recommendation: Let the first process (which initialized the backend) call `tq.close()` to cleanup Yuanrong workers. Other processes only need to close their clients.
+Best practice: Let the process that initialized the backend (typically the main/driver process) call `tq.close()` for cleanup. Other processes can simply close their clients without affecting the shared backend.
 
 
 ### NPU Transfer Issues
 
-When enabling `enable_yr_npu_transport: true`, ensure:
-- CANN is properly installed
-- torch-npu version matches torch version
-- `--remote_h2d_device_ids` parameter correctly specifies NPU device IDs
+When using `enable_yr_npu_transport: true`, ensure:
+- CANN toolkit is properly installed
+- `torch-npu` version matches `torch` version
+- `--remote_h2d_device_ids` includes all device IDs you intend to use
+
+Common errors and solutions:
+- `Device not found`: Check if device ID is included in `--remote_h2d_device_ids`
+- `CANN error`: Verify CANN installation path and environment variables
 
 ### Out of Memory Error
-If you encounter an OutOfMemoryError (OOM) thrown by DataSystems during operation, please increase the value of the configuration option `--shared_memory_size_mb`.
+
+If Yuanrong throws an OOM error during operation:
 ```
 RuntimeError: code: [Out of memory], msg: [Shared memory no space in arena: ...]
 ```
+
+Solution: Increase `--shared_memory_size_mb` in `worker_args`, or reduce the data volume being cached.
 
 
 ## Datasystem Logs
@@ -384,13 +416,13 @@ We recommend developing inside a CANN container.
 
 #### Option 1: Docker Image (Recommended)
 
-First, select the appropriate [CANN image](https://hub.docker.com/r/ascendai/cann) aligned with your **CANN version**, **Ascend hardware**, **OS**, and **Python version**. For examples:
+First, select the appropriate [CANN image](https://hub.docker.com/r/ascendai/cann) aligned with your **CANN version**, **Ascend hardware**, **OS**, and **Python version**. For example:
 
 | CANN Version | Ascend Hardware | OS           | Python Version | Image Name                           |
 | ------------ | --------------- | ------------ | -------------- | ------------------------------------ |
 | 8.2.rc1      | A3              | Ubuntu 22.04 | 3.11           | cann:8.2.rc1-a3-ubuntu22.04-py3.11   |
 | 8.2.rc1      | 910B            | Ubuntu 22.04 | 3.11           | cann:8.2.rc1-910b-ubuntu22.04-py3.11 |
-
+---
 Pull the image:
 
 ```bash
