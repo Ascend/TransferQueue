@@ -18,8 +18,10 @@
 
 
 import pickle
+import struct
 import warnings
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from typing import Any, TypeAlias
 
@@ -387,3 +389,142 @@ def decode(frames: list) -> Any:
     if len(frames) >= 2 and frames[0] == _PICKLE_FALLBACK_SENTINEL:
         return pickle.loads(frames[1])
     return _decoder.decode(frames)
+
+
+# Packed buffer layout:
+#     [item_count: uint32 LE]
+#     [N × (payload_offset: uint32 LE, payload_size: uint32 LE)]
+#     [payload_0 ... payload_{N-1}]
+_PACK_HEADER_FMT = "<I"
+_PACK_HEADER_SIZE = struct.calcsize(_PACK_HEADER_FMT)
+_PACK_ENTRY_FMT = "<II"
+_PACK_ENTRY_SIZE = struct.calcsize(_PACK_ENTRY_FMT)
+
+
+def calc_packed_size(items: Sequence[bytestr]) -> int:
+    """Total bytes required to pack ``items`` into one buffer."""
+    return _PACK_HEADER_SIZE + len(items) * _PACK_ENTRY_SIZE + sum(memoryview(item).nbytes for item in items)
+
+
+def pack_into(target_buffer: bytestr, items: Sequence[bytestr]) -> None:
+    """Concatenate ``items`` into ``target_buffer``, which must be at least ``calc_packed_size(items)`` bytes."""
+    target_mv = memoryview(target_buffer)
+    required = calc_packed_size(items)
+    if target_mv.nbytes < required:
+        raise ValueError(f"pack_into: target buffer has {target_mv.nbytes} bytes, requires {required}")
+    struct.pack_into(_PACK_HEADER_FMT, target_mv, 0, len(items))
+
+    entry_offset = _PACK_HEADER_SIZE
+    payload_offset = _PACK_HEADER_SIZE + len(items) * _PACK_ENTRY_SIZE
+
+    target_tensor = torch.frombuffer(target_mv, dtype=torch.uint8)
+
+    for item in items:
+        item_mv = memoryview(item)
+        nbytes = item_mv.nbytes
+        struct.pack_into(_PACK_ENTRY_FMT, target_mv, entry_offset, payload_offset, nbytes)
+        src_tensor = torch.frombuffer(item_mv, dtype=torch.uint8)
+        target_tensor[payload_offset : payload_offset + nbytes].copy_(src_tensor)
+        entry_offset += _PACK_ENTRY_SIZE
+        payload_offset += nbytes
+
+
+def unpack_from(source_buffer: bytestr) -> list[memoryview]:
+    """Split a packed buffer back into N memoryview slices over ``source_buffer``."""
+    mv = memoryview(source_buffer)
+    item_count = struct.unpack_from(_PACK_HEADER_FMT, mv, 0)[0]
+    result: list[memoryview] = []
+    for i in range(item_count):
+        offset, length = struct.unpack_from(_PACK_ENTRY_FMT, mv, _PACK_HEADER_SIZE + i * _PACK_ENTRY_SIZE)
+        result.append(mv[offset : offset + length])
+    return result
+
+
+def batch_encode_into(
+    objs: list[Any],
+    alloc_buff_func: Callable[[list[int]], list[Any]],
+    *,
+    num_workers: int = 1,
+) -> tuple[list[np.ndarray | memoryview], list[int]]:
+    """Encode multiple objects in-place into caller-allocated buffers.
+
+    Each object is msgpack-encoded (with zero-copy tensor/ndarray extraction)
+    and packed into a buffer slot supplied by ``alloc_buff_func``. Buffers are
+    written in place; the function returns the same buffer list along with
+    each slot's packed byte length.
+
+    Args:
+        objs: Objects to encode, one per output buffer slot.
+        alloc_buff_func: Callable taking per-object packed sizes and returning
+            the corresponding buffer list. ``buffers[i]`` must be an
+            ``np.ndarray`` or ``memoryview`` holding at least ``sizes[i]``
+            bytes.
+        num_workers: Thread count for parallel packing. Default 1 (serial);
+            set ``>1`` only when the upper layer is single-threaded.
+
+    Returns:
+        tuple[list[np.ndarray | memoryview], list[int]]: The buffers returned by
+            ``alloc_buff_func`` with packed bytes written, paired with each
+            object's packed length (``<=`` buffer capacity).
+
+    Note:
+        Lifetime is caller-owned: this function holds no references to the
+        buffers after return. Whatever backs the allocation must outlive all
+        downstream consumers.
+
+    Example:
+        >>> # Pack two tensors into pre-allocated pinned uint8 tensor buffers
+        >>> def alloc(sizes):
+        ...     return [torch.empty(s, dtype=torch.uint8, pin_memory=True) for s in sizes]
+        >>> objs = [torch.tensor([1, 2, 3]), torch.tensor([4.0, 5.0])]
+        >>> bufs, lengths = batch_encode_into(objs, alloc)
+        >>> print(f"packed sizes: {lengths}")
+    """
+    batch_items = [encode(obj) for obj in objs]
+    batch_sizes = [calc_packed_size(items) for items in batch_items]
+    buffers = alloc_buff_func(batch_sizes)
+
+    def _pack_one(pair: tuple[Any, list[bytestr]]) -> None:
+        buf, items = pair
+        mv = buf.numpy().data if hasattr(buf, "numpy") else memoryview(buf)
+        pack_into(mv, items)
+
+    if num_workers <= 1:
+        for pair in zip(buffers, batch_items, strict=True):
+            _pack_one(pair)
+    else:
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            list(executor.map(_pack_one, zip(buffers, batch_items, strict=True)))
+
+    return buffers, batch_sizes
+
+
+def batch_decode_from(source_buffers: Sequence[np.ndarray | memoryview]) -> list[Any]:
+    """Reverse of ``batch_encode_into``: unpack and decode each filled buffer.
+
+    Args:
+        source_buffers: Per-object receive buffers in order. Each must be an
+            ``np.ndarray`` or ``memoryview``.
+
+    Returns:
+        list[Any]: Decoded objects, one per input buffer, in the same order.
+
+    Note:
+        Tensors and ndarrays in the result are zero-copy views over the
+        source buffers. The Python reference chain (``torch.frombuffer`` ->
+        ``Py_buffer`` -> memoryview slice -> parent memoryview -> numpy array
+        -> original buffer) keeps the source alive as long as the decoded
+        object is reachable; the caller does NOT need to retain the source
+        buffer separately.
+
+    Example:
+        >>> # Round-trip: encode then decode
+        >>> def alloc(sizes):
+        ...     return [torch.empty(s, dtype=torch.uint8) for s in sizes]
+        >>> objs = [torch.tensor([1, 2, 3]), torch.tensor([4.0, 5.0])]
+        >>> bufs, _ = batch_encode_into(objs, alloc)
+        >>> decoded = batch_decode_from(bufs)
+    """
+    return [
+        decode(unpack_from(buf.numpy().data if hasattr(buf, "numpy") else memoryview(buf))) for buf in source_buffers
+    ]

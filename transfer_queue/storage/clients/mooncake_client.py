@@ -13,15 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import pickle
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from typing import Any, cast
 
 import torch
 from torch import Tensor
 
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes, merge_contiguous_memory
 
@@ -98,12 +98,17 @@ class MooncakeStoreClient(StorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
-    def put(self, keys: list[str], values: list[Any]) -> None:
+    def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
 
         Args:
             keys (List[str]): List of unique string identifiers.
             values (List[Any]): List of values to store (tensors, scalars, dicts, etc.).
+
+        Returns:
+            Per-key metadata aligned with ``keys``. Tensor entries are ``None``;
+            non-tensor entries carry ``{"packed_size": int}`` so the get-side
+            can pre-allocate the receive buffer.
         """
 
         if not isinstance(keys, list) or not isinstance(values, list):
@@ -124,22 +129,33 @@ class MooncakeStoreClient(StorageKVClient):
                 non_tensor_keys.append(key)
                 non_tensor_values.append(value)
 
-        futures = []
+        tensor_futures: list[Future[None]] = []
+        bytes_futures: list[Future[list[int]]] = []
         with ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS) as executor:
             for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
                 batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
                 batch_tensors = tensor_values[i : i + BATCH_SIZE_LIMIT]
-                futures.append(executor.submit(self._put_tensors_thread_worker, batch_keys, batch_tensors))
+                tensor_futures.append(executor.submit(self._put_tensors_thread_worker, batch_keys, batch_tensors))
 
             for i in range(0, len(non_tensor_keys), BATCH_SIZE_LIMIT):
                 batch_keys = non_tensor_keys[i : i + BATCH_SIZE_LIMIT]
                 batch_values = non_tensor_values[i : i + BATCH_SIZE_LIMIT]
-                futures.append(executor.submit(self._put_bytes_thread_worker, batch_keys, batch_values))
+                bytes_futures.append(executor.submit(self._put_bytes_thread_worker, batch_keys, batch_values))
 
-            for future in as_completed(futures):
-                future.result()
+            for tf in tensor_futures:
+                tf.result()
+            packed_sizes: list[int] = []
+            for bf in bytes_futures:
+                packed_sizes.extend(bf.result())
 
-        return None
+        # bytes results arrive in non-tensor submit order, which matches the order of
+        # non-tensor values; walk values once to scatter packed_size back to its key slot.
+        sizes_iter = iter(packed_sizes)
+        custom_backend_meta: list[dict | None] = [
+            {"packed_size": next(sizes_iter)} if not isinstance(value, torch.Tensor) else None for value in values
+        ]
+
+        return custom_backend_meta
 
     def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
         """Worker thread for putting batch of tensors to MooncakeStore."""
@@ -147,106 +163,47 @@ class MooncakeStoreClient(StorageKVClient):
         batch_ptrs, batch_sizes, _contiguous_tensors = self._preprocess_tensors_for_put(batch_tensors)
         batch_ptr_reduced, batch_sizes_reduced = merge_contiguous_memory(batch_ptrs, batch_sizes)
         self._register_all_buffers(batch_ptr_reduced, batch_sizes_reduced)
-
         try:
-            results = self._store.batch_upsert_from(batch_keys, batch_ptrs, batch_sizes, config=self.replica_config)
-            if len(results) != len(batch_keys):
-                raise RuntimeError(f"batch_upsert_from returned {len(results)} results, expected {len(batch_keys)}")
-
-            failed_indices = [j for j, r in enumerate(results) if r != 0]
-            if not failed_indices:
-                return
-
-            current_failed_keys = [batch_keys[i] for i in failed_indices]
-            current_failed_codes = [results[i] for i in failed_indices]
-            current_failed_indices = failed_indices
-
-            logger.error(
-                f"batch_upsert_from failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
-                f"Retrying up to {MAX_RETRIES} times..."
-            )
-
-            for attempt in range(1, MAX_RETRIES + 1):
-                retry_ptrs = [batch_ptrs[i] for i in current_failed_indices]
-                retry_sizes = [batch_sizes[i] for i in current_failed_indices]
-
-                retry_results = self._store.batch_upsert_from(
-                    current_failed_keys, retry_ptrs, retry_sizes, config=self.replica_config
-                )
-
-                next_failed_indices = []
-                next_failed_keys = []
-                next_failed_codes = []
-
-                for i, ret in enumerate(retry_results):
-                    if ret != 0:
-                        next_failed_indices.append(current_failed_indices[i])
-                        next_failed_keys.append(current_failed_keys[i])
-                        next_failed_codes.append(ret)
-
-                if not next_failed_indices:
-                    logger.info("batch_upsert_from succeeded after retransmission.")
-                    break  # All retries in this attempt succeeded.
-
-                logger.error(
-                    f"batch_upsert_from retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
-                    f"with error codes {next_failed_codes}."
-                )
-
-                current_failed_indices = next_failed_indices
-                current_failed_keys = next_failed_keys
-                current_failed_codes = next_failed_codes
-
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                raise RuntimeError(
-                    f"batch_upsert_from failed for keys {current_failed_keys} with error codes "
-                    f"{current_failed_codes} after retrying {MAX_RETRIES} times."
-                )
-
+            self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
         finally:
             self._unregister_all_buffers(batch_ptr_reduced)
 
-    def _put_bytes_thread_worker(self, batch_keys: list[str], batch_values: list[Any]):
+    def _put_bytes_thread_worker(self, batch_keys: list[str], batch_values: list[Any]) -> list[int]:
         """Worker thread for putting batch of non-tensors to MooncakeStore."""
 
-        serialized_values = [pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL) for v in batch_values]
+        # TODO: switch to a pre-registered buffer from MooncakeStore once such an API is available.
+        region_ptrs: list[int] = []
+        region_sizes: list[int] = []
 
-        # FIXME: When MooncakeStore supports per-key status codes for upsert_batch and get_batch,
-        #        switch the bytes write/read paths from whole-batch retry to per-key selective retry,
-        #        matching the tensor-path behaviour.
-        ret = self._store.upsert_batch(batch_keys, serialized_values, self.replica_config)
-        if ret == 0:
-            return
+        def alloc(sizes: list[int]) -> list[Tensor]:
+            nonlocal region_ptrs, region_sizes
+            # `batch_packed_sizes` are byte counts. With torch.uint8 (1 byte/element),
+            # a 1-D shape of (N,) corresponds to exactly N bytes. We use
+            # `allocate_empty_tensors` to get N uint8 views over a single contiguous,
+            # register-able region. These are plain byte buffers, not real tensors;
+            # consumers apply the actual dtype/shape interpretation when unpacking.
+            dtypes = [torch.uint8] * len(sizes)
+            shapes = [(s,) for s in sizes]
+            buffers, _, region_ptrs, region_sizes = allocate_empty_tensors(dtypes, shapes)
+            return buffers
 
-        logger.error(
-            f"upsert_batch failed for {len(batch_keys)} keys with error code: {ret}. "
-            f"Retrying up to {MAX_RETRIES} times..."
-        )
+        buffers, batch_sizes = serial_utils.batch_encode_into(batch_values, alloc)
+        batch_ptrs = [cast(Tensor, b).data_ptr() for b in buffers]
 
-        for attempt in range(1, MAX_RETRIES + 1):
-            ret = self._store.upsert_batch(batch_keys, serialized_values, self.replica_config)
-            if ret == 0:
-                logger.info("upsert_batch succeeded after retransmission.")
-                return
+        self._register_all_buffers(region_ptrs, region_sizes)
+        try:
+            self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
+        finally:
+            self._unregister_all_buffers(region_ptrs)
 
-            logger.error(
-                f"upsert_batch retry {attempt}/{MAX_RETRIES} failed for {len(batch_keys)} keys with error code: {ret}."
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS)
-
-        raise RuntimeError(
-            f"upsert_batch failed for {len(batch_keys)} keys with error code: {ret} after retrying {MAX_RETRIES} times."
-        )
+        return batch_sizes
 
     def get(
         self,
         keys: list[str],
         shapes: list[Any] | None = None,
         dtypes: list[Any] | None = None,
-        custom_backend_meta: list[str] | None = None,
+        custom_backend_meta: list[dict | None] | None = None,
     ) -> list[Any]:
         """Get multiple key-value pairs from MooncakeStore.
 
@@ -254,7 +211,8 @@ class MooncakeStoreClient(StorageKVClient):
             keys: Keys to fetch.
             shapes: Expected tensor shapes (use [] for scalars).
             dtypes: Expected dtypes; use None for non-tensor data.
-            custom_backend_meta: Optional custom backend metadata.
+            custom_backend_meta: Per-key dicts; non-tensor entries must carry
+                ``{"packed_size": int}`` so the receive buffer can be sized.
 
         Returns:
             Retrieved values in the same order as input keys.
@@ -274,6 +232,9 @@ class MooncakeStoreClient(StorageKVClient):
             else:
                 non_tensor_indices.append(i)
 
+        if non_tensor_indices and (custom_backend_meta is None or len(custom_backend_meta) != len(keys)):
+            raise ValueError("custom_backend_meta with per-key packed_size is required when any dtype is None.")
+
         results = [None] * len(keys)
 
         futures = []
@@ -292,7 +253,11 @@ class MooncakeStoreClient(StorageKVClient):
             for i in range(0, len(non_tensor_indices), BATCH_SIZE_LIMIT):
                 batch_indexes = non_tensor_indices[i : i + BATCH_SIZE_LIMIT]
                 batch_keys = [keys[i] for i in batch_indexes]
-                futures.append(executor.submit(self._get_bytes_thread_worker, batch_keys, batch_indexes))
+                assert custom_backend_meta is not None  # guaranteed by the check above
+                batch_packed_sizes = [cast(dict, custom_backend_meta[j])["packed_size"] for j in batch_indexes]
+                futures.append(
+                    executor.submit(self._get_bytes_thread_worker, batch_keys, batch_packed_sizes, batch_indexes)
+                )
 
             for future in as_completed(futures):
                 retrieved_values, batch_indexes = future.result()
@@ -311,119 +276,34 @@ class MooncakeStoreClient(StorageKVClient):
 
         self._register_all_buffers(region_ptrs, region_sizes)
         try:
-            ret_codes = self._store.batch_get_into(batch_keys, batch_buffer_ptrs, batch_nbytes)
-            if len(ret_codes) != len(batch_keys):
-                raise RuntimeError(f"batch_get_into returned {len(ret_codes)} results, expected {len(batch_keys)}")
-
-            failed_indices = [i for i, ret in enumerate(ret_codes) if ret < 0]
-            if not failed_indices:
-                return batch_buffer_tensors, indexes
-
-            # error handling
-            current_failed_keys = [batch_keys[i] for i in failed_indices]
-            current_failed_codes = [ret_codes[i] for i in failed_indices]
-            current_failed_indices = failed_indices
-
-            logger.error(
-                f"batch_get_into failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
-                f"Retrying up to {MAX_RETRIES} times..."
-            )
-
-            for attempt in range(1, MAX_RETRIES + 1):
-                # Reuse the originally allocated pointers; no need to allocate/register new buffers.
-                retry_ptrs = [batch_buffer_ptrs[i] for i in current_failed_indices]
-                retry_nbytes = [batch_nbytes[i] for i in current_failed_indices]
-
-                retry_codes = self._store.batch_get_into(current_failed_keys, retry_ptrs, retry_nbytes)
-
-                next_failed_indices = []
-                next_failed_keys = []
-                next_failed_codes = []
-
-                for i, ret in enumerate(retry_codes):
-                    if ret < 0:
-                        next_failed_indices.append(current_failed_indices[i])
-                        next_failed_keys.append(current_failed_keys[i])
-                        next_failed_codes.append(ret)
-
-                if not next_failed_indices:
-                    logger.info("batch_get_into succeeded after retransmission.")
-                    break  # All retries in this attempt succeeded.
-
-                logger.error(
-                    f"batch_get_into retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
-                    f"with error codes {next_failed_codes}."
-                )
-
-                # Narrow down to still-failed items for the next retry attempt.
-                current_failed_indices = next_failed_indices
-                current_failed_keys = next_failed_keys
-                current_failed_codes = next_failed_codes
-
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                # All retries exhausted.
-                raise RuntimeError(
-                    f"batch_get_into failed for keys {current_failed_keys} with error codes "
-                    f"{current_failed_codes} after retrying {MAX_RETRIES} times."
-                )
-
+            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
         finally:
             self._unregister_all_buffers(region_ptrs)
 
         return batch_buffer_tensors, indexes
 
-    def _get_bytes_thread_worker(self, batch_keys: list[str], indexes: list[int]) -> tuple[list[Any], list[int]]:
-        raw_results = self._store.get_batch(batch_keys)
-        if len(raw_results) != len(batch_keys):
-            raise RuntimeError(f"get_batch returned {len(raw_results)} items, expected {len(batch_keys)}")
+    def _get_bytes_thread_worker(
+        self, batch_keys: list[str], batch_packed_sizes: list[int], indexes: list[int]
+    ) -> tuple[list[Any], list[int]]:
+        # `batch_packed_sizes` are byte counts. With torch.uint8 (1 byte/element),
+        # a 1-D shape of (N,) corresponds to exactly N bytes. We use
+        # `allocate_empty_tensors` to get N uint8 views over a single contiguous,
+        # register-able region. These are plain byte buffers, not real tensors;
+        # consumers apply the actual dtype/shape interpretation when unpacking.
+        batch_shapes = [(sz,) for sz in batch_packed_sizes]
+        batch_dtypes = [torch.uint8] * len(batch_keys)
+        batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
+        batch_buffer_tensors, batch_buffer_ptrs, region_ptrs, region_sizes = allocate_empty_tensors(
+            batch_dtypes, batch_shapes
+        )
 
-        # FIXME: Use MooncakeStore provided ret codes to detect transmission failures when supported
-        # Currently we rely on empty bytes (b'') to detect transmission failures because
-        # MooncakeStore does not currently return a separate status code per key.
-        failed_indices = [i for i, result in enumerate(raw_results) if result == b""]
-        if failed_indices:
-            current_failed_keys = [batch_keys[i] for i in failed_indices]
-            current_failed_indices = failed_indices
+        self._register_all_buffers(region_ptrs, region_sizes)
+        try:
+            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
+        finally:
+            self._unregister_all_buffers(region_ptrs)
 
-            logger.error(f"get_batch failed for keys {current_failed_keys}. Retrying up to {MAX_RETRIES} times...")
-
-            for attempt in range(1, MAX_RETRIES + 1):
-                retry_results = self._store.get_batch(current_failed_keys)
-
-                next_failed_keys = []
-                next_failed_indices = []
-
-                for i, result in enumerate(retry_results):
-                    original_idx = current_failed_indices[i]
-                    if result == b"":
-                        next_failed_keys.append(current_failed_keys[i])
-                        next_failed_indices.append(original_idx)
-                    else:
-                        # Write the successfully retried value back to its original slot immediately.
-                        raw_results[original_idx] = result
-
-                if not next_failed_indices:
-                    logger.info("get_batch succeeded after retransmission.")
-                    break  # All retries in this attempt succeeded.
-
-                logger.error(f"get_batch retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys.")
-
-                # Narrow down to still-failed items for the next retry attempt.
-                current_failed_keys = next_failed_keys
-                current_failed_indices = next_failed_indices
-
-                if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_SECONDS)
-            else:
-                # All retries exhausted.
-                raise RuntimeError(
-                    f"get_batch failed for keys {current_failed_keys} after retrying {MAX_RETRIES} times."
-                )
-
-        deserialized_results = [pickle.loads(result) if result != b"" else None for result in raw_results]
-        return deserialized_results, indexes
+        return serial_utils.batch_decode_from(batch_buffer_tensors), indexes
 
     def clear(self, keys: list[str], custom_backend_meta: list[Any] | None = None) -> None:
         """Deletes multiple keys from MooncakeStore.
@@ -442,6 +322,130 @@ class MooncakeStoreClient(StorageKVClient):
         if self._store:
             self._store.close()
             self._store = None
+
+    def _batch_upsert_with_retry(self, batch_keys: list[str], batch_ptrs: list[int], batch_sizes: list[int]) -> None:
+        """Run ``batch_upsert_from`` with per-key retry; raise on permanent failure.
+
+        Caller owns the memory regions (register/unregister and lifetime of the
+        backing tensors/buffers).
+        """
+        results = self._store.batch_upsert_from(batch_keys, batch_ptrs, batch_sizes, config=self.replica_config)
+        if len(results) != len(batch_keys):
+            raise RuntimeError(f"batch_upsert_from returned {len(results)} results, expected {len(batch_keys)}")
+
+        failed_indices = [j for j, r in enumerate(results) if r != 0]
+        if not failed_indices:
+            return
+
+        current_failed_keys = [batch_keys[i] for i in failed_indices]
+        current_failed_codes = [results[i] for i in failed_indices]
+        current_failed_indices = failed_indices
+
+        logger.error(
+            f"batch_upsert_from failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
+            f"Retrying up to {MAX_RETRIES} times..."
+        )
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            retry_ptrs = [batch_ptrs[i] for i in current_failed_indices]
+            retry_sizes = [batch_sizes[i] for i in current_failed_indices]
+
+            retry_results = self._store.batch_upsert_from(
+                current_failed_keys, retry_ptrs, retry_sizes, config=self.replica_config
+            )
+
+            next_failed_indices = []
+            next_failed_keys = []
+            next_failed_codes = []
+
+            for i, ret in enumerate(retry_results):
+                if ret != 0:
+                    next_failed_indices.append(current_failed_indices[i])
+                    next_failed_keys.append(current_failed_keys[i])
+                    next_failed_codes.append(ret)
+
+            if not next_failed_indices:
+                logger.info("batch_upsert_from succeeded after retransmission.")
+                return
+
+            logger.error(
+                f"batch_upsert_from retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
+                f"with error codes {next_failed_codes}."
+            )
+
+            current_failed_indices = next_failed_indices
+            current_failed_keys = next_failed_keys
+            current_failed_codes = next_failed_codes
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
+
+        raise RuntimeError(
+            f"batch_upsert_from failed for keys {current_failed_keys} with error codes "
+            f"{current_failed_codes} after retrying {MAX_RETRIES} times."
+        )
+
+    def _batch_get_into_with_retry(
+        self, batch_keys: list[str], batch_buffer_ptrs: list[int], batch_nbytes: list[int]
+    ) -> None:
+        """Run ``batch_get_into`` with per-key retry; raise on permanent failure.
+
+        Caller owns the receive buffers (allocate/register/unregister).
+        """
+        ret_codes = self._store.batch_get_into(batch_keys, batch_buffer_ptrs, batch_nbytes)
+        if len(ret_codes) != len(batch_keys):
+            raise RuntimeError(f"batch_get_into returned {len(ret_codes)} results, expected {len(batch_keys)}")
+
+        failed_indices = [i for i, ret in enumerate(ret_codes) if ret < 0]
+        if not failed_indices:
+            return
+
+        current_failed_keys = [batch_keys[i] for i in failed_indices]
+        current_failed_codes = [ret_codes[i] for i in failed_indices]
+        current_failed_indices = failed_indices
+
+        logger.error(
+            f"batch_get_into failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
+            f"Retrying up to {MAX_RETRIES} times..."
+        )
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            # Reuse the originally allocated pointers; no need to allocate/register new buffers.
+            retry_ptrs = [batch_buffer_ptrs[i] for i in current_failed_indices]
+            retry_nbytes = [batch_nbytes[i] for i in current_failed_indices]
+
+            retry_codes = self._store.batch_get_into(current_failed_keys, retry_ptrs, retry_nbytes)
+
+            next_failed_indices = []
+            next_failed_keys = []
+            next_failed_codes = []
+
+            for i, ret in enumerate(retry_codes):
+                if ret < 0:
+                    next_failed_indices.append(current_failed_indices[i])
+                    next_failed_keys.append(current_failed_keys[i])
+                    next_failed_codes.append(ret)
+
+            if not next_failed_indices:
+                logger.info("batch_get_into succeeded after retransmission.")
+                return
+
+            logger.error(
+                f"batch_get_into retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
+                f"with error codes {next_failed_codes}."
+            )
+
+            current_failed_indices = next_failed_indices
+            current_failed_keys = next_failed_keys
+            current_failed_codes = next_failed_codes
+
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY_SECONDS)
+
+        raise RuntimeError(
+            f"batch_get_into failed for keys {current_failed_keys} with error codes "
+            f"{current_failed_codes} after retrying {MAX_RETRIES} times."
+        )
 
     @staticmethod
     def _preprocess_tensors_for_put(values: list[Tensor]) -> tuple[list[int], list[int], list[Tensor]]:
