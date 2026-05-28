@@ -61,6 +61,17 @@ backend:
     metastore_port: 2379
     # If enable npu transport
     enable_yr_npu_transport: false
+    # If enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
+    # See https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html
+    enable_rdma: false
+    # UCX env vars passed to dscli subprocess. Overrides parent env. TQ defaults UCX_TLS=rc_x when enable_rdma=true.
+    #   UCX_TLS:          RDMA transport mode. "rc_x" (default), "rc" (compatible), "ud" (low-latency), "dc" (large-scale).
+    #   UCX_LOG_FILE:     Path to UCX log file. Requires UCX_LOG_LEVEL to be set.
+    #   UCX_LOG_LEVEL:    FATAL, ERROR, WARN, INFO, DEBUG, TRACE. Use DEBUG/TRACE for troubleshooting.
+    #   UCX_NET_DEVICES:  RDMA device name (e.g., mlx5_0:1). Required in multi-NIC setups.
+    #   UCX_TCP_CM_ROUTE: TCP control-flow interface for UCX connection setup.
+    # Example: ucx_env_vars: { UCX_TLS: rc_x, UCX_LOG_FILE: /tmp/ucx.log, UCX_LOG_LEVEL: ERROR }
+    ucx_env_vars: {}
     # Additional config for yuanrong worker.
     # Recommended options for NPU environments:
     #   --remote_h2d_device_ids       Enable RH2D for efficient cross-node data transfer. Specify NPU device IDs (comma-separated).

@@ -1,6 +1,6 @@
 # OpenYuanrong-Datasystem Integration for TransferQueue
 
-> Last updated: 05/18/2026 
+> Last updated: 05/28/2026 
 
 ## Overview
 
@@ -134,6 +134,8 @@ backend:
     worker_port: 31501                 # Port for Yuanrong datasystem worker on each node
     metastore_port: 2379               # Port for metastore service on the head node
     enable_yr_npu_transport: true      # Enable NPU transport for high-performance device-to-device transfer
+    enable_rdma: false                 # Enable host RDMA (H2H) transport via UCX
+    ucx_env_vars: {}                   # UCX env vars for dscli subprocess (e.g., {UCX_LOG_FILE: /tmp/ucx.log, UCX_LOG_LEVEL: ERROR})
     worker_args: "--shared_memory_size_mb 8192 --remote_h2d_device_ids 0 --enable_huge_tlb true"
 ```
 
@@ -149,6 +151,17 @@ backend:
 - `enable_yr_npu_transport`: Enable NPU transport for high-performance device-to-device data transfer. Set to `true` when using NPU tensors.
 - `worker_args` (**mandatory** when `enable_yr_npu_transport: true`):
   - `--remote_h2d_device_ids`: Enable RH2D (Remote Host-to-Device) for efficient cross-node NPU data transfer. Specify NPU device IDs as comma-separated values (e.g., `0,1,2,3`). Yuanrong manages all specified devices - to put/get tensors on NPU `X`, device ID `X` must be included in this argument.
+
+**RDMA Options:**
+- `enable_rdma`: Whether to enable host RDMA (H2H) transport via UCX. Requires RDMA-capable NIC hardware and `rdma-core` driver on all nodes. When enabled, TQ automatically adds `--enable_rdma true` to the dscli startup command and defaults `UCX_TLS=rc_x` in the subprocess environment. RDMA H2H and RH2D (NPU cross-node) can be enabled simultaneously — they are **not** mutually exclusive.
+- `ucx_env_vars`: Dictionary of UCX environment variables passed to the dscli subprocess. These override parent process environment. Common variables:
+  - `UCX_TLS`: RDMA transport mode. Defaults to `rc_x` when `enable_rdma=true` and not specified here. Alternatives: `rc` (compatible), `ud` (low-latency), `dc` (large-scale). See [UCX environment parameters](https://github.com/openucx/ucx/wiki/UCX-environment-parameters).
+  - `UCX_LOG_FILE`: Path to UCX log file (e.g., `/tmp/ucx.log`). Requires `UCX_LOG_LEVEL` to be set.
+  - `UCX_LOG_LEVEL`: Log verbosity — `FATAL`, `ERROR`, `WARN`, `INFO`, `DEBUG`, `TRACE`. Use `DEBUG`/`TRACE` for troubleshooting.
+  - `UCX_NET_DEVICES`: RDMA device name (e.g., `mlx5_0:1`). Required in multi-NIC setups.
+  - `UCX_TCP_CM_ROUTE`: TCP control-flow interface for UCX connection setup. Must match the RDMA NIC's network plane.
+
+> For RDMA best practices, troubleshooting, and K8s deployment, see [openYuanrong RDMA Best Practices](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html).
 
 > More configuration parameters for deploying the datasystem can refer to [dscli config](https://gitcode.com/openeuler/yuanrong-datasystem/blob/master/docs/source_zh_cn/deployment/dscli.md).
 
@@ -178,6 +191,8 @@ backend:
     worker_port: 31501
     metastore_port: 2379
     enable_yr_npu_transport: true
+    enable_rdma: false
+    ucx_env_vars: {}
     worker_args: "--shared_memory_size_mb 65536 --remote_h2d_device_ids 0 --enable_huge_tlb true"
 ```
 
@@ -290,6 +305,37 @@ dscli start -w --worker_address <WORKER_IP>:31501 \
     --shared_memory_size_mb 8192
 ```
 
+### Start with RDMA
+
+To enable RDMA for host-to-host (H2H) transfer, add `--enable_rdma true` to the dscli command and set UCX environment variables:
+
+```bash
+# Set UCX environment variables
+export UCX_TLS=rc_x
+# (Optional) Configure UCX logging for debugging
+export UCX_LOG_FILE=/tmp/ucx.log
+export UCX_LOG_LEVEL=ERROR
+
+# Head node
+dscli start -w --worker_address <HEAD_IP>:31501 \
+    --metastore_address <HEAD_IP>:2379 \
+    --start_metastore_service true \
+    --enable_rdma true \
+    --arena_per_tenant 1 \
+    --enable_worker_worker_batch_get true \
+    --shared_memory_size_mb 8192
+
+# Worker node
+dscli start -w --worker_address <WORKER_IP>:31501 \
+    --metastore_address <HEAD_IP>:2379 \
+    --enable_rdma true \
+    --arena_per_tenant 1 \
+    --enable_worker_worker_batch_get true \
+    --shared_memory_size_mb 8192
+```
+
+> `UCX_TLS=rc_x` forces RDMA transport — if RDMA is unavailable, the system will error rather than fall back to TCP. For alternative transport modes, see [UCX environment parameters](https://github.com/openucx/ucx/wiki/UCX-environment-parameters).
+
 ### Stop Worker
 
 ```bash
@@ -387,6 +433,17 @@ When using `enable_yr_npu_transport: true`, ensure:
 Common errors and solutions:
 - `Device not found`: Check if device ID is included in `--remote_h2d_device_ids`
 - `CANN error`: Verify CANN installation path and environment variables
+
+### RDMA Issues
+
+When using `enable_rdma: true`, ensure:
+- RDMA NIC hardware and `rdma-core` driver are installed on all nodes. Verify with `ibv_devices`.
+- `UCX_TLS=rc_x` is compatible with your NIC. If not, set alternative mode via `ucx_env_vars` (e.g., `{UCX_TLS: rc}`).
+
+Common errors and solutions:
+- **UCX endpoint timeout**: In multi-NIC setups, UCX may select an isolated network interface for control flow. Set `UCX_NET_DEVICES` and `UCX_TCP_CM_ROUTE` in `ucx_env_vars` to specify the correct RDMA device and its TCP interface. See [openYuanrong RDMA Best Practices](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html) for detailed troubleshooting.
+- **RDMA verification**: Set `UCX_LOG_FILE` and `UCX_LOG_LEVEL` in `ucx_env_vars` (e.g., `{UCX_LOG_FILE: /tmp/ucx.log, UCX_LOG_LEVEL: INFO}`), then check logs for RC/RDMA entries to confirm RDMA is active.
+- **Container environments**: Set `memlock` to `unlimited` in the container, otherwise RDMA memory registration may fail.
 
 ### Out of Memory Error
 

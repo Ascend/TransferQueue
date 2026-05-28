@@ -78,6 +78,8 @@ def start_datasystem_worker(
     metastore_address: str,
     is_head: bool,
     worker_args: str = "",
+    enable_rdma: bool = False,
+    ucx_env_vars: dict | None = None,
 ) -> None:
     """Start Yuanrong datasystem worker in metastore mode.
 
@@ -105,18 +107,33 @@ def start_datasystem_worker(
     if worker_args:
         cmd.extend(worker_args.split())
 
+    # Append --enable_rdma if enabled
+    if enable_rdma:
+        cmd.extend(["--enable_rdma", "true"])
+
     node_type = "head node" if is_head else "worker node"
     logger.info(f"Starting Yuanrong datasystem ({node_type}) at {worker_address}, worker_args={worker_args}")
 
     # Build environment with ASCEND_RT_VISIBLE_DEVICES if specified
     env = None
     device_ids = _parse_remote_h2d_device_ids(worker_args)
-    if device_ids:
+    if device_ids or enable_rdma or ucx_env_vars:
         env = os.environ.copy()
-        env["ASCEND_RT_VISIBLE_DEVICES"] = device_ids
-        logger.info(
-            f"Setting ASCEND_RT_VISIBLE_DEVICES={device_ids} for dscli subprocess ({node_type} at {worker_address})"
-        )
+        if device_ids:
+            env["ASCEND_RT_VISIBLE_DEVICES"] = device_ids
+            logger.info(
+                f"Setting ASCEND_RT_VISIBLE_DEVICES={device_ids} for dscli subprocess ({node_type} at {worker_address})"
+            )
+        # ucx_env_vars overrides parent env (highest priority)
+        if ucx_env_vars:
+            for key, value in ucx_env_vars.items():
+                env[key] = str(value)
+        # Default UCX_TLS=rc_x only when enable_rdma and UCX_TLS still absent
+        if enable_rdma and "UCX_TLS" not in env:
+            env["UCX_TLS"] = "rc_x"
+            logger.info(
+                f"Setting UCX_TLS=rc_x (default for RDMA) for dscli subprocess ({node_type} at {worker_address})"
+            )
 
     try:
         ds_result = subprocess.run(
@@ -179,7 +196,15 @@ class YuanrongWorkerActor:
     intersection of local IP addresses with the provided node IPs.
     """
 
-    def __init__(self, node_ips: list[str], worker_port: int, metastore_port: int, worker_args: str = ""):
+    def __init__(
+        self,
+        node_ips: list[str],
+        worker_port: int,
+        metastore_port: int,
+        worker_args: str = "",
+        enable_rdma: bool = False,
+        ucx_env_vars: dict | None = None,
+    ):
         """Initialize the Yuanrong worker actor.
 
         Args:
@@ -208,6 +233,8 @@ class YuanrongWorkerActor:
         self.metastore_port = metastore_port
         self.worker_address = f"{self.my_ip}:{worker_port}"
         self.worker_args = worker_args
+        self.enable_rdma = enable_rdma
+        self.ucx_env_vars = ucx_env_vars
 
         # First node in the list is assumed to be the head node.
         # This assumption is based on how interface.py constructs node_ips from ray.nodes().
@@ -236,6 +263,8 @@ class YuanrongWorkerActor:
             metastore_address=self.metastore_address,
             is_head=self.is_head,
             worker_args=self.worker_args,
+            enable_rdma=self.enable_rdma,
+            ucx_env_vars=self.ucx_env_vars,
         )
         logger.info(f"Datasystem worker started successfully at {self.worker_address}")
         return self.worker_address
@@ -313,6 +342,8 @@ def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
     worker_port = conf.backend.Yuanrong.worker_port
     metastore_port = conf.backend.Yuanrong.metastore_port
     worker_args = conf.backend.Yuanrong.get("worker_args", "")
+    enable_rdma = conf.backend.Yuanrong.get("enable_rdma", False)
+    ucx_env_vars = dict(conf.backend.Yuanrong.get("ucx_env_vars", {}))
 
     logger.info(f"Found {len(ordered_nodes)} alive Ray nodes: {node_ips}")
 
@@ -352,7 +383,7 @@ def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
             actor = YuanrongWorkerActor.options(  # type: ignore[attr-defined]
                 placement_group=pg,
                 placement_group_bundle_index=rank,
-            ).remote(node_ips, worker_port, metastore_port, worker_args)
+            ).remote(node_ips, worker_port, metastore_port, worker_args, enable_rdma, ucx_env_vars)
             worker_actors.append(actor)
 
         logger.info(f"Created {len(worker_actors)} YuanrongWorkerActor instances")
