@@ -390,7 +390,7 @@ def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
 
         # Find which actor is running on the head node (driver IP)
         # The head node actor needs to start first to initialize metastore service
-        head_actor_index = None
+        head_actor_index = 0
         for idx, actor in enumerate(worker_actors):
             try:
                 node_ip = ray.get(actor.get_node_ip.remote())
@@ -399,10 +399,6 @@ def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
                     break
             except Exception:
                 pass
-
-        if head_actor_index is None:
-            logger.warning("Could not identify head node actor, using actor 0 as default")
-            head_actor_index = 0
 
         logger.info(f"Head node actor identified: actor {head_actor_index}")
 
@@ -426,26 +422,27 @@ def initialize_yuanrong_storage(conf: DictConfig) -> dict[str, Any] | None:
             "worker_actors": worker_actors,
             "metastore_address": metastore_address,
             "placement_group": pg,
+            "head_actor_index": head_actor_index,
         }
     except Exception as e:
         # Cleanup on initialization failure: attempt graceful stop of started workers first
         logger.error(f"Failed to start Yuanrong workers: {e}, cleaning up...")
 
         # Try to gracefully stop workers that may have already started
+        # Stop worker nodes (non-head) in parallel first, then head node (metastore service)
         if worker_actors:
             stop_exceptions = []
-            # Stop worker nodes (all except head node 0) first
-            if len(worker_actors) > 1:
-                stop_refs = [actor.stop.remote() for actor in worker_actors[1:]]
-                for idx, stop_ref in enumerate(stop_refs, start=1):
+            other_indices = [i for i in range(len(worker_actors)) if i != head_actor_index]
+            if other_indices:
+                stop_refs = [worker_actors[idx].stop.remote() for idx in other_indices]
+                for idx, stop_ref in zip(other_indices, stop_refs, strict=False):
                     try:
                         ray.get(stop_ref, timeout=30)
                     except Exception as stop_e:
                         stop_exceptions.append(stop_e)
                         logger.warning(f"Failed to stop worker node actor {idx}: {stop_e}")
-            # Stop head node (actor 0)
             try:
-                ray.get(worker_actors[0].stop.remote(), timeout=30)
+                ray.get(worker_actors[head_actor_index].stop.remote(), timeout=30)
             except Exception as stop_e:
                 stop_exceptions.append(stop_e)
                 logger.warning(f"Failed to stop head node actor: {stop_e}")

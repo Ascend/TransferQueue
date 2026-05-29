@@ -153,17 +153,19 @@ def cleanup_yuanrong_resources(storage_value: Any) -> None:
 
     worker_actors = storage_value.get("worker_actors", [])
     placement_group = storage_value.get("placement_group")
+    head_actor_index = storage_value.get("head_actor_index", 0)
 
     try:
         if worker_actors:
             logger.info(f"Cleaning up Yuanrong backend (stopping {len(worker_actors)} workers)...")
 
-            # Stop worker nodes (all except head node 0) in parallel first
+            # Stop worker nodes (non-head) in parallel first, then head node (metastore service)
             stop_exceptions = []
-            if len(worker_actors) > 1:
-                logger.info(f"Stopping {len(worker_actors) - 1} worker nodes (excluding head) in parallel...")
-                stop_refs = [actor.stop.remote() for actor in worker_actors[1:]]
-                for idx, stop_ref in enumerate(stop_refs, start=1):
+            other_indices = [i for i in range(len(worker_actors)) if i != head_actor_index]
+            if other_indices:
+                logger.info(f"Stopping {len(other_indices)} worker nodes in parallel...")
+                stop_refs = [worker_actors[idx].stop.remote() for idx in other_indices]
+                for idx, stop_ref in zip(other_indices, stop_refs, strict=False):
                     try:
                         ray.get(stop_ref)
                     except Exception as e:
@@ -172,10 +174,10 @@ def cleanup_yuanrong_resources(storage_value: Any) -> None:
                 if len(stop_exceptions) < len(stop_refs):
                     logger.info("Completed stop requests for non-head worker nodes")
 
-            # Then stop head node (actor 0) which runs metastore service
+            # Then stop head node which runs metastore service
             logger.info("Stopping head node with metastore service...")
             try:
-                ray.get(worker_actors[0].stop.remote())
+                ray.get(worker_actors[head_actor_index].stop.remote())
                 logger.info("Head node stopped successfully")
             except Exception as e:
                 stop_exceptions.append(e)
