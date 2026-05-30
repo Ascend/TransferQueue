@@ -4,7 +4,8 @@
 # Prometheus metrics exporter.
 metrics:
   enabled: false
-  port: 0  # HTTP port for /metrics endpoint (0 = auto-assign free port)
+  # HTTP port for /metrics endpoint (0 = auto-assign free port)
+  port: 0
 
 controller:
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
@@ -61,9 +62,9 @@ backend:
     worker_port: 31501
     # Metastore service port
     metastore_port: 2379
-    # If enable npu transport
+    # Whether to enable npu transport
     enable_yr_npu_transport: false
-    # If enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
+    # Whether to enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
     # See https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html
     enable_rdma: false
     # UCX env vars passed to dscli subprocess. Precedence: ucx_env_vars > parent env > TQ default (UCX_TLS=rc_x when enable_rdma=true).
