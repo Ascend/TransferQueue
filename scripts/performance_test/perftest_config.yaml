@@ -4,6 +4,7 @@
 # Prometheus metrics exporter.
 metrics:
   enabled: true
+  # HTTP port for /metrics endpoint (0 = auto-assign free port)
   port: 0
 
 controller:
@@ -20,36 +21,38 @@ backend:
   # SimpleStorage, Yuanrong, MooncakeStore, ...
   storage_backend: SimpleStorage
 
-  # For SimpleStorage:
+  # SimpleStorage: ZMQ-based in-memory storage for out-of-the-box usage
   SimpleStorage:
-    # Total number of samples
+    # Maximum number of experience samples to hold across all storage units
     total_storage_size: 100000
-    # Number of distributed storage units for SimpleStorage backend
+    # Number of distributed storage units.
+    # Recommended: >= 2 x number of nodes for load balancing.
     num_data_storage_units: 16
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
-  # For MooncakeStore:
+  # MooncakeStore: high-performance KV-based hierarchical storage
+  # that supports RDMA transport between GPU and DRAM.
   MooncakeStore:
-    # Whether to let TQ automatically init metadata_server.
+    # Whether TransferQueue should automatically start the Mooncake metadata server.
+    # WARNING: When set to `true`, TQ will attempt to terminate any existing mooncake_master process.
     auto_init: true
-    # Address of the HTTP metadata server
+    # Address of the metadata coordination server.
     metadata_server: localhost:50050
-    # Address of master server
+    # Address of the Mooncake master server.
     master_server_address: localhost:50051
-    # Address of local host. Set to "" to use Ray IP as local host address
+    # Local host address visible to the Mooncake cluster.
+    # Set to "" to auto-detect using Ray's node IP.
     local_hostname: ""
-    # Protocol for transmission. Choose from: tcp, rdma. (default: rdma)
+    # Transport protocol. Choose from: tcp, rdma.
     protocol: rdma
-    # Memory segment size in bytes for mounting
+    # Global memory segment size in bytes **per client** for mounting (default: 4GB)
     global_segment_size: 86294967296
-    # Local buffer size in bytes
+    # Local buffer size in bytes **per client** (default: 1GB)
     local_buffer_size: 86294967296
-    # Network device name. Set to "" to let Mooncake to auto-picks devices
+    # Network device name.
+    # Set to "" to let Mooncake auto-select available devices.
     device_name: ""
-
-  # For RayStore:
-  RayStore:
 
   # For Yuanrong:
   Yuanrong:
@@ -67,3 +70,6 @@ backend:
     #   --enable_huge_tlb             Enable huge page memory to improve performance. Required for >21GB shared memory on 910B.
     # Example: "--shared_memory_size_mb 16384 --remote_h2d_device_ids 0,1,2,3 --enable_huge_tlb true"
     worker_args: "--shared_memory_size_mb 65536 --remote_h2d_device_ids 0 --enable_huge_tlb true"
+
+  # For RayStore:
+  RayStore:
