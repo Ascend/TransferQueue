@@ -50,13 +50,13 @@ class TestYuanrongKVClientZCopy:
 
     def test_mset_mget_p2p(self, storage_client, mocker):
         # Mock serialization/deserialization
-        def mock_serialization(obj):
+        def mock_encode(obj):
             if isinstance(obj, torch.Tensor):
                 return [obj.numpy().tobytes()]
             return [str(obj).encode("utf-8")]
 
-        def mock_deserialization(items):
-            data = items[0]
+        def mock_decode(frames):
+            data = frames[0]
             if len(data) == 12:
                 return torch.from_numpy(np.frombuffer(data, dtype=np.float32).copy())
             try:
@@ -64,8 +64,8 @@ class TestYuanrongKVClientZCopy:
             except UnicodeDecodeError:
                 return data
 
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client._encoder.encode", side_effect=mock_serialization)
-        mocker.patch("transfer_queue.storage.clients.yuanrong_client._decoder.decode", side_effect=mock_deserialization)
+        mocker.patch("transfer_queue.utils.serial_utils.encode", side_effect=mock_encode)
+        mocker.patch("transfer_queue.utils.serial_utils.decode", side_effect=mock_decode)
 
         stored_raw_buffers = []
 
