@@ -41,6 +41,14 @@
 #                           (mooncake and yuanrong require extra binaries —
 #                            opt in explicitly).
 #   --skip <list>           Comma-separated phases to skip.
+#   --no-yuanrong           Skip yuanrong tests EVERYWHERE — the dedicated
+#                           `yuanrong` phase AND the `test_yuanrong_*.py`
+#                           files that `phase_unit` would otherwise sweep
+#                           up. Equivalent to `--skip yuanrong`. The script
+#                           also auto-enables this when `import yr` fails
+#                           in the active interpreter, so the explicit flag
+#                           is only needed to opt out when `yr` IS
+#                           installed but you still want to skip its tests.
 #   --keep-venv             Keep the venv on exit (default: keep on success,
 #                           keep on failure too — we never auto-delete).
 #   --recreate-venv         Force-delete an existing venv before install.
@@ -94,6 +102,8 @@ usage() {
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
+SKIP_YUANRONG=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --python)        PYTHON_BIN="$2"; shift 2 ;;
@@ -104,10 +114,23 @@ while [[ $# -gt 0 ]]; do
         --recreate-venv) RECREATE_VENV=1; shift ;;
         --keep-venv)     shift ;; # accepted for symmetry, no-op (we keep by default)
         --no-color)      NO_COLOR=1;      shift ;;
+        # Shortcut for "I don't have the `yr` (openyuanrong-datasystem) library
+        # and don't want yuanrong tests anywhere — not the dedicated phase,
+        # and not test_yuanrong_*.py files swept up by `phase_unit`".
+        --no-yuanrong)   SKIP_YUANRONG=1; shift ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+# `--skip yuanrong` (the phase) also implies excluding test_yuanrong_*.py
+# from phase_unit. Without this, `--skip yuanrong` is mostly a no-op since
+# the yuanrong phase isn't in DEFAULT_PHASES anyway.
+case ",${SKIP},"      in *",yuanrong,"* ) SKIP_YUANRONG=1 ;; esac
+case ",${ONLY},"      in *",yuanrong,"* ) SKIP_YUANRONG=0 ;; esac
+
+# Auto-detect happens later, after $PY is bound to the right interpreter
+# (system python for --no-install, or the venv python otherwise).
 
 # ---------------------------------------------------------------------------
 # Color helpers
@@ -297,6 +320,58 @@ for mod in ("numpy", "torch", "ray", "tensordict", "transfer_queue", "msgspec", 
     print(f"{mod:15s} {ver}")
 PY
 
+# Preflight: required pytest plugins. Without these, the unit phase fails
+# deep inside a test with a generic "fixture 'mocker' not found" or
+# "fixture 'event_loop' not found" message instead of a clear setup error.
+# These match the [test] extra in pyproject.toml.
+banner "Preflight: pytest plugin check"
+missing_pip_names=""
+for entry in "pytest:pytest" "pytest_mock:pytest-mock" "pytest_asyncio:pytest-asyncio"; do
+    import_name="${entry%%:*}"
+    pip_name="${entry##*:}"
+    if $PY -c "import $import_name" >/dev/null 2>&1; then
+        info "found $pip_name"
+    else
+        missing_pip_names+=" $pip_name"
+        warn "missing $pip_name"
+    fi
+done
+if [[ -n "$missing_pip_names" ]]; then
+    if [[ $NO_INSTALL -eq 1 ]]; then
+        fail "Required pytest plugin(s) missing:$missing_pip_names"
+        echo
+        echo "Fix one of:" >&2
+        echo "  # Preferred — matches CI [test] extra exactly:" >&2
+        echo "  pip install -e '$REPO_ROOT[test,yuanrong]'" >&2
+        echo
+        echo "  # Or just the missing bits:" >&2
+        echo "  pip install$missing_pip_names" >&2
+        echo
+        echo "Then re-run with --no-install." >&2
+        exit 3
+    else
+        # We have an active venv from the install path above — auto-fix.
+        info "Installing missing test plugins:$missing_pip_names"
+        $PIP install $missing_pip_names || {
+            fail "pip install$missing_pip_names failed"
+            exit 3
+        }
+    fi
+fi
+
+# Auto-detect: if yuanrong is NOT being explicitly run (`--only yuanrong`)
+# AND the user hasn't already opted in/out, probe for the `yr` package and
+# auto-skip yuanrong tests if it's unavailable. This is the common-case on
+# non-Ascend machines (the user's H20 box, generic Linux CI, macOS dev).
+case ",${ONLY},"      in *",yuanrong,"* ) yuanrong_explicit=1 ;; *) yuanrong_explicit=0 ;; esac
+if [[ $SKIP_YUANRONG -eq 0 && $yuanrong_explicit -eq 0 ]]; then
+    if ! $PY -c "import yr" >/dev/null 2>&1; then
+        warn "openyuanrong-datasystem (\`yr\`) not importable — auto-skipping yuanrong tests."
+        warn "Override with --only yuanrong or by installing: pip install -e '$REPO_ROOT[yuanrong]'"
+        SKIP_YUANRONG=1
+    fi
+fi
+
 # ---------------------------------------------------------------------------
 # Phase runner
 # ---------------------------------------------------------------------------
@@ -352,8 +427,22 @@ phase_unit() {
     # variants for the Mooncake / Yuanrong backends. Run the SimpleStorage-default
     # e2e here so the default backend is still exercised.
     cleanup_ray
+    local -a ignore_args=( --ignore=tests/sanity )
+    if [[ $SKIP_YUANRONG -eq 1 ]]; then
+        # Pull yuanrong-specific files out of the pytest collection. They
+        # require either `yr` (openyuanrong-datasystem) or `pytest-mock` to
+        # patch yr's symbols, and fail on machines that have neither.
+        # test_storage_client_factory.py is already self-guarded with
+        # `@pytest.mark.skipif(find_spec("datasystem") is None, ...)`, so
+        # it does not need an explicit ignore.
+        ignore_args+=(
+            --ignore=tests/test_yuanrong_client_zero_copy.py
+            --ignore=tests/test_yuanrong_storage_client_e2e.py
+        )
+        info "phase_unit: skipping yuanrong tests (SKIP_YUANRONG=1)"
+    fi
     $PY -m pytest tests \
-        --ignore=tests/sanity \
+        "${ignore_args[@]}" \
         ${PYTEST_ADDOPTS:-}
     local rc=$?
     cleanup_ray
