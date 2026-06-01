@@ -54,6 +54,13 @@
 #   RAY_DEDUP_LOGS          Forwarded (default: 0).
 #   PYTEST_ADDOPTS          Extra pytest args (e.g. "-x -k metadata").
 #
+# Ray daemons leak across processes (raylet, gcs_server, plasma_store, dashboard,
+# worker pools). To avoid "repeat init" / port-6379-conflict errors between
+# tutorials, recipes, and pytest runs, the script:
+#   - runs `ray stop --force` + pkill before each Ray-using invocation
+#   - runs the same cleanup after each invocation
+#   - registers an EXIT/INT/TERM trap so Ctrl-C never leaves orphans behind
+#
 # Exit code: 0 iff every selected phase passed.
 
 set -u
@@ -81,7 +88,7 @@ export TQ_NUM_THREADS="${TQ_NUM_THREADS:-2}"
 export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
 
 usage() {
-    sed -n '17,55p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '17,64p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 # ---------------------------------------------------------------------------
@@ -128,6 +135,48 @@ info()    { echo "${C_DIM}[info]${C_RESET}    $*"; }
 warn()    { echo "${C_YELLOW}[warn]${C_RESET}    $*"; }
 fail()    { echo "${C_RED}[fail]${C_RESET}    $*"; }
 success() { echo "${C_GREEN}[ ok ]${C_RESET}    $*"; }
+
+# ---------------------------------------------------------------------------
+# Ray cleanup
+# ---------------------------------------------------------------------------
+# Ray spawns persistent daemons (raylet, gcs_server, plasma_store, ray::IDLE
+# workers, dashboard, …) that survive the parent Python process. If we don't
+# nuke them between subprocess invocations, the next tutorial/recipe/pytest
+# either reconnects to the stale cluster, hits port conflicts on 6379/8265,
+# or raises "ray has already been initialized" / "Maybe you called ray.init
+# twice by accident". This helper is best-effort and idempotent.
+#
+# We always:
+#   1. Try `ray stop --force` if the CLI is on PATH (clean shutdown via Ray).
+#   2. Fall back to pkill for any leftover daemon processes (works even if
+#      the ray CLI is missing or hung).
+#   3. Clear inherited RAY_ADDRESS so a child doesn't try to attach to a
+#      non-existent cluster.
+#   4. Brief sleep so OS releases ports / sockets before the next invocation.
+cleanup_ray() {
+    if command -v ray >/dev/null 2>&1; then
+        ray stop --force >/dev/null 2>&1 || true
+    fi
+    # Catch every Ray-spawned daemon we've seen leak in practice.
+    pkill -9 -f '[r]aylet'        2>/dev/null || true
+    pkill -9 -f '[g]cs_server'    2>/dev/null || true
+    pkill -9 -f '[p]lasma_store'  2>/dev/null || true
+    pkill -9 -f '[r]ay::'         2>/dev/null || true
+    pkill -9 -f '[d]ashboard.*ray' 2>/dev/null || true
+    pkill -9 -f '[r]ay.*default_worker' 2>/dev/null || true
+    unset RAY_ADDRESS
+    sleep 1
+}
+
+# Ensure we never leave Ray daemons running when the script exits, even on
+# Ctrl-C or an unexpected error. The trap is set after the helper is defined.
+on_exit() {
+    local rc=$?
+    cleanup_ray
+    exit $rc
+}
+trap on_exit EXIT
+trap 'echo; warn "interrupted, cleaning up Ray daemons"; exit 130' INT TERM
 
 # ---------------------------------------------------------------------------
 # Phase selection (bash 3.2 compatible — macOS /bin/bash has no `declare -A`)
@@ -225,6 +274,13 @@ else
     fi
 fi
 
+# Nuke any leftover Ray daemons from a previously-crashed run before we
+# print versions or start any phase. Otherwise the first Ray-using phase
+# silently inherits a stale cluster on 6379/8265.
+banner "Pre-flight Ray cleanup"
+cleanup_ray
+info "Killed any stale Ray daemons from previous runs"
+
 # Numpy + TransferQueue sanity check so we know exactly what we're testing.
 banner "Environment versions"
 $PY - <<'PY'
@@ -295,9 +351,13 @@ phase_unit() {
     # Excludes the e2e/ dir from the default run — those have their own phase
     # variants for the Mooncake / Yuanrong backends. Run the SimpleStorage-default
     # e2e here so the default backend is still exercised.
+    cleanup_ray
     $PY -m pytest tests \
         --ignore=tests/sanity \
         ${PYTEST_ADDOPTS:-}
+    local rc=$?
+    cleanup_ray
+    return $rc
 }
 
 phase_mooncake() {
@@ -311,14 +371,18 @@ phase_mooncake() {
             return 0
         fi
     fi
+    local rc1 rc2
+    cleanup_ray
     cleanup_mooncake_master
     TQ_TEST_BACKEND=MooncakeStore $PY -m pytest tests/e2e/test_e2e_lifecycle_consistency.py \
-        ${PYTEST_ADDOPTS:-} \
-        ; local rc1=$?
+        ${PYTEST_ADDOPTS:-}
+    rc1=$?
+    cleanup_ray
     cleanup_mooncake_master
     TQ_TEST_BACKEND=MooncakeStore $PY -m pytest tests/e2e/test_kv_interface_e2e.py \
-        ${PYTEST_ADDOPTS:-} \
-        ; local rc2=$?
+        ${PYTEST_ADDOPTS:-}
+    rc2=$?
+    cleanup_ray
     cleanup_mooncake_master
     return $(( rc1 != 0 ? rc1 : rc2 ))
 }
@@ -329,24 +393,32 @@ phase_yuanrong() {
         warn "openyuanrong-datasystem is not installed; skipping."
         return 0
     fi
+    local rc1 rc2
+    cleanup_ray
     TQ_TEST_BACKEND=Yuanrong $PY -m pytest tests/e2e/test_e2e_lifecycle_consistency.py \
-        ${PYTEST_ADDOPTS:-} \
-        ; local rc1=$?
+        ${PYTEST_ADDOPTS:-}
+    rc1=$?
+    cleanup_ray
     TQ_TEST_BACKEND=Yuanrong $PY -m pytest tests/e2e/test_kv_interface_e2e.py \
-        ${PYTEST_ADDOPTS:-} \
-        ; local rc2=$?
+        ${PYTEST_ADDOPTS:-}
+    rc2=$?
+    cleanup_ray
     return $(( rc1 != 0 ? rc1 : rc2 ))
 }
 
 phase_tutorials() {
     cd "$REPO_ROOT"
     local failed=0
+    cleanup_ray
     for f in tutorial/*.py; do
         info "Running tutorial: $f"
         if ! $PY "$f"; then
             fail "tutorial failed: $f"
             failed=$((failed + 1))
         fi
+        # Every tutorial spawns its own Ray cluster — tear it down before
+        # starting the next so we don't see port-conflict / repeat-init errors.
+        cleanup_ray
     done
     if command -v jupyter >/dev/null 2>&1; then
         info "Running notebook tutorial: tutorial/basic.ipynb"
@@ -357,6 +429,7 @@ phase_tutorials() {
             fail "notebook tutorial failed: tutorial/basic.ipynb"
             failed=$((failed + 1))
         fi
+        cleanup_ray
     else
         warn "jupyter not on PATH; skipping notebook tutorial."
     fi
@@ -366,9 +439,11 @@ phase_tutorials() {
 phase_recipes() {
     cd "$REPO_ROOT"
     local rc1 rc2
+    cleanup_ray
     $PY recipe/simple_use_case/single_controller_demo.py \
         --num-samples 8 --global-batch-size 4 --rollout-agent-num-workers 1
     rc1=$?
+    cleanup_ray
     $PY recipe/simple_use_case/relax_demo.py \
         --num-steps 1 --global-batch-size 1 --micro-batch-size 1 \
         --num-rollout-workers 1 --num-ref-workers 1 \
@@ -376,6 +451,7 @@ phase_recipes() {
         --rollout-sleep-seconds 0.01 --stage-sleep-seconds 0.01 \
         --weight-sync-seconds 0.01
     rc2=$?
+    cleanup_ray
     return $(( rc1 != 0 ? rc1 : rc2 ))
 }
 
