@@ -20,7 +20,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
-from threading import Lock, Thread
+from threading import Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -361,10 +361,6 @@ class DataPartitionStatus:
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
     revert_keys_mapping: dict[int, str] = field(default_factory=dict)  # global_idx -> key
 
-    # Threading lock for concurrency control; only for preventing mask operation error when expanding production_status.
-    # No need to strictly lock for every read/write operation since freshness is not critical.
-    data_status_lock: Lock = field(default_factory=Lock)
-
     # Dynamic configuration - these are computed from the current state
     @property
     def total_samples_num(self) -> int:
@@ -409,8 +405,7 @@ class DataPartitionStatus:
         max_sample_idx = max(allocated_indexes)
         required_samples = max_sample_idx + 1
 
-        with self.data_status_lock:
-            self.ensure_samples_capacity(required_samples)
+        self.ensure_samples_capacity(required_samples)
 
         logger.debug(f"Pre-allocated indexes in {self.partition_id}: {allocated_indexes}")
 
@@ -526,9 +521,8 @@ class DataPartitionStatus:
             max_sample_idx = max(global_indices) if global_indices else -1
             required_samples = max_sample_idx + 1
 
-            with self.data_status_lock:
-                # Ensure we have enough rows
-                self.ensure_samples_capacity(required_samples)
+            # Ensure we have enough rows
+            self.ensure_samples_capacity(required_samples)
 
             # Register new fields if needed
             new_fields = [f for f in field_names if f not in self.field_name_mapping]
@@ -538,14 +532,12 @@ class DataPartitionStatus:
                     self.field_name_mapping[f] = len(self.field_name_mapping)
 
                 required_fields = len(self.field_name_mapping)
-                with self.data_status_lock:
-                    self.ensure_fields_capacity(required_fields)
+                self.ensure_fields_capacity(required_fields)
 
-            with self.data_status_lock:
-                # Update production status
-                if self.production_status is not None and global_indices and field_names:
-                    field_indices = [self.field_name_mapping.get(f) for f in field_names]
-                    self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
+            # Update production status
+            if self.production_status is not None and global_indices and field_names:
+                field_indices = [self.field_name_mapping.get(f) for f in field_names]
+                self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
 
             # Update field metadata
             self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
@@ -641,8 +633,7 @@ class DataPartitionStatus:
             if partition_global_index.numel() == 0:
                 empty_status = self.consumption_status[task_name].new_zeros(0)
                 return partition_global_index, empty_status
-            with self.data_status_lock:
-                self.ensure_samples_capacity(max(partition_global_index) + 1)
+            self.ensure_samples_capacity(max(partition_global_index) + 1)
             consumption_status = self.consumption_status[task_name][partition_global_index]
         else:
             consumption_status = self.consumption_status[task_name]
@@ -730,23 +721,22 @@ class DataPartitionStatus:
             if field_name not in self.field_name_mapping:
                 return []
 
-        with self.data_status_lock:
-            row_mask = torch.ones(self.allocated_samples_num, dtype=torch.bool)
+        row_mask = torch.ones(self.allocated_samples_num, dtype=torch.bool)
 
-            # Apply consumption filter (exclude already consumed samples)
-            _, consumption_status = self.get_consumption_status(task_name, mask=False)
-            if consumption_status is not None:
-                unconsumed_mask = consumption_status == 0
-                row_mask &= unconsumed_mask
+        # Apply consumption filter (exclude already consumed samples)
+        _, consumption_status = self.get_consumption_status(task_name, mask=False)
+        if consumption_status is not None:
+            unconsumed_mask = consumption_status == 0
+            row_mask &= unconsumed_mask
 
-            # Create column mask for requested fields
-            col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
-            field_indices = [self.field_name_mapping[field] for field in field_names]
-            if field_indices:
-                col_mask[field_indices] = True
+        # Create column mask for requested fields
+        col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
+        field_indices = [self.field_name_mapping[field] for field in field_names]
+        if field_indices:
+            col_mask[field_indices] = True
 
-            # Filter production status by masks
-            relevant_status = self.production_status[row_mask][:, col_mask]
+        # Filter production status by masks
+        relevant_status = self.production_status[row_mask][:, col_mask]
 
         # Check if all required fields are ready for each sample
         all_fields_ready = torch.all(relevant_status, dim=1)
@@ -878,32 +868,20 @@ class DataPartitionStatus:
         Get a snapshot of partition status information.
 
         Returns:
-            DataPartitionStatus object without threading.Lock()
+            DataPartitionStatus object
         """
 
-        def _perform_copy():
-            cls = self.__class__
-            snapshot = cls.__new__(cls)
+        cls = self.__class__
+        snapshot = cls.__new__(cls)
 
-            for name, value in self.__dict__.items():
-                if name == "data_status_lock":
-                    continue
+        for name, value in self.__dict__.items():
+            if isinstance(value, Tensor):
+                new_val = value.clone().detach()
+            else:
+                new_val = copy.deepcopy(value)
 
-                if isinstance(value, Tensor):
-                    new_val = value.clone().detach()
-                else:
-                    new_val = copy.deepcopy(value)
-
-                setattr(snapshot, name, new_val)
-            return snapshot
-
-        lock_obj = getattr(self, "data_status_lock", None)
-
-        if lock_obj:
-            with lock_obj:
-                return _perform_copy()
-        else:
-            return _perform_copy()
+            setattr(snapshot, name, new_val)
+        return snapshot
 
     def clear_data(self, indexes_to_release: list[int], clear_consumption: bool = True):
         """Clear all production and optionally consumption data for given global_indexes."""
@@ -1069,7 +1047,7 @@ class TransferQueueController:
 
     def get_partition_snapshot(self, partition_id: str) -> DataPartitionStatus | None:
         """
-        Get a copy of partition status information, without threading.Lock().
+        Get a copy of partition status information.
 
         Args:
             partition_id: ID of the partition to retrieve
@@ -1622,8 +1600,7 @@ class TransferQueueController:
                     partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
                     partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
 
-                with partition.data_status_lock:
-                    partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
+                partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
         verified_global_indexes = [idx for idx in global_indexes if idx is not None]
         assert len(verified_global_indexes) == len(keys)
