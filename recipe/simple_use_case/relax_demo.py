@@ -131,7 +131,7 @@ class BaseStageWorker:
     def __init__(self, tq_config, tracker, worker_id: int, config: "DemoConfig"):
         tq.init(tq_config)
         self.tq_client = tq.get_client()
-        controller = ray.get_actor("TransferQueueController")
+        controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
         self.cfg = ray.get(controller.get_config.remote())
         self.tracker = tracker
         self.worker_id = worker_id

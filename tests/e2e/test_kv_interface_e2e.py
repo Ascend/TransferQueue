@@ -154,7 +154,7 @@ def tq_system(ray_init, backend_name):
 @pytest.fixture
 def controller(tq_system):
     """Get the TransferQueueController actor for direct verification."""
-    controller = ray.get_actor("TransferQueueController")
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
     yield controller
 
 

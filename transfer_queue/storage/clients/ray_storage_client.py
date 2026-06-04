@@ -57,9 +57,11 @@ class RayStorageClient(StorageKVClient):
 
         # initialize actor
         try:
-            self.storage_actor = ray.get_actor("RayObjectRefStorage")
+            self.storage_actor = ray.get_actor("RayObjectRefStorage", namespace="transfer_queue")
         except ValueError:
-            self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
+            self.storage_actor = RayObjectRefStorage.options(
+                name="RayObjectRefStorage", namespace="transfer_queue", get_if_exists=False
+            ).remote()
 
     def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """

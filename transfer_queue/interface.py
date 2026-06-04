@@ -93,7 +93,7 @@ def _init_from_existing() -> bool:
     global _TQ_CONTROLLER
     try:
         if _TQ_CONTROLLER is None:
-            _TQ_CONTROLLER = ray.get_actor("TransferQueueController")
+            _TQ_CONTROLLER = ray.get_actor("TransferQueueController", namespace="transfer_queue")
 
     except ValueError:
         logger.info("Called _init_from_existing() but TransferQueueController has not been initialized yet.")
@@ -174,9 +174,9 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
 
     try:
         global _TQ_CONTROLLER
-        _TQ_CONTROLLER = TransferQueueController.options(name="TransferQueueController").remote(  # type: ignore[attr-defined]
-            sampler=sampler, polling_mode=final_conf.controller.polling_mode
-        )
+        _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
+            name="TransferQueueController", namespace="transfer_queue"
+        ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         logger.info("TransferQueueController has been created.")
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")

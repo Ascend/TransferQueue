@@ -184,7 +184,7 @@ def update_worker(
     # Step 1: Create StreamingDataset
     # This dataset integrates with TransferQueue and handles batch retrieval
 
-    controller = ray.get_actor("TransferQueueController")
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
     config = ray.get(controller.get_config.remote())
 
     dataset = StreamingDataset(
