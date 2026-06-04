@@ -53,7 +53,7 @@ async def mock_async_storage_manager():
         role=Role.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
-        ports={"handshake_socket": 12347, "data_status_update_socket": 12348},
+        ports={"handshake_socket": 12347},
     )
 
     config = {
@@ -158,7 +158,7 @@ async def test_async_storage_manager_error_handling():
         role=Role.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
-        ports={"handshake_socket": 12346, "data_status_update_socket": 12347},
+        ports={"handshake_socket": 12346},
     )
 
     config = {

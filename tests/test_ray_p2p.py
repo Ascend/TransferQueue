@@ -60,7 +60,6 @@ def create_mock_controller():
         ip="127.0.0.1",
         ports={
             "request_handle_socket": 9981,
-            "data_status_update_socket": 9982,
             "handshake_socket": 9983,
         },
     )

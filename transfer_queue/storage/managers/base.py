@@ -210,7 +210,7 @@ class StorageManager(ABC):
         sock = create_zmq_socket(self.zmq_context, zmq.DEALER, self.controller_info.ip, identity)
 
         try:
-            sock.connect(self.controller_info.to_addr("data_status_update_socket"))
+            sock.connect(self.controller_info.to_addr("request_handle_socket"))
 
             normalized_field_schema = {}
             for field_name, field in field_schema.items():

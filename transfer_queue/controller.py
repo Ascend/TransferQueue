@@ -1021,7 +1021,6 @@ class TransferQueueController:
 
         # Start background processing threads
         self._start_process_handshake()
-        self._start_process_update_data_status()
         self._start_process_request()
 
         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
@@ -1685,7 +1684,6 @@ class TransferQueueController:
             try:
                 self._handshake_socket_port = get_free_port(ip=self._node_ip)
                 self._request_handle_socket_port = get_free_port(ip=self._node_ip)
-                self._data_status_update_socket_port = get_free_port(ip=self._node_ip)
 
                 self.handshake_socket = create_zmq_socket(
                     ctx=self.zmq_context,
@@ -1701,15 +1699,6 @@ class TransferQueueController:
                 )
                 self.request_handle_socket.bind(format_zmq_address(self._node_ip, self._request_handle_socket_port))
 
-                self.data_status_update_socket = create_zmq_socket(
-                    ctx=self.zmq_context,
-                    socket_type=zmq.ROUTER,
-                    ip=self._node_ip,
-                )
-                self.data_status_update_socket.bind(
-                    format_zmq_address(self._node_ip, self._data_status_update_socket_port)
-                )
-
                 break
             except zmq.ZMQError:
                 logger.warning(f"[{self.controller_id}]: Try to bind ZMQ sockets failed, retrying...")
@@ -1722,7 +1711,6 @@ class TransferQueueController:
             ports={
                 "handshake_socket": self._handshake_socket_port,
                 "request_handle_socket": self._request_handle_socket_port,
-                "data_status_update_socket": self._data_status_update_socket_port,
             },
         )
 
@@ -1780,15 +1768,6 @@ class TransferQueueController:
             daemon=True,
         )
         self.wait_connection_thread.start()
-
-    def _start_process_update_data_status(self):
-        """Start the data status update processing thread."""
-        self.process_update_data_status_thread = Thread(
-            target=self._update_data_status,
-            name="TransferQueueControllerProcessUpdateDataStatusThread",
-            daemon=True,
-        )
-        self.process_update_data_status_thread.start()
 
     def _start_process_request(self):
         """Start the request processing thread."""
@@ -2045,23 +2024,7 @@ class TransferQueueController:
                         body={"partition_info": partition_info, "message": message},
                     )
 
-            self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
-
-    def _update_data_status(self):
-        """Process data status update messages from storage units - adapted for partitions."""
-        logger.debug(f"[{self.controller_id}]: start receiving update_data_status requests...")
-
-        perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
-
-        while True:
-            monitor = self._metrics if self._metrics is not None else perf_monitor
-
-            messages = self.data_status_update_socket.recv_multipart(copy=False)
-            identity = messages.pop(0)
-            serialized_msg = messages
-            request_msg = ZMQMessage.deserialize(serialized_msg)
-
-            if request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
+            elif request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
                 with monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
                     message_data = request_msg.body
                     partition_id = message_data.get("partition_id")
@@ -2079,7 +2042,6 @@ class TransferQueueController:
                             self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
                         logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
 
-                    # Send acknowledgment
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
                         sender_id=self.controller_id,
@@ -2089,7 +2051,8 @@ class TransferQueueController:
                             "success": success,
                         },
                     )
-                    self.data_status_update_socket.send_multipart([identity, *response_msg.serialize()])
+
+            self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""
