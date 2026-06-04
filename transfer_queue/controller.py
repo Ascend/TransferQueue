@@ -2019,9 +2019,11 @@ class TransferQueueController:
                             self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
                         logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
 
+                    # Send acknowledgment
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
                         sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
                         body={
                             "controller_id": self.controller_id,
                             "partition_id": partition_id,
