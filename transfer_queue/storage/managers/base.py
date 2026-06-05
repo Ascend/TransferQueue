@@ -71,7 +71,7 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context: zmq.asyncio.Context | None = None
+        self.zmq_context = zmq.asyncio.Context()
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -109,9 +109,6 @@ class StorageManager(ABC):
                 self.controller_handshake_socket.close(linger=0)
                 self.controller_handshake_socket = None
             sync_zmq_context.term()
-
-            # create async context for data status update
-            self.zmq_context = zmq.asyncio.Context()
 
         except Exception as e:
             logger.error(f"Failed to connect to controller: {e}")
