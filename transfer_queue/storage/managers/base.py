@@ -67,6 +67,7 @@ class StorageManager(ABC):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
+        self.zmq_ctx = zmq.asyncio.Context()
 
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
@@ -84,27 +85,34 @@ class StorageManager(ABC):
         self._notify_thread.start()
 
     def _connect_to_controller(self) -> None:
-        """Establish initial connection to the controller via a blocking handshake."""
+        """Initialize ZMQ sockets between storage unit and controller for handshake."""
         if not isinstance(self.controller_info, ZMQServerInfo):
             raise ValueError(f"controller_info should be ZMQServerInfo, but got {type(self.controller_info)}")
 
-        sync_zmq_context = zmq.Context()
         try:
+            # Create a synchronous context for handshake (blocking operation)
+            sync_zmq_context = zmq.Context()
+
+            # create zmq socket for handshake (sync, for initial connection)
             self.controller_handshake_socket = create_zmq_socket(
                 ctx=sync_zmq_context,
                 socket_type=zmq.DEALER,
                 ip=self.controller_info.ip,
                 identity=f"{self.storage_manager_id}-controller_handshake_socket-{uuid4().hex[:8]}".encode(),
             )
+
+            # do handshake with controller using sync socket
             self._do_handshake_with_controller()
-        except Exception as e:
-            logger.error(f"Failed to connect to controller: {e}")
-            raise
-        finally:
+
+            # close the sync handshake socket and context after handshake
             if self.controller_handshake_socket and not self.controller_handshake_socket.closed:
                 self.controller_handshake_socket.close(linger=0)
                 self.controller_handshake_socket = None
             sync_zmq_context.term()
+
+        except Exception as e:
+            logger.error(f"Failed to connect to controller: {e}")
+            raise
 
     def _do_handshake_with_controller(self) -> None:
         """Handshake with controller to establish connection with retransmission mechanism."""
@@ -222,8 +230,7 @@ class StorageManager(ABC):
                 if len(per_sample_shapes) != len(global_indexes):
                     raise ValueError(
                         f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
-                        f"skipping per_sample_shapes normalization."
+                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
                     )
                 field_copy["per_sample_shapes"] = {
                     global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
@@ -249,9 +256,10 @@ class StorageManager(ABC):
 
     async def _notify_and_wait(self, request_msg: list) -> None:
         """Send a data status notification to the controller and block until ACK is received."""
-        zmq_ctx = zmq.asyncio.Context()
         identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(ctx=zmq_ctx, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity)
+        sock = create_zmq_socket(
+            ctx=self.zmq_ctx, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
+        )
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(self.controller_info.to_addr("request_handle_socket"))
 
@@ -283,15 +291,17 @@ class StorageManager(ABC):
                         break
                 except asyncio.TimeoutError:
                     timeout -= poll_interval
+                except Exception as e:
+                    logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
+                    break
 
             if not response_received:
-                raise TimeoutError(
+                logger.error(
                     f"[{self.storage_manager_id}]: Timeout waiting for data status update ACK "
                     f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
                 )
         finally:
             sock.close()
-            zmq_ctx.term()
 
     @abstractmethod
     async def put_data(
@@ -352,6 +362,9 @@ class StorageManager(ABC):
 
         self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
         self._notify_thread.join(timeout=5)
+
+        self.zmq_ctx.term()
+
         logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
     def __del__(self):
