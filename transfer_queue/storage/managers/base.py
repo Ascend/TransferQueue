@@ -74,18 +74,6 @@ class StorageManager(ABC):
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
-        self._notify_zmq_ctx = zmq.asyncio.Context()
-        identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-        self._notify_sock = create_zmq_socket(
-            ctx=self._notify_zmq_ctx,
-            socket_type=zmq.DEALER,
-            ip=self.controller_info.ip,
-            identity=identity,
-        )
-        self._notify_sock.setsockopt(zmq.LINGER, 0)
-        self._notify_sock.connect(self.controller_info.to_addr("request_handle_socket"))
-
-        self._notify_lock = asyncio.Lock()
         self._notify_loop = asyncio.new_event_loop()
         self._notify_thread = threading.Thread(
             target=_run_notify_loop,
@@ -261,10 +249,14 @@ class StorageManager(ABC):
 
     async def _notify_and_wait(self, request_msg: list) -> None:
         """Send a data status notification to the controller and block until ACK is received."""
-        assert self._notify_sock is not None
+        zmq_ctx = zmq.asyncio.Context()
+        identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
+        sock = create_zmq_socket(ctx=zmq_ctx, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity)
+        sock.setsockopt(zmq.LINGER, 0)
+        sock.connect(self.controller_info.to_addr("request_handle_socket"))
 
-        async with self._notify_lock:
-            await self._notify_sock.send_multipart(request_msg)
+        try:
+            await sock.send_multipart(request_msg)
             logger.debug(
                 f"[{self.storage_manager_id}]: Sent data status update request "
                 f"to controller id #{self.controller_info.id} successfully."
@@ -277,7 +269,7 @@ class StorageManager(ABC):
                 try:
                     poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
                     messages = await asyncio.wait_for(
-                        self._notify_sock.recv_multipart(copy=False),
+                        sock.recv_multipart(copy=False),
                         timeout=poll_interval,
                     )
                     response_msg = ZMQMessage.deserialize(messages)
@@ -297,6 +289,9 @@ class StorageManager(ABC):
                     f"[{self.storage_manager_id}]: Timeout waiting for data status update ACK "
                     f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
                 )
+        finally:
+            sock.close()
+            zmq_ctx.term()
 
     @abstractmethod
     async def put_data(
@@ -354,18 +349,6 @@ class StorageManager(ABC):
 
         if not hasattr(self, "_notify_loop") or not self._notify_loop.is_running():
             return
-
-        async def _cleanup() -> None:
-            if self._notify_sock and not self._notify_sock.closed:
-                self._notify_sock.close()
-            if self._notify_zmq_ctx:
-                self._notify_zmq_ctx.term()
-
-        future = asyncio.run_coroutine_threadsafe(_cleanup(), self._notify_loop)
-        try:
-            future.result(timeout=5)
-        except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Error closing notify ZMQ: {e}")
 
         self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
         self._notify_thread.join(timeout=5)
