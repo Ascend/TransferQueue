@@ -16,6 +16,7 @@
 import asyncio
 import itertools
 import os
+import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
@@ -45,6 +46,14 @@ TQ_STORAGE_HANDSHAKE_RETRY_INTERVAL = int(os.environ.get("TQ_STORAGE_HANDSHAKE_R
 TQ_STORAGE_HANDSHAKE_MAX_RETRIES = int(os.environ.get("TQ_STORAGE_HANDSHAKE_MAX_RETRIES", 3))
 TQ_DATA_UPDATE_RESPONSE_TIMEOUT = int(os.environ.get("TQ_DATA_UPDATE_RESPONSE_TIMEOUT", 30))
 
+
+def _run_notify_loop(notify_loop: asyncio.AbstractEventLoop) -> None:
+    asyncio.set_event_loop(notify_loop)
+    try:
+        notify_loop.run_forever()
+    finally:
+        notify_loop.close()
+
 LIMIT_THREADS_PER_MANAGER_IN_DRIVER = 8
 LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR = 4
 
@@ -61,41 +70,70 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context: zmq.asyncio.Context | None = None
         self._connect_to_controller()
 
+        # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
+        self._notify_loop = asyncio.new_event_loop()
+        self._notify_thread = threading.Thread(
+            target=_run_notify_loop,
+            args=(self._notify_loop,),
+            daemon=True,
+            name=f"{self.storage_manager_id}-notify_data_status_loop",
+        )
+        self._notify_thread.start()
+
+        self._notify_zmq_ctx: zmq.asyncio.Context | None = None
+        self._notify_sock: zmq.asyncio.Socket | None = None
+        self._notify_lock = asyncio.Lock()
+        notify_sock_ready = threading.Event()
+        asyncio.run_coroutine_threadsafe(self._init_notify_zmq(notify_sock_ready), self._notify_loop)
+        notify_sock_ready.wait()
+
     def _connect_to_controller(self) -> None:
-        """Initialize ZMQ sockets between storage unit and controller for handshake."""
+        """Establish initial connection to the controller via a blocking handshake."""
         if not isinstance(self.controller_info, ZMQServerInfo):
             raise ValueError(f"controller_info should be ZMQServerInfo, but got {type(self.controller_info)}")
 
+        sync_zmq_context = zmq.Context()
         try:
-            # Create a synchronous context for handshake (blocking operation)
-            sync_zmq_context = zmq.Context()
-
-            # create zmq socket for handshake (sync, for initial connection)
             self.controller_handshake_socket = create_zmq_socket(
                 ctx=sync_zmq_context,
                 socket_type=zmq.DEALER,
                 ip=self.controller_info.ip,
                 identity=f"{self.storage_manager_id}-controller_handshake_socket-{uuid4().hex[:8]}".encode(),
             )
-
-            # do handshake with controller using sync socket
             self._do_handshake_with_controller()
-
-            # close the sync handshake socket and context after handshake
+        except Exception as e:
+            logger.error(f"Failed to connect to controller: {e}")
+            raise
+        finally:
             if self.controller_handshake_socket and not self.controller_handshake_socket.closed:
                 self.controller_handshake_socket.close(linger=0)
                 self.controller_handshake_socket = None
             sync_zmq_context.term()
 
-            # create async context for data status update
-            self.zmq_context = zmq.asyncio.Context()
-
+    async def _init_notify_zmq(self, notify_sock_ready: threading.Event) -> None:
+        """Create the async ZMQ DEALER socket used for data status notifications."""
+        try:
+            self._notify_zmq_ctx = zmq.asyncio.Context()
+            identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
+            self._notify_sock = create_zmq_socket(
+                ctx=self._notify_zmq_ctx,
+                socket_type=zmq.DEALER,
+                ip=self.controller_info.ip,
+                identity=identity,
+            )
+            self._notify_sock.setsockopt(zmq.LINGER, 0)
+            self._notify_sock.connect(self.controller_info.to_addr("request_handle_socket"))
+            logger.debug(
+                f"[{self.storage_manager_id}]: Notify ZMQ socket connected "
+                f"to controller {self.controller_info.id}."
+            )
         except Exception as e:
-            logger.error(f"Failed to connect to controller: {e}")
+            logger.critical(f"[{self.storage_manager_id}]: Failed to initialize notify ZMQ: {e}")
             raise
+        finally:
+            notify_sock_ready.set()
 
     def _do_handshake_with_controller(self) -> None:
         """Handshake with controller to establish connection with retransmission mechanism."""
@@ -205,54 +243,47 @@ class StorageManager(ABC):
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
             return
 
-        # create dynamic socket
-        identity = f"{self.storage_manager_id}-data_update-{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(self.zmq_context, zmq.DEALER, self.controller_info.ip, identity)
+        normalized_field_schema = {}
+        for field_name, field in field_schema.items():
+            field_copy = field.copy()
+            per_sample_shapes = field_copy.get("per_sample_shapes", None)
+            if isinstance(per_sample_shapes, list | tuple):
+                if len(per_sample_shapes) != len(global_indexes):
+                    raise ValueError(
+                        f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
+                        f"skipping per_sample_shapes normalization."
+                    )
+                field_copy["per_sample_shapes"] = {
+                    global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
+                }
+            normalized_field_schema[field_name] = field_copy
 
-        try:
-            sock.connect(self.controller_info.to_addr("request_handle_socket"))
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
+            sender_id=self.storage_manager_id,
+            body={
+                "partition_id": partition_id,
+                "global_indexes": global_indexes,
+                "field_schema": normalized_field_schema,
+                "custom_backend_meta": custom_backend_meta,
+            },
+        ).serialize()
 
-            normalized_field_schema = {}
-            for field_name, field in field_schema.items():
-                # Work on a shallow copy to avoid mutating caller-provided schema
-                field_copy = field.copy()
-                per_sample_shapes = field_copy.get("per_sample_shapes", None)
-                if isinstance(per_sample_shapes, list | tuple):
-                    if len(per_sample_shapes) != len(global_indexes):
-                        raise ValueError(
-                            f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                            f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'; "
-                            f"skipping per_sample_shapes normalization."
-                        )
-                    else:
-                        field_copy["per_sample_shapes"] = {
-                            global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
-                        }
+        thread_future = asyncio.run_coroutine_threadsafe(
+            self._notify_and_wait(request_msg),
+            self._notify_loop,
+        )
+        await asyncio.wrap_future(thread_future)
 
-                normalized_field_schema[field_name] = field_copy
+    async def _notify_and_wait(self, request_msg: list) -> None:
+        """Send a data status notification to the controller and block until ACK is received."""
+        assert self._notify_sock is not None
 
-            # convert per_sample_shapes into dict
-            for field in field_schema.values():
-                per_sample_shapes = field.get("per_sample_shapes", None)
-                if per_sample_shapes:
-                    per_sample_shapes = {global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))}
-                    field["per_sample_shapes"] = per_sample_shapes
-
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                body={
-                    "partition_id": partition_id,
-                    "global_indexes": global_indexes,
-                    "field_schema": normalized_field_schema,
-                    "custom_backend_meta": custom_backend_meta,
-                },
-            ).serialize()
-
-            await sock.send_multipart(request_msg)
+        async with self._notify_lock:
+            await self._notify_sock.send_multipart(request_msg)
             logger.debug(
-                f"[{self.storage_manager_id}]: Send data status update request "
-                f"from storage manager id #{self.storage_manager_id} "
+                f"[{self.storage_manager_id}]: Sent data status update request "
                 f"to controller id #{self.controller_info.id} successfully."
             )
 
@@ -262,7 +293,10 @@ class StorageManager(ABC):
             while not response_received and timeout > 0:
                 try:
                     poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
-                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=poll_interval)
+                    messages = await asyncio.wait_for(
+                        self._notify_sock.recv_multipart(copy=False),
+                        timeout=poll_interval,
+                    )
                     response_msg = ZMQMessage.deserialize(messages)
 
                     if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
@@ -271,32 +305,15 @@ class StorageManager(ABC):
                             f"[{self.storage_manager_id}]: Get data status update ACK response "
                             f"from controller id #{response_msg.sender_id} successfully."
                         )
+                        break
                 except asyncio.TimeoutError:
                     timeout -= poll_interval
-                except Exception as e:
-                    logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
-                    break
 
             if not response_received:
-                logger.error(f"[{self.storage_manager_id}]: Did not receive data status update ACK.")
-
-        except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Error during notify_data_update: {e}")
-            try:
-                error_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ERROR,  # type: ignore[arg-type]
-                    sender_id=self.storage_manager_id,
-                    body={"message": f"Failed to notify: {str(e)}"},
-                ).serialize()
-                await sock.send_multipart(error_msg)
-            except Exception:
-                pass
-        finally:
-            try:
-                if not sock.closed:
-                    sock.close(linger=-1)
-            except Exception:
-                pass
+                raise TimeoutError(
+                    f"[{self.storage_manager_id}]: Timeout waiting for data status update ACK "
+                    f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
+                )
 
     @abstractmethod
     async def put_data(
@@ -344,8 +361,7 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement clear_data")
 
     def close(self) -> None:
-        """Close all ZMQ sockets and context to prevent resource leaks."""
-        # Close handshake socket if it exists
+        """Close all ZMQ sockets/contexts and stop the notify loop."""
         if self.controller_handshake_socket:
             try:
                 if not self.controller_handshake_socket.closed:
@@ -353,8 +369,24 @@ class StorageManager(ABC):
             except Exception as e:
                 logger.error(f"[{self.storage_manager_id}]: Error closing controller_handshake_socket: {str(e)}")
 
-        if self.zmq_context:
-            self.zmq_context.term()
+        if not hasattr(self, "_notify_loop") or not self._notify_loop.is_running():
+            return
+
+        async def _cleanup() -> None:
+            if self._notify_sock and not self._notify_sock.closed:
+                self._notify_sock.close()
+            if self._notify_zmq_ctx:
+                self._notify_zmq_ctx.term()
+
+        future = asyncio.run_coroutine_threadsafe(_cleanup(), self._notify_loop)
+        try:
+            future.result(timeout=5)
+        except Exception as e:
+            logger.error(f"[{self.storage_manager_id}]: Error closing notify ZMQ: {e}")
+
+        self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
+        self._notify_thread.join(timeout=5)
+        logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
