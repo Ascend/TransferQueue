@@ -67,11 +67,11 @@ class StorageManager(ABC):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
-        self.zmq_ctx = zmq.asyncio.Context()
 
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
+        self.zmq_context: zmq.asyncio.Context | None = None
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -109,6 +109,9 @@ class StorageManager(ABC):
                 self.controller_handshake_socket.close(linger=0)
                 self.controller_handshake_socket = None
             sync_zmq_context.term()
+
+            # create async context for data status update
+            self.zmq_context = zmq.asyncio.Context()
 
         except Exception as e:
             logger.error(f"Failed to connect to controller: {e}")
@@ -258,7 +261,7 @@ class StorageManager(ABC):
         """Send a data status notification to the controller and block until ACK is received."""
         identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
         sock = create_zmq_socket(
-            ctx=self.zmq_ctx, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
+            ctx=self.zmq_context, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
         )
         sock.setsockopt(zmq.LINGER, 0)
         sock.connect(self.controller_info.to_addr("request_handle_socket"))
@@ -301,7 +304,11 @@ class StorageManager(ABC):
                     f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
                 )
         finally:
-            sock.close()
+            try:
+                if not sock.closed:
+                    sock.close(linger=-1)
+            except Exception:
+                pass
 
     @abstractmethod
     async def put_data(
@@ -363,7 +370,7 @@ class StorageManager(ABC):
         self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
         self._notify_thread.join(timeout=5)
 
-        self.zmq_ctx.term()
+        self.zmq_context.term()
 
         logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
