@@ -54,6 +54,7 @@ def _run_notify_loop(notify_loop: asyncio.AbstractEventLoop) -> None:
     finally:
         notify_loop.close()
 
+
 LIMIT_THREADS_PER_MANAGER_IN_DRIVER = 8
 LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR = 4
 
@@ -126,8 +127,7 @@ class StorageManager(ABC):
             self._notify_sock.setsockopt(zmq.LINGER, 0)
             self._notify_sock.connect(self.controller_info.to_addr("request_handle_socket"))
             logger.debug(
-                f"[{self.storage_manager_id}]: Notify ZMQ socket connected "
-                f"to controller {self.controller_info.id}."
+                f"[{self.storage_manager_id}]: Notify ZMQ socket connected to controller {self.controller_info.id}."
             )
         except Exception as e:
             logger.critical(f"[{self.storage_manager_id}]: Failed to initialize notify ZMQ: {e}")
