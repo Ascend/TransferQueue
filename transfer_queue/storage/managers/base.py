@@ -74,6 +74,18 @@ class StorageManager(ABC):
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
+        self._notify_zmq_ctx = zmq.asyncio.Context()
+        identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
+        self._notify_sock = create_zmq_socket(
+            ctx=self._notify_zmq_ctx,
+            socket_type=zmq.DEALER,
+            ip=self.controller_info.ip,
+            identity=identity,
+        )
+        self._notify_sock.setsockopt(zmq.LINGER, 0)
+        self._notify_sock.connect(self.controller_info.to_addr("request_handle_socket"))
+
+        self._notify_lock = asyncio.Lock()
         self._notify_loop = asyncio.new_event_loop()
         self._notify_thread = threading.Thread(
             target=_run_notify_loop,
@@ -82,13 +94,6 @@ class StorageManager(ABC):
             name=f"{self.storage_manager_id}-notify_data_status_loop",
         )
         self._notify_thread.start()
-
-        self._notify_zmq_ctx: zmq.asyncio.Context | None = None
-        self._notify_sock: zmq.asyncio.Socket | None = None
-        self._notify_lock = asyncio.Lock()
-        notify_sock_ready = threading.Event()
-        asyncio.run_coroutine_threadsafe(self._init_notify_zmq(notify_sock_ready), self._notify_loop)
-        notify_sock_ready.wait()
 
     def _connect_to_controller(self) -> None:
         """Establish initial connection to the controller via a blocking handshake."""
@@ -112,28 +117,6 @@ class StorageManager(ABC):
                 self.controller_handshake_socket.close(linger=0)
                 self.controller_handshake_socket = None
             sync_zmq_context.term()
-
-    async def _init_notify_zmq(self, notify_sock_ready: threading.Event) -> None:
-        """Create the async ZMQ DEALER socket used for data status notifications."""
-        try:
-            self._notify_zmq_ctx = zmq.asyncio.Context()
-            identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-            self._notify_sock = create_zmq_socket(
-                ctx=self._notify_zmq_ctx,
-                socket_type=zmq.DEALER,
-                ip=self.controller_info.ip,
-                identity=identity,
-            )
-            self._notify_sock.setsockopt(zmq.LINGER, 0)
-            self._notify_sock.connect(self.controller_info.to_addr("request_handle_socket"))
-            logger.debug(
-                f"[{self.storage_manager_id}]: Notify ZMQ socket connected to controller {self.controller_info.id}."
-            )
-        except Exception as e:
-            logger.critical(f"[{self.storage_manager_id}]: Failed to initialize notify ZMQ: {e}")
-            raise
-        finally:
-            notify_sock_ready.set()
 
     def _do_handshake_with_controller(self) -> None:
         """Handshake with controller to establish connection with retransmission mechanism."""
