@@ -213,12 +213,12 @@ pip install TransferQueue
 
 ### Simple Case: Regular Tensor
 <p align="center">
-  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.6.png?raw=true" width="100%">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.8.png?raw=true" width="100%">
 </p>
 
 ### Complex Case: Regular Tensor + NestedTensor + NonTensor
 <p align="center">
-  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.6.png?raw=true" width="100%">
+  <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.8.png?raw=true" width="100%">
 </p>
 
 > Note: The openYuanrong benchmark uses only a single NPU, so it doesn't reflect multi-NPU scalability. Additionally, openYuanrong was tested on a different hardware setup than the other backends.
