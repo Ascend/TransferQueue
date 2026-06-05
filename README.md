@@ -211,7 +211,7 @@ pip install TransferQueue
 
 <h2 id="performance">📊 Performance</h2>
 
-### Simple Case: Regular Tensor Only
+### Simple Case: Regular Tensor
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_simple_0.1.6.png?raw=true" width="100%">
 </p>
@@ -221,11 +221,12 @@ pip install TransferQueue
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/performance_complex_0.1.6.png?raw=true" width="100%">
 </p>
 
-> Note: Optimization for MooncakeStore and other backends are still in process. Warmly welcome contributions from the community!
+> Note: The openYuanrong benchmark uses only a single NPU, so it doesn't reflect multi-NPU scalability. Additionally, openYuanrong was tested on a different hardware setup than the other backends.
 
-For detailed performance benchmarks, please refer to [this blog](https://www.yuque.com/haomingzi-lfse7/lhp4el/tml8ke0zkgn6roey?singleDoc#).
+For detailed performance benchmarks, please refer to [the full benchmark report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mywsxovevynra42u?singleDoc#).
 
-We also provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mt0vedqy7c337pgg?singleDoc#) that demonstrates more than **8192 concurrent clients writing 2 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss.
+### Stress Test
+Beyond throughput, we also validated stability under high concurrency. We provide a [stress test report](https://www.yuque.com/haomingzi-lfse7/lhp4el/mt0vedqy7c337pgg?singleDoc#) that demonstrates more than **8192 concurrent clients writing 2 TB of data** into TransferQueue across 4 nodes. The system remains stable without any crashes or data loss.
 
 <h2 id="customize"> 🛠️ Customize TransferQueue</h2>
 
