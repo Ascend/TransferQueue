@@ -21,7 +21,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from functools import wraps
 from operator import itemgetter
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, Optional
 from uuid import uuid4
 
 import torch
@@ -329,10 +329,24 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             raise
 
         partition_id = metadata.partition_ids[0]
+
+        # Forward any user-defined custom_meta carried on the BatchMeta so it lands
+        # atomically with the readiness notification (avoids the put/set_custom_meta
+        # race for streaming consumers). Only sent when at least one sample has it.
+        user_custom_meta_list = metadata.get_all_custom_meta()
+        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None
+        if any(user_custom_meta_list):
+            user_custom_meta = {
+                metadata.global_indexes[i]: user_custom_meta_list[i]
+                for i in range(len(user_custom_meta_list))
+                if user_custom_meta_list[i]
+            }
+
         await self.notify_data_update(
             partition_id,
             metadata.global_indexes,
             field_schema,
+            user_custom_meta=user_custom_meta,
         )
 
     @dynamic_storage_manager_socket(socket_name="put_get_socket", timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT)

@@ -40,6 +40,7 @@ from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
 from .sampler.rank_aware_sampler import RankAwareSampler
 from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
+from .sampler.streaming_token_budget_sampler import StreamingTokenBudgetSampler
 
 __all__ = (
     [
@@ -78,6 +79,7 @@ __all__ = (
         "SequentialSampler",
         "RankAwareSampler",
         "SeqlenBalancedSampler",
+        "StreamingTokenBudgetSampler",
     ]
 )
 

@@ -197,6 +197,7 @@ class TransferQueueStorageManager(ABC):
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -206,6 +207,8 @@ class TransferQueueStorageManager(ABC):
             global_indexes: Data update related global_indexes.
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}.
             custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
+            user_custom_meta: User-defined per-sample custom_meta in {global_index: {...}} format. When provided,
+                the controller writes it before marking samples ready, so it lands atomically with readiness.
         """
 
         if not self.controller_info:
@@ -253,6 +256,7 @@ class TransferQueueStorageManager(ABC):
                     "global_indexes": global_indexes,
                     "field_schema": normalized_field_schema,
                     "custom_backend_meta": custom_backend_meta,
+                    "user_custom_meta": user_custom_meta,
                 },
             ).serialize()
 
@@ -608,11 +612,24 @@ class KVStorageManager(TransferQueueStorageManager):
         # Get current data partition id
         partition_id = metadata.partition_ids[0]
 
+        # Forward any user-defined custom_meta carried on the BatchMeta so it lands
+        # atomically with the readiness notification (avoids the put/set_custom_meta
+        # race for streaming consumers). Only sent when at least one sample has it.
+        user_custom_meta_list = metadata.get_all_custom_meta()
+        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None
+        if any(user_custom_meta_list):
+            user_custom_meta = {
+                metadata.global_indexes[i]: user_custom_meta_list[i]
+                for i in range(len(user_custom_meta_list))
+                if user_custom_meta_list[i]
+            }
+
         await self.notify_data_update(
             partition_id,
             metadata.global_indexes,
             field_schema,
             per_field_custom_backend_meta,
+            user_custom_meta,
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:

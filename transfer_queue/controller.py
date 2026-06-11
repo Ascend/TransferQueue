@@ -58,7 +58,7 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
-TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
+TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = float(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 0.5))
 
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
@@ -506,6 +506,7 @@ class DataPartitionStatus:
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -521,6 +522,11 @@ class DataPartitionStatus:
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional per-sample per-field
                 custom metadata provided by storage backend
+            user_custom_meta: Optional user-defined per-sample custom_meta in
+                {global_index: {...}} format. When provided, it is written
+                BEFORE production_status is flipped to ready, so any sample a
+                sampler observes as ready is guaranteed to carry its custom_meta
+                (eliminates the put/set_custom_meta race for streaming consumers).
 
         Returns:
             True if update was successful, False on error
@@ -547,6 +553,11 @@ class DataPartitionStatus:
                 required_fields = len(self.field_name_mapping)
                 with self.data_status_lock:
                     self.ensure_fields_capacity(required_fields)
+
+            # Write user custom_meta BEFORE marking samples ready, so a sampler
+            # that observes production_status==1 always sees the custom_meta too.
+            if user_custom_meta:
+                self.set_custom_meta(user_custom_meta)
 
             with self.data_status_lock:
                 # Update production status
@@ -1128,6 +1139,7 @@ class TransferQueueController:
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        user_custom_meta: Optional[dict[int, dict[str, Any]]] = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -1138,6 +1150,8 @@ class TransferQueueController:
             global_indexes: List of sample indices to update
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional custom backend metadata
+            user_custom_meta: Optional user-defined per-sample custom_meta in
+                {global_index: {...}} format, written atomically before ready.
 
         Returns:
             True if update was successful, False otherwise
@@ -1148,7 +1162,9 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, field_schema, custom_backend_meta)
+        success = partition.update_production_status(
+            global_indexes, field_names, field_schema, custom_backend_meta, user_custom_meta
+        )
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1246,6 +1262,7 @@ class TransferQueueController:
         task_name: str | None = None,
         batch_size: int | None = None,
         sampling_config: Optional[dict[str, Any]] = None,
+        token_budget: int | None = None,
         *args,
         **kwargs,
     ) -> BatchMeta:
@@ -1261,7 +1278,15 @@ class TransferQueueController:
                 - mode="force_fetch": Get metadata for unconsumed samples without sampling
                                       (excludes already consumed samples)
             task_name: Name of the consumer task (required for fetch modes)
-            batch_size: Number of samples to retrieve
+            batch_size: Number of samples to retrieve (sample-count fetch mode).
+                Mutually exclusive with ``token_budget``.
+            sampling_config: Sampler-specific kwargs (e.g. dp_rank, dp_size).
+            token_budget: If provided, switch to token-budget fetch mode. The
+                configured sampler (must be a streaming token-aware sampler such
+                as :class:`StreamingTokenBudgetSampler`) returns a slice whose
+                accumulated ``total_lengths`` reaches ``token_budget``. The
+                sampler decides readiness, so the controller skips the
+                "wait until N ready" loop and asks the sampler directly.
             *args: Additional positional arguments
             **kwargs: Additional keyword arguments
 
@@ -1304,63 +1329,151 @@ class TransferQueueController:
             assert task_name is not None
             # Find ready samples within current data partition and package into BatchMeta when reading
 
-            if batch_size is None:
-                raise ValueError("must provide batch_size in fetch mode")
+            if token_budget is not None:
+                # Token-budget fetch path: the sampler is stateful (streaming) and
+                # decides readiness internally, so we skip the "wait for N ready"
+                # gate and instead poll the sampler with the current ready pool.
+                # If the sampler returns empty AND the partition has no unconsumed
+                # samples left, the rollout for this DP is done — return empty meta.
+                if batch_size is not None:
+                    raise ValueError("token_budget and batch_size are mutually exclusive")
 
-            start_time = time.time()
-            while True:
-                # ready_for_consume_indexes: samples where all required fields are produced
-                # (production status is ready) and not yet consumed
-                ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
+                sampling_config = sampling_config or {}
 
-                if len(ready_for_consume_indexes) < batch_size:
-                    if self.polling_mode:
-                        # Return cached result if available
-                        if self.sampler.has_cached_result(partition_id, task_name, sampling_config):
-                            break
-                        else:
-                            logger.debug(
-                                f"[{self.controller_id}]: Not enough data for task {task_name} in "
-                                f"partition {partition_id}. Required: {batch_size}, "
-                                f"Available: {len(ready_for_consume_indexes)}."
-                                f" Returning None due to polling mode."
-                            )
-                            return BatchMeta.empty()
+                # Polling semantics: return empty meta quickly if the sampler
+                # can't produce data right now.  The request thread is single-
+                # threaded for all GET_META; holding it here would deadlock
+                # other consumers (e.g. reference / advantages) that need to
+                # push data into TQ before this actor can drain anything.
+                # The actor-side drain loop uses check_consumption_status to
+                # know when the partition is truly done.
+                start_time = time.time()
+                while True:
+                    partition = self._get_partition(partition_id)
+                    if partition is None:
+                        # Producer hasn't created this partition yet
+                        # (race: consumer called before any insert). Wait.
+                        batch_global_indexes, consumed_indexes = [], []
                     else:
-                        logger.warning(
-                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
+                        ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
+
+                        # Both task_name and partition_id arrive via the
+                        # sampling_config splat — the relax client composes them
+                        # into the sampling_config dict before calling get_meta
+                        # (see relax/utils/data/stream_dataloader.py
+                        # get_data_from_transfer_queue: config = {**sampling_config,
+                        # "batch_index": batch_index, "partition_id": partition_id}).
+                        # Passing them again here causes a "multiple values for
+                        # keyword argument" TypeError.
+                        # production_done: every pre-allocated sample of this
+                        # partition has been produced for the requested fields,
+                        # so no more data is coming.  The streaming sampler uses
+                        # this to trigger its end-of-stream tail flush (dump all
+                        # remaining ready samples even if they can't form a full
+                        # balance unit), preventing a tail livelock under DP>1.
+                        production_done = False
+                        try:
+                            _, prod = partition.get_production_status_for_fields(data_fields, mask=True)
+                            if prod is not None and prod.numel() > 0:
+                                production_done = bool((prod == 1).all().item())
+                        except Exception:
+                            production_done = False
+
+                        batch_global_indexes, consumed_indexes = self.sampler(
+                            ready_for_consume_indexes,
+                            0,  # batch_size unused in token-budget mode
+                            partition=partition,
+                            token_budget=token_budget,
+                            production_done=production_done,
+                            **sampling_config,
+                            **kwargs,
                         )
-                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+
+                    if batch_global_indexes:
+                        break
+
+                    # Sampler returned nothing. Two possibilities:
+                    # 1) Partition still has unconsumed samples but not enough for a
+                    #    balance round → wait for more production.
+                    # 2) Partition is fully consumed (production complete AND every
+                    #    allocated sample marked consumed) → signal end-of-stream.
+                    if partition is not None:
+                        _, cons = partition.get_consumption_status(task_name, mask=True)
+                        if (
+                            partition.production_status is not None
+                            and cons.numel() > 0
+                            and bool((cons == 1).all().item())
+                        ):
+                            # True end-of-stream: everything produced has been
+                            # consumed.  Signal drain completion.
+                            return BatchMeta.empty()
+
+                    # Bounded wait: short backoff inside the handler so other
+                    # consumers' GET_META requests aren't starved.  When the
+                    # wait exceeds TQ_CONTROLLER_GET_METADATA_TIMEOUT, return
+                    # empty meta and let the actor-side drain loop retry.
                     if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
-                        raise TimeoutError(
-                            f"Timeout while waiting for sufficient data for task {task_name}. "
-                            f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
-                        )
-                else:
-                    break
+                        return BatchMeta.empty()
+                    time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+            else:
+                if batch_size is None:
+                    raise ValueError("must provide batch_size or token_budget in fetch mode")
 
-            batch_global_indexes, consumed_indexes = self.sampler(
-                ready_for_consume_indexes,
-                batch_size,
-                partition=self._get_partition(partition_id),
-                **(sampling_config or {}),
-                **kwargs,
-            )
+                start_time = time.time()
+                while True:
+                    # ready_for_consume_indexes: samples where all required fields are produced
+                    # (production status is ready) and not yet consumed
+                    ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
 
-            # Check if we got valid results from the sampler.
-            # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
-            # batches per DP rank, so we only check for empty results.
-            if len(batch_global_indexes) == 0:
-                if self.polling_mode:
-                    return BatchMeta.empty()
-                raise RuntimeError(
-                    f"Sampler returned no samples. Please check the sampler logic. "
-                    f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
-                    f"after sampling: {len(batch_global_indexes)}"
+                    if len(ready_for_consume_indexes) < batch_size:
+                        if self.polling_mode:
+                            # Return cached result if available
+                            if self.sampler.has_cached_result(partition_id, task_name, sampling_config):
+                                break
+                            else:
+                                logger.debug(
+                                    f"[{self.controller_id}]: Not enough data for task {task_name} in "
+                                    f"partition {partition_id}. Required: {batch_size}, "
+                                    f"Available: {len(ready_for_consume_indexes)}."
+                                    f" Returning None due to polling mode."
+                                )
+                                return BatchMeta.empty()
+                        else:
+                            logger.warning(
+                                f"[{self.controller_id}]: Insufficient data for task {task_name}. "
+                                f"Required: {batch_size} "
+                                f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                                f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                                f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
+                            )
+                            time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
+                        if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+                            raise TimeoutError(
+                                f"Timeout while waiting for sufficient data for task {task_name}. "
+                                f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
+                            )
+                    else:
+                        break
+
+                batch_global_indexes, consumed_indexes = self.sampler(
+                    ready_for_consume_indexes,
+                    batch_size,
+                    partition=self._get_partition(partition_id),
+                    **(sampling_config or {}),
+                    **kwargs,
                 )
+
+                # Check if we got valid results from the sampler.
+                # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
+                # batches per DP rank, so we only check for empty results.
+                if len(batch_global_indexes) == 0:
+                    if self.polling_mode:
+                        return BatchMeta.empty()
+                    raise RuntimeError(
+                        f"Sampler returned no samples. Please check the sampler logic. "
+                        f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
+                        f"after sampling: {len(batch_global_indexes)}"
+                    )
 
             # Mark samples as consumed if in fetch mode
             if consumed_indexes:
@@ -1835,11 +1948,12 @@ class TransferQueueController:
 
                     metadata = self.get_metadata(
                         data_fields=params["data_fields"],
-                        batch_size=params["batch_size"],
+                        batch_size=params.get("batch_size"),
                         partition_id=params["partition_id"],
                         mode=params.get("mode", "fetch"),
                         task_name=params.get("task_name"),
                         sampling_config=params.get("sampling_config", {}),
+                        token_budget=params.get("token_budget"),
                     )
 
                     response_msg = ZMQMessage.create(
@@ -2083,6 +2197,7 @@ class TransferQueueController:
                         global_indexes=message_data.get("global_indexes", []),
                         field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
+                        user_custom_meta=message_data.get("user_custom_meta", None),
                     )
 
                     if success:
