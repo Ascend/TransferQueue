@@ -34,6 +34,8 @@ from .interface import (
     kv_clear,
     kv_list,
     kv_put,
+    load_checkpoint,
+    save_checkpoint,
 )
 from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
@@ -61,6 +63,11 @@ __all__ = (
         "async_kv_list",
         "async_kv_clear",
         "KVBatchMeta",
+    ]
+    + [
+        # Checkpoint Interface
+        "save_checkpoint",
+        "load_checkpoint",
     ]
     + [
         # High-Level StreamingDataLoader Interface

@@ -19,6 +19,7 @@ import warnings
 from collections import defaultdict
 from collections.abc import Mapping
 from operator import itemgetter
+from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 import torch
@@ -39,6 +40,9 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
+
+_SU_SUBDIR = "storage_units"
+_SU_INFO_FILE = "su_info.json"
 
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
@@ -523,6 +527,121 @@ class AsyncSimpleStorageManager(StorageManager):
             Dictionary mapping storage unit IDs to their ZMQServerInfo.
         """
         return self.storage_unit_infos
+
+    @with_storage_unit_socket
+    async def _save_single_storage_unit(
+        self,
+        path: str,
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ):
+        try:
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={"path": path},
+            )
+            await socket.send_multipart(request_msg.serialize(), copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+            if (
+                response_msg.request_type != ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE
+                or not response_msg.body.get("success")
+            ):
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} failed to save checkpoint to {path}: "
+                    f"{response_msg.body.get('message', 'unknown error')}"
+                )
+        except Exception as e:
+            logger.error(f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}")
+            raise
+
+    @with_storage_unit_socket
+    async def _load_single_storage_unit(
+        self,
+        path: str,
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ):
+        try:
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={"path": path},
+            )
+            await socket.send_multipart(request_msg.serialize(), copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+            if (
+                response_msg.request_type != ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
+                or not response_msg.body.get("success")
+            ):
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} failed to load checkpoint from {path}: "
+                    f"{response_msg.body.get('message', 'unknown error')}"
+                )
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
+            )
+            raise
+
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
+
+        Writes a storage_units/su_info.json manifest for load_checkpoint to use.
+        Validates current SU count matches the manifest on load.
+        """
+        import json
+
+        su_dir = Path(checkpoint_dir) / _SU_SUBDIR
+        su_dir.mkdir(parents=True, exist_ok=True)
+
+        su_ids = list(self.storage_unit_infos.keys())
+        paths = [str(su_dir / f"su_{pos}_{su_id}.pkl") for pos, su_id in enumerate(su_ids)]
+        tasks = [
+            self._save_single_storage_unit(path, target_storage_unit=su_id)
+            for su_id, path in zip(su_ids, paths, strict=False)
+        ]
+        await asyncio.gather(*tasks)
+
+        su_info_list = [{"position": pos, "storage_unit_id": su_id} for pos, su_id in enumerate(su_ids)]
+        with open(su_dir / _SU_INFO_FILE, "w") as f:
+            json.dump(su_info_list, f)
+
+        logger.info(f"[{self.storage_manager_id}]: saved {len(su_ids)} storage units to {su_dir}")
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        """Restore all storage units from the storage_units/ subdirectory of checkpoint_dir."""
+        import json
+
+        su_dir = Path(checkpoint_dir) / _SU_SUBDIR
+        su_info_path = su_dir / _SU_INFO_FILE
+        if not su_info_path.exists():
+            raise FileNotFoundError(f"Storage unit manifest not found: {su_info_path}")
+
+        with open(su_info_path) as f:
+            su_info_list = json.load(f)
+
+        su_ids = list(self.storage_unit_infos.keys())
+        if len(su_ids) != len(su_info_list):
+            raise ValueError(
+                f"Storage unit count mismatch: checkpoint has {len(su_info_list)}, current system has {len(su_ids)}."
+            )
+
+        entries = sorted(su_info_list, key=lambda e: e["position"])
+        tasks = [
+            self._load_single_storage_unit(
+                str(su_dir / f"su_{entry['position']}_{entry['storage_unit_id']}.pkl"),
+                target_storage_unit=su_ids[entry["position"]],
+            )
+            for entry in entries
+        ]
+        await asyncio.gather(*tasks)
+
+        logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""

@@ -1061,6 +1061,75 @@ class AsyncTransferQueueClient:
         except Exception as e:
             logger.warning(f"Error closing storage manager: {e}")
 
+    # ==================== Checkpoint API ====================
+    @with_controller_socket
+    async def async_save_controller_checkpoint(
+        self,
+        path: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Send SAVE_CHECKPOINT to controller and wait for response."""
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={"path": path},
+        )
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(response_serialized)
+        if response_msg.request_type != ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE:
+            raise RuntimeError(
+                f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
+                f"from controller during checkpoint dump"
+            )
+        if not response_msg.body.get("success"):
+            raise RuntimeError(f"[{self.client_id}]: Controller failed to dump checkpoint to {path}")
+
+    @with_controller_socket
+    async def async_load_controller_checkpoint(
+        self,
+        path: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Send LOAD_CHECKPOINT to controller and wait for response."""
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={"path": path},
+        )
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(response_serialized)
+        if response_msg.request_type != ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE:
+            raise RuntimeError(
+                f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
+                f"from controller during checkpoint restore"
+            )
+        if not response_msg.body.get("success"):
+            raise RuntimeError(f"[{self.client_id}]: Controller failed to restore checkpoint from {path}")
+
+    async def async_save_storage_checkpoint(self, checkpoint_dir: str) -> None:
+        """Save storage state into checkpoint_dir via StorageManager."""
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before checkpoint operations."
+            )
+        await self.storage_manager.save_checkpoint(checkpoint_dir)
+
+    async def async_load_storage_checkpoint(self, checkpoint_dir: str) -> None:
+        """Restore storage state from checkpoint_dir via StorageManager."""
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before checkpoint operations."
+            )
+        await self.storage_manager.load_checkpoint(checkpoint_dir)
+
 
 class TransferQueueClient(AsyncTransferQueueClient):
     """Synchronous client wrapper for TransferQueue.
@@ -1129,6 +1198,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
+        self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
+        self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
+        self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
+        self._load_storage_checkpoint = _make_sync(self.async_load_storage_checkpoint)
 
     # ==================== Basic API ====================
     def get_meta(
@@ -1560,6 +1633,23 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._kv_list(partition_id=partition_id)
+
+    # ==================== Checkpoint API ====================
+    def save_controller_checkpoint(self, path: str) -> None:
+        """Synchronously dump controller state to a file via ZMQ RPC."""
+        return self._save_controller_checkpoint(path)
+
+    def load_controller_checkpoint(self, path: str) -> None:
+        """Synchronously restore controller state from a file via ZMQ RPC."""
+        return self._load_controller_checkpoint(path)
+
+    def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
+        """Synchronously save storage state into checkpoint_dir."""
+        return self._save_storage_checkpoint(checkpoint_dir)
+
+    def load_storage_checkpoint(self, checkpoint_dir: str) -> None:
+        """Synchronously restore storage state from checkpoint_dir."""
+        return self._load_storage_checkpoint(checkpoint_dir)
 
     def close(self) -> None:
         """Close the client and cleanup resources including event loop and thread."""

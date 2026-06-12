@@ -352,6 +352,25 @@ class StorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+        """Save storage state into checkpoint_dir.
+
+        The implementation is backend-specific: each backend decides what to
+        persist and how to lay out files within checkpoint_dir.
+
+        Raises:
+            NotImplementedError: If this storage backend does not support checkpoint.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support checkpoint")
+
+    async def load_checkpoint(self, checkpoint_dir: str) -> None:
+        """Restore storage state from checkpoint_dir.
+
+        Raises:
+            NotImplementedError: If this storage backend does not support checkpoint.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support checkpoint")
+
     def close(self) -> None:
         """Close all ZMQ sockets/contexts and stop the notify loop."""
 
