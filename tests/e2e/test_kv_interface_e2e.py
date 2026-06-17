@@ -946,6 +946,52 @@ class TestKVClearE2E:
 
         tq_api.kv_clear(keys=keys[2:], partition_id=partition_id)
 
+    def test_kv_clear_idempotent(self, controller, tq_api):
+        """Test kv_clear is idempotent for non-existent keys and partitions."""
+        partition_id = "test_partition"
+        keys = ["idempotent_0", "idempotent_1", "idempotent_2", "idempotent_3"]
+
+        # Batch put 4 keys
+        fields = TensorDict(
+            {"data": torch.tensor([[0], [1], [2], [3]])},
+            batch_size=4,
+        )
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}, {}, {}])
+
+        # Clear non-existent keys should not raise and should not affect existing keys
+        tq_api.kv_clear(keys=["nonexistent_key_1", "nonexistent_key_2"], partition_id=partition_id)
+        partition_info = tq_api.kv_list(partition_id=partition_id)
+        assert len(partition_info[partition_id]) == 4
+        for key in keys:
+            assert key in partition_info[partition_id]
+
+        # Clear mix of existent and non-existent keys should only remove existent ones
+        tq_api.kv_clear(keys=[keys[0], "nonexistent_key_3"], partition_id=partition_id)
+        partition_info = tq_api.kv_list(partition_id=partition_id)
+        assert len(partition_info[partition_id]) == 3
+        assert keys[0] not in partition_info[partition_id]
+        assert keys[1] in partition_info[partition_id]
+        assert keys[2] in partition_info[partition_id]
+        assert keys[3] in partition_info[partition_id]
+
+        # Clear already-cleared key should be idempotent
+        tq_api.kv_clear(keys=[keys[0], "nonexistent_key_4"], partition_id=partition_id)
+        partition_info = tq_api.kv_list(partition_id=partition_id)
+        assert len(partition_info[partition_id]) == 3
+        assert keys[0] not in partition_info[partition_id]
+
+        # Verify via controller - only keys[0] should be removed from keys_mapping
+        partition = get_controller_partition(controller, partition_id)
+        assert keys[0] not in partition.keys_mapping
+        for key in keys[1:]:
+            assert key in partition.keys_mapping
+
+        # Clear non-existent partition should not raise
+        tq_api.kv_clear(keys=["any_key"], partition_id="nonexistent_partition")
+
+        # Clean up
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
 
 class TestKVE2ECornerCases:
     """End-to-end tests for corner cases."""
