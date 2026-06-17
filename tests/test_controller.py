@@ -591,6 +591,98 @@ class TestTransferQueueController:
 
         print("✓ Clear meta correct")
 
+    def test_controller_clear_meta_idempotent(self, ray_setup):
+        """Test clear_meta is idempotent when clearing non-existent data."""
+        gbs = 4
+        num_n_samples = 2
+        partition_id = "test_clear_meta_idempotent"
+        other_partition_id = "test_clear_meta_idempotent_other"
+
+        tq_controller = TransferQueueController.remote()
+
+        # Create two partitions
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+        other_metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=other_partition_id,
+                mode="insert",
+            )
+        )
+
+        # Update production status for both partitions
+        field_schema = {
+            "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
+            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+        }
+        ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+        ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=other_partition_id,
+                global_indexes=other_metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+
+        # Clear non-existent partition should not raise
+        ray.get(
+            tq_controller.clear_meta.remote(
+                global_indexes=[0, 1],
+                partition_ids=["non_existent_partition", "non_existent_partition"],
+            )
+        )
+
+        partition_before = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        initial_global_indexes = set(partition_before.global_indexes)
+
+        # Clear mix of existent and non-existent global indexes
+        ray.get(
+            tq_controller.clear_meta.remote(
+                global_indexes=[0, 1, 100, 101],
+                partition_ids=[partition_id, partition_id, partition_id, partition_id],
+            )
+        )
+        partition_after = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        # Only existing indexes 0 and 1 should be removed; 100 and 101 are ignored
+        assert set(partition_after.global_indexes) == initial_global_indexes - {0, 1}
+
+        # Clearing already-cleared indexes should be idempotent
+        ray.get(
+            tq_controller.clear_meta.remote(
+                global_indexes=[0, 1, 100],
+                partition_ids=[partition_id, partition_id, partition_id],
+            )
+        )
+        partition_after = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert set(partition_after.global_indexes) == initial_global_indexes - {0, 1}
+
+        # Clearing across multiple partitions where one does not exist should still clear the other
+        ray.get(
+            tq_controller.clear_meta.remote(
+                global_indexes=[2, 0],
+                partition_ids=[other_partition_id, "non_existent_partition"],
+            )
+        )
+        other_partition_after = ray.get(tq_controller.get_partition_snapshot.remote(other_partition_id))
+        assert 2 not in other_partition_after.global_indexes
+
+        print("✓ Clear meta idempotent correct")
+
 
 class TestTransferQueueControllerCustomMeta:
     """Integration tests for TransferQueueController custom_meta and custom_backend_meta methods.
@@ -807,8 +899,34 @@ class TestTransferQueueControllerKvInterface:
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
+    def test_controller_kv_retrieve_meta_partial_keys_without_create(self, ray_setup):
+        """Test kv_retrieve_meta filters out non-existent keys without create."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "kv_partial_test"
+
+        # Create some keys first
+        existing_keys = ["existing_key_1", "existing_key_2", "existing_key_3"]
+        ray.get(tq_controller.kv_retrieve_meta.remote(keys=existing_keys, partition_id=partition_id, create=True))
+
+        # Retrieve a mix of existing and non-existing keys
+        keys_to_retrieve = ["existing_key_1", "nonexistent_key", "existing_key_3", "another_missing_key"]
+        batch_meta = ray.get(
+            tq_controller.kv_retrieve_meta.remote(keys=keys_to_retrieve, partition_id=partition_id, create=False)
+        )
+
+        # Only existing keys should be returned
+        assert batch_meta.size == 2
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        retrieved_keys = {partition.revert_keys_mapping[idx] for idx in batch_meta.global_indexes}
+        assert retrieved_keys == {"existing_key_1", "existing_key_3"}
+
+        print("✓ kv_retrieve_meta filters out non-existent keys without create")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+
     def test_controller_kv_retrieve_meta_non_existent_without_create(self, ray_setup):
-        """Test kv_retrieve_meta raises error for non-existent keys without create."""
+        """Test kv_retrieve_meta returns empty BatchMeta for non-existent keys without create."""
         tq_controller = TransferQueueController.remote()
         partition_id = "kv_nonexistent_test"
 
@@ -821,13 +939,13 @@ class TestTransferQueueControllerKvInterface:
         )
         assert batch_meta.size == 0
 
-        print("✓ kv_retrieve_meta return an empty BatchMeta for non-existent keys without create")
+        print("✓ kv_retrieve_meta returns an empty BatchMeta for non-existent keys without create")
 
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
     def test_controller_kv_retrieve_meta_empty_partition_without_create(self, ray_setup):
-        """Test kv_retrieve_meta raises error for non-existent partition without create."""
+        """Test kv_retrieve_meta returns empty BatchMeta for non-existent partition without create."""
         tq_controller = TransferQueueController.remote()
         partition_id = "nonexistent_partition"
 
@@ -836,7 +954,7 @@ class TestTransferQueueControllerKvInterface:
         )
         assert batch_meta.size == 0
 
-        print("✓ kv_retrieve_meta return an empty BatchMeta for non-existent partition_id without create")
+        print("✓ kv_retrieve_meta returns an empty BatchMeta for non-existent partition_id without create")
 
     def test_controller_kv_retrieve_meta_with_production_status(self, ray_setup):
         """Test kv_retrieve_meta works with production status update."""

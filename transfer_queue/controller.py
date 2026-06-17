@@ -1463,11 +1463,13 @@ class TransferQueueController:
             clear_consumption: Whether to also clear consumption status
         """
 
-        logger.debug(f"[{self.controller_id}]: clearing metadata in partition {partition_id}")
+        logger.debug(f"[{self.controller_id}]: Clearing metadata in partition {partition_id}.")
 
         partition = self._get_partition(partition_id)
         if not partition:
-            logger.warning(f"Try to clear an non-existent partition {partition_id}!")
+            logger.warning(
+                f"[{self.controller_id}]: Trying to clear a non-existent partition {partition_id}. No action taken."
+            )
             return
 
         global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
@@ -1490,7 +1492,10 @@ class TransferQueueController:
         logger.debug(f"[{self.controller_id}]: Resetting consumption for partition {partition_id}, task={task_name}")
         partition = self._get_partition(partition_id)
         if not partition:
-            logger.warning(f"Try to reset consumption of an non-existent partition {partition_id}!")
+            logger.warning(
+                f"[{self.controller_id}]: Trying to reset consumption of a non-existent partition {partition_id}. "
+                f"No action taken."
+            )
             return
         partition.reset_consumption(task_name)
 
@@ -1529,23 +1534,27 @@ class TransferQueueController:
             partition = self._get_partition(partition_id)
             if not partition:
                 logger.info(
-                    f"[{self.controller_id}]: Try to clear data in non-exist partition {partition_id}. "
-                    f"No operation is executed."
+                    f"[{self.controller_id}]: Trying to clear data in a non-existent partition {partition_id}. "
+                    f"Skipping operation for this partition."
                 )
-                return
+                continue
 
             global_indexes_to_clear = [idx for _, idx in group]
-            non_exist_global_indexes = set(global_indexes_to_clear) - partition.global_indexes
-            if len(non_exist_global_indexes) > 0:
+            existing_global_indexes = partition.global_indexes
+            non_existent_global_indexes = set(global_indexes_to_clear) - existing_global_indexes
+            if non_existent_global_indexes:
                 logger.info(
-                    f"[{self.controller_id}]: Some global_indexes to clear do not exist in partition {partition_id}. "
-                    f"Non-exist global_indexes: {non_exist_global_indexes}"
+                    f"[{self.controller_id}]: Some global_indexes to be cleared do not exist in "
+                    f"partition {partition_id}: {non_existent_global_indexes}. They will be ignored."
                 )
 
-            global_indexes_to_clear = list(set(global_indexes_to_clear) - non_exist_global_indexes)
-            if len(global_indexes_to_clear) == 0:
-                logger.info("[{self.controller_id}]: No global indexes to clear. No operation is executed.")
-                return
+            global_indexes_to_clear = list(set(global_indexes_to_clear) & existing_global_indexes)
+            if not global_indexes_to_clear:
+                logger.info(
+                    f"[{self.controller_id}]: No existing global indexes to clear in partition {partition_id}. "
+                    f"Skipping operation for this partition."
+                )
+                continue
 
             # Clear data from partition
             partition.clear_data(global_indexes_to_clear, clear_consumption)
@@ -1561,6 +1570,7 @@ class TransferQueueController:
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
+        For non-existing keys, we simply emit them in returned BatchMeta.
 
         Args:
             keys: List of keys to retrieve from the controller
@@ -1577,7 +1587,9 @@ class TransferQueueController:
         partition = self._get_partition(partition_id)
         if partition is None:
             if not create:
-                logger.warning(f"Partition {partition_id} not found!")
+                logger.warning(
+                    f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta."
+                )
                 return BatchMeta.empty()
 
             self.create_partition(partition_id)
@@ -1590,8 +1602,8 @@ class TransferQueueController:
         if len(none_indexes) > 0:
             if not create:
                 logger.warning(
-                    f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}! "
-                    f"The size of retrieved BatchMeta will be smaller than len(keys)."
+                    f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}. "
+                    f"They will be excluded from the retrieved BatchMeta."
                 )
             else:
                 # create non-exist keys

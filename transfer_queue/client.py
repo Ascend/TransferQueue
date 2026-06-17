@@ -436,7 +436,10 @@ class AsyncTransferQueueClient:
             metadata = await self._get_partition_meta(partition_id)
 
             if not metadata:
-                logger.warning(f"Try to clear an non-exist partition {partition_id}. No action will be taken.")
+                logger.warning(
+                    f"[{self.client_id}]: Trying to clear a non-existent partition {partition_id}. "
+                    f"No action will be taken."
+                )
                 return
 
             # Clear the controller metadata
