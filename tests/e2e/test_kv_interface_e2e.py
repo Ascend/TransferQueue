@@ -946,7 +946,31 @@ class TestKVClearE2E:
 
         tq_api.kv_clear(keys=keys[2:], partition_id=partition_id)
 
-    def test_kv_clear_idempotent(self, controller, tq_api):
+    def test_kv_clear_does_not_leak_reused_index_across_partitions(self, controller, tq_api):
+        """Clearing a key in one partition must not make reused indexes visible there again."""
+        field_name = "x"
+        p1 = "clear_reuse_partition_1"
+        p2 = "clear_reuse_partition_2"
+
+        tq_api.kv_put(key="a", partition_id=p1, fields={field_name: torch.tensor([1])})
+        tq_api.kv_clear(keys="a", partition_id=p1)
+
+        tq_api.kv_put(key="b", partition_id=p2, fields={field_name: torch.tensor([2])})
+
+        leaked_meta = tq.get_client().get_meta(
+            data_fields=[field_name],
+            batch_size=1,
+            partition_id=p1,
+            mode="fetch",
+            task_name="clear_reuse_after_other_partition_put",
+        )
+
+        assert leaked_meta.size == 0
+        assert leaked_meta.global_indexes == []
+        assert not leaked_meta.is_ready
+
+
+def test_kv_clear_idempotent(self, controller, tq_api):
         """Test kv_clear is idempotent for non-existent keys and partitions."""
         partition_id = "test_partition"
         keys = ["idempotent_0", "idempotent_1", "idempotent_2", "idempotent_3"]
