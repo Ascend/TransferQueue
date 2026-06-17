@@ -2032,21 +2032,21 @@ class TransferQueueController:
                         body={"partition_info": partition_info, "message": message},
                     )
 
-            elif request_msg.request_type == ZMQRequestType.SAVE_CHECKPOINT:
+            elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
                 path = request_msg.body["path"]
                 success = self.save_checkpoint(path)
                 response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.SAVE_CHECKPOINT_RESPONSE,
+                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
                     sender_id=self.controller_id,
                     receiver_id=request_msg.sender_id,
                     body={"success": success},
                 )
 
-            elif request_msg.request_type == ZMQRequestType.LOAD_CHECKPOINT:
+            elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
                 path = request_msg.body["path"]
                 success = self.load_checkpoint(path)
                 response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.LOAD_CHECKPOINT_RESPONSE,
+                    request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
                     sender_id=self.controller_id,
                     receiver_id=request_msg.sender_id,
                     body={"success": success},
