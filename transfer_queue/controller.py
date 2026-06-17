@@ -1528,14 +1528,24 @@ class TransferQueueController:
         for partition_id, group in groupby(combined, key=itemgetter(0)):
             partition = self._get_partition(partition_id)
             if not partition:
-                raise ValueError(f"Partition {partition_id} not found")
+                logger.info(
+                    f"[{self.controller_id}]: Try to clear data in non-exist partition {partition_id}. "
+                    f"No operation is executed."
+                )
+                return
 
             global_indexes_to_clear = [idx for _, idx in group]
-            if not set(global_indexes_to_clear).issubset(partition.global_indexes):
-                raise ValueError(
-                    f"Some global_indexes to clear do not exist in partition {partition_id}. "
-                    f"Target: {global_indexes_to_clear}, Existing: {partition.global_indexes}"
+            non_exist_global_indexes = set(global_indexes_to_clear) - partition.global_indexes
+            if len(non_exist_global_indexes) > 0:
+                logger.info(
+                    f"[{self.controller_id}]: Some global_indexes to clear do not exist in partition {partition_id}. "
+                    f"Non-exist global_indexes: {non_exist_global_indexes}"
                 )
+
+            global_indexes_to_clear = list(set(global_indexes_to_clear) - non_exist_global_indexes)
+            if len(global_indexes_to_clear) == 0:
+                logger.info("[{self.controller_id}]: No global indexes to clear. No operation is executed.")
+                return
 
             # Clear data from partition
             partition.clear_data(global_indexes_to_clear, clear_consumption)
@@ -1579,8 +1589,10 @@ class TransferQueueController:
         none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
         if len(none_indexes) > 0:
             if not create:
-                logger.error(f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}!")
-                return BatchMeta.empty()
+                logger.warning(
+                    f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}! "
+                    f"The size of retrieved BatchMeta will be smaller than len(keys)."
+                )
             else:
                 # create non-exist keys
                 batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
@@ -1603,7 +1615,6 @@ class TransferQueueController:
                 partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
         verified_global_indexes = [idx for idx in global_indexes if idx is not None]
-        assert len(verified_global_indexes) == len(keys)
 
         # must fetch fields that the requested samples all have
         col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
