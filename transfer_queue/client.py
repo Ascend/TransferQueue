@@ -1068,24 +1068,38 @@ class AsyncTransferQueueClient:
         path: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Send SAVE_CHECKPOINT to controller and wait for response."""
-        assert socket is not None
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
-            sender_id=self.client_id,
-            receiver_id=self._controller.id,
-            body={"path": path},
-        )
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
-        if response_msg.request_type != ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE:
-            raise RuntimeError(
-                f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
-                f"from controller during checkpoint dump"
+        """Asynchronously save controller state to a file via ZMQ RPC.
+
+        Sends a SAVE_CONTROLLER_CHECKPOINT request to the controller and waits
+        for acknowledgement. The controller serializes its state directly to
+        ``path`` in-process.
+
+        Args:
+            path: Absolute path for the output .pkl file. The caller must
+                ensure this path is writable from the node running the controller.
+            socket: ZMQ socket injected by @with_controller_socket.
+
+        Raises:
+            RuntimeError: If the RPC fails or an unexpected response is received.
+        """
+        try:
+            assert socket is not None
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
+                sender_id=self.client_id,
+                receiver_id=self._controller.id,
+                body={"path": path},
             )
-        if not response_msg.body.get("success"):
-            raise RuntimeError(f"[{self.client_id}]: Controller failed to dump checkpoint to {path}")
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            if response_msg.request_type != ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
+                    f"from controller during checkpoint dump"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in save_controller_checkpoint: {str(e)}") from e
 
     @with_controller_socket
     async def async_load_controller_checkpoint(
@@ -1093,27 +1107,54 @@ class AsyncTransferQueueClient:
         path: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Send LOAD_CHECKPOINT to controller and wait for response."""
-        assert socket is not None
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
-            sender_id=self.client_id,
-            receiver_id=self._controller.id,
-            body={"path": path},
-        )
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
-        if response_msg.request_type != ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE:
-            raise RuntimeError(
-                f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
-                f"from controller during checkpoint restore"
+        """Asynchronously restore controller state from a file via ZMQ RPC.
+
+        Sends a LOAD_CONTROLLER_CHECKPOINT request to the controller and waits
+        for acknowledgement. The controller deserializes its state directly from
+        ``path`` in-process, overwriting the current in-memory state.
+
+        Args:
+            path: Absolute path to a .pkl file previously written by
+                ``async_save_controller_checkpoint``. The caller must ensure
+                this path is readable from the node running the controller.
+            socket: ZMQ socket injected by @with_controller_socket.
+
+        Raises:
+            RuntimeError: If the RPC fails or an unexpected response is received.
+        """
+        try:
+            assert socket is not None
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,  # type: ignore[arg-type]
+                sender_id=self.client_id,
+                receiver_id=self._controller.id,
+                body={"path": path},
             )
-        if not response_msg.body.get("success"):
-            raise RuntimeError(f"[{self.client_id}]: Controller failed to restore checkpoint from {path}")
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            if response_msg.request_type != ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
+                    f"from controller during checkpoint restore"
+                )
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in load_controller_checkpoint: {str(e)}") from e
 
     async def async_save_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Save storage state into checkpoint_dir via StorageManager."""
+        """Asynchronously save storage state to a directory via StorageManager.
+
+        Delegates to the underlying StorageManager, which fans out save requests
+        to all storage units concurrently.
+
+        Args:
+            checkpoint_dir: Directory under which storage unit files are written.
+                The StorageManager creates a ``storage_units/`` subdirectory here.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized.
+            NotImplementedError: If the storage backend does not support checkpoint.
+        """
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -1122,7 +1163,21 @@ class AsyncTransferQueueClient:
         await self.storage_manager.save_checkpoint(checkpoint_dir)
 
     async def async_load_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Restore storage state from checkpoint_dir via StorageManager."""
+        """Asynchronously restore storage state from a directory via StorageManager.
+
+        Delegates to the underlying StorageManager, which fans out load requests
+        to all storage units concurrently. Existing in-memory data is overwritten.
+
+        Args:
+            checkpoint_dir: Directory previously written by
+                ``async_save_storage_checkpoint``, containing the
+                ``storage_units/`` subdirectory and manifest.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized.
+            FileNotFoundError: If the storage unit manifest is missing.
+            ValueError: If the number of storage units does not match the checkpoint.
+        """
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -1636,19 +1691,51 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:
-        """Synchronously dump controller state to a file via ZMQ RPC."""
+        """Synchronously save controller state to a file via ZMQ RPC.
+
+        Args:
+            path: Absolute path for the output .pkl file.
+
+        Raises:
+            RuntimeError: If the RPC fails or an unexpected response is received.
+        """
         return self._save_controller_checkpoint(path)
 
     def load_controller_checkpoint(self, path: str) -> None:
-        """Synchronously restore controller state from a file via ZMQ RPC."""
+        """Synchronously restore controller state from a file via ZMQ RPC.
+
+        Args:
+            path: Absolute path to a .pkl file previously written by
+                ``save_controller_checkpoint``.
+
+        Raises:
+            RuntimeError: If the RPC fails or an unexpected response is received.
+        """
         return self._load_controller_checkpoint(path)
 
     def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Synchronously save storage state into checkpoint_dir."""
+        """Synchronously save storage state to a directory via StorageManager.
+
+        Args:
+            checkpoint_dir: Directory under which storage unit files are written.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized.
+            NotImplementedError: If the storage backend does not support checkpoint.
+        """
         return self._save_storage_checkpoint(checkpoint_dir)
 
     def load_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Synchronously restore storage state from checkpoint_dir."""
+        """Synchronously restore storage state from a directory via StorageManager.
+
+        Args:
+            checkpoint_dir: Directory previously written by ``save_storage_checkpoint``.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized.
+            FileNotFoundError: If the storage unit manifest is missing.
+            ValueError: If the number of storage units does not match the checkpoint.
+        """
         return self._load_storage_checkpoint(checkpoint_dir)
 
     def close(self) -> None:

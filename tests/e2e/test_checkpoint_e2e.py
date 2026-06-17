@@ -26,7 +26,7 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
 
@@ -44,6 +44,11 @@ _TQ_CONFIG = OmegaConf.create(
         },
     }
 )
+
+
+# ---------------------------------------------------------------------------
+# fixtures
+# ---------------------------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
@@ -87,32 +92,12 @@ def checkpoint_dir(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def _put_batch(keys, partition_id, input_ids, attention_mask, tags=None):
-    fields = TensorDict(
-        {"input_ids": input_ids, "attention_mask": attention_mask},
-        batch_size=len(keys),
-    )
-    if tags is None:
-        tags = [{} for _ in keys]
-    tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=tags)
-
-
-def _get_batch(keys, partition_id):
-    return tq.kv_batch_get(keys=keys, partition_id=partition_id)
-
-
-def assert_tensor_equal(tensor_a, tensor_b, msg=""):
-    """Assert two tensors are equal, handling nested vs dense comparisons."""
-    if (isinstance(tensor_a, torch.Tensor) and tensor_a.is_nested) or (
-        isinstance(tensor_b, torch.Tensor) and tensor_b.is_nested
-    ):
-        seq_a = list(tensor_a)
-        seq_b = list(tensor_b)
-        assert len(seq_a) == len(seq_b), f"{msg} Length mismatch: {len(seq_a)} vs {len(seq_b)}"
-        for t1, t2 in zip(seq_a, seq_b, strict=True):
-            assert torch.equal(t1, t2), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
+def _assert_tensor_equal(a, b, msg=""):
+    if (isinstance(a, torch.Tensor) and a.is_nested) or (isinstance(b, torch.Tensor) and b.is_nested):
+        for t1, t2 in zip(list(a), list(b), strict=True):
+            assert torch.equal(t1, t2), f"{msg} mismatch"
     else:
-        assert torch.equal(tensor_a, tensor_b), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
+        assert torch.equal(a, b), f"{msg} mismatch"
 
 
 # ---------------------------------------------------------------------------
@@ -121,151 +106,242 @@ def assert_tensor_equal(tensor_a, tensor_b, msg=""):
 
 
 class TestCheckpointRoundtrip:
-    def test_save_creates_expected_files(self, tq_system, checkpoint_dir):
-        keys = ["k0", "k1"]
-        partition_id = "p0"
-        _put_batch(keys, partition_id, torch.tensor([[1, 2], [3, 4]]), torch.ones(2, 2))
+    """Standard data → save → verify files → wipe → load → verify data."""
 
+    def test_tensor_fields(self, tq_system, checkpoint_dir, controller):
+        # Define test data
+        keys = ["k0", "k1"]
+        partition_id = "p_tensor"
+        input_ids = torch.tensor([[1, 2], [3, 4]])
+        attention_mask = torch.ones(2, 2)
+
+        # Put
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": input_ids, "attention_mask": attention_mask}, batch_size=len(keys)),
+            tags=[{} for _ in keys],
+        )
+
+        # Save
         tq.save_checkpoint(checkpoint_dir)
 
+        # Check saved state: expected files exist
         assert (checkpoint_dir / "metadata.json").exists()
         assert (checkpoint_dir / "controller_state.pkl").exists()
-
-        with open(checkpoint_dir / "metadata.json") as f:
-            info = json.load(f)
-
-        assert info["storage_saved"] is True
         su_dir = checkpoint_dir / "storage_units"
         assert su_dir.exists()
         assert (su_dir / "su_info.json").exists()
-
-    def test_metadata_json_content(self, tq_system, checkpoint_dir):
-        keys = ["m0"]
-        _put_batch(keys, "p_meta", torch.tensor([[10, 20]]), torch.ones(1, 2))
-
-        tq.save_checkpoint(checkpoint_dir, metadata={"iteration": 42, "loss": 0.5})
-
         with open(checkpoint_dir / "metadata.json") as f:
             meta = json.load(f)
+        assert meta["storage_saved"] is True
 
-        assert meta["user_metadata"]["iteration"] == 42
-        assert meta["user_metadata"]["loss"] == pytest.approx(0.5)
-        assert "storage_saved" in meta
-
-    def test_load_restores_controller_partitions(self, tq_system, checkpoint_dir, controller):
-        keys = ["a0", "a1", "a2"]
-        partition_id = "p_ctrl"
-        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
-        tags = [{"idx": i} for i in range(3)]
-        _put_batch(keys, partition_id, input_ids, torch.ones(3, 3), tags)
-
-        tq.save_checkpoint(checkpoint_dir)
-
-        # wipe controller state
+        # Wipe controller state so load has real work to do
         ray.get(controller.clear_partition.remote(partition_id))
         assert ray.get(controller.list_partitions.remote()) == []
 
+        # Load
         tq.load_checkpoint(checkpoint_dir)
 
-        # partition must be back
-        partitions = ray.get(controller.list_partitions.remote())
-        assert partition_id in partitions
+        # Check loaded state: partition and data restored
+        assert partition_id in ray.get(controller.list_partitions.remote())
+        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id)
+        _assert_tensor_equal(retrieved["input_ids"], input_ids)
+        _assert_tensor_equal(retrieved["attention_mask"], attention_mask)
 
-        # key-to-global-index mapping must be intact
+    def test_controller_metadata(self, tq_system, checkpoint_dir, controller):
+        # Define test data
+        keys = ["a0", "a1", "a2"]
+        partition_id = "p_meta"
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]])
+        tags = [{"idx": i} for i in range(3)]
+
+        # Put
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": input_ids, "attention_mask": torch.ones(3, 3)}, batch_size=len(keys)),
+            tags=tags,
+        )
+
+        # Save
+        tq.save_checkpoint(checkpoint_dir)
+
+        # Wipe
+        ray.get(controller.clear_partition.remote(partition_id))
+
+        # Load
+        tq.load_checkpoint(checkpoint_dir)
+
+        # Check loaded state: key mapping and tags intact
         snapshot = ray.get(controller.get_partition_snapshot.remote(partition_id))
-        for key in keys:
-            assert key in snapshot.keys_mapping
-
-        # tags must be intact
         for i, key in enumerate(keys):
+            assert key in snapshot.keys_mapping
             gidx = snapshot.keys_mapping[key]
             assert snapshot.custom_meta[gidx]["idx"] == i
 
-    def test_load_restores_storage_data(self, tq_system, checkpoint_dir, controller):
-        keys = ["s0", "s1"]
-        partition_id = "p_storage"
-        input_ids = torch.tensor([[10, 20], [30, 40]])
-        attention_mask = torch.ones(2, 2)
-        _put_batch(keys, partition_id, input_ids, attention_mask)
+    def test_multiple_partitions(self, tq_system, checkpoint_dir, controller):
+        # Define test data
+        partitions_data = {f"part_{i}": (torch.full((2, 4), i, dtype=torch.long), torch.ones(2, 4)) for i in range(3)}
 
+        # Put
+        for pid, (iids, mask) in partitions_data.items():
+            tq.kv_batch_put(
+                keys=[f"{pid}_k0", f"{pid}_k1"],
+                partition_id=pid,
+                fields=TensorDict({"input_ids": iids, "attention_mask": mask}, batch_size=2),
+                tags=[{}, {}],
+            )
+
+        # Save
         tq.save_checkpoint(checkpoint_dir)
 
-        # clear both controller and storage state so load has to restore from scratch
+        # Wipe
+        for pid in partitions_data:
+            ray.get(controller.clear_partition.remote(pid))
+
+        # Load
+        tq.load_checkpoint(checkpoint_dir)
+
+        # Check loaded state
+        for pid, (iids, _) in partitions_data.items():
+            retrieved = tq.kv_batch_get(keys=[f"{pid}_k0", f"{pid}_k1"], partition_id=pid, select_fields=["input_ids"])
+            _assert_tensor_equal(retrieved["input_ids"], iids)
+
+    def test_user_metadata_preserved(self, tq_system, checkpoint_dir):
+        # Define test data
+        keys = ["m0"]
+
+        # Put
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id="p_usermeta",
+            fields=TensorDict(
+                {"input_ids": torch.tensor([[10, 20]]), "attention_mask": torch.ones(1, 2)}, batch_size=1
+            ),
+            tags=[{}],
+        )
+
+        # Save with user metadata
+        tq.save_checkpoint(checkpoint_dir, metadata={"iteration": 42, "loss": 0.5})
+
+        # Check saved state: user metadata written correctly
+        with open(checkpoint_dir / "metadata.json") as f:
+            meta = json.load(f)
+        assert meta["user_metadata"]["iteration"] == 42
+        assert meta["user_metadata"]["loss"] == pytest.approx(0.5)
+
+    def test_non_tensor_fields(self, tq_system, checkpoint_dir, controller):
+        # Define test data
+        keys = ["t0", "t1"]
+        partition_id = "p_str"
+        input_ids = torch.tensor([[1, 2], [3, 4]])
+        fields = TensorDict(
+            {"input_ids": input_ids, "text": NonTensorStack("hello", "world")},
+            batch_size=2,
+        )
+
+        # Put
+        tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}])
+
+        # Save
+        tq.save_checkpoint(checkpoint_dir)
+
+        # Wipe
         ray.get(controller.clear_partition.remote(partition_id))
 
+        # Load
         tq.load_checkpoint(checkpoint_dir)
 
-        retrieved = _get_batch(keys, partition_id)
-        assert_tensor_equal(retrieved["input_ids"], input_ids)
-        assert_tensor_equal(retrieved["attention_mask"], attention_mask)
+        # Check loaded state
+        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["input_ids"])
+        _assert_tensor_equal(retrieved["input_ids"], input_ids)
 
-    def test_load_restores_multiple_partitions(self, tq_system, checkpoint_dir, controller):
-        for i in range(3):
-            _put_batch(
-                [f"p{i}_k0", f"p{i}_k1"],
-                f"part_{i}",
-                torch.full((2, 4), i, dtype=torch.long),
-                torch.ones(2, 4),
+    def test_nested_tensor_fields(self, tq_system, checkpoint_dir, controller):
+        # Define test data
+        keys = ["j0", "j1", "j2"]
+        partition_id = "p_jagged"
+
+        # Put (variable-length sequences)
+        for i, key in enumerate(keys):
+            tq.kv_put(
+                key=key,
+                partition_id=partition_id,
+                fields=TensorDict({"seq": torch.arange(i + 1, dtype=torch.float).unsqueeze(0)}, batch_size=1),
+                tag=None,
             )
 
+        # Save
         tq.save_checkpoint(checkpoint_dir)
 
-        for i in range(3):
-            ray.get(controller.clear_partition.remote(f"part_{i}"))
+        # Wipe
+        ray.get(controller.clear_partition.remote(partition_id))
 
+        # Load
         tq.load_checkpoint(checkpoint_dir)
 
-        for i in range(3):
-            retrieved = tq.kv_batch_get(
-                keys=[f"p{i}_k0", f"p{i}_k1"],
-                partition_id=f"part_{i}",
-                select_fields=["input_ids"],
-            )
-            assert_tensor_equal(retrieved["input_ids"], torch.full((2, 4), i, dtype=torch.long))
+        # Check loaded state
+        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["seq"])
+        for i, component in enumerate(retrieved["seq"].unbind()):
+            _assert_tensor_equal(component, torch.arange(i + 1, dtype=torch.float))
 
 
 # ---------------------------------------------------------------------------
-# include_storage=False
+# include_storage=False (SimpleStorage override)
 # ---------------------------------------------------------------------------
 
 
-class TestCheckpointMetadataOnly:
-    def test_save_include_storage_false_simplestorage_override(self, tq_system, checkpoint_dir):
-        """For SimpleStorage, include_storage=False is overridden to True because in-memory
-        data would be lost on restart. storage_saved must be True and storage_units must exist."""
-        _put_batch(["n0"], "p_nometa", torch.tensor([[1, 2]]), torch.ones(1, 2))
+class TestIncludeStorageFalse:
+    """For SimpleStorage, include_storage=False is silently forced to True."""
 
+    def test_storage_saved_is_true(self, tq_system, checkpoint_dir):
+        # Define test data + Put
+        tq.kv_batch_put(
+            keys=["n0"],
+            partition_id="p_nometa",
+            fields=TensorDict({"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}, batch_size=1),
+            tags=[{}],
+        )
+
+        # Save with include_storage=False
         tq.save_checkpoint(checkpoint_dir, include_storage=False)
 
+        # Check saved state: storage_saved must be True and directory must exist
         with open(checkpoint_dir / "metadata.json") as f:
-            info = json.load(f)
-
-        assert info["storage_saved"] is True
+            meta = json.load(f)
+        assert meta["storage_saved"] is True
         assert (checkpoint_dir / "storage_units").exists()
 
-    def test_load_after_include_storage_false_restores_both(self, tq_system, checkpoint_dir, controller):
-        """With SimpleStorage, include_storage=False is forced True, so both controller and
-        storage are saved and restored."""
+    def test_both_restored_after_load(self, tq_system, checkpoint_dir, controller):
+        # Define test data
         keys = ["n0", "n1"]
         partition_id = "p_nometa2"
         input_ids = torch.tensor([[5, 6], [7, 8]])
-        _put_batch(keys, partition_id, input_ids, torch.ones(2, 2))
 
+        # Put
+        tq.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": input_ids, "attention_mask": torch.ones(2, 2)}, batch_size=len(keys)),
+            tags=[{} for _ in keys],
+        )
+
+        # Save
         tq.save_checkpoint(checkpoint_dir, include_storage=False)
 
+        # Wipe
         ray.get(controller.clear_partition.remote(partition_id))
 
+        # Load
         tq.load_checkpoint(checkpoint_dir)
 
-        partitions = ray.get(controller.list_partitions.remote())
-        assert partition_id in partitions
-
+        # Check loaded state: both controller and storage restored
+        assert partition_id in ray.get(controller.list_partitions.remote())
         snapshot = ray.get(controller.get_partition_snapshot.remote(partition_id))
         for key in keys:
             assert key in snapshot.keys_mapping
-
-        retrieved = _get_batch(keys, partition_id)
-        assert_tensor_equal(retrieved["input_ids"], input_ids)
+        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id)
+        _assert_tensor_equal(retrieved["input_ids"], input_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +351,6 @@ class TestCheckpointMetadataOnly:
 
 class TestCheckpointErrors:
     def test_save_raises_if_not_initialized(self, tmp_path):
-        # call save_checkpoint before tq.init() in a fresh module state
         import transfer_queue.interface as iface
 
         original = iface._TQ_CONTROLLER
@@ -308,10 +383,16 @@ class TestCheckpointErrors:
             tq.load_checkpoint(ck)
 
     def test_load_raises_on_storage_unit_count_mismatch(self, tq_system, tmp_path, checkpoint_dir):
-        _put_batch(["e0"], "p_err", torch.tensor([[1, 2]]), torch.ones(1, 2))
+        # Define test data + Put + Save
+        tq.kv_batch_put(
+            keys=["e0"],
+            partition_id="p_err",
+            fields=TensorDict({"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}, batch_size=1),
+            tags=[{}],
+        )
         tq.save_checkpoint(checkpoint_dir)
 
-        # tamper: add a fake extra SU entry in su_info.json so count differs
+        # Tamper: add a fake extra SU entry so count differs
         su_info_path = checkpoint_dir / "storage_units" / "su_info.json"
         with open(su_info_path) as f:
             su_info = json.load(f)
@@ -323,8 +404,13 @@ class TestCheckpointErrors:
             tq.load_checkpoint(checkpoint_dir)
 
     def test_no_partial_state_on_failed_save(self, tq_system, tmp_path):
-        """A failed save must not leave a partial directory."""
-        _put_batch(["f0"], "p_fail", torch.tensor([[1, 2]]), torch.ones(1, 2))
+        # Define test data + Put
+        tq.kv_batch_put(
+            keys=["f0"],
+            partition_id="p_fail",
+            fields=TensorDict({"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}, batch_size=1),
+            tags=[{}],
+        )
 
         ck = tmp_path / "ck"
 
@@ -337,59 +423,6 @@ class TestCheckpointErrors:
             with pytest.raises(RuntimeError, match="simulated dump failure"):
                 tq.save_checkpoint(ck)
 
-        assert not ck.exists(), "Partial checkpoint directory should have been cleaned up"
-        assert not (tmp_path / "ck.tmp").exists(), "Temp directory should have been cleaned up"
-
-
-# ---------------------------------------------------------------------------
-# data variety
-# ---------------------------------------------------------------------------
-
-
-class TestCheckpointDataVariety:
-    def test_non_tensor_fields_roundtrip(self, tq_system, checkpoint_dir, controller):
-        """String fields should survive save/load."""
-        from tensordict import NonTensorStack
-
-        keys = ["t0", "t1"]
-        partition_id = "p_str"
-        fields = TensorDict(
-            {
-                "input_ids": torch.tensor([[1, 2], [3, 4]]),
-                "text": NonTensorStack("hello", "world"),
-            },
-            batch_size=2,
-        )
-        tq.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}])
-
-        tq.save_checkpoint(checkpoint_dir)
-
-        ray.get(controller.clear_partition.remote(partition_id))
-
-        tq.load_checkpoint(checkpoint_dir)
-
-        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["input_ids"])
-        assert_tensor_equal(retrieved["input_ids"], torch.tensor([[1, 2], [3, 4]]))
-
-    def test_nested_tensor_fields_roundtrip(self, tq_system, checkpoint_dir, controller):
-        """Variable-length (jagged) tensor fields should survive save/load."""
-        keys = ["j0", "j1", "j2"]
-        partition_id = "p_jagged"
-        for i, key in enumerate(keys):
-            seq = torch.arange(i + 1, dtype=torch.float).unsqueeze(0)
-            tq.kv_put(
-                key=key,
-                partition_id=partition_id,
-                fields=TensorDict({"seq": seq}, batch_size=1),
-                tag=None,
-            )
-
-        tq.save_checkpoint(checkpoint_dir)
-
-        ray.get(controller.clear_partition.remote(partition_id))
-
-        tq.load_checkpoint(checkpoint_dir)
-
-        retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["seq"])
-        for i, component in enumerate(retrieved["seq"].unbind()):
-            assert_tensor_equal(component, torch.arange(i + 1, dtype=torch.float))
+        # Check saved state: no partial directory left
+        assert not ck.exists()
+        assert not (tmp_path / "ck.tmp").exists()

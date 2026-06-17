@@ -41,8 +41,8 @@ logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
-_SU_SUBDIR = "storage_units"
-_SU_INFO_FILE = "su_info.json"
+_SU_SUBDIR = "simple_storage"
+_SU_INFO_FILE = "storage_unit_info.json"
 
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
@@ -554,8 +554,9 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"{response_msg.body.get('message', 'unknown error')}"
                 )
         except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}")
-            raise
+            raise RuntimeError(
+                f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}"
+            ) from e
 
     @with_storage_unit_socket
     async def _load_single_storage_unit(
@@ -583,10 +584,9 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"{response_msg.body.get('message', 'unknown error')}"
                 )
         except Exception as e:
-            logger.error(
+            raise RuntimeError(
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
-            )
-            raise
+            ) from e
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.

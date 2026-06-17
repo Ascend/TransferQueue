@@ -546,20 +546,17 @@ class SimpleStorageUnit:
         )
 
     def _handle_save_checkpoint(self, data_parts) -> ZMQMessage:
-        """
-        Serialize storage unit data directly to a file.
-
-        Writes data in-process to avoid transmitting the payload back over the
-        Ray object store — only a bool ACK is returned to the caller.
+        """Serialize storage unit data directly to a file.
 
         Args:
-            path: data_parts: ZMQMessage from client, including
-                absolute path for the output .pkl file.
-                The caller must ensure this path is reachable from the node
-                running this actor (shared filesystem required for multi-node setups).
+            data_parts: ZMQMessage from client, containing ``path`` in body:
+                absolute path for the output .pkl file. The caller must ensure
+                this path is reachable from the node running this actor
+                (shared filesystem required for multi-node setups).
 
         Returns:
-            Checkpoint dump success response ZMQMessage.
+            ZMQMessage with ``success=True`` on success, or ``success=False``
+            and ``message`` containing the error string on failure.
         """
         path = data_parts.body["path"]
         try:
@@ -586,17 +583,18 @@ class SimpleStorageUnit:
             )
 
     def _handle_load_checkpoint(self, data_parts) -> ZMQMessage:
-        """
-        Restore storage unit data directly from a file.
+        """Restore storage unit data directly from a file.
 
         Args:
-            path: data_parts: ZMQMessage from client, including
-                absolute path for the output .pkl file.
-                The caller must ensure this path is reachable from the node
-                running this actor (shared filesystem required for multi-node setups).
+            data_parts: ZMQMessage from client, containing ``path`` in body:
+                absolute path to a .pkl file previously written by
+                ``_handle_save_checkpoint``. The caller must ensure this path
+                is reachable from the node running this actor
+                (shared filesystem required for multi-node setups).
 
         Returns:
-            Checkpoint restore success response ZMQMessage.
+            ZMQMessage with ``success=True`` on success, or ``success=False``
+            and ``message`` containing the error string on failure.
         """
         path = data_parts.body["path"]
         try:
@@ -609,6 +607,11 @@ class SimpleStorageUnit:
                     f"checkpoint={data['storage_unit_size']}, current={self.storage_unit_size}"
                 )
 
+            if self.storage_data._active_keys:
+                logger.warning(
+                    f"[{self.storage_unit_id}]: overwriting {len(self.storage_data._active_keys)} "
+                    f"existing keys with checkpoint data from {path}"
+                )
             self.storage_data.field_data.clear()
             self.storage_data._active_keys.clear()
             self.storage_data.field_data = data["field_data"]

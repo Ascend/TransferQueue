@@ -1069,14 +1069,17 @@ def save_checkpoint(
 
     .. note::
         **Multi-node limitation**: checkpoint_dir must reside on a shared network
-        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes running
-        storage units. Single-node deployments have no such requirement.
+        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
+        Single-node deployments have no such requirement.
 
     Args:
         checkpoint_dir: Directory to save the checkpoint (created if not exists).
         include_storage: Whether to save storage backend state. Set to False to
                          save controller metadata only (e.g. for KV backends where
                          data persists externally and does not need to be re-saved).
+                         For SimpleStorage (in-memory), this flag is ignored and
+                         storage is always saved — skipping it would cause data loss
+                         on restart.
         metadata: User-defined key-value pairs written into metadata.json.
                   Example: {"time_stamp": 1234567.891234, "step": 10}
 
@@ -1141,8 +1144,8 @@ def load_checkpoint(
 
     .. note::
         **Multi-node limitation**: checkpoint_dir must reside on a shared network
-        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes running
-        storage units. Single-node deployments have no such requirement.
+        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
+        Single-node deployments have no such requirement.
 
     Args:
         checkpoint_dir: Path to the checkpoint directory.
