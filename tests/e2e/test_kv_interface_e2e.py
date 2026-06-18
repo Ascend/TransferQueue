@@ -970,7 +970,7 @@ class TestKVClearE2E:
         assert not leaked_meta.is_ready
 
 
-def test_kv_clear_idempotent(self, controller, tq_api):
+    def test_kv_clear_idempotent(self, controller, tq_api):
         """Test kv_clear is idempotent for non-existent keys and partitions."""
         partition_id = "test_partition"
         keys = ["idempotent_0", "idempotent_1", "idempotent_2", "idempotent_3"]
