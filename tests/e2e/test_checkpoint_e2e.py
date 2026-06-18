@@ -129,9 +129,9 @@ class TestCheckpointRoundtrip:
         # Check saved state: expected files exist
         assert (checkpoint_dir / "metadata.json").exists()
         assert (checkpoint_dir / "controller_state.pkl").exists()
-        su_dir = checkpoint_dir / "storage_units"
+        su_dir = checkpoint_dir / "simple_storage"
         assert su_dir.exists()
-        assert (su_dir / "su_info.json").exists()
+        assert (su_dir / "storage_unit_info.json").exists()
         with open(checkpoint_dir / "metadata.json") as f:
             meta = json.load(f)
         assert meta["storage_saved"] is True
@@ -310,7 +310,7 @@ class TestIncludeStorageFalse:
         with open(checkpoint_dir / "metadata.json") as f:
             meta = json.load(f)
         assert meta["storage_saved"] is True
-        assert (checkpoint_dir / "storage_units").exists()
+        assert (checkpoint_dir / "simple_storage").exists()
 
     def test_both_restored_after_load(self, tq_system, checkpoint_dir, controller):
         # Define test data
@@ -393,7 +393,7 @@ class TestCheckpointErrors:
         tq.save_checkpoint(checkpoint_dir)
 
         # Tamper: add a fake extra SU entry so count differs
-        su_info_path = checkpoint_dir / "storage_units" / "su_info.json"
+        su_info_path = checkpoint_dir / "simple_storage" / "storage_unit_info.json"
         with open(su_info_path) as f:
             su_info = json.load(f)
         su_info.append({"position": 99, "storage_unit_id": "fake"})
