@@ -478,8 +478,9 @@ class AsyncTransferQueueClient:
             # Clear the controller metadata
             await self._clear_meta_in_controller(metadata)
 
-            # Clear storage unit data
-            await self.storage_manager.clear_data(metadata)
+            # Clear storage unit data (skip if no fields, e.g. tag-only entries)
+            if metadata.field_names:
+                await self.storage_manager.clear_data(metadata)
 
             logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
         except Exception as e:
