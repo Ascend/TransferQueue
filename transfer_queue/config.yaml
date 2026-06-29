@@ -23,8 +23,9 @@ backend:
 
   # SimpleStorage: ZMQ-based in-memory storage for out-of-the-box usage
   SimpleStorage:
-    # Maximum number of experience samples to hold across all storage units
-    total_storage_size: 100000
+    # Maximum number of experience samples to hold across all storage units.
+    # Set to null for unlimited capacity (no capacity check).
+    total_storage_size: null
     # Number of distributed storage units.
     # Recommended: >= 2 x number of nodes for load balancing.
     num_data_storage_units: 2
