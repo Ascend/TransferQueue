@@ -475,12 +475,24 @@ class AsyncTransferQueueClient:
             if not self._controller:
                 raise RuntimeError("No controller registered")
 
+            # If field_names is empty,
+            # query the controller for the partition's fields before clearing meta.
+            if not metadata.field_names:
+                merged_field_schema: dict = {}
+                for partition_id in dict.fromkeys(metadata.partition_ids):
+                    partition_meta = await self._get_partition_meta(partition_id)
+                    if partition_meta:
+                        merged_field_schema.update(partition_meta.field_schema)
+                if merged_field_schema:
+                    metadata = metadata.copy()
+                    metadata.field_schema = merged_field_schema
+                    metadata._field_names = sorted(merged_field_schema.keys())
+
             # Clear the controller metadata
             await self._clear_meta_in_controller(metadata)
 
-            # Clear storage unit data (skip if no fields, e.g. tag-only entries)
-            if metadata.field_names:
-                await self.storage_manager.clear_data(metadata)
+            # Clear storage unit data
+            await self.storage_manager.clear_data(metadata)
 
             logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
         except Exception as e:
