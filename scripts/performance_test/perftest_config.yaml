@@ -95,6 +95,11 @@ backend:
       eviction_high_watermark_ratio: 0.9
       # Fraction of memory to free during each eviction cycle.
       eviction_ratio: 0.1
+    # Enable GPUDirect RDMA (GDR) transfer path.
+    # Requires: protocol: rdma and a GDR-capable GPU
+    use_gdr: false
+    # Size of the pre-registered CUDA staging buffer in MB (only used when use_gdr: true).
+    gdr_staging_buffer_mb: 1024
 
   # For Yuanrong:
   Yuanrong:
