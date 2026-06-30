@@ -85,6 +85,29 @@ BACKEND_CONFIGS = {
             },
         },
     },
+    # MooncakeStore with GDR staging buffer enabled.
+    # GPU tensors are transferred via the persistent staging buffer path;
+    # CPU tensors and non-tensors fall through to the original CPU RDMA path.
+    # auto_init=true: TQ starts mooncake_master automatically on transfer_queue.init().
+    "MooncakeStore_GDR": {
+        "controller": {
+            "polling_mode": True,
+        },
+        "backend": {
+            "storage_backend": "MooncakeStore",
+            "MooncakeStore": {
+                "global_segment_size": 134217728,  # 128MB
+                "local_buffer_size": 134217728,  # 128MB
+                "metadata_server": "localhost:50050",
+                "master_server_address": "localhost:50051",
+                "protocol": "tcp",
+                "device_name": "",
+                "auto_init": True,
+                "use_gdr": True,
+                "gdr_staging_buffer_mb": 256,
+            },
+        },
+    },
 }
 
 
@@ -102,12 +125,13 @@ def backend_name():
     """Get the backend name from environment variable.
 
     Environment variables:
-        TQ_TEST_BACKEND: Backend name (SimpleStorage, MooncakeStore, or Yuanrong)
+        TQ_TEST_BACKEND: Backend name (SimpleStorage, MooncakeStore, Yuanrong, or MooncakeStore_GDR)
 
     To run tests for a specific backend:
         TQ_TEST_BACKEND=SimpleStorage pytest tests/e2e/test_e2e_lifecycle_consistency.py
         TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_e2e_lifecycle_consistency.py
         TQ_TEST_BACKEND=Yuanrong pytest tests/e2e/test_e2e_lifecycle_consistency.py
+        TQ_TEST_BACKEND=MooncakeStore_GDR pytest tests/e2e/test_e2e_lifecycle_consistency.py
     """
     return os.environ.get("TQ_TEST_BACKEND", "SimpleStorage")
 
@@ -132,7 +156,7 @@ def e2e_client(ray_cluster, backend_name):
     transfer_queue.close()
 
 
-def generate_complex_data(indices: list[int]) -> TensorDict:
+def generate_complex_data(indices: list[int], device: torch.device | None = None) -> TensorDict:
     """Generate complex TensorDict with all supported field types."""
     n = len(indices)
 
@@ -184,6 +208,15 @@ def generate_complex_data(indices: list[int]) -> TensorDict:
 
     # List of objects (dicts)
     list_obj = [{"key": f"value_{i}", "num": i} for i in indices]
+
+    if device is not None:
+        tensor_f32 = tensor_f32.to(device)
+        tensor_i64 = tensor_i64.to(device)
+        tensor_bf16 = tensor_bf16.to(device)
+        tensor_f16 = tensor_f16.to(device)
+        nested_jagged = nested_jagged.to(device)
+        nested_strided = nested_strided.to(device)
+        special_val = special_val.to(device)
 
     field_values = {
         "tensor_f32": tensor_f32,
@@ -237,6 +270,7 @@ def verify_special_values(retrieved: torch.Tensor, expected: torch.Tensor) -> bo
     if len(retrieved) != len(expected):
         return False
     for r, e in zip(retrieved, expected, strict=True):
+        r, e = r.cpu(), e.cpu()
         # Check Inf column
         if not (torch.isinf(r[0]) and r[0] > 0):
             return False
@@ -256,6 +290,7 @@ def verify_nested_tensor_equal(retrieved, expected) -> bool:
     if len(r_list) != len(e_list):
         return False
     for r, e in zip(r_list, e_list, strict=True):
+        r, e = r.cpu(), e.cpu()
         # Handle NaN: positions must match
         r_nan = torch.isnan(r)
         e_nan = torch.isnan(e)
@@ -350,7 +385,7 @@ def recover_local_index(global_index_order, new_global_index_order):
 
 
 # Scenario One: Core Read/Write Consistency
-def test_core_consistency(e2e_client):
+def test_core_consistency(e2e_client, backend_name):
     """Put full complex data then get - verify all field types are correctly round-tripped."""
     client = e2e_client
     partition_id = "test_core_consistency"
@@ -359,7 +394,8 @@ def test_core_consistency(e2e_client):
 
     # 1. Put full complex data
     indices = list(range(batch_size))
-    original_data = generate_complex_data(indices)
+    device = torch.device("cuda") if backend_name == "MooncakeStore_GDR" and torch.cuda.is_available() else None
+    original_data = generate_complex_data(indices, device=device)
     fields = DEFAULT_FIELDS
 
     meta = client.put(data=original_data, partition_id=partition_id)
@@ -372,16 +408,16 @@ def test_core_consistency(e2e_client):
 
         # 3. Verify Standard Tensors (may be returned as nested tensors)
         for i in range(batch_size):
-            assert torch.allclose(retrieved_data["tensor_f32"][i], original_data["tensor_f32"][i]), (
+            assert torch.allclose(retrieved_data["tensor_f32"][i].cpu(), original_data["tensor_f32"][i].cpu()), (
                 f"tensor_f32 mismatch at index {i}"
             )
-            assert torch.equal(retrieved_data["tensor_i64"][i], original_data["tensor_i64"][i]), (
+            assert torch.equal(retrieved_data["tensor_i64"][i].cpu(), original_data["tensor_i64"][i].cpu()), (
                 f"tensor_i64 mismatch at index {i}"
             )
-            assert torch.equal(retrieved_data["tensor_bf16"][i], original_data["tensor_bf16"][i]), (
+            assert torch.equal(retrieved_data["tensor_bf16"][i].cpu(), original_data["tensor_bf16"][i].cpu()), (
                 f"tensor_bf16 mismatch at index {i}"
             )
-            assert torch.equal(retrieved_data["tensor_f16"][i], original_data["tensor_f16"][i]), (
+            assert torch.equal(retrieved_data["tensor_f16"][i].cpu(), original_data["tensor_f16"][i].cpu()), (
                 f"tensor_f16 mismatch at index {i}"
             )
 
@@ -402,7 +438,7 @@ def test_core_consistency(e2e_client):
 
         # 7. Verify NumPy Arrays (may be returned as nested tensors)
         for i in range(batch_size):
-            assert np.allclose(retrieved_data["np_array"][i].numpy(), original_data["np_array"][i]), (
+            assert np.allclose(retrieved_data["np_array"][i].cpu().numpy(), original_data["np_array"][i]), (
                 f"np_array mismatch at index {i}"
             )
 
@@ -442,12 +478,13 @@ def test_core_consistency(e2e_client):
 
 
 # Scenario Two: Cross-Shard Update
-def test_cross_shard_complex_update(e2e_client):
+def test_cross_shard_complex_update(e2e_client, backend_name):
     """Cross-shard update: put A + put B, update overlapping region, verify all regions."""
 
     client = e2e_client
     partition_id = "test_cross_shard_update"
     task_name = "cross_shard_task"
+    device = torch.device("cuda") if backend_name == "MooncakeStore_GDR" and torch.cuda.is_available() else None
 
     # Define index ranges
     idx_a = list(range(0, 20))  # Put A
@@ -467,18 +504,18 @@ def test_cross_shard_complex_update(e2e_client):
 
     try:
         # 2. Put A: indices 0-19
-        data_a = generate_complex_data(idx_a)
+        data_a = generate_complex_data(idx_a, device=device)
         meta_a = alloc_meta.select_samples(list(range(0, 20)))
         client.put(data=data_a, metadata=meta_a)
 
         # 3. Put B: indices 20-39
-        data_b = generate_complex_data(idx_b)
+        data_b = generate_complex_data(idx_b, device=device)
         meta_b = alloc_meta.select_samples(list(range(20, 40)))
         client.put(data=data_b, metadata=meta_b)
 
         # 4. Update indices 10-29 with modified values and new fields
         modified_indices = [i + 1000 for i in idx_update]  # Offset to make values distinguishable
-        data_update = generate_complex_data(modified_indices)
+        data_update = generate_complex_data(modified_indices, device=device)
 
         # Add new fields
         new_extra_tensor = torch.stack([torch.ones(3) * i for i in idx_update])  # Shape: (20, 3)
@@ -505,23 +542,23 @@ def test_cross_shard_complex_update(e2e_client):
             full_data = _reorder_tensordict(full_data, sorted_order)
 
         # 6. Verify region 0-9: original Put A values
-        original_data_0_9 = generate_complex_data(list(range(0, 10)))
+        original_data_0_9 = generate_complex_data(list(range(0, 10)), device=device)
         for i in range(10):
-            assert torch.allclose(full_data["tensor_f32"][i], original_data_0_9["tensor_f32"][i]), (
+            assert torch.allclose(full_data["tensor_f32"][i].cpu(), original_data_0_9["tensor_f32"][i].cpu()), (
                 f"Region 0-9 tensor_f32 mismatch at index {i}"
             )
 
         # 7. Verify region 10-29: updated values (using offset indices 1010-1029)
-        updated_expected = generate_complex_data([i + 1000 for i in range(10, 30)])
+        updated_expected = generate_complex_data([i + 1000 for i in range(10, 30)], device=device)
         for i in range(20):
-            assert torch.allclose(full_data["tensor_f32"][10 + i], updated_expected["tensor_f32"][i]), (
+            assert torch.allclose(full_data["tensor_f32"][10 + i].cpu(), updated_expected["tensor_f32"][i].cpu()), (
                 f"Region 10-29 tensor_f32 mismatch at index {10 + i}"
             )
 
         # 8. Verify region 30-39: original Put B values
-        original_data_30_39 = generate_complex_data(list(range(30, 40)))
+        original_data_30_39 = generate_complex_data(list(range(30, 40)), device=device)
         for i in range(10):
-            assert torch.allclose(full_data["tensor_f32"][30 + i], original_data_30_39["tensor_f32"][i]), (
+            assert torch.allclose(full_data["tensor_f32"][30 + i].cpu(), original_data_30_39["tensor_f32"][i].cpu()), (
                 f"Region 30-39 tensor_f32 mismatch at index {30 + i}"
             )
 
@@ -818,7 +855,7 @@ def test_dynamic_tensor_shape_nested_transition(e2e_client):
 
 
 # Scenario Seven: Retrieved Data Writability and Memory Safety
-def test_retrieved_data_writability_and_memory_safety(e2e_client):
+def test_retrieved_data_writability_and_memory_safety(e2e_client, backend_name):
     """Verify that all data types retrieved via GET are writable and memory-independent.
 
     This test validates the ZMQ copy=False GET path (Plan 1):
@@ -832,9 +869,10 @@ def test_retrieved_data_writability_and_memory_safety(e2e_client):
     batch_size = 8
     task_name = "writability_task"
     fields = DEFAULT_FIELDS
+    device = torch.device("cuda") if backend_name == "MooncakeStore_GDR" and torch.cuda.is_available() else None
 
     indices = list(range(batch_size))
-    original_data = generate_complex_data(indices)
+    original_data = generate_complex_data(indices, device=device)
     original_meta = client.put(data=original_data, partition_id=partition_id)
 
     global_index_order = original_meta.global_indexes
@@ -901,25 +939,25 @@ def test_retrieved_data_writability_and_memory_safety(e2e_client):
 
         # tensor_f32[0,0] should be the original value, not 99999.0
         for i in range(batch_size):
-            assert torch.allclose(retrieved2["tensor_f32"][i], original_data["tensor_f32"][i]), (
+            assert torch.allclose(retrieved2["tensor_f32"][i].cpu(), original_data["tensor_f32"][i].cpu()), (
                 "Modifying retrieved tensor_f32 should not affect stored data"
             )
 
         # tensor_i64[0,0] should be the original value, not 88888
         for i in range(batch_size):
-            assert torch.equal(retrieved2["tensor_i64"][i], original_data["tensor_i64"][i]), (
+            assert torch.equal(retrieved2["tensor_i64"][i].cpu(), original_data["tensor_i64"][i].cpu()), (
                 "Modifying retrieved tensor_i64 should not affect stored data"
             )
 
         # tensor_bf16 should match original
         for i in range(batch_size):
-            assert torch.equal(retrieved2["tensor_bf16"][i], original_data["tensor_bf16"][i]), (
+            assert torch.equal(retrieved2["tensor_bf16"][i].cpu(), original_data["tensor_bf16"][i].cpu()), (
                 "Modifying retrieved tensor_bf16 should not affect stored data"
             )
 
         # tensor_f16 should match original
         for i in range(batch_size):
-            assert torch.equal(retrieved2["tensor_f16"][i], original_data["tensor_f16"][i]), (
+            assert torch.equal(retrieved2["tensor_f16"][i].cpu(), original_data["tensor_f16"][i].cpu()), (
                 "Modifying retrieved tensor_f16 should not affect stored data"
             )
 
@@ -927,6 +965,65 @@ def test_retrieved_data_writability_and_memory_safety(e2e_client):
         assert verify_nested_tensor_equal(retrieved2["nested_jagged"], original_data["nested_jagged"]), (
             "Modifying retrieved nested_jagged should not affect stored data"
         )
+
+    finally:
+        client.clear_partition(partition_id)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GDR test")
+def test_gdr_gpu_tensor_roundtrip(e2e_client, backend_name):
+    """GDR path: put GPU tensors, get back and verify data, clear and verify gone.
+
+    Only meaningful when backend_name == "MooncakeStore_GDR"; skipped otherwise.
+    Tests the full staging-buffer path: D2D pack → RDMA PUT → RDMA GET → D2D unpack.
+    """
+    if backend_name != "MooncakeStore_GDR":
+        pytest.skip("GDR roundtrip only runs with TQ_TEST_BACKEND=MooncakeStore_GDR")
+
+    client = e2e_client
+    partition_id = "test_gdr_gpu_tensor_roundtrip"
+    task_name = "gdr_roundtrip_task"
+    batch_size = 8
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    # Build a TensorDict with GPU tensors only (GDR path).
+    indices = list(range(batch_size))
+    gpu_data = TensorDict(
+        {
+            "gpu_f32": torch.stack([torch.arange(i, i + 64, dtype=torch.float32, device=device) for i in indices]),
+            "gpu_bf16": torch.stack(
+                [torch.full((32,), float(i), dtype=torch.bfloat16, device=device) for i in indices]
+            ),
+            "gpu_f16": torch.stack([torch.linspace(0, i, 16, dtype=torch.float16, device=device) for i in indices]),
+            "gpu_i64": torch.stack(
+                [torch.arange(i * 10, i * 10 + 8, dtype=torch.int64, device=device) for i in indices]
+            ),
+        },
+        batch_size=batch_size,
+    )
+
+    meta = client.put(data=gpu_data, partition_id=partition_id)
+    assert meta.size == batch_size
+
+    try:
+        # GET: verify data integrity
+        retrieved_meta = poll_for_meta(client, partition_id, list(gpu_data.keys()), batch_size, task_name, mode="fetch")
+        assert retrieved_meta is not None and retrieved_meta.size == batch_size, "Failed to retrieve GDR metadata"
+        retrieved = client.get_data(retrieved_meta)
+
+        for i in range(batch_size):
+            assert torch.equal(retrieved["gpu_f32"][i].cpu(), gpu_data["gpu_f32"][i].cpu()), (
+                f"gpu_f32 mismatch at index {i}"
+            )
+            assert torch.equal(retrieved["gpu_bf16"][i].cpu(), gpu_data["gpu_bf16"][i].cpu()), (
+                f"gpu_bf16 mismatch at index {i}"
+            )
+            assert torch.equal(retrieved["gpu_f16"][i].cpu(), gpu_data["gpu_f16"][i].cpu()), (
+                f"gpu_f16 mismatch at index {i}"
+            )
+            assert torch.equal(retrieved["gpu_i64"][i].cpu(), gpu_data["gpu_i64"][i].cpu()), (
+                f"gpu_i64 mismatch at index {i}"
+            )
 
     finally:
         client.clear_partition(partition_id)

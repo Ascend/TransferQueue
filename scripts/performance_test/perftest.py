@@ -212,12 +212,17 @@ class TQClientActor:
     def __init__(self, config: dict[str, Any], use_complex_case: bool = False):
         self.config = config
         self.use_complex_case = use_complex_case
+        mooncake_cfg = config.get("backend", {}).get("MooncakeStore", {})
+        self.use_gdr = bool(mooncake_cfg.get("use_gdr", False))
+        self.gdr_device = "cuda:0"
         self.test_data = None
         self.total_data_size_gb = 0.0
         self.test_keys = None
 
     def initialize(self) -> None:
         """Initialize transfer_queue with the config."""
+        if self.use_gdr:
+            torch.cuda.set_device(self.gdr_device)
         tq.init(OmegaConf.create(self.config))
 
     def create_test_case(
@@ -249,11 +254,16 @@ class TQClientActor:
             return list(partition_info[partition_id].keys())
         return []
 
-    def get_data(self, partition_id: str, keys: list[str] | None = None) -> None:
+    def get_data(self, partition_id: str, keys: list[str] | None = None, move_to_gpu: bool = False) -> None:
         """Get data from storage using kv_batch_get."""
         if keys is None:
             keys = self.test_keys
-        tq.kv_batch_get(keys=keys, partition_id=partition_id)
+        result = tq.kv_batch_get(keys=keys, partition_id=partition_id)
+        if move_to_gpu:
+            cpu_tensors = [v for v in result.values() if torch.is_tensor(v) and not v.is_cuda]
+            torch.cuda.synchronize()
+            _ = [t.to(self.gdr_device) for t in cpu_tensors]
+            torch.cuda.synchronize()
 
     def delete(self, partition_id: str, keys: list[str] | None = None) -> None:
         """Delete data from storage using kv_clear."""
@@ -316,6 +326,9 @@ class TQThroughputTester:
         # Get backend from config
         self.backend = self.full_config["backend"]["storage_backend"]
 
+        # GDR is configured via backend.MooncakeStore.use_gdr (no separate CLI flag).
+        self.use_gdr = bool(self.full_config["backend"].get("MooncakeStore", {}).get("use_gdr", False))
+
         # For Yuanrong, always use inter_node
         self.use_inter_node = self.backend == "Yuanrong"
 
@@ -330,6 +343,18 @@ class TQThroughputTester:
         # Check worker_node_ip for Yuanrong
         if self.use_inter_node and self.worker_node_ip is None:
             raise ValueError("worker_node_ip is required for Yuanrong backend")
+
+        # GDR only applies to MooncakeStore on GPU; reject other combos up front.
+        if self.use_gdr:
+            if self.backend != "MooncakeStore":
+                raise ValueError(
+                    f"backend.MooncakeStore.use_gdr=true requires the MooncakeStore backend, got '{self.backend}'."
+                )
+            if self.device != "gpu":
+                raise ValueError(
+                    f"backend.MooncakeStore.use_gdr=true requires --device gpu "
+                    f"(CUDA tensors are needed for the GDR path), got '{self.device}'."
+                )
 
     def _prepare_config(self) -> dict[str, Any]:
         """Prepare the config by directly reading the backend_config file.
@@ -393,9 +418,9 @@ class TQThroughputTester:
         # Initialize transfer_queue
         logger.info(f"Using {self.backend} as storage backend.")
 
-        w = self.writer.initialize.remote()
-        r = self.reader.initialize.remote()
-        ray.get([w, r])
+        # Writer first: ensures storage bootstrap binds to the head address before reader attaches.
+        ray.get(self.writer.initialize.remote())
+        ray.get(self.reader.initialize.remote())
 
     def run_throughput_test(self, skip_dataset_create=False) -> dict[str, Any]:
         """Run the throughput test and print results.
@@ -438,10 +463,11 @@ class TQThroughputTester:
 
         time.sleep(2)
 
-        # GET_DATA operation using kv_batch_get
+        # GET_DATA operation using kv_batch_get; move_to_gpu adds H2D into get_time
+        move_to_gpu = self.device == "gpu" and not self.use_gdr
         logger.info("Starting GET_DATA operation (kv_batch_get)...")
         start_get_data = time.perf_counter()
-        ray.get(self.reader.get_data.remote(partition_id=partition_id, keys=keys))
+        ray.get(self.reader.get_data.remote(partition_id=partition_id, keys=keys, move_to_gpu=move_to_gpu))
         end_get_data = time.perf_counter()
         get_time = end_get_data - start_get_data
         get_gbit_per_sec = (self.total_data_size_gb * 8) / get_time
@@ -462,6 +488,7 @@ class TQThroughputTester:
         logger.info("=" * 60)
         logger.info(f"Backend: {self.backend}")
         logger.info(f"Device: {self.device}")
+        logger.info(f"GDR: {self.use_gdr}")
         logger.info(f"Total Data Size: {self.total_data_size_gb:.6f} GB")
         logger.info(f"PUT Time: {put_time:.8f}s")
         logger.info(f"GET Time: {get_time:.8f}s")
@@ -474,6 +501,7 @@ class TQThroughputTester:
         return {
             "backend": self.backend,
             "device": self.device,
+            "use_gdr": self.use_gdr,
             "total_data_size_gb": self.total_data_size_gb,
             "put_time": put_time,
             "get_time": get_time,
