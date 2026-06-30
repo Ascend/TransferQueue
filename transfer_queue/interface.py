@@ -1174,9 +1174,9 @@ def load_checkpoint(
     if not controller_path.exists():
         raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
 
-    client.load_controller_checkpoint(str(controller_path))
-
     if meta.get("storage_saved"):
         client.load_storage_checkpoint(str(checkpoint_dir))
+
+    client.load_controller_checkpoint(str(controller_path))
 
     logger.info(f"Checkpoint loaded from {checkpoint_dir}")
