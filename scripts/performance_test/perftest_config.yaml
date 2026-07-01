@@ -53,6 +53,8 @@ backend:
     # Network device name.
     # Set to "" to let Mooncake auto-select available devices.
     device_name: ""
+    # GPU Direct RDMA. When true, CUDA tensors are transferred directly from GPU memory
+    use_gdr: false
 
   # For Yuanrong:
   Yuanrong:

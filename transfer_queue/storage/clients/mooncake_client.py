@@ -23,6 +23,12 @@ from torch import Tensor
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.mooncake_utils import (
+    GdrStaging,
+    _aligned_offsets,
+    chunk_subkeys,
+    split_by_bytes,
+)
 from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes, merge_contiguous_memory
 
 logger = get_logger(__name__)
@@ -65,6 +71,16 @@ class MooncakeStoreClient(StorageKVClient):
         self.device_name = config.get("device_name", "")
         if self.device_name is None:
             self.device_name = ""
+
+        self.use_gdr = bool(config.get("use_gdr", False))
+        # gdr_staging_buffer_mb > 0: use persistent staging buffer (GDR path).
+        # gdr_staging_buffer_mb = 0: fall back to CPU RDMA path even if use_gdr=True.
+        self.gdr_staging_buffer_mb = int(config.get("gdr_staging_buffer_mb", 1024))
+        buffer_bytes = self.gdr_staging_buffer_mb * 1024 * 1024
+        # GdrStaging instance created eagerly but cudaMalloc is deferred to first use.
+        # Skip GDR if CUDA context is not initialized in this process (e.g. CPU-only workers)
+        gdr_eligible = self.use_gdr and buffer_bytes > 0 and torch.cuda.is_initialized()
+        self._gdr_staging: GdrStaging | None = GdrStaging(buffer_bytes) if gdr_eligible else None
 
         if self.local_hostname is None or self.local_hostname == "":
             from transfer_queue.utils.zmq_utils import get_node_ip_address
@@ -117,10 +133,12 @@ class MooncakeStoreClient(StorageKVClient):
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
 
-        tensor_keys = []
-        tensor_values = []
-        non_tensor_keys = []
-        non_tensor_values = []
+        use_gdr_path = self.use_gdr and self._gdr_staging is not None
+
+        tensor_keys: list[str] = []
+        tensor_values: list[Tensor] = []
+        non_tensor_keys: list[str] = []
+        non_tensor_values: list[Any] = []
 
         for key, value in zip(keys, values, strict=True):
             if isinstance(value, torch.Tensor):
@@ -130,13 +148,18 @@ class MooncakeStoreClient(StorageKVClient):
                 non_tensor_keys.append(key)
                 non_tensor_values.append(value)
 
+        gdr_meta: dict[str, dict | None] = {}
+        if use_gdr_path and tensor_keys:
+            gdr_meta = dict(zip(tensor_keys, self._put_tensors_gdr(tensor_keys, tensor_values), strict=False))
+
         tensor_futures: list[Future[None]] = []
         bytes_futures: list[Future[list[int]]] = []
         with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
-            for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
-                batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
-                batch_tensors = tensor_values[i : i + BATCH_SIZE_LIMIT]
-                tensor_futures.append(executor.submit(self._put_tensors_thread_worker, batch_keys, batch_tensors))
+            if not use_gdr_path:
+                for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
+                    batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
+                    batch_tensors = tensor_values[i : i + BATCH_SIZE_LIMIT]
+                    tensor_futures.append(executor.submit(self._put_tensors_thread_worker, batch_keys, batch_tensors))
 
             for i in range(0, len(non_tensor_keys), BATCH_SIZE_LIMIT):
                 batch_keys = non_tensor_keys[i : i + BATCH_SIZE_LIMIT]
@@ -150,19 +173,65 @@ class MooncakeStoreClient(StorageKVClient):
             for tf in tensor_futures:
                 tf.result()
 
-        # bytes results arrive in non-tensor submit order, which matches the order of
-        # non-tensor values; walk values once to scatter packed_size back to its key slot.
+        # Walk keys/values once to scatter results back to original slots.
         sizes_iter = iter(packed_sizes)
         custom_backend_meta: list[dict | None] = [
-            {"packed_size": next(sizes_iter)} if not isinstance(value, torch.Tensor) else None for value in values
+            gdr_meta.get(key) if isinstance(value, torch.Tensor) else {"packed_size": next(sizes_iter)}
+            for key, value in zip(keys, values, strict=False)
         ]
 
         return custom_backend_meta
 
-    def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
-        """Worker thread for putting batch of tensors to MooncakeStore."""
+    def _put_tensors_gdr(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> list[dict | None]:
+        """GDR tensor PUT path using the persistent pre-registered staging buffer.
 
-        batch_ptrs, batch_sizes, _contiguous_tensors = self._preprocess_tensors_for_put(batch_tensors)
+        split_by_bytes() groups tensors so each group's aligned total fits within the
+        staging buffer. Oversized tensors (nbytes > buffer_size) get a singleton group
+        and are stored as :c{i} sub-keys. Normal groups are packed and upserted together.
+
+        Returns per-key meta: None for normal tensors, {"n_chunks": n} for oversized
+        tensors that were split into :c{i} sub-keys. clear() uses this to expand keys.
+        """
+        assert self._gdr_staging is not None
+        self._gdr_staging.lazy_init(self._store)
+        staging = self._gdr_staging
+        buffer_size = staging.size
+
+        # Caller guarantees all tensors are CUDA; make contiguous outside the lock.
+        contiguous_tensors = [t.contiguous() for t in batch_tensors]
+        nbytes = [t.nbytes for t in contiguous_tensors]
+        groups = split_by_bytes(nbytes, buffer_size)
+
+        meta: list[dict | None] = [None] * len(batch_keys)
+
+        with staging.acquire():
+            for idxs in groups:
+                g_keys = [batch_keys[i] for i in idxs]
+                g_tensors = [contiguous_tensors[i] for i in idxs]
+
+                if len(idxs) == 1 and g_tensors[0].nbytes > buffer_size:
+                    # Oversized tensor: split into :c{i} sub-keys.
+                    tensor = g_tensors[0]
+                    key = g_keys[0]
+                    sub_keys = chunk_subkeys(key, tensor.nbytes, buffer_size)
+                    memcpy_chunk = staging.memcpy_d2d_async if tensor.is_cuda else staging.memcpy_h2d_async
+                    for i, sub_key in enumerate(sub_keys):
+                        chunk_size = min(buffer_size, tensor.nbytes - i * buffer_size)
+                        memcpy_chunk(staging.ptr, tensor.data_ptr() + i * buffer_size, chunk_size)
+                        staging.synchronize()
+                        self._batch_upsert_with_retry([sub_key], [staging.ptr], [chunk_size])
+                    meta[idxs[0]] = {"n_chunks": len(sub_keys)}
+                else:
+                    # Normal group: aligned total fits in buffer; pack and upsert together.
+                    sub_ptrs, sizes = staging.pack(g_tensors)
+                    self._batch_upsert_with_retry(g_keys, sub_ptrs, sizes)
+
+        return meta
+
+    def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
+        """Worker thread for putting batch of cpu tensors to MooncakeStore."""
+
+        batch_ptrs, batch_sizes, _ = self._preprocess_tensors_for_put(batch_tensors)
         batch_ptr_reduced, batch_sizes_reduced = merge_contiguous_memory(batch_ptrs, batch_sizes)
         self._register_all_buffers(batch_ptr_reduced, batch_sizes_reduced)
         try:
@@ -227,26 +296,42 @@ class MooncakeStoreClient(StorageKVClient):
         if not (len(keys) == len(shapes) == len(dtypes)):
             raise ValueError("Lengths of keys, shapes, dtypes must match")
 
-        tensor_indices: list[int] = []
-        tensor_keys: list[str] = []
-        tensor_shapes: list[Any] = []
-        tensor_dtypes: list[Any] = []
+        use_gdr_path = self.use_gdr and self._gdr_staging is not None
+
+        gpu_tensor_indices: list[int] = []
+        gpu_tensor_keys: list[str] = []
+        gpu_tensor_shapes: list[Any] = []
+        gpu_tensor_dtypes: list[Any] = []
+        cpu_tensor_indices: list[int] = []
+        cpu_tensor_keys: list[str] = []
+        cpu_tensor_shapes: list[Any] = []
+        cpu_tensor_dtypes: list[Any] = []
         non_tensor_indices: list[int] = []
         non_tensor_keys: list[str] = []
         non_tensor_packed_sizes: list[int] = []
 
         for i, dtype in enumerate(dtypes):
             if dtype is not None:
-                tensor_indices.append(i)
-                tensor_keys.append(keys[i])
-                tensor_shapes.append(shapes[i])
-                tensor_dtypes.append(dtype)
+                if use_gdr_path:
+                    gpu_tensor_indices.append(i)
+                    gpu_tensor_keys.append(keys[i])
+                    gpu_tensor_shapes.append(shapes[i])
+                    gpu_tensor_dtypes.append(dtype)
+                else:
+                    cpu_tensor_indices.append(i)
+                    cpu_tensor_keys.append(keys[i])
+                    cpu_tensor_shapes.append(shapes[i])
+                    cpu_tensor_dtypes.append(dtype)
             else:
                 non_tensor_indices.append(i)
                 non_tensor_keys.append(keys[i])
 
-        if non_tensor_indices and (custom_backend_meta is None or len(custom_backend_meta) != len(keys)):
-            raise ValueError("custom_backend_meta with per-key packed_size is required when any dtype is None.")
+        if (gpu_tensor_indices and use_gdr_path) or non_tensor_indices:
+            if custom_backend_meta is None or len(custom_backend_meta) != len(keys):
+                raise ValueError(
+                    "custom_backend_meta is required when GDR is enabled (for n_chunks) "
+                    "or when any dtype is None (for packed_size)."
+                )
 
         if non_tensor_indices:
             assert custom_backend_meta is not None
@@ -257,13 +342,22 @@ class MooncakeStoreClient(StorageKVClient):
 
         results = [None] * len(keys)
 
+        if gpu_tensor_keys:
+            assert custom_backend_meta is not None
+            gpu_tensor_meta = [custom_backend_meta[i] for i in gpu_tensor_indices]
+            retrieved, batch_idx = self._get_tensors_gdr(
+                gpu_tensor_keys, gpu_tensor_shapes, gpu_tensor_dtypes, gpu_tensor_indices, gpu_tensor_meta
+            )
+            for idx, val in zip(batch_idx, retrieved, strict=True):
+                results[idx] = val
+
         futures = []
         with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
-            for i in range(0, len(tensor_indices), BATCH_SIZE_LIMIT):
-                batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
-                batch_shapes = tensor_shapes[i : i + BATCH_SIZE_LIMIT]
-                batch_dtypes = tensor_dtypes[i : i + BATCH_SIZE_LIMIT]
-                batch_indexes = tensor_indices[i : i + BATCH_SIZE_LIMIT]
+            for i in range(0, len(cpu_tensor_indices), BATCH_SIZE_LIMIT):
+                batch_keys = cpu_tensor_keys[i : i + BATCH_SIZE_LIMIT]
+                batch_shapes = cpu_tensor_shapes[i : i + BATCH_SIZE_LIMIT]
+                batch_dtypes = cpu_tensor_dtypes[i : i + BATCH_SIZE_LIMIT]
+                batch_indexes = cpu_tensor_indices[i : i + BATCH_SIZE_LIMIT]
                 futures.append(
                     executor.submit(
                         self._get_tensors_thread_worker, batch_keys, batch_shapes, batch_dtypes, batch_indexes
@@ -301,6 +395,74 @@ class MooncakeStoreClient(StorageKVClient):
 
         return batch_buffer_tensors, indexes
 
+    def _get_tensors_gdr(
+        self,
+        batch_keys: list[str],
+        batch_shapes: list[tuple],
+        batch_dtypes: list[torch.dtype],
+        indexes: list[int],
+        batch_meta: list[dict | None],
+    ) -> tuple[list[Tensor], list[int]]:
+        """GDR tensor GET path using the persistent pre-registered staging buffer.
+
+        split_by_bytes() groups tensors so each group's aligned total fits within the
+        staging buffer. Oversized singleton groups reassemble from :c{i} sub-keys.
+        Normal groups use a single batch_get_into + unpack.
+
+        NOTE: An alternative design is to skip the staging buffer entirely: for each group,
+        cudaMalloc a fresh buffer, register it, RDMA GET directly into it, unregister it,
+        then slice into tensors via torch.from_blob (eliminating the D2D copy and the staging
+        buffer lock). However, all tensors in a group would share one underlying buffer via
+        PyTorch's storage refcount — the buffer is freed only when the last tensor in the
+        group is GC'd. A single long-lived tensor silently keeps the entire batch allocation
+        alive, which is a hard-to-debug memory leak. We keep the D2D copy for now to give
+        each returned tensor an independent PyTorch-managed lifetime.
+        """
+        assert self._gdr_staging is not None
+        self._gdr_staging.lazy_init(self._store)
+        staging = self._gdr_staging
+        device = torch.device("cuda", torch.cuda.current_device())
+        buffer_size = staging.size
+        batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
+
+        # Grouping happens outside the lock.
+        groups = split_by_bytes(batch_nbytes, buffer_size)
+
+        tensors: list[torch.Tensor] = [None] * len(batch_keys)  # type: ignore[list-item]
+
+        with staging.acquire():
+            for idxs in groups:
+                g_keys = [batch_keys[i] for i in idxs]
+                g_nbytes = [batch_nbytes[i] for i in idxs]
+                g_dtypes = [batch_dtypes[i] for i in idxs]
+                g_shapes = [batch_shapes[i] for i in idxs]
+
+                if len(idxs) == 1 and g_nbytes[0] > buffer_size:
+                    # Oversized tensor: reassemble from :c{i} sub-keys.
+                    key = g_keys[0]
+                    total = g_nbytes[0]
+                    meta_entry = batch_meta[idxs[0]]
+                    assert meta_entry is not None
+                    n_chunks = meta_entry["n_chunks"]
+                    sub_keys = [f"{key}:c{i}" for i in range(n_chunks)]
+                    final_tensor = torch.empty(tuple(g_shapes[0]), dtype=g_dtypes[0], device=device)
+                    for i, sub_key in enumerate(sub_keys):
+                        chunk_size = min(buffer_size, total - i * buffer_size)
+                        self._batch_get_into_with_retry([sub_key], [staging.ptr], [chunk_size])
+                        staging.memcpy_d2d_async(final_tensor.data_ptr() + i * buffer_size, staging.ptr, chunk_size)
+                    staging.synchronize()
+                    tensors[idxs[0]] = final_tensor
+                else:
+                    # Normal group: aligned total fits; batch_get_into then unpack.
+                    offsets, _ = _aligned_offsets(g_nbytes)
+                    sub_ptrs = [staging._ptr + off for off in offsets]
+                    self._batch_get_into_with_retry(g_keys, sub_ptrs, g_nbytes)
+                    unpacked = staging.unpack(sub_ptrs, g_nbytes, g_dtypes, g_shapes, device)
+                    for pos, t in zip(idxs, unpacked, strict=True):
+                        tensors[pos] = t
+
+        return tensors, indexes
+
     def _get_bytes_thread_worker(
         self, batch_keys: list[str], batch_packed_sizes: list[int], indexes: list[int]
     ) -> tuple[list[Any], list[int]]:
@@ -331,13 +493,30 @@ class MooncakeStoreClient(StorageKVClient):
             keys (List[str]): List of keys to remove.
             custom_backend_meta (List[Any], optional): ...
         """
-        ret_codes = self._store.batch_remove(keys, force=True)
+        if self._gdr_staging is not None and custom_backend_meta is not None:
+            actual_keys: list[str] = []
+            for key, meta in zip(keys, custom_backend_meta, strict=True):
+                if isinstance(meta, dict) and "n_chunks" in meta:
+                    actual_keys.extend(f"{key}:c{i}" for i in range(meta["n_chunks"]))
+                else:
+                    actual_keys.append(key)
+        else:
+            if self._gdr_staging is not None:
+                logger.warning(
+                    "GDR is enabled but custom_backend_meta is None; chunked sub-keys (if any) will not be removed."
+                )
+            actual_keys = keys
+
+        ret_codes = self._store.batch_remove(actual_keys, force=True)
         for i, ret in enumerate(ret_codes):
             if not (ret == 0 or ret == -704):
-                logger.error(f"remove failed for key `{keys[i]}` with error code: {ret}")
+                logger.error(f"remove failed for key `{actual_keys[i]}` with error code: {ret}")
 
     def close(self):
         """Closes MooncakeStore."""
+        if self._gdr_staging is not None:
+            self._gdr_staging.close(self._store)
+            self._gdr_staging = None
         if self._store:
             self._store.close()
             self._store = None
@@ -472,9 +651,6 @@ class MooncakeStoreClient(StorageKVClient):
         size_list: list[int] = []
         tensor_list: list[Tensor] = []  # hold reference for the contiguous tensor
         for t in values:
-            # TODO: support gpu direct rdma and use different data paths.
-            #       For GPU, it's more reasonable to perform data copy since
-            #       The register overhead is much higher than CPU
             if t.device.type == "cuda":
                 t = t.cpu()
             t = t.contiguous()

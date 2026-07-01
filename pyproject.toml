@@ -119,7 +119,8 @@ yuanrong = [
     "openyuanrong-datasystem"
 ]
 mooncake = [
-    "mooncake-transfer-engine==0.3.10.post2"
+    "mooncake-transfer-engine==0.3.10.post2",
+    "cuda-python",
 ]
 
 # If you need to mimic `package_dir={'': '.'}`:
