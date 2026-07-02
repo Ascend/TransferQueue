@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import pickle
 import time
 import weakref
 from threading import Event, Thread
@@ -310,6 +311,10 @@ class SimpleStorageUnit:
                             response_msg = self._handle_clear(request_msg)
                     elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                         response_msg = self._handle_get_metrics()
+                    elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                        response_msg = self._handle_save_checkpoint(request_msg)
+                    elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                        response_msg = self._handle_load_checkpoint(request_msg)
                     else:
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
@@ -537,10 +542,100 @@ class SimpleStorageUnit:
                 metrics["op_stats"] = op_stats
 
         return ZMQMessage.create(
-            request_type=ZMQRequestType.METRICS_RESPONSE,
+            request_type=ZMQRequestType.METRICS_RESPONSE,  # type: ignore[arg-type]
             sender_id=self.storage_unit_id,
             body=metrics,
         )
+
+    def _handle_save_checkpoint(self, data_parts) -> ZMQMessage:
+        """Serialize storage unit data directly to a file.
+
+        Args:
+            data_parts: ZMQMessage from client, containing ``path`` in body:
+                absolute path for the output .pkl file. The caller must ensure
+                this path is reachable from the node running this actor
+                (shared filesystem required for multi-node setups).
+
+        Returns:
+            ZMQMessage with ``success=True`` on success, or ``success=False``
+            and ``message`` containing the error string on failure.
+        """
+        path = data_parts.body["path"]
+        try:
+            state = {
+                "storage_unit_id": self.storage_unit_id,
+                "storage_unit_size": self.storage_unit_size,
+                "field_data": self.storage_data.field_data,
+                "active_keys": self.storage_data._active_keys,
+            }
+            with open(path, "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": True},
+            )
+        except Exception as e:
+            logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
+
+    def _handle_load_checkpoint(self, data_parts) -> ZMQMessage:
+        """Restore storage unit data directly from a file.
+
+        Args:
+            data_parts: ZMQMessage from client, containing ``path`` in body:
+                absolute path to a .pkl file previously written by
+                ``_handle_save_checkpoint``. The caller must ensure this path
+                is reachable from the node running this actor
+                (shared filesystem required for multi-node setups).
+
+        Returns:
+            ZMQMessage with ``success=True`` on success, or ``success=False``
+            and ``message`` containing the error string on failure.
+        """
+        path = data_parts.body["path"]
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+
+            if data["storage_unit_size"] != self.storage_unit_size:
+                logger.warning(
+                    f"[{self.storage_unit_id}]: storage_unit_size mismatch — "
+                    f"checkpoint={data['storage_unit_size']}, current={self.storage_unit_size}"
+                )
+
+            if self.storage_data._active_keys:
+                logger.warning(
+                    f"[{self.storage_unit_id}]: overwriting {len(self.storage_data._active_keys)} "
+                    f"existing keys with checkpoint data from {path}"
+                )
+            self.storage_data.field_data.clear()
+            self.storage_data._active_keys.clear()
+            self.storage_data.field_data = data["field_data"]
+            self.storage_data._active_keys = data["active_keys"]
+
+            logger.info(
+                f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "
+                f"{len(data['active_keys'])} keys, {len(data['field_data'])} fields"
+            )
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": True},
+            )
+
+        except Exception as e:
+            logger.error(f"[{self.storage_unit_id}]: load checkpoint failed: {e}")
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
 
     @staticmethod
     def _cumulative_bucket_counts(hist) -> list[float]:

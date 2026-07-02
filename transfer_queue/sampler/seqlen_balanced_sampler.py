@@ -196,6 +196,17 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
         for k in keys_to_remove:
             del self._balanced_cache[k]
 
+    def save_checkpoint(self) -> dict:
+        """Return sampler state including the balanced cache."""
+        state = super().save_checkpoint()
+        state["_balanced_cache"] = self._balanced_cache
+        return state
+
+    def load_checkpoint(self, state: dict) -> None:
+        """Restore sampler state including the balanced cache."""
+        super().load_checkpoint(state)
+        self._balanced_cache = state["_balanced_cache"]
+
 
 # Copied from https://github.com/volcengine/verl/blob/468adf22c43b744348051fccd7a5d830c6c3c36a/verl/utils/seqlen_balancing.py
 def karmarkar_karp(seqlen_list: list[int], k_partitions: int, equal_size: bool):

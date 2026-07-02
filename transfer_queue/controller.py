@@ -15,6 +15,7 @@
 
 import copy
 import os
+import pickle
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -2056,6 +2057,26 @@ class TransferQueueController:
                         body={"partition_info": partition_info, "message": message},
                     )
 
+            elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
+                path = request_msg.body["path"]
+                self.save_checkpoint(path)
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": True},
+                )
+
+            elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
+                path = request_msg.body["path"]
+                self.load_checkpoint(path)
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": True},
+                )
+
             self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
@@ -2069,6 +2090,64 @@ class TransferQueueController:
     def get_config(self) -> DictConfig:
         """Retrieve the global config of TransferQueue."""
         return self.tq_config
+
+    def save_checkpoint(self, path: str) -> None:
+        """Serialize controller state directly to a file.
+
+        Writes in-process to avoid transmitting the payload back over the
+        Ray object store.
+
+        Args:
+            path: Absolute path for the output .pkl file.
+
+        Raises:
+            Exception: If serialization or file I/O fails.
+        """
+        try:
+            state = {
+                "controller_id": self.controller_id,
+                "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
+                "index_manager": {
+                    "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
+                    "reusable_indexes": list(self.index_manager.reusable_indexes),
+                    "global_index_counter": self.index_manager.global_index_counter,
+                    "allocated_indexes": set(self.index_manager.allocated_indexes),
+                },
+                "sampler": self.sampler.save_checkpoint(),
+            }
+            with open(path, "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"[{self.controller_id}]: dumped to {path}")
+        except Exception as e:
+            raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
+
+    def load_checkpoint(self, path: str) -> None:
+        """Restore controller state directly from a file.
+
+        Args:
+            path: Absolute path to a .pkl file previously written by save_checkpoint().
+
+        Raises:
+            Exception: If deserialization or file I/O fails.
+        """
+        try:
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+
+            self.controller_id = state["controller_id"]
+            self.partitions = state["partitions"]
+
+            im = state["index_manager"]
+            self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
+            self.index_manager.reusable_indexes = im["reusable_indexes"]
+            self.index_manager.global_index_counter = im["global_index_counter"]
+            self.index_manager.allocated_indexes = im["allocated_indexes"]
+
+            self.sampler.load_checkpoint(state["sampler"])
+
+            logger.info(f"[{self.controller_id}]: restored from {path}")
+        except Exception as e:
+            raise RuntimeError(f"[{self.controller_id}]: load checkpoint failed: {e}") from e
 
     def register_sampler(
         self,
