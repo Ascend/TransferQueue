@@ -1039,3 +1039,109 @@ class TestTransferQueueControllerKvInterface:
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_1))
         ray.get(tq_controller.clear_partition.remote(partition_2))
+
+
+class TestTransferQueueControllerCheckpoint:
+    """Tests for TransferQueueController save/load checkpoint functionality."""
+
+    def test_controller_checkpoint_round_trip(self, ray_setup, tmp_path):
+        """Save and load controller state; verify partition data is preserved."""
+        gbs = 4
+        partition_id = "ckpt_partition"
+        ckpt_path = str(tmp_path / "controller.pkl")
+
+        tq_controller = TransferQueueController.remote()
+
+        # Insert some data
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+        field_schema = {
+            "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
+            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+        }
+        ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+
+        # Save checkpoint
+        ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
+        assert (tmp_path / "controller.pkl").exists()
+
+        # Create a fresh controller and restore
+        new_controller = TransferQueueController.remote()
+        ray.get(new_controller.load_checkpoint.remote(ckpt_path))
+
+        # Verify partition state was restored
+        partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))
+        assert partition is not None
+        assert set(partition.global_indexes) == set(metadata.global_indexes)
+        assert partition.production_status is not None
+
+        index_range = ray.get(new_controller.get_partition_index_range.remote(partition_id))
+        assert sorted(index_range) == sorted(metadata.global_indexes)
+
+        print("✓ Controller checkpoint round-trip preserves partition state")
+
+    def test_controller_checkpoint_restores_index_manager(self, ray_setup, tmp_path):
+        """Verify that global_index counter is correctly restored after load."""
+        ckpt_path = str(tmp_path / "controller.pkl")
+
+        tq_controller = TransferQueueController.remote()
+
+        # Insert into two partitions to advance the index counter
+        for pid in ["ckpt_p1", "ckpt_p2"]:
+            meta = ray.get(
+                tq_controller.get_metadata.remote(
+                    data_fields=["f"],
+                    batch_size=4,
+                    partition_id=pid,
+                    mode="insert",
+                )
+            )
+            ray.get(
+                tq_controller.update_production_status.remote(
+                    partition_id=pid,
+                    global_indexes=meta.global_indexes,
+                    field_schema={"f": {"dtype": "torch.float32", "shape": (1,)}},
+                )
+            )
+
+        ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
+
+        new_controller = TransferQueueController.remote()
+        ray.get(new_controller.load_checkpoint.remote(ckpt_path))
+
+        # New inserts should continue from where the counter left off (no index collision)
+        meta_after = ray.get(
+            new_controller.get_metadata.remote(
+                data_fields=["f"],
+                batch_size=2,
+                partition_id="ckpt_p3",
+                mode="insert",
+            )
+        )
+        existing_indexes = set(range(8))  # 2 partitions × 4 samples
+        assert not set(meta_after.global_indexes) & existing_indexes, "Index collision after checkpoint restore"
+
+        print("✓ Index manager counter correctly restored")
+
+    def test_controller_checkpoint_load_nonexistent_file(self, ray_setup, tmp_path):
+        """Loading from a missing file should raise RuntimeError."""
+        missing = str(tmp_path / "does_not_exist.pkl")
+        tq_controller = TransferQueueController.remote()
+
+        with pytest.raises(ray.exceptions.RayTaskError):
+            ray.get(tq_controller.load_checkpoint.remote(missing))
+
+        print("✓ load_checkpoint raises on missing file")
