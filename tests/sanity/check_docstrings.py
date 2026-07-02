@@ -31,11 +31,12 @@ class DocstringChecker(ast.NodeVisitor):
         self.filename = filename
         self.missing_docstrings: list[tuple[str, str, int]] = []
         self.current_class = None
+        self.public_scope = True
         self.function_nesting_level = 0
 
     def visit_FunctionDef(self, node: ast.FunctionDef):
         """Visit function definitions and check for docstrings."""
-        if not node.name.startswith("_") and self.function_nesting_level == 0:
+        if self._is_public(node.name) and self.function_nesting_level == 0:
             if not self._has_docstring(node):
                 func_name = f"{self.current_class}.{node.name}" if self.current_class else node.name
                 self.missing_docstrings.append((func_name, self.filename, node.lineno))
@@ -46,7 +47,7 @@ class DocstringChecker(ast.NodeVisitor):
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef):
         """Visit async function definitions and check for docstrings."""
-        if not node.name.startswith("_") and self.function_nesting_level == 0:
+        if self._is_public(node.name) and self.function_nesting_level == 0:
             if not self._has_docstring(node):
                 func_name = f"{self.current_class}.{node.name}" if self.current_class else node.name
                 self.missing_docstrings.append((func_name, self.filename, node.lineno))
@@ -57,14 +58,22 @@ class DocstringChecker(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef):
         """Visit class definitions and check for docstrings."""
-        if not node.name.startswith("_"):
+        is_public_class = self._is_public(node.name)
+        if is_public_class:
             if not self._has_docstring(node):
                 self.missing_docstrings.append((node.name, self.filename, node.lineno))
 
         old_class = self.current_class
+        old_public_scope = self.public_scope
         self.current_class = node.name
+        self.public_scope = is_public_class
         self.generic_visit(node)
         self.current_class = old_class
+        self.public_scope = old_public_scope
+
+    def _is_public(self, name: str) -> bool:
+        """Return whether a name is part of a public scope."""
+        return self.public_scope and not name.startswith("_")
 
     def _has_docstring(self, node) -> bool:
         """Check if a node has a docstring."""
