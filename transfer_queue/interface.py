@@ -246,6 +246,13 @@ def close():
                             f"Consider manually killing the mooncake_master."
                         )
 
+                    # Terminate offload client process if it was started
+                    if isinstance(value, dict):
+                        offload_proc = value.get("offload_client_process")
+                        if offload_proc is not None and offload_proc.poll() is None:
+                            offload_proc.terminate()
+                            logger.info(f"Terminated mooncake_client offload process (PID: {offload_proc.pid}).")
+
                     if _TQ_CLIENT:
                         try:
                             ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
