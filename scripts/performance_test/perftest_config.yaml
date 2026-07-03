@@ -38,6 +38,7 @@ backend:
     # WARNING: When set to `true`, TQ will attempt to terminate any existing mooncake_master process.
     auto_init: true
     # Address of the metadata coordination server.
+    # Set to "P2PHANDSHAKE" to use peer-to-peer handshake mode (recommended for multi-NIC environments).
     metadata_server: localhost:50050
     # Address of the Mooncake master server.
     master_server_address: localhost:50051
@@ -53,6 +54,47 @@ backend:
     # Network device name.
     # Set to "" to let Mooncake auto-select available devices.
     device_name: ""
+    # Whether to hard-pin objects in memory. Hard-pinned objects are never evicted.
+    # Set to null (default) for auto-management: hard_pin is disabled when offload is enabled,
+    # and enabled otherwise. Set to true/false to explicitly override.
+    hard_pin: null
+
+    # SSD Offload configuration.
+    # When enabled, TQ will start a standalone mooncake_client process that offloads
+    # data from DRAM to NVMe SSD when memory usage exceeds the high watermark.
+    # This is essential for environments where total CPU DRAM < GPU HBM.
+    #
+    # Architecture note:
+    #   The offload client is a **single-node centralized SSD storage pool** that runs
+    #   on the first node where tq.init() is called. It registers itself with mooncake_master
+    #   and serves the entire cluster — when eviction is triggered, the master moves data
+    #   from ANY node's memory to this offload client via TCP/RDMA.
+    #   Ensure that `local_hostname` (above) is set to a cluster-reachable address so that
+    #   all nodes can transfer data to the offload client.
+    #
+    # TODO: Support multi-node distributed offload (one client per node) for better
+    #       scalability in large clusters.
+    offload:
+      # Master switch for SSD offload.
+      enabled: false
+      # Path to the SSD directory for offloaded data.
+      file_storage_path: /tmp/mooncake_offload
+      # Local buffer size in bytes for the offload client (default: 2GB).
+      local_buffer_size_bytes: 2147483648
+      # Whether to use io_uring for async I/O (requires kernel >= 5.1 and liburing).
+      use_uring: false
+      # Heartbeat interval in seconds for the offload client.
+      # Note: This is paired with mooncake_master's -client_ttl (default: 30s).
+      # The client sends heartbeats at this interval; the master considers the client
+      # dead if no heartbeat is received within client_ttl. Ensure:
+      #   heartbeat_interval_seconds << client_ttl (currently 2s << 30s = tolerates ~15 missed beats)
+      heartbeat_interval_seconds: 2
+      # Port for the standalone mooncake_client process.
+      client_port: 42052
+      # Eviction high watermark ratio (0.0-1.0). Eviction starts when memory usage exceeds this ratio.
+      eviction_high_watermark_ratio: 0.9
+      # Fraction of memory to free during each eviction cycle.
+      eviction_ratio: 0.1
 
   # For Yuanrong:
   Yuanrong:
