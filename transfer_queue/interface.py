@@ -251,6 +251,10 @@ def close():
                         offload_proc = value.get("offload_client_process")
                         if offload_proc is not None and offload_proc.poll() is None:
                             offload_proc.terminate()
+                            try:
+                                offload_proc.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                offload_proc.kill()
                             logger.info(f"Terminated mooncake_client offload process (PID: {offload_proc.pid}).")
 
                     if _TQ_CLIENT:

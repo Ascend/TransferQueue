@@ -55,9 +55,9 @@ backend:
     # Set to "" to let Mooncake auto-select available devices.
     device_name: ""
     # Whether to hard-pin objects in memory. Hard-pinned objects are never evicted.
-    # When offload is enabled, this is automatically set to false unless explicitly overridden.
-    # Set to true for maximum read performance when offload is not needed.
-    hard_pin: true
+    # Set to null (default) for auto-management: hard_pin is disabled when offload is enabled,
+    # and enabled otherwise. Set to true/false to explicitly override.
+    hard_pin: null
 
     # SSD Offload configuration.
     # When enabled, TQ will start a standalone mooncake_client process that offloads

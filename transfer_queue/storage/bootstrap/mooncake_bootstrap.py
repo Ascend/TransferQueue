@@ -259,6 +259,10 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
 
             # Terminate the master process since offload cannot work without the client
             process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
             raise RuntimeError(
                 f"mooncake_client exited unexpectedly (exit code: {client_process.returncode}). "
                 f"SSD offload is enabled but the offload client failed to start. "

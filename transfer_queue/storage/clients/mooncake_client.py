@@ -94,7 +94,11 @@ class MooncakeStoreClient(StorageKVClient):
         # and offloaded to SSD. Hard-pinned objects are never evicted by Mooncake.
         offload_conf = config.get("offload", {})
         offload_enabled = offload_conf.get("enabled", False) if isinstance(offload_conf, dict) else False
-        self.replica_config.with_hard_pin = bool(config.get("hard_pin", not offload_enabled))
+        hard_pin = config.get("hard_pin", None)
+        if hard_pin is None:
+            # Auto-manage: disable hard_pin when offload is enabled
+            hard_pin = not offload_enabled
+        self.replica_config.with_hard_pin = bool(hard_pin)
 
         self._store = MooncakeDistributedStore()
         ret = self._store.setup(
