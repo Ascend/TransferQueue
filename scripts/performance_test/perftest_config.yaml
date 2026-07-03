@@ -66,7 +66,7 @@ backend:
     #
     # Architecture note:
     #   The offload client is a **single-node centralized SSD storage pool** that runs
-    #   on the node where tq.init() is called. It registers itself with mooncake_master
+    #   on the first node where tq.init() is called. It registers itself with mooncake_master
     #   and serves the entire cluster — when eviction is triggered, the master moves data
     #   from ANY node's memory to this offload client via TCP/RDMA.
     #   Ensure that `local_hostname` (above) is set to a cluster-reachable address so that

@@ -188,7 +188,7 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
     # Start standalone mooncake_client for SSD offload if enabled.
     #
     # Architecture: The offload client is a single-node centralized SSD storage pool.
-    # It runs only on the node that calls tq.init(), but serves the entire cluster:
+    # It runs only on the first node that calls tq.init(), but serves the entire cluster:
     # when mooncake_master triggers eviction, it moves data from ANY node's DRAM segment
     # to this offload client's SSD via TCP/RDMA. The client registers itself with the
     # master using `local_hostname`, which must be reachable from all cluster nodes.
