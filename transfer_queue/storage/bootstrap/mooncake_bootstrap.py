@@ -185,7 +185,18 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
             f"mooncake_master exited with error. Check {log_file_path} for detailed logs. Output:\n{error_msg}"
         )
 
-    # Start standalone mooncake_client for SSD offload if enabled
+    # Start standalone mooncake_client for SSD offload if enabled.
+    #
+    # Architecture: The offload client is a single-node centralized SSD storage pool.
+    # It runs only on the node that calls tq.init(), but serves the entire cluster:
+    # when mooncake_master triggers eviction, it moves data from ANY node's DRAM segment
+    # to this offload client's SSD via TCP/RDMA. The client registers itself with the
+    # master using `local_hostname`, which must be reachable from all cluster nodes.
+    #
+    # Heartbeat relationship:
+    #   - mooncake_master uses -client_ttl=30 (seconds) to detect dead clients.
+    #   - mooncake_client sends heartbeats every `heartbeat_interval_seconds` (default: 2s).
+    #   - Ratio: 30s / 2s = tolerates up to ~15 consecutive missed heartbeats.
     if enable_offload:
         ssd_path = offload_conf.get("file_storage_path", "/tmp/mooncake_offload")
         client_port = str(offload_conf.get("client_port", 42052))

@@ -63,6 +63,17 @@ backend:
     # When enabled, TQ will start a standalone mooncake_client process that offloads
     # data from DRAM to NVMe SSD when memory usage exceeds the high watermark.
     # This is essential for environments where total CPU DRAM < GPU HBM.
+    #
+    # Architecture note:
+    #   The offload client is a **single-node centralized SSD storage pool** that runs
+    #   on the node where tq.init() is called. It registers itself with mooncake_master
+    #   and serves the entire cluster — when eviction is triggered, the master moves data
+    #   from ANY node's memory to this offload client via TCP/RDMA.
+    #   Ensure that `local_hostname` (above) is set to a cluster-reachable address so that
+    #   all nodes can transfer data to the offload client.
+    #
+    # TODO: Support multi-node distributed offload (one client per node) for better
+    #       scalability in large clusters.
     offload:
       # Master switch for SSD offload.
       enabled: false
@@ -73,6 +84,10 @@ backend:
       # Whether to use io_uring for async I/O (requires kernel >= 5.1 and liburing).
       use_uring: false
       # Heartbeat interval in seconds for the offload client.
+      # Note: This is paired with mooncake_master's -client_ttl (default: 30s).
+      # The client sends heartbeats at this interval; the master considers the client
+      # dead if no heartbeat is received within client_ttl. Ensure:
+      #   heartbeat_interval_seconds << client_ttl (currently 2s << 30s = tolerates ~15 missed beats)
       heartbeat_interval_seconds: 2
       # Port for the standalone mooncake_client process.
       client_port: 42052
