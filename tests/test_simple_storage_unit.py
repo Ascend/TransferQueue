@@ -22,15 +22,15 @@ import torch
 import zmq
 
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 
 class MockStorageClient:
     """Mock client for testing storage unit operations."""
 
-    def __init__(self, storage_put_get_address):
+    def __init__(self, storage_put_get_address, storage_ip):
         self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.DEALER)
+        self.socket = create_zmq_socket(self.context, zmq.DEALER, storage_ip)
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
         self.socket.connect(storage_put_get_address)
 
@@ -91,7 +91,7 @@ def storage_setup(ray_setup):
     put_get_address = zmq_info.to_addr("put_get_socket")
     time.sleep(1)  # Wait for socket to be ready
 
-    yield storage_actor, put_get_address
+    yield storage_actor, put_get_address, zmq_info.ip
 
     # Cleanup
     ray.kill(storage_actor)
@@ -99,9 +99,9 @@ def storage_setup(ray_setup):
 
 def test_put_get_single_client(storage_setup):
     """Test basic put and get operations with a single client."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT data
     global_indexes = [0, 1, 2]
@@ -134,10 +134,10 @@ def test_put_get_single_client(storage_setup):
 
 def test_put_get_multiple_clients(storage_setup):
     """Test put and get operations with multiple clients."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
     num_clients = 3
-    clients = [MockStorageClient(put_get_address) for _ in range(num_clients)]
+    clients = [MockStorageClient(put_get_address, storage_ip) for _ in range(num_clients)]
 
     # Each client puts unique data using different global_indexes
     for i, client in enumerate(clients):
@@ -155,7 +155,7 @@ def test_put_get_multiple_clients(storage_setup):
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
 
     # Test overlapping global indexes
-    overlapping_client = MockStorageClient(put_get_address)
+    overlapping_client = MockStorageClient(put_get_address, storage_ip)
     overlap_global_indexes = [0]  # Overlaps with first client's index 0
     overlap_field_data = {"log_probs": [torch.tensor([999, 999, 999])], "rewards": [torch.tensor([999])]}
     response = overlapping_client.send_put(99, overlap_global_indexes, overlap_field_data)
@@ -193,9 +193,9 @@ def test_put_get_multiple_clients(storage_setup):
 
 def test_performance_basic(storage_setup):
     """Basic performance test with larger data volume."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT performance test
     put_latencies = []
@@ -251,9 +251,9 @@ def test_performance_basic(storage_setup):
 
 def test_put_get_nested_tensor(storage_setup):
     """Test put and get operations with nested tensors."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT data with nested tensors
     global_indexes = [0, 1, 2]
@@ -290,9 +290,9 @@ def test_put_get_nested_tensor(storage_setup):
 
 def test_put_get_non_tensor_data(storage_setup):
     """Test put and get operations with non-tensor data (strings)."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT data with non-tensor data
     global_indexes = [0, 1, 2]
@@ -328,9 +328,9 @@ def test_put_get_non_tensor_data(storage_setup):
 
 def test_put_get_single_item(storage_setup):
     """Test put and get operations for a single item."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT single item data
     field_data = {
@@ -358,9 +358,9 @@ def test_put_get_single_item(storage_setup):
 
 def test_clear_data(storage_setup):
     """Test clear operations."""
-    _, put_get_address = storage_setup
+    _, put_get_address, storage_ip = storage_setup
 
-    client = MockStorageClient(put_get_address)
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # PUT data first
     global_indexes = [0, 1, 2]
@@ -448,8 +448,8 @@ def test_storage_unit_data_parser(storage_setup):
 
     data_parser converts shape descriptors into random tensors of those shapes.
     """
-    _, put_get_address = storage_setup
-    client = MockStorageClient(put_get_address)
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
 
     def create_data_by_shape_parser(field_data):
         if "data_to_be_parsed" in field_data:
@@ -492,8 +492,8 @@ def test_storage_unit_data_parser(storage_setup):
 
 def test_storage_unit_data_parser_callable_types(storage_setup):
     """Test that various callable types (partial, callable class) work as data_parser."""
-    _, put_get_address = storage_setup
-    client = MockStorageClient(put_get_address)
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
 
     from functools import partial
 
@@ -542,8 +542,8 @@ def test_storage_unit_data_parser_callable_types(storage_setup):
 
 def test_storage_unit_data_parser_validation(storage_setup):
     """Test that invalid data_parser inputs produce clear error messages."""
-    _, put_get_address = storage_setup
-    client = MockStorageClient(put_get_address)
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
 
     # 1. Non-callable data_parser should return a clear TypeError
     response = client.send_put(
