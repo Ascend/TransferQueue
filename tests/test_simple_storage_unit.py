@@ -633,7 +633,7 @@ def test_storage_unit_data_parser_validation(storage_setup):
 
 def test_storage_unit_checkpoint_round_trip(storage_setup, tmp_path):
     """Save storage state to a file, load it into a fresh unit, verify data."""
-    storage_actor, put_get_address = storage_setup
+    _, put_get_address = storage_setup
     ckpt_path = str(tmp_path / "storage_unit.pkl")
     client = MockStorageClient(put_get_address)
 
@@ -680,7 +680,7 @@ def test_storage_unit_checkpoint_round_trip(storage_setup, tmp_path):
 
 def test_storage_unit_checkpoint_overwrites_existing_data(storage_setup, tmp_path):
     """Loading a checkpoint into a unit that already has data replaces it entirely."""
-    storage_actor, put_get_address = storage_setup
+    _, put_get_address = storage_setup
     ckpt_path = str(tmp_path / "storage_unit_overwrite.pkl")
     client = MockStorageClient(put_get_address)
 
