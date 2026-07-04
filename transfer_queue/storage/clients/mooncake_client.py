@@ -78,13 +78,27 @@ class MooncakeStoreClient(StorageKVClient):
         if self.master_server_address is None or not isinstance(self.master_server_address, str):
             raise ValueError("Missing or invalid 'master_server_address' in config")
 
-        if not self.metadata_server.startswith("http://") and not self.metadata_server.startswith("etcd://"):
-            self.metadata_server = f"http://{self.metadata_server}"
-        if not self.metadata_server.startswith("etcd://") and not self.metadata_server.endswith("/metadata"):
-            self.metadata_server = self.metadata_server + "/metadata"
+        # Support P2PHANDSHAKE mode: if metadata_server is "P2PHANDSHAKE" (case-insensitive),
+        # normalize to the exact string "P2PHANDSHAKE" and pass it directly without adding
+        # http:// prefix. This avoids IP detection issues in multi-NIC environments.
+        if str(self.metadata_server).strip().upper() == "P2PHANDSHAKE":
+            self.metadata_server = "P2PHANDSHAKE"
+        else:
+            if not self.metadata_server.startswith("http://") and not self.metadata_server.startswith("etcd://"):
+                self.metadata_server = f"http://{self.metadata_server}"
+            if not self.metadata_server.startswith("etcd://") and not self.metadata_server.endswith("/metadata"):
+                self.metadata_server = self.metadata_server + "/metadata"
 
         self.replica_config = ReplicateConfig()
-        self.replica_config.with_hard_pin = True
+        # When offload is enabled, hard_pin must be disabled so that objects can be evicted
+        # and offloaded to SSD. Hard-pinned objects are never evicted by Mooncake.
+        offload_conf = config.get("offload", {})
+        offload_enabled = offload_conf.get("enabled", False) if isinstance(offload_conf, dict) else False
+        hard_pin = config.get("hard_pin", None)
+        if hard_pin is None:
+            # Auto-manage: disable hard_pin when offload is enabled
+            hard_pin = not offload_enabled
+        self.replica_config.with_hard_pin = bool(hard_pin)
 
         self._store = MooncakeDistributedStore()
         ret = self._store.setup(

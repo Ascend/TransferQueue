@@ -107,6 +107,41 @@ def test_data_partition_status():
     print("DataPartitionStatus tests passed!\n")
 
 
+def test_data_partition_status_production_status_is_partition_local():
+    """Regression test that partitions do not share production_status tensors."""
+    from transfer_queue.controller import DataPartitionStatus
+
+    partition = DataPartitionStatus(partition_id="partition_a")
+    other_partition = DataPartitionStatus(partition_id="partition_b")
+
+    assert partition.production_status.data_ptr() != other_partition.production_status.data_ptr()
+
+
+def test_cleared_partition_does_not_observe_reused_index_from_other_partition():
+    """A cleared partition must not become ready when another partition reuses its index."""
+    from transfer_queue.controller import DataPartitionStatus
+
+    field_schema = {
+        "x": {
+            "dtype": "torch.int64",
+            "shape": (1,),
+            "is_nested": False,
+            "is_non_tensor": False,
+        }
+    }
+
+    partition = DataPartitionStatus(partition_id="partition_a")
+    other_partition = DataPartitionStatus(partition_id="partition_b")
+
+    assert partition.update_production_status([0], ["x"], field_schema=field_schema)
+    partition.clear_data([0], clear_consumption=True)
+    assert partition.scan_data_status(["x"], task_name="consumer_before_reuse") == []
+
+    assert other_partition.update_production_status([0], ["x"], field_schema=field_schema)
+
+    assert partition.scan_data_status(["x"], task_name="consumer_after_reuse") == []
+
+
 def test_partition_interface():
     """Test the partition interface design."""
     print("Testing partition interface design...")

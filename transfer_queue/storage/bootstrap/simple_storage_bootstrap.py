@@ -33,8 +33,13 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
 
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
-    total_storage_size = conf.backend.SimpleStorage.total_storage_size
+    total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
     storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
+
+    # Compute per-unit capacity: None means unlimited
+    storage_unit_size = (
+        math.ceil(total_storage_size / num_data_storage_units) if total_storage_size is not None else None
+    )
 
     for storage_unit_rank in range(num_data_storage_units):
         storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
@@ -42,7 +47,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             placement_group_bundle_index=storage_unit_rank,
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
-            storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
+            storage_unit_size=storage_unit_size,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")

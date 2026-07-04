@@ -258,7 +258,8 @@ def get_free_port(ip: str) -> int:
                 # in that case just ignore and use the default behavior.
                 pass
 
-        sock.bind(("", 0))
+        bind_host = "::" if is_ipv6 else ""
+        sock.bind((bind_host, 0))
         return sock.getsockname()[1]
 
 

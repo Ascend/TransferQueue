@@ -61,10 +61,10 @@ class StorageUnitData:
         }
     """
 
-    def __init__(self, storage_size: int):
+    def __init__(self, storage_size: int | None = None):
         # field_name -> {global_index: data} nested dict
         self.field_data: dict[str, dict] = {}
-        # Capacity upper bound (not pre-allocated list length)
+        # Capacity upper bound (None means unlimited)
         self.storage_size = storage_size
         # Track active global_index keys for O(1) capacity checks
         self._active_keys: set = set()
@@ -104,12 +104,13 @@ class StorageUnitData:
             global_indexes: Global indexes to use as dict keys.
         """
         # Capacity is enforced per unique sample key, not counted per-field
-        new_global_keys = [k for k in global_indexes if k not in self._active_keys]
-        if len(self._active_keys) + len(new_global_keys) > self.storage_size:
-            raise ValueError(
-                f"Storage capacity exceeded: {len(self._active_keys)} existing + "
-                f"{len(new_global_keys)} new > {self.storage_size}"
-            )
+        if self.storage_size is not None:
+            new_global_keys = [k for k in global_indexes if k not in self._active_keys]
+            if len(self._active_keys) + len(new_global_keys) > self.storage_size:
+                raise ValueError(
+                    f"Storage capacity exceeded: {len(self._active_keys)} existing + "
+                    f"{len(new_global_keys)} new > {self.storage_size}"
+                )
         for f, values in field_data.items():
             if len(values) != len(global_indexes):
                 raise ValueError(
@@ -153,11 +154,12 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    def __init__(self, storage_unit_size: int):
+    def __init__(self, storage_unit_size: int | None = None):
         """Initialize a SimpleStorageUnit with the specified size.
 
         Args:
             storage_unit_size: Maximum number of elements that can be stored in this storage unit.
+                If None, the storage unit has unlimited capacity.
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
         self.storage_unit_size = storage_unit_size

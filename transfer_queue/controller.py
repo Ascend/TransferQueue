@@ -333,7 +333,9 @@ class DataPartitionStatus:
     # Values: 0 = not produced, 1 = ready for consumption
     TQ_PRE_ALLOC_SAMPLE_NUM = int(os.environ.get("TQ_PRE_ALLOC_SAMPLE_NUM", 1))
 
-    production_status: Tensor = torch.zeros(TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
+    production_status: Tensor = field(
+        default_factory=lambda: torch.zeros(DataPartitionStatus.TQ_PRE_ALLOC_SAMPLE_NUM, 1, dtype=torch.int8)
+    )
 
     # Consumption status per task - task_name -> consumption_tensor
     # Each tensor tracks which samples have been consumed by that task
@@ -1464,11 +1466,13 @@ class TransferQueueController:
             clear_consumption: Whether to also clear consumption status
         """
 
-        logger.debug(f"[{self.controller_id}]: clearing metadata in partition {partition_id}")
+        logger.debug(f"[{self.controller_id}]: Clearing metadata in partition {partition_id}.")
 
         partition = self._get_partition(partition_id)
         if not partition:
-            logger.warning(f"Try to clear an non-existent partition {partition_id}!")
+            logger.warning(
+                f"[{self.controller_id}]: Trying to clear a non-existent partition {partition_id}. No action taken."
+            )
             return
 
         global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
@@ -1491,7 +1495,10 @@ class TransferQueueController:
         logger.debug(f"[{self.controller_id}]: Resetting consumption for partition {partition_id}, task={task_name}")
         partition = self._get_partition(partition_id)
         if not partition:
-            logger.warning(f"Try to reset consumption of an non-existent partition {partition_id}!")
+            logger.warning(
+                f"[{self.controller_id}]: Trying to reset consumption of a non-existent partition {partition_id}. "
+                f"No action taken."
+            )
             return
         partition.reset_consumption(task_name)
 
@@ -1529,14 +1536,28 @@ class TransferQueueController:
         for partition_id, group in groupby(combined, key=itemgetter(0)):
             partition = self._get_partition(partition_id)
             if not partition:
-                raise ValueError(f"Partition {partition_id} not found")
+                logger.info(
+                    f"[{self.controller_id}]: Trying to clear data in a non-existent partition {partition_id}. "
+                    f"Skipping operation for this partition."
+                )
+                continue
 
             global_indexes_to_clear = [idx for _, idx in group]
-            if not set(global_indexes_to_clear).issubset(partition.global_indexes):
-                raise ValueError(
-                    f"Some global_indexes to clear do not exist in partition {partition_id}. "
-                    f"Target: {global_indexes_to_clear}, Existing: {partition.global_indexes}"
+            existing_global_indexes = partition.global_indexes
+            non_existent_global_indexes = set(global_indexes_to_clear) - existing_global_indexes
+            if non_existent_global_indexes:
+                logger.info(
+                    f"[{self.controller_id}]: Some global_indexes to be cleared do not exist in "
+                    f"partition {partition_id}: {non_existent_global_indexes}. They will be ignored."
                 )
+
+            global_indexes_to_clear = list(set(global_indexes_to_clear) & existing_global_indexes)
+            if not global_indexes_to_clear:
+                logger.info(
+                    f"[{self.controller_id}]: No existing global indexes to clear in partition {partition_id}. "
+                    f"Skipping operation for this partition."
+                )
+                continue
 
             # Clear data from partition
             partition.clear_data(global_indexes_to_clear, clear_consumption)
@@ -1552,6 +1573,7 @@ class TransferQueueController:
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
+        For non-existing keys, we simply emit them in returned BatchMeta.
 
         Args:
             keys: List of keys to retrieve from the controller
@@ -1568,7 +1590,9 @@ class TransferQueueController:
         partition = self._get_partition(partition_id)
         if partition is None:
             if not create:
-                logger.warning(f"Partition {partition_id} not found!")
+                logger.warning(
+                    f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta."
+                )
                 return BatchMeta.empty()
 
             self.create_partition(partition_id)
@@ -1580,8 +1604,10 @@ class TransferQueueController:
         none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
         if len(none_indexes) > 0:
             if not create:
-                logger.error(f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}!")
-                return BatchMeta.empty()
+                logger.warning(
+                    f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}. "
+                    f"They will be excluded from the retrieved BatchMeta."
+                )
             else:
                 # create non-exist keys
                 batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
@@ -1604,7 +1630,6 @@ class TransferQueueController:
                 partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
         verified_global_indexes = [idx for idx in global_indexes if idx is not None]
-        assert len(verified_global_indexes) == len(keys)
 
         # must fetch fields that the requested samples all have
         col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
