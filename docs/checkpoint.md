@@ -44,7 +44,7 @@ def save_checkpoint(
 
 | Parameter | Description |
 |-----------|-------------|
-| `checkpoint_dir` | Directory to write the checkpoint. Created if it does not exist. If a checkpoint already exists at this path it is replaced atomically. |
+| `checkpoint_dir` | Directory to write the checkpoint. Created if it does not exist. If a checkpoint already exists at this path it is replaced (best-effort; see [Known Limitations §3](#3-replacing-an-existing-checkpoint-is-not-fully-atomic)). |
 | `include_storage` | Whether to save storage unit data. For `SimpleStorage` (in-memory), this is forced to `True` regardless of the value passed — skipping storage would cause complete data loss on restart. For persistent external backends, `False` is valid. |
 | `metadata` | Optional user-defined key-value pairs written into `metadata.json`. Useful for recording step number, timestamp, etc. |
 
@@ -72,12 +72,12 @@ def load_checkpoint(
 
 ```
 checkpoint_dir/
-├── metadata.json            # Flags and user metadata
-├── controller_state.pkl     # Controller state (pickle)
-└── storage_units/
-    ├── su_info.json         # Position-to-ID manifest
-    ├── su_0_<id>.pkl        # StorageUnit at position 0
-    ├── su_1_<id>.pkl        # StorageUnit at position 1
+├── metadata.json                        # Flags and user metadata
+├── controller_state.pkl                 # Controller state (pickle)
+└── simple_storage/
+    ├── storage_unit_info.json           # Position-to-ID manifest
+    ├── su_0_<id>.pkl                    # StorageUnit at position 0
+    ├── su_1_<id>.pkl                    # StorageUnit at position 1
     └── ...
 ```
 
@@ -90,7 +90,7 @@ checkpoint_dir/
 }
 ```
 
-**`su_info.json`**
+**`storage_unit_info.json`**
 
 ```json
 [
