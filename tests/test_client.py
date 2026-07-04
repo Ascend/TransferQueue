@@ -143,6 +143,12 @@ class MockController:
                     elif request_msg.request_type == ZMQRequestType.KV_LIST:
                         response_body = self._mock_kv_list(request_msg.body)
                         response_type = ZMQRequestType.KV_LIST_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
+                        response_body = {"message": "checkpoint saved"}
+                        response_type = ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
+                        response_body = {"message": "checkpoint loaded"}
+                        response_type = ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
@@ -1319,3 +1325,123 @@ class TestClientKVInterface:
                 global_indexes=[0, "invalid"],
                 partition_id="test_partition",
             )
+
+
+# =====================================================
+# Checkpoint Interface Tests
+# =====================================================
+
+
+class TestClientCheckpointInterface:
+    """Tests for client save/load checkpoint interface methods."""
+
+    def test_save_controller_checkpoint_sync(self, client_setup, tmp_path):
+        """Synchronous save_controller_checkpoint sends correct request."""
+        client, _, _ = client_setup
+        ckpt_path = str(tmp_path / "controller.pkl")
+
+        # Should not raise — mock controller acknowledges the request
+        client.save_controller_checkpoint(ckpt_path)
+
+    def test_load_controller_checkpoint_sync(self, client_setup, tmp_path):
+        """Synchronous load_controller_checkpoint sends correct request."""
+        client, _, _ = client_setup
+        ckpt_path = str(tmp_path / "controller.pkl")
+
+        client.load_controller_checkpoint(ckpt_path)
+
+    @pytest.mark.asyncio
+    async def test_async_save_controller_checkpoint(self, client_setup, tmp_path):
+        """Async save_controller_checkpoint sends correct request."""
+        client, _, _ = client_setup
+        ckpt_path = str(tmp_path / "controller_async.pkl")
+
+        await client.async_save_controller_checkpoint(ckpt_path)
+
+    @pytest.mark.asyncio
+    async def test_async_load_controller_checkpoint(self, client_setup, tmp_path):
+        """Async load_controller_checkpoint sends correct request."""
+        client, _, _ = client_setup
+        ckpt_path = str(tmp_path / "controller_async.pkl")
+
+        await client.async_load_controller_checkpoint(ckpt_path)
+
+    def test_save_storage_checkpoint_sync(self, client_setup, tmp_path):
+        """Synchronous save_storage_checkpoint delegates to storage manager."""
+        client, _, _ = client_setup
+        ckpt_dir = str(tmp_path / "storage_ckpt")
+
+        called_with = []
+
+        async def mock_save_checkpoint(directory):
+            called_with.append(directory)
+
+        client.storage_manager.save_checkpoint = mock_save_checkpoint
+        client.save_storage_checkpoint(ckpt_dir)
+        assert called_with == [ckpt_dir]
+
+    def test_load_storage_checkpoint_sync(self, client_setup, tmp_path):
+        """Synchronous load_storage_checkpoint delegates to storage manager."""
+        client, _, _ = client_setup
+        ckpt_dir = str(tmp_path / "storage_ckpt")
+
+        called_with = []
+
+        async def mock_load_checkpoint(directory):
+            called_with.append(directory)
+
+        client.storage_manager.load_checkpoint = mock_load_checkpoint
+        client.load_storage_checkpoint(ckpt_dir)
+        assert called_with == [ckpt_dir]
+
+    @pytest.mark.asyncio
+    async def test_async_save_storage_checkpoint(self, client_setup, tmp_path):
+        """Async save_storage_checkpoint delegates to storage manager."""
+        client, _, _ = client_setup
+        ckpt_dir = str(tmp_path / "storage_ckpt_async")
+
+        called_with = []
+
+        async def mock_save_checkpoint(directory):
+            called_with.append(directory)
+
+        client.storage_manager.save_checkpoint = mock_save_checkpoint
+        await client.async_save_storage_checkpoint(ckpt_dir)
+        assert called_with == [ckpt_dir]
+
+    @pytest.mark.asyncio
+    async def test_async_load_storage_checkpoint(self, client_setup, tmp_path):
+        """Async load_storage_checkpoint delegates to storage manager."""
+        client, _, _ = client_setup
+        ckpt_dir = str(tmp_path / "storage_ckpt_async")
+
+        called_with = []
+
+        async def mock_load_checkpoint(directory):
+            called_with.append(directory)
+
+        client.storage_manager.load_checkpoint = mock_load_checkpoint
+        await client.async_load_storage_checkpoint(ckpt_dir)
+        assert called_with == [ckpt_dir]
+
+    def test_save_storage_checkpoint_without_manager(self, mock_controller, tmp_path):
+        """save_storage_checkpoint raises RuntimeError if storage manager not initialized."""
+        client = TransferQueueClient(
+            client_id="no_storage_client",
+            controller_info=mock_controller.zmq_server_info,
+        )
+        ckpt_dir = str(tmp_path / "should_fail")
+
+        with pytest.raises(RuntimeError, match="Storage manager not initialized"):
+            client.save_storage_checkpoint(ckpt_dir)
+
+    def test_load_storage_checkpoint_without_manager(self, mock_controller, tmp_path):
+        """load_storage_checkpoint raises RuntimeError if storage manager not initialized."""
+        client = TransferQueueClient(
+            client_id="no_storage_client2",
+            controller_info=mock_controller.zmq_server_info,
+        )
+        ckpt_dir = str(tmp_path / "should_fail")
+
+        with pytest.raises(RuntimeError, match="Storage manager not initialized"):
+            client.load_storage_checkpoint(ckpt_dir)

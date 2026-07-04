@@ -124,3 +124,29 @@ class BaseSampler(ABC):
         """
         if partition_id in self._states.keys():
             self._states.pop(partition_id)
+
+    def save_checkpoint(self) -> dict:
+        """Return the sampler's serializable state for checkpointing.
+
+        By default this returns ``_states``, the shared cache used by all
+        samplers. Subclasses that maintain additional runtime state (e.g.
+        a separate balanced cache) should override this method and include
+        their extra fields.
+
+        Returns:
+            A dict that can be passed to ``restore_state`` to recreate the
+            current sampling state.
+        """
+        return {"_states": self._states}
+
+    def load_checkpoint(self, state: dict) -> None:
+        """Restore the sampler's state from a checkpoint.
+
+        By default this restores ``_states``. Subclasses that override
+        ``save_checkpoint`` must also override this method to restore their extra
+        fields.
+
+        Args:
+            state: A dict previously returned by ``save_checkpoint``.
+        """
+        self._states = state["_states"]

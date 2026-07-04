@@ -64,6 +64,24 @@ class MockStorageClient:
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
+    def send_save_checkpoint(self, client_id, path):
+        msg = ZMQMessage.create(
+            request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT,
+            sender_id=f"mock_client_{client_id}",
+            body={"path": path},
+        )
+        self.socket.send_multipart(msg.serialize())
+        return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
+
+    def send_load_checkpoint(self, client_id, path):
+        msg = ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT,
+            sender_id=f"mock_client_{client_id}",
+            body={"path": path},
+        )
+        self.socket.send_multipart(msg.serialize())
+        return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
+
     def close(self):
         self.socket.close()
         self.context.term()
@@ -609,5 +627,107 @@ def test_storage_unit_data_parser_validation(storage_setup):
     )
     assert response.request_type == ZMQRequestType.PUT_ERROR
     assert "data_parser changed the number of elements" in response.body["message"]
+
+    client.close()
+
+
+def test_storage_unit_checkpoint_round_trip(storage_setup, tmp_path):
+    """Save storage state to a file, load it into a fresh unit, verify data."""
+    _, put_get_address, storage_ip = storage_setup
+    ckpt_path = str(tmp_path / "storage_unit.pkl")
+    client = MockStorageClient(put_get_address, storage_ip)
+
+    # 1. Put some data
+    global_indexes = [10, 11, 12]
+    field_data = {
+        "log_probs": [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0]), torch.tensor([5.0, 6.0])],
+        "rewards": [torch.tensor([0.1]), torch.tensor([0.2]), torch.tensor([0.3])],
+    }
+    response = client.send_put(0, global_indexes, field_data)
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+
+    # 2. Save checkpoint
+    response = client.send_save_checkpoint(0, ckpt_path)
+    assert response.request_type == ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE
+    assert response.body["success"] is True
+    assert (tmp_path / "storage_unit.pkl").exists()
+
+    # 3. Create a fresh storage unit and load the checkpoint into it
+    fresh_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(storage_unit_size=10000)
+    fresh_zmq_info = ray.get(fresh_actor.get_zmq_server_info.remote())
+    import time as _time
+
+    _time.sleep(1)
+    fresh_address = fresh_zmq_info.to_addr("put_get_socket")
+    fresh_client = MockStorageClient(fresh_address, fresh_zmq_info.ip)
+
+    response = fresh_client.send_load_checkpoint(0, ckpt_path)
+    assert response.request_type == ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
+    assert response.body["success"] is True
+
+    # 4. Verify data is accessible in the fresh unit
+    response = fresh_client.send_get(0, global_indexes, ["log_probs", "rewards"])
+    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
+    retrieved = response.body["data"]
+    torch.testing.assert_close(retrieved["log_probs"][0], torch.tensor([1.0, 2.0]))
+    torch.testing.assert_close(retrieved["log_probs"][2], torch.tensor([5.0, 6.0]))
+    torch.testing.assert_close(retrieved["rewards"][1], torch.tensor([0.2]))
+
+    fresh_client.close()
+    client.close()
+    ray.kill(fresh_actor)
+
+
+def test_storage_unit_checkpoint_overwrites_existing_data(storage_setup, tmp_path):
+    """Loading a checkpoint into a unit that already has data replaces it entirely."""
+    _, put_get_address, storage_ip = storage_setup
+    ckpt_path = str(tmp_path / "storage_unit_overwrite.pkl")
+    client = MockStorageClient(put_get_address, storage_ip)
+
+    # 1. Put original data and save checkpoint
+    response = client.send_put(0, [20, 21], {"val": [torch.tensor([1.0]), torch.tensor([2.0])]})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    response = client.send_save_checkpoint(0, ckpt_path)
+    assert response.body["success"] is True
+
+    # 2. Create a second unit, pre-populate it with different data, then load the checkpoint
+    second_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(storage_unit_size=10000)
+    second_zmq_info = ray.get(second_actor.get_zmq_server_info.remote())
+    import time as _time
+
+    _time.sleep(1)
+    second_address = second_zmq_info.to_addr("put_get_socket")
+    second_client = MockStorageClient(second_address, second_zmq_info.ip)
+
+    # 3. Write different data into the second unit before loading
+    response = second_client.send_put(0, [99], {"val": [torch.tensor([999.0])]})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+
+    # 4. Load checkpoint — should overwrite
+    response = second_client.send_load_checkpoint(0, ckpt_path)
+    assert response.body["success"] is True
+
+    # 5. Old data (index 99) should be gone; checkpoint data (indexes 20, 21) should be present
+    response = second_client.send_get(0, [20, 21], ["val"])
+    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
+    retrieved = response.body["data"]
+    torch.testing.assert_close(retrieved["val"][0], torch.tensor([1.0]))
+    torch.testing.assert_close(retrieved["val"][1], torch.tensor([2.0]))
+
+    second_client.close()
+    client.close()
+    ray.kill(second_actor)
+
+
+def test_storage_unit_checkpoint_load_missing_file(storage_setup, tmp_path):
+    """Loading from a non-existent file returns success=False."""
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
+    missing_path = str(tmp_path / "does_not_exist.pkl")
+
+    response = client.send_load_checkpoint(0, missing_path)
+    assert response.request_type == ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
+    assert response.body["success"] is False
+    assert "message" in response.body
 
     client.close()

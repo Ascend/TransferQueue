@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
+import shutil
 import subprocess
 import time
 from importlib import resources
+from pathlib import Path
 from typing import Any, Callable
 
 import ray
@@ -31,6 +34,7 @@ from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
@@ -1058,3 +1062,132 @@ def get_client():
     """Get a TransferQueueClient for using low-level API"""
     assert _TQ_CLIENT is not None, "Please initialize the TransferQueue first by calling `tq.init()`!"
     return _TQ_CLIENT
+
+
+# ==================== Checkpoint API ====================
+
+_METADATA_FILE = "metadata.json"
+_CONTROLLER_FILE = "controller_state.pkl"
+
+
+def save_checkpoint(
+    checkpoint_dir: str | Path,
+    *,
+    include_storage: bool = True,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Save a full checkpoint of the TransferQueue system state.
+
+    .. note::
+        **Multi-node limitation**: checkpoint_dir must reside on a shared network
+        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
+        Single-node deployments have no such requirement.
+
+    Args:
+        checkpoint_dir: Directory to save the checkpoint (created if not exists).
+        include_storage: Whether to save storage backend state. Set to False to
+                         save controller metadata only (e.g. for KV backends where
+                         data persists externally and does not need to be re-saved).
+                         For SimpleStorage (in-memory), this flag is ignored and
+                         storage is always saved — skipping it would cause data loss
+                         on restart.
+        metadata: User-defined key-value pairs written into metadata.json.
+                  Example: {"time_stamp": 1234567.891234, "step": 10}
+
+    Raises:
+        RuntimeError: TransferQueue is not initialized.
+        OSError: Failed to write checkpoint files.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    checkpoint_dir = Path(checkpoint_dir)
+    tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + ".tmp")
+
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    try:
+        client = _maybe_create_tq_client()
+
+        controller_path = tmp_dir / _CONTROLLER_FILE
+        client.save_controller_checkpoint(str(controller_path))
+        logger.info("Controller state saved.")
+
+        if not include_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager):
+            logger.warning(
+                "include_storage=False has no effect for SimpleStorage: "
+                "in-memory data would be lost on restart. Forcing include_storage=True."
+            )
+            include_storage = True
+
+        if include_storage:
+            try:
+                client.save_storage_checkpoint(str(tmp_dir))
+            except NotImplementedError:
+                logger.warning("Storage backend does not support checkpoint; storage data will not be saved.")
+                include_storage = False
+
+        meta_content = {
+            "storage_saved": include_storage,
+            "user_metadata": metadata or {},
+        }
+        with open(tmp_dir / _METADATA_FILE, "w") as f:
+            json.dump(meta_content, f, indent=2)
+
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        tmp_dir.rename(checkpoint_dir)
+
+        logger.info(f"Checkpoint saved to {checkpoint_dir}")
+
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        raise
+
+
+def load_checkpoint(
+    checkpoint_dir: str | Path,
+) -> None:
+    """Restore TransferQueue system state from a checkpoint.
+
+    .. note::
+        **Multi-node limitation**: checkpoint_dir must reside on a shared network
+        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
+        Single-node deployments have no such requirement.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory.
+
+    Raises:
+        FileNotFoundError: Checkpoint directory or required files do not exist.
+        RuntimeError: TransferQueue is not initialized, or restore fails.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    checkpoint_dir = Path(checkpoint_dir)
+    if not checkpoint_dir.exists():
+        raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
+
+    metadata_path = checkpoint_dir / _METADATA_FILE
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"{_METADATA_FILE} not found in {checkpoint_dir}")
+
+    with open(metadata_path) as f:
+        meta = json.load(f)
+
+    client = _maybe_create_tq_client()
+
+    controller_path = checkpoint_dir / _CONTROLLER_FILE
+    if not controller_path.exists():
+        raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
+
+    if meta.get("storage_saved"):
+        client.load_storage_checkpoint(str(checkpoint_dir))
+
+    client.load_controller_checkpoint(str(controller_path))
+
+    logger.info(f"Checkpoint loaded from {checkpoint_dir}")
