@@ -100,6 +100,7 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
             f"Host and port are required (e.g., host:port)."
         )
 
+    master_server_host = master_server_parsed.hostname
     master_server_port = str(master_server_parsed.port)
 
     # Read offload configuration from config
@@ -112,6 +113,7 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
         "-default_kv_lease_ttl=999999",
         "-default_kv_soft_pin_ttl=999999",
         "--allow_evict_soft_pinned_objects=false",
+        f"--rpc_address={master_server_host}",
         f"--rpc_port={master_server_port}",
     ]
 
