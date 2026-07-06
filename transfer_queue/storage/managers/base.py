@@ -714,9 +714,8 @@ class KVStorageManager(StorageManager):
         """Remove stored data associated with the given metadata."""
 
         if not metadata.field_names:
-            raise RuntimeError(
-                "Fail to clear_data for key-value based backends due to lack of `field_names` in BatchMeta"
-            )
+            logger.debug("clear_data called with no field_names; nothing to clear for KV-based backend.")
+            return
 
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
