@@ -442,11 +442,11 @@ class AsyncTransferQueueClient:
                 )
                 return
 
-            # Clear the controller metadata
-            await self._clear_partition_in_controller(partition_id)
-
             # Clear storage unit data
             await self.storage_manager.clear_data(metadata)
+
+            # Clear the controller metadata
+            await self._clear_partition_in_controller(partition_id)
 
             logger.debug(f"[{self.client_id}]: Clear operation for partition_id {partition_id} completed.")
         except Exception as e:
@@ -475,11 +475,11 @@ class AsyncTransferQueueClient:
             if not self._controller:
                 raise RuntimeError("No controller registered")
 
-            # Clear the controller metadata
-            await self._clear_meta_in_controller(metadata)
-
             # Clear storage unit data
             await self.storage_manager.clear_data(metadata)
+
+            # Clear the controller metadata
+            await self._clear_meta_in_controller(metadata)
 
             logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
         except Exception as e:
