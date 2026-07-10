@@ -475,11 +475,10 @@ class AsyncTransferQueueClient:
             if not self._controller:
                 raise RuntimeError("No controller registered")
 
-            # Clear storage unit data first, so released indexes are not reused
-            # before the underlying storage is actually freed.
+            # Clear storage unit data
             await self.storage_manager.clear_data(metadata)
 
-            # Clear the controller metadata (releases indexes to reusable pool)
+            # Clear the controller metadata
             await self._clear_meta_in_controller(metadata)
 
             logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
