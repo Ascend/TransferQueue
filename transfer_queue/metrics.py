@@ -332,9 +332,26 @@ class TQMetricsExporter:
                 label = metrics.get("storage_unit_id", su_id)
                 capacity = metrics.get("capacity", 0)
                 active = metrics.get("active_keys", 0)
-                self.storage_capacity.labels(storage_unit_id=label).set(capacity)
+                # ``capacity`` is ``None`` when the storage unit is configured with
+                # unlimited capacity (``total_storage_size=None``).
+                if capacity is not None:
+                    self.storage_capacity.labels(storage_unit_id=label).set(capacity)
+                    self.storage_utilization.labels(storage_unit_id=label).set(
+                        active / capacity if capacity > 0 else 0.0
+                    )
+                else:
+                    # If the storage unit was previously reporting a numeric
+                    # capacity and later transitions to unlimited (e.g. after
+                    # re-registration), remove the stale series so dashboards
+                    # do not keep serving outdated capacity / utilization
+                    # values. This mirrors the stale-label pruning applied to
+                    # partition-level gauges above.
+                    for gauge in (self.storage_capacity, self.storage_utilization):
+                        try:
+                            gauge.remove(label)
+                        except (KeyError, ValueError):
+                            pass
                 self.storage_active_keys.labels(storage_unit_id=label).set(active)
-                self.storage_utilization.labels(storage_unit_id=label).set(active / capacity if capacity > 0 else 0.0)
                 self.storage_memory_rss.labels(storage_unit_id=label).set(metrics.get("process_rss_bytes", 0))
 
                 # Per-operation request stats

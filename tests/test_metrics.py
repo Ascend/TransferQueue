@@ -271,6 +271,77 @@ class TestStorageMetricsCollection:
         assert exporter.storage_capacity.labels(storage_unit_id="SU_002")._value.get() == 500
         assert call_count == 2
 
+    def test_storage_metrics_skips_capacity_when_none(self):
+        """When capacity is None (unlimited storage), capacity/utilization
+        gauges must not be populated, but other metrics still are.
+
+        Regression test guarding against re-introducing ``Gauge.set(None)``,
+        which raises ``TypeError`` inside ``float()`` and floods the logs
+        with warnings once per collection interval.
+        """
+        exporter = TQMetricsExporter()
+
+        fake_su_info = MagicMock()
+        fake_su_info.id = "SU_UNLIMITED"
+        exporter._storage_unit_infos = {"SU_UNLIMITED": fake_su_info}
+
+        exporter._query_storage_unit = MagicMock(
+            return_value={
+                "storage_unit_id": "SU_UNLIMITED",
+                "capacity": None,
+                "active_keys": 42,
+                "process_rss_bytes": 128 * 1024 * 1024,
+            }
+        )
+
+        exporter.collect_storage_metrics()
+
+        # capacity / utilization must have no series for this storage unit
+        assert ("SU_UNLIMITED",) not in exporter.storage_capacity._metrics
+        assert ("SU_UNLIMITED",) not in exporter.storage_utilization._metrics
+        # active_keys and memory_rss are still reported
+        assert exporter.storage_active_keys.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 42
+        assert exporter.storage_memory_rss.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 128 * 1024 * 1024
+
+    def test_storage_metrics_prunes_stale_capacity_on_switch_to_unlimited(self):
+        """If a storage unit transitions from a numeric capacity to unlimited,
+        the previously-set ``storage_capacity`` / ``storage_utilization``
+        series must be removed so dashboards do not keep serving stale values.
+        """
+        exporter = TQMetricsExporter()
+
+        fake_su_info = MagicMock()
+        fake_su_info.id = "SU_SWITCH"
+        exporter._storage_unit_infos = {"SU_SWITCH": fake_su_info}
+
+        # First collection: numeric capacity → both gauges get populated.
+        exporter._query_storage_unit = MagicMock(
+            return_value={
+                "storage_unit_id": "SU_SWITCH",
+                "capacity": 1000,
+                "active_keys": 250,
+                "process_rss_bytes": 64 * 1024 * 1024,
+            }
+        )
+        exporter.collect_storage_metrics()
+        assert exporter.storage_capacity.labels(storage_unit_id="SU_SWITCH")._value.get() == 1000
+        assert exporter.storage_utilization.labels(storage_unit_id="SU_SWITCH")._value.get() == 0.25
+
+        # Second collection: unlimited capacity → stale series must be pruned.
+        exporter._query_storage_unit = MagicMock(
+            return_value={
+                "storage_unit_id": "SU_SWITCH",
+                "capacity": None,
+                "active_keys": 300,
+                "process_rss_bytes": 64 * 1024 * 1024,
+            }
+        )
+        exporter.collect_storage_metrics()
+        assert ("SU_SWITCH",) not in exporter.storage_capacity._metrics
+        assert ("SU_SWITCH",) not in exporter.storage_utilization._metrics
+        # active_keys keeps updating with the latest value.
+        assert exporter.storage_active_keys.labels(storage_unit_id="SU_SWITCH")._value.get() == 300
+
 
 # ---------------------------------------------------------------------------
 # Test: ZMQ request type registration
