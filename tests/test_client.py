@@ -92,6 +92,9 @@ class MockController:
                     if request_msg.request_type == ZMQRequestType.GET_META:
                         response_body = self._mock_batch_meta(request_msg.body)
                         response_type = ZMQRequestType.GET_META_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.MARK_CLEARING:
+                        response_body = {"message": "mark clearing ok"}
+                        response_type = ZMQRequestType.MARK_CLEARING_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.CLEAR_META:
                         response_body = {"message": "clear meta ok"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
