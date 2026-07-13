@@ -442,10 +442,13 @@ class AsyncTransferQueueClient:
                 )
                 return
 
+            # Mark as pending deletion so consumers cannot read stale data
+            await self._mark_clearing_in_controller(metadata)
+
             # Clear storage unit data
             await self.storage_manager.clear_data(metadata)
 
-            # Clear the controller metadata
+            # Release controller metadata and indexes
             await self._clear_partition_in_controller(partition_id)
 
             logger.debug(f"[{self.client_id}]: Clear operation for partition_id {partition_id} completed.")
@@ -475,15 +478,43 @@ class AsyncTransferQueueClient:
             if not self._controller:
                 raise RuntimeError("No controller registered")
 
+            # Mark as pending deletion so consumers cannot read stale data
+            await self._mark_clearing_in_controller(metadata)
+
             # Clear storage unit data
             await self.storage_manager.clear_data(metadata)
 
-            # Clear the controller metadata
+            # Release controller metadata and indexes
             await self._clear_meta_in_controller(metadata)
 
             logger.debug(f"[{self.client_id}]: Clear operation for batch {metadata} completed.")
         except Exception as e:
             raise RuntimeError(f"Error in clear_samples operation: {str(e)}") from e
+
+    @with_controller_socket
+    async def _mark_clearing_in_controller(self, metadata: BatchMeta, socket=None):
+        """Mark samples as pending deletion in the controller.
+
+        Args:
+            metadata: The BatchMeta of the data to be marked
+            socket: ZMQ socket (injected by decorator)
+
+        Raises:
+            RuntimeError: If the controller returns an unexpected response
+        """
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.MARK_CLEARING,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body={"global_indexes": metadata.global_indexes, "partition_ids": metadata.partition_ids},
+        )
+
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(response_serialized)
+
+        if response_msg.request_type != ZMQRequestType.MARK_CLEARING_RESPONSE:
+            raise RuntimeError("Failed to mark samples as clearing in controller.")
 
     @with_controller_socket
     async def _clear_meta_in_controller(self, metadata: BatchMeta, socket=None):

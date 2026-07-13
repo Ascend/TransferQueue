@@ -1457,6 +1457,41 @@ class TransferQueueController:
         )
         return batch_meta
 
+    def mark_clearing(self, global_indexes: list[int], partition_ids: list[str]) -> None:
+        """Mark samples as pending deletion by zeroing their production status.
+
+        This prevents consumers from reading data that is about to be deleted from
+        storage, closing the window between storage clear and controller clear.
+
+        Args:
+            global_indexes: global indexes to mark as pending deletion
+            partition_ids: corresponding partition IDs for each global index
+        """
+        if global_indexes is None or partition_ids is None:
+            raise ValueError("global_indexes and partition_ids cannot be None")
+
+        if len(global_indexes) != len(partition_ids):
+            raise ValueError(
+                f"global_indexes and partition_ids must have the same length, "
+                f"got {len(global_indexes)} and {len(partition_ids)}"
+            )
+
+        combined = list(zip(partition_ids, global_indexes, strict=True))
+        combined.sort(key=itemgetter(0))
+
+        for partition_id, group in groupby(combined, key=itemgetter(0)):
+            partition = self._get_partition(partition_id)
+            if not partition:
+                logger.info(
+                    f"[{self.controller_id}]: Trying to mark clearing in a non-existent partition {partition_id}. "
+                    f"Skipping operation for this partition."
+                )
+                continue
+            indexes = [idx for _, idx in group]
+            existing = list(set(indexes) & partition.global_indexes)
+            if existing and partition.production_status is not None:
+                partition.production_status[existing, :] = 0
+
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
         Clear data for a specific partition (delete the whole partition).
@@ -1880,6 +1915,18 @@ class TransferQueueController:
                         sender_id=self.controller_id,
                         receiver_id=request_msg.sender_id,
                         body={"message": "Successfully set custom_meta"},
+                    )
+
+            elif request_msg.request_type == ZMQRequestType.MARK_CLEARING:
+                with monitor.measure(op_type="MARK_CLEARING"):
+                    params = request_msg.body
+                    self.mark_clearing(params["global_indexes"], params["partition_ids"])
+
+                    response_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.MARK_CLEARING_RESPONSE,
+                        sender_id=self.controller_id,
+                        receiver_id=request_msg.sender_id,
+                        body={"message": "Mark clearing completed"},
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_META:
