@@ -1,0 +1,1 @@
+../../../.agent/skills/simplicity-first/SKILL.md
