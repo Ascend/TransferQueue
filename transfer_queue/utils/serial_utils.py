@@ -438,23 +438,23 @@ def calc_packed_size(items: Sequence[bytestr]) -> int:
 
 def pack_into(target_buffer: bytestr, items: Sequence[bytestr]) -> None:
     """Concatenate ``items`` into ``target_buffer``, which must be at least ``calc_packed_size(items)`` bytes."""
-    target_mv = memoryview(target_buffer)
-    required = calc_packed_size(items)
+    target_mv = memoryview(target_buffer).cast("B")
+    # Materialise the views once: they are needed for both the size check and the
+    # copy, and calc_packed_size would otherwise walk every item a second time.
+    item_mvs = [memoryview(item).cast("B") for item in items]
+    count = len(item_mvs)
+    required = _PACK_HEADER_SIZE + count * _PACK_ENTRY_SIZE + sum(mv.nbytes for mv in item_mvs)
     if target_mv.nbytes < required:
         raise ValueError(f"pack_into: target buffer has {target_mv.nbytes} bytes, requires {required}")
-    struct.pack_into(_PACK_HEADER_FMT, target_mv, 0, len(items))
+    struct.pack_into(_PACK_HEADER_FMT, target_mv, 0, count)
 
     entry_offset = _PACK_HEADER_SIZE
-    payload_offset = _PACK_HEADER_SIZE + len(items) * _PACK_ENTRY_SIZE
+    payload_offset = _PACK_HEADER_SIZE + count * _PACK_ENTRY_SIZE
 
-    target_tensor = torch.frombuffer(target_mv, dtype=torch.uint8)
-
-    for item in items:
-        item_mv = memoryview(item)
+    for item_mv in item_mvs:
         nbytes = item_mv.nbytes
         struct.pack_into(_PACK_ENTRY_FMT, target_mv, entry_offset, payload_offset, nbytes)
-        src_tensor = torch.frombuffer(item_mv, dtype=torch.uint8)
-        target_tensor[payload_offset : payload_offset + nbytes].copy_(src_tensor)
+        target_mv[payload_offset : payload_offset + nbytes] = item_mv
         entry_offset += _PACK_ENTRY_SIZE
         payload_offset += nbytes
 
