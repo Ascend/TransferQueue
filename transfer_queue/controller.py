@@ -781,8 +781,10 @@ class DataPartitionStatus:
             >>> partition.get_field_custom_backend_meta([0, 1], ["field_a", "field_b"])
             {0: {'field_a': {'meta1': 'xxx'}, 'field_b': {'meta1': 'xxx'}}, 1: {...}}
         """
+
+        wanted = set(field_names)
         return {
-            idx: {f: v for f, v in self.field_custom_backend_meta[idx].items() if f in field_names}
+            idx: {f: v for f, v in self.field_custom_backend_meta[idx].items() if f in wanted}
             for idx in global_indices
             if idx in self.field_custom_backend_meta
         }
@@ -1434,11 +1436,18 @@ class TransferQueueController:
                     if field_name in partition.field_name_mapping
                 ]
                 if field_indices:
-                    for i, global_idx in enumerate(batch_global_indexes):
-                        if global_idx < partition.production_status.shape[0]:
-                            sample_status = partition.production_status[global_idx, field_indices]
-                            if torch.all(sample_status == 1):
-                                production_status[i] = 1
+                    rows = np.fromiter(batch_global_indexes, dtype=np.int64, count=batch_size)
+                    in_range = rows < partition.production_status.shape[0]
+                    if in_range.any():
+                        row_idx = torch.from_numpy(rows[in_range])
+                        col_idx = torch.as_tensor(field_indices, dtype=torch.long)
+                        ready = (
+                            (partition.production_status[row_idx[:, None], col_idx] == 1)
+                            .all(dim=1)
+                            .to(torch.int8)
+                            .numpy()
+                        )
+                        production_status[in_range] = ready
 
         custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
