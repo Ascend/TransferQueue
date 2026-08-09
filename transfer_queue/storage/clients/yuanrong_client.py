@@ -197,7 +197,7 @@ class GeneralKVClientAdapter(StorageStrategy):
 
     PUT_KEYS_LIMIT: int = 10_000
     GET_CLEAR_KEYS_LIMIT: int = 10_000
-    DS_MAX_WORKERS: int = 16
+    DS_MAX_WORKERS: int = 1
 
     def __init__(self, config: dict):
         port = config.get("worker_port")
