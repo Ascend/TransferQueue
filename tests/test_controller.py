@@ -594,6 +594,202 @@ class TestTransferQueueController:
 
         print("✓ Clear meta correct")
 
+    def test_controller_mark_clearing(self, ray_setup):
+        """Test mark_clearing prevents consumers from reading data pending deletion.
+
+        Simulates the three-step clear protocol introduced in PR #141:
+        1. mark_clearing zeroes production_status
+        2. storage clear (simulated by marking)
+        3. clear_meta releases indexes
+        """
+        gbs = 4
+        num_n_samples = 2
+        partition_id = "test_mark_clearing"
+
+        tq_controller = TransferQueueController.remote()
+
+        # Create metadata in insert mode
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+
+        assert metadata.global_indexes == list(range(gbs * num_n_samples))
+
+        # Update production status
+        field_schema = {
+            "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
+            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+        }
+        success = ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+        assert success
+
+        # Verify all samples are produced
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert torch.all(partition.production_status[metadata.global_indexes, :] == 1)
+
+        # Mark first 4 samples as pending deletion
+        global_indexes_to_mark = [0, 1, 2, 3]
+        partition_ids_to_mark = [partition_id] * len(global_indexes_to_mark)
+
+        ray.get(
+            tq_controller.mark_clearing.remote(
+                global_indexes=global_indexes_to_mark,
+                partition_ids=partition_ids_to_mark,
+            )
+        )
+
+        # Verify marked samples have production_status zeroed
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert torch.all(partition.production_status[[0, 1, 2, 3], :] == 0)
+        # Verify unmarked samples still have production_status = 1
+        assert torch.all(partition.production_status[[4, 5, 6, 7], :] == 1)
+
+        # Try to fetch data - marked samples should not be returned
+        fetch_meta = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="fetch",
+                task_name="consumer_task",
+            )
+        )
+
+        # Only unmarked samples (4, 5, 6, 7) should be returned
+        assert set(fetch_meta.global_indexes) == set([4, 5, 6, 7])
+        print("✓ mark_clearing prevents stale reads - marked samples not returned in fetch")
+
+        # Complete the clear protocol - clear the marked samples
+        ray.get(
+            tq_controller.clear_meta.remote(
+                global_indexes=global_indexes_to_mark,
+                partition_ids=partition_ids_to_mark,
+            )
+        )
+
+        # Verify only unmarked samples remain
+        partition_after_clear = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert set(partition_after_clear.global_indexes) == set([4, 5, 6, 7])
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+        print("✓ mark_clearing three-step clear protocol correct")
+
+    def test_controller_mark_clearing_idempotent(self, ray_setup):
+        """Test mark_clearing is idempotent and handles edge cases gracefully."""
+        gbs = 4
+        num_n_samples = 2
+        partition_id = "test_mark_clearing_idempotent"
+        other_partition_id = "test_mark_clearing_idempotent_other"
+
+        tq_controller = TransferQueueController.remote()
+
+        # Create partition with data
+        data_fields = ["prompt_ids", "attention_mask"]
+        metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=partition_id,
+                mode="insert",
+            )
+        )
+
+        field_schema = {
+            "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
+            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+        }
+        ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=partition_id,
+                global_indexes=metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+
+        # Test 1: Mark clearing on non-existent partition should not crash
+        ray.get(
+            tq_controller.mark_clearing.remote(
+                global_indexes=[0, 1],
+                partition_ids=["non_existent_partition", "non_existent_partition"],
+            )
+        )
+        # Should complete without error
+        print("✓ mark_clearing handles non-existent partition gracefully")
+
+        # Test 2: Mark clearing with mix of existent and non-existent global_indexes
+        ray.get(
+            tq_controller.mark_clearing.remote(
+                global_indexes=[0, 1, 100, 101],
+                partition_ids=[partition_id, partition_id, partition_id, partition_id],
+            )
+        )
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        # Only existing indexes 0 and 1 should be marked
+        assert torch.all(partition.production_status[[0, 1], :] == 0)
+        # Indexes 100, 101 don't exist so no effect; other indexes should still be 1
+        assert torch.all(partition.production_status[[2, 3, 4, 5, 6, 7], :] == 1)
+        print("✓ mark_clearing handles partial non-existent indexes correctly")
+
+        # Test 3: Idempotency - marking already-marked samples should not cause issues
+        ray.get(
+            tq_controller.mark_clearing.remote(
+                global_indexes=[0, 1],
+                partition_ids=[partition_id, partition_id],
+            )
+        )
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        assert torch.all(partition.production_status[[0, 1], :] == 0)
+        print("✓ mark_clearing is idempotent")
+
+        # Test 4: Multiple partitions
+        other_metadata = ray.get(
+            tq_controller.get_metadata.remote(
+                data_fields=data_fields,
+                batch_size=gbs * num_n_samples,
+                partition_id=other_partition_id,
+                mode="insert",
+            )
+        )
+        ray.get(
+            tq_controller.update_production_status.remote(
+                partition_id=other_partition_id,
+                global_indexes=other_metadata.global_indexes,
+                field_schema=field_schema,
+            )
+        )
+
+        # Mark samples across both partitions
+        ray.get(
+            tq_controller.mark_clearing.remote(
+                global_indexes=[2, other_metadata.global_indexes[0]],
+                partition_ids=[partition_id, other_partition_id],
+            )
+        )
+
+        partition = ray.get(tq_controller.get_partition_snapshot.remote(partition_id))
+        other_partition = ray.get(tq_controller.get_partition_snapshot.remote(other_partition_id))
+
+        assert torch.all(partition.production_status[[2], :] == 0)
+        assert torch.all(other_partition.production_status[[other_metadata.global_indexes[0]], :] == 0)
+        print("✓ mark_clearing handles multiple partitions correctly")
+
+        # Clean up
+        ray.get(tq_controller.clear_partition.remote(partition_id))
+        ray.get(tq_controller.clear_partition.remote(other_partition_id))
+
     def test_controller_clear_meta_idempotent(self, ray_setup):
         """Test clear_meta is idempotent when clearing non-existent data."""
         gbs = 4
