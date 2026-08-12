@@ -657,10 +657,11 @@ class TestTransferQueueController:
         assert torch.all(partition.production_status[[4, 5, 6, 7], :] == 1)
 
         # Try to fetch data - marked samples should not be returned
+        # Only request 4 samples since 4 are marked and unavailable
         fetch_meta = ray.get(
             tq_controller.get_metadata.remote(
                 data_fields=data_fields,
-                batch_size=gbs * num_n_samples,
+                batch_size=4,
                 partition_id=partition_id,
                 mode="fetch",
                 task_name="consumer_task",
