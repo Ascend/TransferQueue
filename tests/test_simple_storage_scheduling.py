@@ -43,7 +43,7 @@ def test_round_robin_uses_all_alive_nodes_by_default(monkeypatch):
     assert _node_ids(strategies) == [_NODE_A, _NODE_B, _NODE_A, _NODE_B, _NODE_A]
 
 
-def test_node_resource_filters_nodes_and_zero_capacity(monkeypatch):
+def test_required_node_resource_filters_nodes_and_zero_capacity(monkeypatch):
     nodes = [
         _node(_NODE_C, resources={"storage_pool": 2}),
         _node(_NODE_B, resources={"storage_pool": 0}),
@@ -52,24 +52,24 @@ def test_node_resource_filters_nodes_and_zero_capacity(monkeypatch):
     ]
     monkeypatch.setattr(common.ray, "nodes", lambda: nodes)
 
-    strategies = common.get_node_round_robin_scheduling_strategies(4, node_resource="storage_pool")
+    strategies = common.get_node_round_robin_scheduling_strategies(4, required_node_resource="storage_pool")
 
     assert _node_ids(strategies) == [_NODE_A, _NODE_C, _NODE_A, _NODE_C]
 
 
-def test_node_resource_excludes_dead_nodes(monkeypatch):
+def test_required_node_resource_excludes_dead_nodes(monkeypatch):
     nodes = [
         _node(_NODE_A, alive=False, resources={"storage_pool": 1}),
         _node(_NODE_B, resources={"storage_pool": 1}),
     ]
     monkeypatch.setattr(common.ray, "nodes", lambda: nodes)
 
-    strategies = common.get_node_round_robin_scheduling_strategies(2, node_resource="storage_pool")
+    strategies = common.get_node_round_robin_scheduling_strategies(2, required_node_resource="storage_pool")
 
     assert _node_ids(strategies) == [_NODE_B, _NODE_B]
 
 
-def test_node_resource_raises_when_no_alive_node_matches(monkeypatch):
+def test_required_node_resource_raises_when_no_alive_node_matches(monkeypatch):
     nodes = [
         _node(_NODE_A, resources={"storage_pool": 0}),
         _node(_NODE_B, alive=False, resources={"storage_pool": 1}),
@@ -77,7 +77,7 @@ def test_node_resource_raises_when_no_alive_node_matches(monkeypatch):
     monkeypatch.setattr(common.ray, "nodes", lambda: nodes)
 
     with pytest.raises(ValueError, match="No alive Ray nodes provide custom resource 'storage_pool'"):
-        common.get_node_round_robin_scheduling_strategies(1, node_resource="storage_pool")
+        common.get_node_round_robin_scheduling_strategies(1, required_node_resource="storage_pool")
 
 
 def test_default_no_alive_node_error_is_unchanged(monkeypatch):
@@ -87,7 +87,7 @@ def test_default_no_alive_node_error_is_unchanged(monkeypatch):
         common.get_node_round_robin_scheduling_strategies(1)
 
 
-def test_simple_storage_initialization_forwards_node_resource(monkeypatch):
+def test_simple_storage_initialization_forwards_required_node_resource(monkeypatch):
     strategy = MagicMock(node_id=_NODE_A)
     get_strategies = MagicMock(return_value=[strategy])
     storage_unit = MagicMock()
@@ -105,7 +105,7 @@ def test_simple_storage_initialization_forwards_node_resource(monkeypatch):
                 "SimpleStorage": {
                     "num_data_storage_units": 1,
                     "total_storage_size": None,
-                    "node_resource": "storage_pool",
+                    "required_node_resource": "storage_pool",
                 },
             }
         }
@@ -113,5 +113,5 @@ def test_simple_storage_initialization_forwards_node_resource(monkeypatch):
 
     handles = simple_storage_bootstrap.initialize_simple_storage(conf)
 
-    get_strategies.assert_called_once_with(1, node_resource="storage_pool")
+    get_strategies.assert_called_once_with(1, required_node_resource="storage_pool")
     assert handles == {"TransferQueueStorageUnit#0": storage_handle}

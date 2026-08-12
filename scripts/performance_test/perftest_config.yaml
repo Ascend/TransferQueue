@@ -30,7 +30,7 @@ backend:
     # Recommended: >= 2 x number of nodes so each node hosts multiple units.
     num_data_storage_units: 16
     # Optional Ray custom resource required on storage nodes. null keeps all alive nodes eligible.
-    node_resource: null
+    required_node_resource: null
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 

@@ -46,7 +46,7 @@ def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
 
 
 def get_node_round_robin_scheduling_strategies(
-    num_actors: int, node_resource: str | None = None
+    num_actors: int, required_node_resource: str | None = None
 ) -> list[NodeAffinitySchedulingStrategy]:
     """
     Compute one scheduling strategy per actor that round-robins actors across
@@ -59,7 +59,7 @@ def get_node_round_robin_scheduling_strategies(
 
     Args:
         num_actors (int): Number of Ray actors to schedule.
-        node_resource (str | None): Optional Ray custom resource required on eligible nodes.
+        required_node_resource (str | None): Optional Ray custom resource required on eligible nodes.
 
     Returns:
         list[NodeAffinitySchedulingStrategy]: One scheduling strategy per actor.
@@ -68,14 +68,15 @@ def get_node_round_robin_scheduling_strategies(
     alive_node_ids = sorted(
         node["NodeID"]
         for node in nodes
-        if node.get("Alive", False) and (node_resource is None or node.get("Resources", {}).get(node_resource, 0) > 0)
+        if node.get("Alive", False)
+        and (required_node_resource is None or node.get("Resources", {}).get(required_node_resource, 0) > 0)
     )
     if not alive_node_ids:
-        if node_resource is not None:
+        if required_node_resource is not None:
             raise ValueError(
-                f"No alive Ray nodes provide custom resource {node_resource!r}. "
+                f"No alive Ray nodes provide custom resource {required_node_resource!r}. "
                 "Start eligible nodes with a positive resource capacity or unset "
-                "backend.SimpleStorage.node_resource."
+                "backend.SimpleStorage.required_node_resource."
             )
         raise RuntimeError("No alive Ray nodes found. Is Ray initialized?")
 
