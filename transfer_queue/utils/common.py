@@ -45,10 +45,12 @@ def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
     return placement_group
 
 
-def get_node_round_robin_scheduling_strategies(num_actors: int) -> list[NodeAffinitySchedulingStrategy]:
+def get_node_round_robin_scheduling_strategies(
+    num_actors: int, node_resource: str | None = None
+) -> list[NodeAffinitySchedulingStrategy]:
     """
-    Compute one scheduling strategy per actor that round-robins actors across all
-    currently alive Ray nodes, in order.
+    Compute one scheduling strategy per actor that round-robins actors across
+    eligible alive Ray nodes, in order.
 
     Unlike a placement group with SPREAD (best-effort) or STRICT_SPREAD (fails when
     num_actors > num_nodes), this guarantees each node is assigned floor(num_actors /
@@ -57,13 +59,24 @@ def get_node_round_robin_scheduling_strategies(num_actors: int) -> list[NodeAffi
 
     Args:
         num_actors (int): Number of Ray actors to schedule.
+        node_resource (str | None): Optional Ray custom resource required on eligible nodes.
 
     Returns:
         list[NodeAffinitySchedulingStrategy]: One scheduling strategy per actor.
     """
     nodes = ray.nodes()
-    alive_node_ids = sorted(node["NodeID"] for node in nodes if node.get("Alive", False))
+    alive_node_ids = sorted(
+        node["NodeID"]
+        for node in nodes
+        if node.get("Alive", False) and (node_resource is None or node.get("Resources", {}).get(node_resource, 0) > 0)
+    )
     if not alive_node_ids:
+        if node_resource is not None:
+            raise ValueError(
+                f"No alive Ray nodes provide custom resource {node_resource!r}. "
+                "Start eligible nodes with a positive resource capacity or unset "
+                "backend.SimpleStorage.node_resource."
+            )
         raise RuntimeError("No alive Ray nodes found. Is Ray initialized?")
 
     return [

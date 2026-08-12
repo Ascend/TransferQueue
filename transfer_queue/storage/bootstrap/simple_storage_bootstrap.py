@@ -34,7 +34,10 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
-    scheduling_strategies = get_node_round_robin_scheduling_strategies(num_data_storage_units)
+    node_resource = conf.backend.SimpleStorage.get("node_resource", None)
+    scheduling_strategies = get_node_round_robin_scheduling_strategies(
+        num_data_storage_units, node_resource=node_resource
+    )
 
     # Compute per-unit capacity: None means unlimited
     storage_unit_size = (
