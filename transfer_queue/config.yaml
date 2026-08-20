@@ -115,6 +115,9 @@ backend:
     metastore_port: 2379
     # Whether to enable npu transport
     enable_yr_npu_transport: false
+    # Number of worker threads used to serialize objects in parallel before storing
+    # them via the general KV client. 1 disables parallelism (serial packing).
+    ds_max_workers: 1
     # Whether to enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
     # See https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html
     enable_rdma: false

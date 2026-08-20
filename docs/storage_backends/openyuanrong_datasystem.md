@@ -134,6 +134,7 @@ backend:
     worker_port: 31501                 # Port for Yuanrong datasystem worker on each node
     metastore_port: 2379               # Port for metastore service on the head node
     enable_yr_npu_transport: true      # Enable NPU transport for high-performance device-to-device transfer
+    ds_max_workers: 1                  # Worker threads for parallel serialization in the general KV client
     enable_rdma: false                 # Enable host RDMA (H2H) transport via UCX
     ucx_env_vars: {}                   # UCX env vars for dscli subprocess (e.g., {UCX_LOG_FILE: /tmp/ucx.log, UCX_LOG_LEVEL: ERROR})
     worker_args: "--shared_memory_size_mb 8192 --remote_h2d_device_ids 0 --enable_huge_tlb true"
@@ -143,6 +144,7 @@ backend:
 - `auto_init`: Whether to automatically initialize Yuanrong backend. Default is `True`.
 - `worker_port`: Port for Yuanrong datasystem worker on each node.
 - `metastore_port`: Port for metastore service on the head node.
+- `ds_max_workers`: Number of worker threads used to serialize objects in parallel before storing them via the general KV client. Default is `1` (serial packing).
 - `worker_args`: Additional arguments passed to `dscli start` command:
   - `--shared_memory_size_mb`: Shared memory size in MB for datasystem worker.
   - `--enable_huge_tlb`: Configure huge page memory to reduce TLB misses and improve memory access efficiency. Note: may cause system memory shortage, kernel OOM, or system instability.  **Please allocate huge pages before starting datasystem** - refer to [Huge Page Guide](https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/appendix/hugepage_guide.html). Before enabling, OS config required (root privilege): `sysctl -w vm.nr_hugepages=<count>` (each page is 2MB, e.g. 65536 for 128GB) and `ulimit -l unlimited` (allow pinning enough memory for RDMA/Ascend).

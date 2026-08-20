@@ -205,6 +205,11 @@ class GeneralKVClientAdapter(StorageStrategy):
         if port is None or not isinstance(port, int):
             raise ValueError("Missing or invalid 'worker_port' in config")
 
+        ds_max_workers = config.get("ds_max_workers", self.DS_MAX_WORKERS)
+        if not isinstance(ds_max_workers, int) or ds_max_workers < 1:
+            raise ValueError(f"Invalid 'ds_max_workers' in config: {ds_max_workers}. Expecting a positive integer")
+        self.DS_MAX_WORKERS = ds_max_workers
+
         logger.info(f"Auto-detecting reachable host for Yuanrong port {port}...")
         host = find_reachable_host(port)
         if host is None:

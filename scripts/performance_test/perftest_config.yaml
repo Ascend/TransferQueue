@@ -114,6 +114,9 @@ backend:
     metastore_port: 2379
     # If enable npu transport
     enable_yr_npu_transport: true
+    # Number of worker threads used to serialize objects in parallel before storing
+    # them via the general KV client. 1 disables parallelism (serial packing).
+    ds_max_workers: 1
     # Additional config for yuanrong worker.
     # Recommended options for NPU environments:
     #   --remote_h2d_device_ids       Enable RH2D for efficient cross-node data transfer. Specify NPU device IDs (comma-separated).
