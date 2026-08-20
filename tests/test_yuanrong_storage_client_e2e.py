@@ -61,7 +61,7 @@ class MockKVClient:
     def init(self):
         pass
 
-    def mcreate(self, keys, sizes):
+    def mcreate(self, keys, sizes, ttl_second=0):
         class MockBuffer:
             def __init__(self, size):
                 self._data = bytearray(size)

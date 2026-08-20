@@ -809,5 +809,11 @@ class KVStorageManager(StorageManager):
             )
 
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
-        _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
+        # Clear routes only by backend tag, so custom_meta is built directly,
+        # in the field-major order that _generate_keys uses.
+        custom_meta = [
+            per_sample.get(field_name)
+            for field_name in sorted(metadata.field_names)
+            for per_sample in metadata._custom_backend_meta
+        ]
         self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)

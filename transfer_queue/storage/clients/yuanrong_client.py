@@ -197,6 +197,7 @@ class GeneralKVClientAdapter(StorageStrategy):
 
     PUT_KEYS_LIMIT: int = 10_000
     GET_CLEAR_KEYS_LIMIT: int = 10_000
+    CLEAR_EXPIRE_SECOND: int = 1
     DS_MAX_WORKERS: int = 1
 
     def __init__(self, config: dict):
@@ -213,6 +214,10 @@ class GeneralKVClientAdapter(StorageStrategy):
                 "Please ensure yuanrong datasystem is running."
             )
         logger.info(f"Using auto-detected host: {host}")
+
+        # Written onto every key and refreshed by each write, so a reused key never
+        # inherits an older deadline. 0 keeps the synchronous-delete behaviour.
+        self._ttl_second = int(config.get("data_ttl_second", 0))
 
         self._ds_client = datasystem.KVClient(host, port)
         self._ds_client.init()
@@ -256,10 +261,13 @@ class GeneralKVClientAdapter(StorageStrategy):
         return isinstance(strategy_tag, str) and strategy_tag == self.strategy_tag()
 
     def clear(self, keys: list[str]) -> None:
-        """Delete keys in batches."""
+        """Release keys in batches, expiring them if a TTL is configured."""
         for i in range(0, len(keys), self.GET_CLEAR_KEYS_LIMIT):
             batch_keys = keys[i : i + self.GET_CLEAR_KEYS_LIMIT]
-            self._ds_client.delete(batch_keys)
+            if self._ttl_second:
+                self._ds_client.expire(batch_keys, self.CLEAR_EXPIRE_SECOND)
+            else:
+                self._ds_client.delete(batch_keys)
 
     def mset_zero_copy(self, keys: list[str], objs: list[Any]):
         """Store multiple objects in zero-copy mode using parallel serialization and buffer packing.
@@ -273,7 +281,11 @@ class GeneralKVClientAdapter(StorageStrategy):
         def alloc(sizes):
             # DataSystem buffers must be converted via MutableData() to obtain
             # a memoryview-compatible data structure for zero-copy packing.
-            mcreate_bufs = self._ds_client.mcreate(keys, sizes)
+            # A cleared global_index goes back into the reusable pool, so a later
+            # put rebuilds the same key and must re-arm the deadline explicitly;
+            # passing 0 there would keep clear's expiry. ttl_second=0 itself is
+            # datasystem's default "never expire", so the delete path is safe.
+            mcreate_bufs = self._ds_client.mcreate(keys, sizes, ttl_second=self._ttl_second)
             buffers.extend(mcreate_bufs)
             return [buf.MutableData() for buf in mcreate_bufs]
 
@@ -485,6 +497,20 @@ class YuanrongStorageClient(StorageKVClient):
             A dictionary mapping each active strategy to a list of indexes in `items`
             that it should handle. Every index appears exactly once.
         """
+        # Backend-meta tags are hashable and, for a batch written by one backend,
+        # all identical - so one selector call can decide the whole batch, for example
+        # Skipping the per-item loop takes a 1024-sample x 20-field clear from ~20k
+        # selector calls down to one. Mixed or unmatched tags fall through to the loop below.
+        if item_label == self.ROUTE_ITEM_AS_BACKEND_META:
+            distinct = set(items)
+            if len(distinct) == 1:
+                tag = distinct.pop()
+                owner = next((s for s in self._strategies if selector(s, tag)), None)
+                if owner is not None:
+                    routed: dict[StorageStrategy, list[int]] = {s: [] for s in self._strategies}
+                    routed[owner] = list(range(len(items)))
+                    return routed
+
         unmatched_count = 0
         warning_count = 0
         routed_indexes: dict[StorageStrategy, list[int]] = {s: [] for s in self._strategies}

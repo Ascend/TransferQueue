@@ -115,6 +115,11 @@ backend:
     metastore_port: 2379
     # Whether to enable npu transport
     enable_yr_npu_transport: false
+    # Lifetime in seconds written onto every stored key, refreshed on each write.
+    # When > 0, clear expires keys instead of deleting them (0 keeps synchronous
+    # delete); the TTL bounds when the space is reclaimed. Must exceed the
+    # lifetime of any single batch. Ignored by the NPU tensor path.
+    data_ttl_second: 0
     # Whether to enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
     # See https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html
     enable_rdma: false

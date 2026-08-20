@@ -48,6 +48,39 @@ class TestYuanrongKVClientZCopy:
     def storage_client(self, mock_kv_client):
         return GeneralKVClientAdapter({"worker_port": 31501})
 
+    @pytest.mark.parametrize("ttl", [0, 3600])
+    def test_clear_honours_data_ttl(self, mock_kv_client, ttl):
+        """With a TTL configured, clear expires keys instead of deleting them.
+
+        Both halves have to hold together: the TTL must also reach mcreate, because a
+        cleared index is reused and only an explicit TTL re-arms the deadline on the
+        rewritten key.
+        """
+        client = GeneralKVClientAdapter({"worker_port": 31501, "data_ttl_second": ttl})
+        assert client._ttl_second == ttl
+
+        keys = ["k0", "k1"]
+        client.clear(keys)
+        if ttl:
+            mock_kv_client.expire.assert_called_once_with(keys, client.CLEAR_EXPIRE_SECOND)
+            mock_kv_client.delete.assert_not_called()
+        else:
+            mock_kv_client.delete.assert_called_once_with(keys)
+            mock_kv_client.expire.assert_not_called()
+
+        mock_kv_client.mcreate.side_effect = lambda ks, sizes, ttl_second=0: [MockBuffer(s) for s in sizes]
+        client.mset_zero_copy(keys, [b"a", b"b"])
+        assert mock_kv_client.mcreate.call_args.kwargs["ttl_second"] == ttl
+
+    def test_clear_batches_beyond_the_key_limit(self, mock_kv_client):
+        """datasystem rejects more than GET_CLEAR_KEYS_LIMIT keys in one call."""
+        client = GeneralKVClientAdapter({"worker_port": 31501, "data_ttl_second": 60})
+        n = client.GET_CLEAR_KEYS_LIMIT + 5
+        client.clear([f"k{i}" for i in range(n)])
+        assert mock_kv_client.expire.call_count == 2
+        assert len(mock_kv_client.expire.call_args_list[0].args[0]) == client.GET_CLEAR_KEYS_LIMIT
+        assert len(mock_kv_client.expire.call_args_list[1].args[0]) == 5
+
     def test_mset_mget_p2p(self, storage_client, mocker):
         # Mock serialization/deserialization
         def mock_encode(obj):
@@ -69,7 +102,7 @@ class TestYuanrongKVClientZCopy:
 
         stored_raw_buffers = []
 
-        def side_effect_mcreate(keys, sizes):
+        def side_effect_mcreate(keys, sizes, ttl_second=0):
             buffers = [MockBuffer(size) for size in sizes]
             for b in buffers:
                 stored_raw_buffers.append(b.MutableData())
