@@ -32,10 +32,7 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[test,build,yuanrong]"
-        # Pin below 0.3.12: the 0.3.12 non-cuda wheel ships a mooncake_master binary
-        # linked against libcudart.so.12, which fails to start on runners without CUDA.
-        pip install "mooncake-transfer-engine-non-cuda<0.3.12"
+        pip install -e ".[test,build,yuanrong,mooncake]"
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names
