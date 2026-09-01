@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -476,3 +477,97 @@ def test_put_data_custom_backend_meta_length_mismatch_raises_error(test_data_for
         asyncio.run(manager.put_data(test_data_for_put_data["data"], test_data_for_put_data["metadata"]))
 
     assert "does not match" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+@patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
+async def test_kv_backend_operations_do_not_block_event_loop(test_data_for_put_data):
+    mock_storage_client = MagicMock()
+    config = {"client_name": "MockClient"}
+    with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
+        manager = KVStorageManager(controller_info=MagicMock(), config=config)
+    manager.notify_data_update = AsyncMock()
+
+    data = test_data_for_put_data["data"]
+    metadata = test_data_for_put_data["metadata"]
+    values = manager._generate_values(data)
+    loop_thread = threading.get_ident()
+    merge_thread = None
+    merge_tensors = manager._merge_tensors_to_tensordict
+
+    def record_merge_thread(*args, **kwargs):
+        nonlocal merge_thread
+        merge_thread = threading.get_ident()
+        return merge_tensors(*args, **kwargs)
+
+    manager._merge_tensors_to_tensordict = record_merge_thread
+
+    operations = [
+        ("put", lambda: manager.put_data(data, metadata), None),
+        ("get", lambda: manager.get_data(metadata), values),
+        ("clear", lambda: manager.clear_data(metadata), None),
+    ]
+
+    try:
+        for name, invoke, result in operations:
+            started = threading.Event()
+            release = threading.Event()
+            call_thread = None
+
+            def blocking_call(
+                *args,
+                _started=started,
+                _release=release,
+                _result=result,
+                **kwargs,
+            ):
+                nonlocal call_thread
+                call_thread = threading.get_ident()
+                _started.set()
+                _release.wait(timeout=2)
+                return _result
+
+            getattr(mock_storage_client, name).side_effect = blocking_call
+            task = asyncio.create_task(invoke())
+            for _ in range(100):
+                if started.is_set() or task.done():
+                    break
+                await asyncio.sleep(0.01)
+
+            if task.done() and not started.is_set():
+                await task
+            assert started.is_set(), f"storage_client.{name} was not called"
+            assert not task.done(), f"storage_client.{name} blocked the event loop"
+            assert call_thread != loop_thread
+            release.set()
+            await task
+            if name == "get":
+                assert merge_thread != loop_thread
+    finally:
+        manager.close()
+
+
+@patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
+def test_close_releases_kv_resources_once():
+    mock_storage_client = MagicMock()
+    config = {"client_name": "MockClient"}
+    with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
+        manager = KVStorageManager(controller_info=MagicMock(), config=config)
+
+    storage_executor = manager._get_storage_executor()
+    reconstruction_executor = manager._get_executor()
+    storage_executor.submit(lambda: None).result()
+    reconstruction_executor.submit(lambda: None).result()
+    assert storage_executor is not reconstruction_executor
+
+    manager.close()
+    manager.close()
+
+    assert manager._storage_executor is None
+    assert manager._multi_threads_executor is None
+    assert not manager._notify_thread.is_alive()
+    mock_storage_client.close.assert_called_once_with()
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        storage_executor.submit(lambda: None)
+    with pytest.raises(RuntimeError, match="cannot schedule new futures after shutdown"):
+        reconstruction_executor.submit(lambda: None)

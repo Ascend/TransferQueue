@@ -14,12 +14,12 @@
 # limitations under the License.
 
 import asyncio
+import functools
 import inspect
 import itertools
 import os
 import threading
 import time
-import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
@@ -530,13 +530,14 @@ class KVStorageManager(StorageManager):
                 the controller notify/handshake path, so they keep an independent
                 context rather than drawing on a caller's shared socket budget.
         """
+        self._closed = False
         client_name = config.get("client_name", None)
         if client_name is None:
             raise ValueError("Missing client_name in config")
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
+        self._storage_executor: ThreadPoolExecutor | None = None
         self._multi_threads_executor: ThreadPoolExecutor | None = None
-        self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
     def _generate_keys(field_names: list[str], global_indexes: list[int]) -> list[str]:
@@ -579,40 +580,56 @@ class KVStorageManager(StorageManager):
                 results.extend(field_data)
         return results
 
-    @staticmethod
-    def _shutdown_executor(thread_executor: ThreadPoolExecutor | None) -> None:
-        """
-        A static method to ensure no strong reference to 'self' is held within the
-        finalizer's callback, enabling proper garbage collection.
-        """
-        if thread_executor:
-            thread_executor.shutdown(wait=False)
+    def _get_num_threads(self) -> int:
+        """Bound per-manager thread pools according to the current Ray allocation."""
+        if hasattr(self, "_num_threads"):
+            return self._num_threads
+
+        ray_context = ray.get_runtime_context()
+        is_in_ray_actor_or_task = ray_context.get_actor_id() is not None or ray_context.get_task_id() is not None
+
+        if is_in_ray_actor_or_task:
+            ray_assigned_cpus = ray_context.get_assigned_resources().get("CPU", 1)
+            num_threads = min(max(2, int(ray_assigned_cpus)), LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR)
+        else:
+            num_threads = min(max(2, os.cpu_count() or 2), LIMIT_THREADS_PER_MANAGER_IN_DRIVER)
+
+        self._num_threads = num_threads
+        return num_threads
 
     def _get_executor(self) -> ThreadPoolExecutor:
-        """Lazy Creating multi-thread executor for speeding up '_merge_tensors_to_tensordict'"""
+        """Lazily create the executor used to reconstruct TensorDict fields."""
+        if self._closed:
+            raise RuntimeError("KVStorageManager is closed")
+
         if self._multi_threads_executor is None:
-            ray_context = ray.get_runtime_context()
-            is_in_ray_actor_or_task = ray_context.get_actor_id() is not None or ray_context.get_task_id() is not None
-
-            if is_in_ray_actor_or_task:
-                # In ray actor:
-                ray_assigned_cpus = ray_context.get_assigned_resources().get("CPU", 1)
-                # num_threads must be 2 at least.
-                num_threads = max(2, int(ray_assigned_cpus))
-                num_threads = min(num_threads, LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR)
-            else:
-                # In Driver:
-                # num_threads must be 2 at least.
-                num_threads = max(2, os.cpu_count() or 2)
-                num_threads = min(num_threads, LIMIT_THREADS_PER_MANAGER_IN_DRIVER)
-
-            self._num_threads = num_threads
             self._multi_threads_executor = ThreadPoolExecutor(
-                max_workers=self._num_threads, thread_name_prefix="KVStorageManager"
+                max_workers=self._get_num_threads(), thread_name_prefix="KVStorageManager"
             )
 
         assert self._multi_threads_executor is not None
         return self._multi_threads_executor
+
+    def _get_storage_executor(self) -> ThreadPoolExecutor:
+        """Lazily create the executor that owns synchronous backend calls.
+
+        A separate pool lets get workers wait for parallel field reconstruction
+        without deadlocking concurrent gets through nested submissions.
+        """
+        if self._closed:
+            raise RuntimeError("KVStorageManager is closed")
+
+        if self._storage_executor is None:
+            self._storage_executor = ThreadPoolExecutor(
+                max_workers=self._get_num_threads(), thread_name_prefix="KVStorageManagerIO"
+            )
+
+        return self._storage_executor
+
+    async def _run_storage_call(self, operation: Callable, *args, **kwargs):
+        """Run a synchronous backend operation without blocking the caller's event loop."""
+        call = functools.partial(operation, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(self._get_storage_executor(), call)
 
     def _merge_tensors_to_tensordict(self, metadata: BatchMeta, values: list[Any]) -> TensorDict:
         """
@@ -747,8 +764,7 @@ class KVStorageManager(StorageManager):
         keys = self._generate_keys(data_field_names, metadata.global_indexes)
         values = self._generate_values(data)
 
-        loop = asyncio.get_event_loop()
-        custom_backend_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
+        custom_backend_meta = await self._run_storage_call(self.storage_client.put, keys, values)
 
         field_schema = extract_field_schema(data)
 
@@ -795,10 +811,14 @@ class KVStorageManager(StorageManager):
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         shapes, dtypes, custom_backend_meta = self._get_shape_type_custom_backend_meta_list(metadata)
-        values = self.storage_client.get(
-            keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
-        )
-        return self._merge_tensors_to_tensordict(metadata, values)
+
+        def get_and_merge() -> TensorDict:
+            values = self.storage_client.get(
+                keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
+            )
+            return self._merge_tensors_to_tensordict(metadata, values)
+
+        return await self._run_storage_call(get_and_merge)
 
     async def clear_data(self, metadata: BatchMeta) -> None:
         """Remove stored data associated with the given metadata."""
@@ -810,4 +830,34 @@ class KVStorageManager(StorageManager):
 
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
-        self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)
+        await self._run_storage_call(self.storage_client.clear, keys=keys, custom_backend_meta=custom_meta)
+
+    def close(self) -> None:
+        """Wait for KV work, release backend resources, and stop manager services."""
+        if self._closed:
+            return
+        self._closed = True
+
+        storage_executor = getattr(self, "_storage_executor", None)
+        self._storage_executor = None
+        executor = getattr(self, "_multi_threads_executor", None)
+        self._multi_threads_executor = None
+        for executor_name, current_executor in (
+            ("storage", storage_executor),
+            ("reconstruction", executor),
+        ):
+            if current_executor is None:
+                continue
+            try:
+                current_executor.shutdown(wait=True)
+            except Exception as e:
+                logger.warning(f"[{self.storage_manager_id}]: Error shutting down KV {executor_name} executor: {e}")
+
+        storage_client = getattr(self, "storage_client", None)
+        if storage_client is not None:
+            try:
+                storage_client.close()
+            except Exception as e:
+                logger.warning(f"[{self.storage_manager_id}]: Error closing KV storage client: {e}")
+
+        super().close()
