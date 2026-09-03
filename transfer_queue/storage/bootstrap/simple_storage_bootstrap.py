@@ -16,6 +16,7 @@
 import math
 from typing import Any
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
@@ -25,6 +26,8 @@ from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
+
+SIMPLE_STORAGE_START_TIMEOUT_SECONDS = 60
 
 
 @StorageBootstrapProvider.register_provider("SimpleStorage")
@@ -38,6 +41,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     scheduling_strategies = get_node_round_robin_scheduling_strategies(
         num_data_storage_units, required_node_resource=required_node_resource
     )
+    available_cpus = ray.available_resources().get("CPU", 0.0)
 
     # Compute per-unit capacity: None means unlimited
     storage_unit_size = (
@@ -57,7 +61,20 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             f"on node {scheduling_strategies[storage_unit_rank].node_id}."
         )
 
-    storage_zmq_info = process_zmq_server_info(simple_storage_handles)
+    try:
+        storage_zmq_info = process_zmq_server_info(simple_storage_handles, timeout=SIMPLE_STORAGE_START_TIMEOUT_SECONDS)
+    except ray.exceptions.GetTimeoutError as error:
+        for storage_node in simple_storage_handles.values():
+            ray.kill(storage_node)
+        raise RuntimeError(
+            f"SimpleStorage startup timed out after {SIMPLE_STORAGE_START_TIMEOUT_SECONDS} seconds. "
+            "Each SimpleStorageUnit requires 1 Ray CPU; "
+            f"backend.SimpleStorage.num_data_storage_units={num_data_storage_units} therefore requires "
+            f"Ray CPU capacity of {num_data_storage_units}, but Ray reported "
+            f"available CPU capacity of {available_cpus:g} "
+            "before startup. "
+            "Reduce backend.SimpleStorage.num_data_storage_units or make more CPUs available on the eligible Ray nodes."
+        ) from error
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
 

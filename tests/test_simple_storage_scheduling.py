@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 from omegaconf import OmegaConf
 
+from transfer_queue import interface
 from transfer_queue.storage.bootstrap import simple_storage_bootstrap
 from transfer_queue.utils import common
 
@@ -96,7 +97,8 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
 
     monkeypatch.setattr(simple_storage_bootstrap, "get_node_round_robin_scheduling_strategies", get_strategies)
     monkeypatch.setattr(simple_storage_bootstrap, "SimpleStorageUnit", storage_unit)
-    monkeypatch.setattr(simple_storage_bootstrap, "process_zmq_server_info", lambda _: {})
+    monkeypatch.setattr(simple_storage_bootstrap, "process_zmq_server_info", lambda _, timeout=None: {})
+    monkeypatch.setattr(simple_storage_bootstrap.ray, "available_resources", lambda: {"CPU": 1.0})
 
     conf = OmegaConf.create(
         {
@@ -115,3 +117,68 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
 
     get_strategies.assert_called_once_with(1, required_node_resource="storage_pool")
     assert handles == {"TransferQueueStorageUnit#0": storage_handle}
+
+
+def test_simple_storage_start_timeout_kills_units_and_reports_cpu_requirement(monkeypatch):
+    strategies = [MagicMock(node_id=_NODE_A), MagicMock(node_id=_NODE_A)]
+    storage_handles = [MagicMock(), MagicMock()]
+    server_info_ref = MagicMock()
+    storage_handles[0].get_zmq_server_info.remote.return_value = server_info_ref
+    storage_unit = MagicMock()
+    storage_unit.options.return_value.remote.side_effect = storage_handles
+    get = MagicMock(side_effect=simple_storage_bootstrap.ray.exceptions.GetTimeoutError())
+    kill = MagicMock()
+
+    monkeypatch.setattr(
+        simple_storage_bootstrap, "get_node_round_robin_scheduling_strategies", lambda *_args, **_kwargs: strategies
+    )
+    monkeypatch.setattr(simple_storage_bootstrap, "SimpleStorageUnit", storage_unit)
+    monkeypatch.setattr(simple_storage_bootstrap.ray, "available_resources", lambda: {"CPU": 1.0})
+    monkeypatch.setattr(simple_storage_bootstrap.ray, "get", get)
+    monkeypatch.setattr(simple_storage_bootstrap.ray, "kill", kill)
+
+    conf = OmegaConf.create(
+        {
+            "backend": {
+                "storage_backend": "SimpleStorage",
+                "SimpleStorage": {"num_data_storage_units": 2, "total_storage_size": None},
+            }
+        }
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        simple_storage_bootstrap.initialize_simple_storage(conf)
+
+    assert str(exc_info.value) == (
+        "SimpleStorage startup timed out after 60 seconds. Each SimpleStorageUnit requires 1 Ray CPU; "
+        "backend.SimpleStorage.num_data_storage_units=2 therefore requires Ray CPU capacity of 2, but Ray reported "
+        "available CPU capacity of 1 before startup. Reduce backend.SimpleStorage.num_data_storage_units or make "
+        "more CPUs available on the eligible Ray nodes."
+    )
+    get.assert_called_once_with(server_info_ref, timeout=simple_storage_bootstrap.SIMPLE_STORAGE_START_TIMEOUT_SECONDS)
+    assert kill.call_args_list == [call(storage_handles[0]), call(storage_handles[1])]
+
+
+def test_init_rolls_back_controller_when_storage_initialization_fails(monkeypatch):
+    controller = MagicMock()
+    controller_class = MagicMock()
+    controller_class.options.return_value.remote.return_value = controller
+    storage_error = RuntimeError("storage initialization failed")
+    kill = MagicMock()
+
+    monkeypatch.setattr(interface, "_TQ_CLIENT", None)
+    monkeypatch.setattr(interface, "_TQ_STORAGE", None)
+    monkeypatch.setattr(interface, "_TQ_CONTROLLER", None)
+    monkeypatch.setattr(interface, "_init_from_existing", lambda: False)
+    monkeypatch.setattr(interface, "TransferQueueController", controller_class)
+    monkeypatch.setattr(interface, "process_zmq_server_info", lambda _: {})
+    monkeypatch.setattr(interface, "_maybe_create_tq_storage", MagicMock(side_effect=storage_error))
+    monkeypatch.setattr(interface.ray, "kill", kill)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        interface.init()
+
+    assert exc_info.value is storage_error
+    kill.assert_called_once_with(controller)
+    assert interface._TQ_CONTROLLER is None
+    assert interface._TQ_STORAGE is None
