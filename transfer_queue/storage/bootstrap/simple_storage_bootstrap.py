@@ -65,7 +65,10 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
         storage_zmq_info = process_zmq_server_info(simple_storage_handles, timeout=SIMPLE_STORAGE_START_TIMEOUT_SECONDS)
     except ray.exceptions.GetTimeoutError as error:
         for storage_node in simple_storage_handles.values():
-            ray.kill(storage_node)
+            try:
+                ray.kill(storage_node)
+            except Exception:
+                logger.exception("Failed to kill SimpleStorageUnit after startup timeout.")
         raise RuntimeError(
             f"SimpleStorage startup timed out after {SIMPLE_STORAGE_START_TIMEOUT_SECONDS} seconds. "
             "Each SimpleStorageUnit requires 1 Ray CPU; "
