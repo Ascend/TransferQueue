@@ -431,12 +431,13 @@ def with_zmq_socket(
     return decorator
 
 
-def process_zmq_server_info(handlers: dict[Any, Any] | Any):
+def process_zmq_server_info(handlers: dict[Any, Any] | Any, timeout: float | None = None):
     """Extract ZMQ server information from handler objects.
 
     Args:
         handlers: Dictionary of handler objects (controllers, storage managers or storage units),
                   or a single handler object
+        timeout: Maximum seconds to wait for all handlers to return their server information.
 
     Returns:
         If handlers is a dictionary: Dictionary mapping handler names to their ZMQ server information
@@ -451,9 +452,10 @@ def process_zmq_server_info(handlers: dict[Any, Any] | Any):
         >>> handlers = {"storage_0": storage_0, "storage_1": storage_1}
         >>> info_dict = process_zmq_server_info(handlers)"""
     if not isinstance(handlers, dict):
-        return ray.get(handlers.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
-    else:
-        server_info = {}
-        for name, handler in handlers.items():
-            server_info[name] = ray.get(handler.get_zmq_server_info.remote())  # type: ignore[union-attr, attr-defined]
-        return server_info
+        return ray.get(handlers.get_zmq_server_info.remote(), timeout=timeout)  # type: ignore[union-attr, attr-defined]
+    if not handlers:
+        return {}
+
+    server_info_refs = [handler.get_zmq_server_info.remote() for handler in handlers.values()]
+    server_info = ray.get(server_info_refs, timeout=timeout)
+    return dict(zip(handlers, server_info, strict=True))

@@ -16,6 +16,7 @@
 import math
 from typing import Any
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
@@ -25,6 +26,8 @@ from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
+
+SIMPLE_STORAGE_START_TIMEOUT_SECONDS = 60
 
 
 @StorageBootstrapProvider.register_provider("SimpleStorage")
@@ -38,27 +41,47 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     scheduling_strategies = get_node_round_robin_scheduling_strategies(
         num_data_storage_units, required_node_resource=required_node_resource
     )
+    available_cpus = ray.available_resources().get("CPU", 0.0)
 
     # Compute per-unit capacity: None means unlimited
     storage_unit_size = (
         math.ceil(total_storage_size / num_data_storage_units) if total_storage_size is not None else None
     )
 
-    for storage_unit_rank in range(num_data_storage_units):
-        storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
-            scheduling_strategy=scheduling_strategies[storage_unit_rank],
-            name=f"TransferQueueStorageUnit#{storage_unit_rank}",
-        ).remote(
-            storage_unit_size=storage_unit_size,
-        )
-        simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
-        logger.info(
-            f"TransferQueueStorageUnit#{storage_unit_rank} has been created "
-            f"on node {scheduling_strategies[storage_unit_rank].node_id}."
-        )
+    try:
+        for storage_unit_rank in range(num_data_storage_units):
+            storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
+                scheduling_strategy=scheduling_strategies[storage_unit_rank],
+                name=f"TransferQueueStorageUnit#{storage_unit_rank}",
+            ).remote(
+                storage_unit_size=storage_unit_size,
+            )
+            simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
+            logger.info(
+                f"TransferQueueStorageUnit#{storage_unit_rank} has been created "
+                f"on node {scheduling_strategies[storage_unit_rank].node_id}."
+            )
 
-    storage_zmq_info = process_zmq_server_info(simple_storage_handles)
-    backend_name = conf.backend.storage_backend
-    conf.backend[backend_name].zmq_info = storage_zmq_info
+        storage_zmq_info = process_zmq_server_info(simple_storage_handles, timeout=SIMPLE_STORAGE_START_TIMEOUT_SECONDS)
+        backend_name = conf.backend.storage_backend
+        conf.backend[backend_name].zmq_info = storage_zmq_info
+    except Exception as error:
+        for storage_node in simple_storage_handles.values():
+            try:
+                ray.kill(storage_node)
+            except Exception:
+                logger.exception("Failed to kill SimpleStorageUnit after startup failure.")
+        if isinstance(error, ray.exceptions.GetTimeoutError):
+            raise RuntimeError(
+                f"SimpleStorage startup timed out after {SIMPLE_STORAGE_START_TIMEOUT_SECONDS} seconds. "
+                "Each SimpleStorageUnit requires 1 Ray CPU; "
+                f"backend.SimpleStorage.num_data_storage_units={num_data_storage_units} therefore requires "
+                f"Ray CPU capacity of {num_data_storage_units}, but Ray reported "
+                f"cluster-wide available CPU capacity of {available_cpus:g} "
+                "before startup. "
+                "Reduce backend.SimpleStorage.num_data_storage_units or make more CPUs available "
+                "on the eligible Ray nodes."
+            ) from error
+        raise
 
     return simple_storage_handles

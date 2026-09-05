@@ -107,7 +107,14 @@ def _init_from_existing() -> bool:
 
     conf = None
     while conf is None:
-        conf = ray.get(_TQ_CONTROLLER.get_config.remote())
+        try:
+            conf = ray.get(_TQ_CONTROLLER.get_config.remote())
+        except ray.exceptions.RayActorError:
+            # Startup rollback can kill the controller before a client connects.
+            # Let the next init() discover its replacement in that case.
+            if _TQ_CLIENT is None:
+                _TQ_CONTROLLER = None
+            raise
         if conf is not None:
             _maybe_create_tq_client(conf)
 
@@ -190,7 +197,11 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
 
-    final_conf = _maybe_create_tq_storage(final_conf)
+    try:
+        final_conf = _maybe_create_tq_storage(final_conf)
+    except Exception:
+        close()
+        raise
 
     ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
