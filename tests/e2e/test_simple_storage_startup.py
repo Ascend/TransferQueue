@@ -113,7 +113,7 @@ def _run_in_isolated_cluster(num_storage_units):
 def test_simple_storage_startup_and_readback(num_storage_units):
     # Ray's cluster shutdown resets process-wide state. Keep cluster creation
     # and cleanup outside pytest, with separate cluster discovery files.
-    with tempfile.TemporaryDirectory(dir="/tmp") as ray_temp:
+    with tempfile.TemporaryDirectory() as ray_temp:
         result = subprocess.run(
             [sys.executable, __file__, str(num_storage_units)],
             env={**os.environ, "RAY_TMPDIR": ray_temp},
