@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import os
 import shutil
@@ -44,6 +59,10 @@ logger = get_logger(__name__)
 _TQ_CLIENT: Any = None
 _TQ_STORAGE: Any = None
 _TQ_CONTROLLER: Any = None
+
+# Storage worker and proxy joins may take up to 10 seconds; leave time for Ray
+# dispatch and SSD cleanup without allowing close() to block indefinitely.
+_SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S = 15
 
 
 def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClient:
@@ -239,8 +258,17 @@ def close():
             for key, value in _TQ_STORAGE.items():
                 if key == "SimpleStorage":
                     # only the process that do first-time init can clean the distributed storage
-                    for storage in value.values():
-                        ray.kill(storage)
+                    storage_handles = list(value.values())
+                    try:
+                        ray.get(
+                            [storage.shutdown.remote() for storage in storage_handles],
+                            timeout=_SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to gracefully shut down SimpleStorage units: {e}")
+                    finally:
+                        for storage in storage_handles:
+                            ray.kill(storage)
                 elif key == "MooncakeStore":
                     check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
                     if check.returncode == 0:

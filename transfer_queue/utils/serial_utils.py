@@ -14,6 +14,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
@@ -23,6 +38,7 @@ import warnings
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any, TypeAlias
 
 import cloudpickle
@@ -57,6 +73,36 @@ warnings.filterwarnings(action="ignore", message=r"The given buffer is not writa
 # This enables the global _encoder/_decoder instances to be safely used across threads
 _encoder_aux_buffers: ContextVar[list[bytestr] | None] = ContextVar("encoder_aux_buffers", default=None)
 _decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder_aux_buffers", default=None)
+_decoder_storage_info: ContextVar["DecodeStorageInfo | None"] = ContextVar("decoder_storage_info", default=None)
+
+
+@dataclass(frozen=True)
+class DecodedBuffer:
+    """Wire-buffer metadata retained while decoding a storage payload."""
+
+    encoding: str
+    buffer: bytestr | None = None
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+    children: tuple["DecodedBuffer", ...] = ()
+
+
+@dataclass
+class DecodeStorageInfo:
+    """Associate decoded objects with the wire buffers from which they were built."""
+
+    _buffers_by_object_id: dict[int, DecodedBuffer] = field(default_factory=dict)
+    _object_owners: list[Any] = field(default_factory=list)
+
+    def record(self, value: Any, decoded_buffer: DecodedBuffer) -> None:
+        """Associate a decoded object with its reusable wire-buffer metadata."""
+        self._buffers_by_object_id[id(value)] = decoded_buffer
+        # Keep the object alive until the PUT completes so object ids cannot be reused.
+        self._object_owners.append(value)
+
+    def get_buffer(self, value: Any) -> DecodedBuffer | None:
+        """Return reusable wire-buffer metadata for a decoded object."""
+        return self._buffers_by_object_id.get(id(value))
 
 
 class MsgpackEncoder:
@@ -296,6 +342,12 @@ class MsgpackDecoder:
             # If tensordict not available, return as dict
             return obj
 
+    @staticmethod
+    def _record_storage_buffer(value: Any, decoded_buffer: DecodedBuffer) -> None:
+        storage_info = _decoder_storage_info.get()
+        if storage_info is not None:
+            storage_info.record(value, decoded_buffer)
+
     def _decode_tensor(self, meta: tuple) -> torch.Tensor:
         """Decode tensor from (dtype, shape, buffer_idx) tuple."""
         dtype, shape, idx = meta
@@ -303,12 +355,23 @@ class MsgpackDecoder:
         torch_dtype = getattr(torch, dtype)
 
         if not buffer:  # Handle empty tensors
-            return torch.empty(shape, dtype=torch_dtype)
+            result = torch.empty(shape, dtype=torch_dtype)
+        else:
+            # Create uint8 tensor from buffer, then view as original dtype and reshape
+            arr = torch.frombuffer(buffer, dtype=torch.uint8)
+            # Convert back to proper shape & type
+            result = arr.view(torch_dtype).view(shape)
 
-        # Create uint8 tensor from buffer, then view as original dtype and reshape
-        arr = torch.frombuffer(buffer, dtype=torch.uint8)
-        # Convert back to proper shape & type
-        return arr.view(torch_dtype).view(shape)
+        self._record_storage_buffer(
+            result,
+            DecodedBuffer(
+                encoding="tensor",
+                buffer=buffer,
+                dtype=dtype,
+                shape=tuple(shape),
+            ),
+        )
+        return result
 
     def _decode_nested_tensor(self, nested_meta: dict) -> torch.Tensor:
         """Decode nested tensor from serialized sub-tensors."""
@@ -320,9 +383,24 @@ class MsgpackDecoder:
 
         # Reconstruct nested tensor with appropriate layout
         if layout == "jagged":
-            return torch.nested.as_nested_tensor(sub_tensors, layout=torch.jagged)
+            result = torch.nested.as_nested_tensor(sub_tensors, layout=torch.jagged)
         else:  # strided
-            return torch.nested.as_nested_tensor(sub_tensors, layout=torch.strided)
+            result = torch.nested.as_nested_tensor(sub_tensors, layout=torch.strided)
+
+        children = tuple(
+            DecodedBuffer(
+                encoding="tensor",
+                buffer=self.aux_buffers[idx],
+                dtype=dtype,
+                shape=tuple(shape),
+            )
+            for dtype, shape, idx in tensor_metas
+        )
+        self._record_storage_buffer(
+            result,
+            DecodedBuffer(encoding="nested_tensor", children=children),
+        )
+        return result
 
     def _decode_numpy(self, meta: tuple) -> np.ndarray:
         """Decode numpy array from (dtype_str, shape, buffer_idx) tuple."""
@@ -331,11 +409,22 @@ class MsgpackDecoder:
         np_dtype = np.dtype(dtype_str)
 
         if not buffer:  # empty array
-            return np.empty(shape, dtype=np_dtype)
+            result = np.empty(shape, dtype=np_dtype)
+        else:
+            # Reconstruct from raw bytes: uint8 view → reinterpret as original dtype
+            arr = np.frombuffer(buffer, dtype=np.uint8)
+            result = arr.view(np_dtype).reshape(shape)
 
-        # Reconstruct from raw bytes: uint8 view → reinterpret as original dtype
-        arr = np.frombuffer(buffer, dtype=np.uint8)
-        return arr.view(np_dtype).reshape(shape)
+        self._record_storage_buffer(
+            result,
+            DecodedBuffer(
+                encoding="numpy",
+                buffer=buffer,
+                dtype=dtype_str,
+                shape=tuple(shape),
+            ),
+        )
+        return result
 
     def ext_hook(self, code: int, data: memoryview) -> Any:
         """Custom decoding hook for types msgspec doesn't natively support.
@@ -419,6 +508,16 @@ def decode(frames: list) -> Any:
     if len(frames) >= 2 and _is_pickle_fallback(frames[0]):
         return pickle.loads(frames[1])
     return _decoder.decode(frames)
+
+
+def decode_with_storage_info(frames: list) -> tuple[Any, DecodeStorageInfo]:
+    """Decode frames and retain reusable tensor/array wire-buffer metadata."""
+    storage_info = DecodeStorageInfo()
+    token = _decoder_storage_info.set(storage_info)
+    try:
+        return decode(frames), storage_info
+    finally:
+        _decoder_storage_info.reset(token)
 
 
 # Packed buffer layout:

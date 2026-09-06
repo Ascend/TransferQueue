@@ -13,15 +13,36 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import time
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
 import pytest
 import ray
 import tensordict
 import torch
 import zmq
 
-from transfer_queue.storage.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import (
+    HybridStorageUnitData,
+    SimpleStorageUnit,
+    SSDFieldStore,
+)
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 
@@ -455,6 +476,189 @@ def test_storage_unit_data_capacity_uses_active_keys():
     assert len(storage._active_keys) == 2
     storage.put_data({"f": [4]}, global_indexes=[3])
     assert storage._active_keys == {0, 1, 3}
+
+
+def test_hybrid_storage_routes_each_sample_by_payload_size_and_clears(tmp_path):
+    """Each large sample gets an SSD file while small samples remain in memory."""
+    storage = HybridStorageUnitData(
+        storage_size=2,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data(
+            {
+                "mixed": [b"x" * 100, b"y" * 10],
+                "small": [1, 2],
+                "complex": [{"payload": "x" * 100}, {"payload": "y" * 100}],
+            },
+            [1, 2],
+        )
+
+        assert storage._locations == {
+            "mixed": {1: "ssd", 2: "mem"},
+            "small": {1: "mem", 2: "mem"},
+            "complex": {1: "ssd", 2: "ssd"},
+        }
+        assert storage.get_data(["mixed", "small", "complex"], [1, 2]) == {
+            "small": [1, 2],
+            "complex": [{"payload": "x" * 100}, {"payload": "y" * 100}],
+            "mixed": [b"x" * 100, b"y" * 10],
+        }
+        sample_files = list(tmp_path.rglob("*.bin"))
+        assert len(sample_files) == 3
+        assert len({path.name for path in sample_files}) == 3
+
+        storage.clear([1])
+        assert storage.active_key_count == 1
+        with pytest.raises(KeyError):
+            storage.get_data(["mixed"], [1])
+        assert len(list(tmp_path.rglob("*.bin"))) == 1
+
+        with pytest.raises(ValueError, match="Storage capacity exceeded"):
+            storage.put_data({"mixed": [b"a" * 100, b"b" * 100]}, [3, 4])
+    finally:
+        storage.close()
+
+    assert not (tmp_path / "test-run").exists()
+
+
+def test_hybrid_storage_rolls_back_failed_ssd_put(tmp_path, monkeypatch):
+    """A failed SSD append must not expose memory fields or routing state."""
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+
+    def fail_write(_fd, _data):
+        raise OSError("injected SSD failure")
+
+    monkeypatch.setattr(storage._ssd_store, "_write_many", fail_write)
+    try:
+        with pytest.raises(OSError, match="injected SSD failure"):
+            storage.put_data({"small": [1], "large": [b"x" * 100]}, [1])
+
+        assert storage.active_key_count == 0
+        assert storage._locations == {}
+        assert storage._mem_store.field_data == {}
+    finally:
+        storage.close()
+
+
+def test_failed_ssd_overwrite_preserves_old_value(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    old_value = b"o" * 100
+    try:
+        storage.put_data({"value": [old_value]}, [1])
+        old_path = next(tmp_path.rglob("*.bin"))
+
+        def fail_write(_fd, _data):
+            raise OSError("injected overwrite failure")
+
+        monkeypatch.setattr(storage._ssd_store, "_write_many", fail_write)
+        with pytest.raises(OSError, match="injected overwrite failure"):
+            storage.put_data({"value": [b"n" * 100]}, [1])
+
+        assert storage.get_data(["value"], [1])["value"] == [old_value]
+        assert old_path.exists()
+        assert list(tmp_path.rglob("*.bin")) == [old_path]
+    finally:
+        storage.close()
+
+
+def test_hybrid_storage_default_threshold_is_one_mib(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data(
+            {"value": [b"a" * (1024 * 1024 - 1), b"b" * (1024 * 1024)]},
+            [1, 2],
+        )
+        assert storage._locations["value"] == {1: "mem", 2: "ssd"}
+    finally:
+        storage.close()
+
+
+def test_hybrid_storage_round_trips_supported_codecs(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    values = torch.arange(64, dtype=torch.float32).view(2, 32)
+    variable = [
+        torch.arange(20, dtype=torch.float32),
+        torch.arange(40, dtype=torch.float32),
+    ]
+    arrays = np.arange(64, dtype=np.float32).reshape(2, 32)
+    objects = [{"payload": "a" * 100}, {"payload": "b" * 100}]
+    try:
+        fields = {"tensor": values, "variable": variable, "array": arrays, "object": objects}
+        storage.put_data(fields, [1, 2])
+        assert storage._locations == {field: {1: "ssd", 2: "ssd"} for field in fields}
+        assert {entry.codec for entry in storage._ssd_store._offset_index["tensor"].values()} == {"tensor"}
+        assert {entry.codec for entry in storage._ssd_store._offset_index["array"].values()} == {"numpy"}
+        assert {entry.codec for entry in storage._ssd_store._offset_index["object"].values()} == {"pickle"}
+
+        result = storage.get_data(list(fields), [1, 2])
+        torch.testing.assert_close(result["tensor"][0], values[0])
+        torch.testing.assert_close(result["tensor"][1], values[1])
+        torch.testing.assert_close(result["variable"][0], variable[0])
+        torch.testing.assert_close(result["variable"][1], variable[1])
+        np.testing.assert_array_equal(result["array"][0], arrays[0])
+        np.testing.assert_array_equal(result["array"][1], arrays[1])
+        assert result["object"] == objects
+    finally:
+        storage.close()
+
+
+def test_ssd_storage_cleans_orphans_without_removing_active_units(tmp_path):
+    """Startup cleanup removes unlocked owned directories and preserves live units."""
+    active = SSDFieldStore(str(tmp_path), "active-run", "active-unit")
+    orphan = SSDFieldStore(str(tmp_path), "orphan-run", "orphan-unit")
+    orphan_path = orphan._base_path
+    orphan._owner_lock.close()
+    orphan._owner_lock = None
+    try:
+        scanner = SSDFieldStore(str(tmp_path), "scanner-run", "scanner-unit")
+        try:
+            assert active._base_path.exists()
+            assert not orphan_path.exists()
+        finally:
+            scanner.close()
+    finally:
+        active.close()
+        orphan.close()
+
+
+def test_ssd_storage_units_can_initialize_concurrently(tmp_path):
+    def create_store(rank):
+        return SSDFieldStore(str(tmp_path), "shared-run", f"unit-{rank}")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        stores = list(executor.map(create_store, range(8)))
+    try:
+        assert len([path for path in (tmp_path / "shared-run").iterdir() if path.is_dir()]) == 8
+    finally:
+        for store in stores:
+            store.close()
 
 
 def test_storage_unit_data_parser(storage_setup):

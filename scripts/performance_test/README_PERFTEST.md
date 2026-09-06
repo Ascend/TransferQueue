@@ -43,6 +43,8 @@ python perftest.py \
 | `--worker_node_ip` | Worker node IP address (required for Yuanrong) | None | No |
 | `--output_csv` | Path to output CSV file | None | No |
 | `--use_complex_case` | Use complex test case with nested tensors and NonTensorStack fields | False | No |
+| `--ssd_offload` | Enable SimpleStorage SSD offload; requires `--ssd_path` | False | No |
+| `--ssd_path` | Existing local SSD directory used by `--ssd_offload` | None | No |
 
 ## Backend Configuration
 
@@ -57,6 +59,10 @@ backend:
     total_storage_size: 100000
     num_data_storage_units: 16
 ```
+
+`--ssd_offload` injects the SSD configuration and writes `--ssd_path` into the
+in-memory configuration for that run. The path must already exist and be a
+directory on every storage node.
 
 ### Yuanrong Configuration
 
@@ -171,6 +177,49 @@ HEAD_NODE_IP=192.168.0.1 WORKER_NODE_IP=192.168.0.2 DEVICE=npu ./run_perf_test.s
 
 After running the tests, `draw_figure.py` reads all CSV files from `results/` and generates a grouped bar chart comparing total throughput (Gbps) across backends and data sizes.
 
+## Running the SSD Offload Performance Test
+
+`run_ssd_offload_perf_test.sh` is the dedicated entry point for storage-tier
+features such as SimpleStorage SSD offload. The script keeps backend and size
+matrices as arrays for future extension; currently it runs only:
+
+- **Backend**: SimpleStorage
+- **Workloads**:
+  - Sample1MiB (batch=512, fields=8, seq=262144, total=4 GiB)
+  - Sample2MiB (batch=512, fields=8, seq=524288, total=8 GiB)
+  - Sample4MiB (batch=512, fields=8, seq=1048576, total=16 GiB)
+
+The workload names describe the size of one float32 field sample. All three
+sizes meet the SSD offload threshold, while the batch size and field count stay
+fixed for a direct comparison.
+For each backend and workload, the script runs SSD offload first and then runs
+the same workload without offload as the host-memory baseline.
+
+```bash
+HEAD_NODE_IP=192.168.0.1 \
+WORKER_NODE_IP=192.168.0.2 \
+SSD_OFFLOAD_PATH=/path/to/local/ssd \
+./run_ssd_offload_perf_test.sh
+```
+
+Configuration variables:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `HEAD_NODE_IP` | Head node IP address | `127.0.0.1` |
+| `WORKER_NODE_IP` | Worker node IP address | `127.0.0.1` |
+| `DEVICE` | Device type (`cpu`, `npu`, `gpu`) | `cpu` |
+| `NUM_TEST_ITERATIONS` | Number of iterations | `4` |
+| `USE_COMPLEX_CASE` | Use complex test data | `false` |
+| `SSD_OFFLOAD_PATH` | Existing local SSD directory | Required |
+
+Results are written to:
+
+- SSD offload: `results/simplestorage_ssd_{sample-size}.csv`
+- Host memory: `results/simplestorage_{sample-size}.csv`
+
+Here, `{sample-size}` is `sample1mib`, `sample2mib`, or `sample4mib`.
+
 ## Examples
 
 ### SimpleStorage backend (simple case)
@@ -183,6 +232,24 @@ python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage
 ```bash
 python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
   --head_node_ip=192.168.0.1 --use_complex_case
+```
+
+### SimpleStorage SSD offload
+
+Run the host-memory and SSD cases separately with identical workload options:
+
+```bash
+# Host-memory baseline
+python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
+  --head_node_ip=192.168.0.1 --global_batch_size=64 --field_num=8 \
+  --seq_len=262144 --num_test_iterations=3 \
+  --output_csv=results/simple_storage_memory.csv
+
+# SSD offload
+python perftest.py --backend_config=perftest_config.yaml --backend=SimpleStorage \
+  --head_node_ip=192.168.0.1 --global_batch_size=64 --field_num=8 \
+  --seq_len=262144 --num_test_iterations=3 --ssd_offload --ssd_path=/path/to/local/ssd \
+  --output_csv=results/simple_storage_ssd.csv
 ```
 
 ### Yuanrong backend (inter-node)
@@ -225,6 +292,7 @@ Throughput is shown in both Gb/s (gigabits per second) and GB/s (gigabytes per s
 |--------|-------------|
 | `backend` | Backend name |
 | `device` | Device type |
+| `ssd_offload` | Whether SimpleStorage SSD offload was enabled |
 | `total_data_size_gb` | Data size in GB |
 | `put_time` | PUT duration (seconds) |
 | `get_time` | GET duration (seconds) |

@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import socket
 import time
 from collections.abc import Sequence
@@ -28,7 +43,7 @@ import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import DecodeStorageInfo, decode, decode_with_storage_info, encode
 
 logger = get_logger(__name__)
 
@@ -231,7 +246,29 @@ class ZMQMessage:
             result = decode(frames)
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
+        return cls._from_decoded(result)
 
+    @classmethod
+    def deserialize_with_storage_info(
+        cls,
+        frames: list,
+    ) -> tuple["ZMQMessage", DecodeStorageInfo]:
+        """Deserialize and retain buffer metadata needed by storage backends."""
+        if not frames:
+            raise ValueError("Empty frames received")
+
+        if frame_nbytes(frames[0]) == 0:
+            raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
+
+        try:
+            result, storage_info = decode_with_storage_info(frames)
+        except Exception as e:
+            raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
+        return cls._from_decoded(result), storage_info
+
+    @classmethod
+    def _from_decoded(cls, result: dict[str, Any]) -> "ZMQMessage":
+        """Build a message from the decoded wire dictionary."""
         return cls(
             request_type=ZMQRequestType(result["request_type"]),
             sender_id=result["sender_id"],
