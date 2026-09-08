@@ -40,11 +40,60 @@ try:
 except ImportError:
     MOONCAKE_STORE_IMPORTED = False
 
+MOONCAKE_BUFFER_POOL_IMPORTED: bool = True
+try:
+    from mooncake.store import BufferPool
+except ImportError:
+    # Older mooncake builds have no lease API; those fall back to registering per transfer.
+    MOONCAKE_BUFFER_POOL_IMPORTED = False
+
 BATCH_SIZE_LIMIT: int = 400
 MAX_BATCH_WORKER_THREADS = 4
 MAX_SERIAL_WORKER_THREADS = 4
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+
+
+def _copy_lease_into_tensors(lease, targets: list[Tensor], offsets: list[int]) -> None:
+    """Copy each staged region out of the lease buffer into the caller's tensors.
+
+    A uniform, tightly-packed group (same dtype+shape, laid out contiguously in the
+    target region) is copied in a single strided pass. This is the many-small-key
+    case, where a per-tensor Python loop otherwise dominates the read; ragged groups
+    fall back to a per-tensor copy. Every frombuffer view is dropped before returning:
+    the pool refuses to release a lease while an exported view of its buffer is alive.
+    """
+    t0 = targets[0]
+    numel = t0.numel()
+    uniform = len(targets) > 1
+    if uniform:
+        base_off = t0.storage_offset()
+        base_ptr = t0.untyped_storage().data_ptr()
+        for j, t in enumerate(targets):
+            if (
+                t.dtype != t0.dtype
+                or t.shape != t0.shape
+                or not t.is_contiguous()
+                or t.storage_offset() != base_off + j * numel
+                or t.untyped_storage().data_ptr() != base_ptr
+            ):
+                uniform = False
+                break
+
+    if uniform:
+        k = len(targets)
+        stride_elems = (offsets[1] - offsets[0]) // t0.element_size()
+        src = torch.frombuffer(
+            lease.buffer, dtype=t0.dtype, count=(k - 1) * stride_elems + numel
+        ).as_strided((k, numel), (stride_elems, 1))
+        t0.as_strided((k, numel), (numel, 1), t0.storage_offset()).copy_(src)
+        del src
+        return
+
+    for target, off in zip(targets, offsets, strict=True):
+        staged = torch.frombuffer(lease.buffer, dtype=target.dtype, count=target.numel(), offset=off)
+        target.copy_(staged.view(target.shape))
+        del staged
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
@@ -133,6 +182,21 @@ class MooncakeStoreClient(StorageKVClient):
         )
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
+
+        # RDMA can only target registered (pinned) memory, and register_buffer is a kernel
+        # operation that costs far more than the transfer it enables. Lease receive buffers
+        # from the local buffer that setup() already registered instead of registering per
+        # transfer. See https://github.com/Ascend/TransferQueue/issues/169
+        # max_bytes=0: lease from that local buffer only, without an extra arena.
+        self._buffer_pool = BufferPool(self._store, max_bytes=0) if MOONCAKE_BUFFER_POOL_IMPORTED else None
+        if self._buffer_pool is None:
+            logger.warning(
+                "mooncake.store.BufferPool is unavailable, so every tensor read registers and "
+                "unregisters its own receive buffer. Upgrade mooncake-transfer-engine to lease "
+                "pre-registered buffers instead."
+            )
+        # One share per reader thread, so all of them can hold a lease at the same time.
+        self._lease_bytes = self.local_buffer_size // MAX_BATCH_WORKER_THREADS
 
     def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
@@ -408,13 +472,70 @@ class MooncakeStoreClient(StorageKVClient):
             batch_dtypes, batch_shapes
         )
 
+        if self._buffer_pool is None:
+            self._read_into_own_buffers(batch_keys, batch_buffer_ptrs, batch_nbytes, region_ptrs, region_sizes)
+            return batch_buffer_tensors, indexes
+
+        # split_by_bytes() keeps every lease request within one thread's share of the pool,
+        # so a batch larger than that share is read in several rounds instead of failing.
+        for group in split_by_bytes(batch_nbytes, self._lease_bytes):
+            self._read_group_via_lease(group, batch_keys, batch_buffer_ptrs, batch_nbytes, batch_buffer_tensors)
+
+        return batch_buffer_tensors, indexes
+
+    def _read_into_own_buffers(
+        self, keys: list[str], ptrs: list[int], nbytes: list[int], region_ptrs: list[int], region_sizes: list[int]
+    ) -> None:
+        """Register the receive regions for one transfer, read into them, then unregister."""
         self._register_all_buffers(region_ptrs, region_sizes)
         try:
-            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
+            self._batch_get_into_with_retry(keys, ptrs, nbytes)
         finally:
             self._unregister_all_buffers(region_ptrs)
 
-        return batch_buffer_tensors, indexes
+    def _read_group_via_lease(
+        self,
+        group: list[int],
+        batch_keys: list[str],
+        batch_ptrs: list[int],
+        batch_nbytes: list[int],
+        batch_tensors: list[Tensor],
+    ) -> None:
+        """Read one group of keys into leased memory, then copy into the caller's tensors.
+
+        The copy is what lets the lease return to the pool immediately, keeping the
+        returned tensors owned by the caller exactly as the register-per-read path does.
+        """
+        keys = [batch_keys[i] for i in group]
+        nbytes = [batch_nbytes[i] for i in group]
+        offsets, total = _aligned_offsets(nbytes)
+
+        lease = self._acquire_lease(total)
+        if lease is None:
+            ptrs = [batch_ptrs[i] for i in group]
+            region_ptrs, region_sizes = merge_contiguous_memory(ptrs, nbytes)
+            self._read_into_own_buffers(keys, ptrs, nbytes, region_ptrs, region_sizes)
+            return
+
+        try:
+            self._batch_get_into_with_retry(keys, [lease.ptr + off for off in offsets], nbytes)
+            _copy_lease_into_tensors(lease, [batch_tensors[i] for i in group], offsets)
+        finally:
+            lease.release()
+
+    def _acquire_lease(self, nbytes: int):
+        """Lease ``nbytes`` of pre-registered memory, or None when the pool cannot serve it.
+
+        Never block: mooncake would otherwise wait for capacity that a request larger than
+        the local buffer never gets. Exhaustion surfaces as None in some builds and as an
+        exception in others, and both mean the caller should register its own memory.
+        """
+        assert self._buffer_pool is not None
+        try:
+            return self._buffer_pool.acquire(nbytes, block=False)
+        except Exception as e:
+            logger.warning(f"Leasing {nbytes} B of pre-registered memory failed ({e}); registering own buffer.")
+            return None
 
     def _get_tensors_gdr(
         self,
@@ -535,6 +656,10 @@ class MooncakeStoreClient(StorageKVClient):
 
     def close(self):
         """Closes MooncakeStore."""
+        # Release the leased regions before the store they belong to goes away.
+        if self._buffer_pool is not None:
+            self._buffer_pool.close()
+            self._buffer_pool = None
         if self._gdr_staging is not None:
             self._gdr_staging.close(self._store)
             self._gdr_staging = None
