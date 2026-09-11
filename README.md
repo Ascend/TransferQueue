@@ -32,6 +32,7 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
 <h2 id="updates">🔄 Updates</h2>
 
  - **September 8, 2026**: 🔥 TransferQueue has been adopted in [Meshy](https://github.com/OpenBMB/Meshy). Meshy models each role as a dedicated service, and TransferQueue serves as the data flow manager that connects each role.
+ - **August 14, 2026**: 🔥 TransferQueue has been adopted in [Dressage]https://github.com/Accio-Lab/Dressage. By integrating TQ, peak memory usage of the data plane on the master node is reduced by 91% in a 32-node GLM-5.2 setup. Refer to the [report](https://github.com/Accio-Lab/Dressage/blob/main/docs/trajectory-storage-refactor-en.md) for details.
  - **June 18, 2026**: 🔥 TransferQueue has been adopted in [ROLL](https://github.com/alibaba/ROLL/pull/463). This integration introduces a [`RemoteBatch`](https://github.com/alibaba/ROLL/blob/main/docs_roll/docs/User%20Guides/Advanced%20Features/remote_batch_transfer.md) abstraction, enabling seamless compatibility with existing `DataProto` design.
  - **June 9, 2026**: 🔥 TransferQueue has been adopted in [UniRL](https://github.com/Tencent-Hunyuan/UniRL), a unified RL framework for multimodal models developed by Tencent Hunyuan.
  - **April 15, 2026**: 🔥 TransferQueue has been adopted in [Relax](https://github.com/redai-infra/Relax)! By leveraging the `StreamingDataLoader` abstraction, it schedules training data across the cluster at micro-batch granularity, reducing synchronization barriers in a single-controller setup.
