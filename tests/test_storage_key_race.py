@@ -20,9 +20,9 @@ import logging
 import pytest
 import torch
 
+from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
-    SimpleStorageUnit,
     StorageKeyNotFoundError,
     StorageUnitData,
 )
@@ -66,18 +66,26 @@ def test_surviving_key_is_unaffected(storage_data):
 def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
     # The reply crosses ZMQ as text, so the marker is what lets the caller rebuild the type.
     storage_data.clear([1])
-    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
-    unit = unit_class.__new__(unit_class)
-    unit.storage_unit_id = "storage_unit_0"
-    unit.storage_data = storage_data
+    transfer = ZmqPayloadTransfer()
     request = ZMQMessage.create(
         request_type=ZMQRequestType.GET_DATA,
         sender_id="client_0",
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
-    with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
-        reply = unit_class._handle_get(unit, request)
+    def load_data(fields, global_indexes):
+        try:
+            return storage_data.get_data(fields, global_indexes)
+        except StorageKeyNotFoundError as exc:
+            raise StorageKeyNotFoundError(f"{KEY_NOT_FOUND_MARKER}: {exc}") from exc
+
+    with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.payload_transfer.zmq"):
+        reply = transfer.handle_request(
+            request,
+            storage_id="storage_unit_0",
+            load_data=load_data,
+            store_data=lambda *_: None,
+        )
 
     assert reply.request_type == ZMQRequestType.GET_ERROR
     assert KEY_NOT_FOUND_MARKER in reply.body["message"]

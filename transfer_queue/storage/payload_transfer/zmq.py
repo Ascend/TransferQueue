@@ -31,6 +31,7 @@ from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 logger = get_logger(__name__)
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))
+KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
 
 class ZmqPayloadTransfer(PayloadTransfer):
@@ -137,7 +138,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     data = load_data(fields, global_indexes)
                 return self._response(ZMQRequestType.GET_DATA_RESPONSE, storage_id, {"data": data})
             except Exception as exc:
-                logger.error(
+                log = logger.debug if KEY_NOT_FOUND_MARKER in str(exc) else logger.error
+                log(
                     f"[{storage_id}]: _handle_get error, "
                     f"fields={fields}, global_indexes={global_indexes}: {type(exc).__name__}: {exc}"
                 )

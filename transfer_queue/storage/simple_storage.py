@@ -320,8 +320,14 @@ class SimpleStorageUnit:
                 try:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
-                    if operation in (ZMQRequestType.PUT_DATA, ZMQRequestType.GET_DATA):
-                        with monitor.measure(op_type=operation.name):
+                    metric_op = {
+                        ZMQRequestType.PUT_DATA: "PUT_DATA",
+                        ZMQRequestType.GET_DATA: "GET_DATA",
+                        ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
+                        ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
+                    }.get(operation)
+                    if metric_op is not None:
+                        with monitor.measure(op_type=metric_op):
                             response_msg = self.payload_transfer.handle_request(
                                 request_msg,
                                 storage_id=self.storage_unit_id,

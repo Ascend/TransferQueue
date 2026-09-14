@@ -134,6 +134,7 @@ class NixlRuntime:
         self._receives: dict[str, _ReceiveState] = {}
         self._reusable_receive_buffer: _RegisteredReceiveBuffer | None = None
         self._remote_metadata: dict[str, bytes] = {}
+        self._deferred_sends: list[tuple[Any, list[_FrameRegistration]]] = []
         self._lock = threading.RLock()
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
@@ -260,6 +261,26 @@ class NixlRuntime:
             raise NixlError("failed to register NIXL source frame")
         return _FrameRegistration(owner, registrations, address, memoryview(owner).nbytes)
 
+    def _release_send_resources(self, handle: Any, registrations: list[_FrameRegistration]) -> bool:
+        """Release a send only after NIXL confirms its handle can be released."""
+        try:
+            self._agent.release_xfer_handle(handle)
+        except Exception as exc:
+            logger.warning("failed to release NIXL transfer handle; keeping source memory registered: %s", exc)
+            return False
+        for registration in registrations:
+            self._deregister_registration(registration.registrations)
+        return True
+
+    def _reap_deferred_sends(self) -> None:
+        if not self._deferred_sends:
+            return
+        pending = []
+        for handle, registrations in self._deferred_sends:
+            if not self._release_send_resources(handle, registrations):
+                pending.append((handle, registrations))
+        self._deferred_sends = pending
+
     def _send_scatter(
         self,
         remote_name: str,
@@ -273,6 +294,7 @@ class NixlRuntime:
         try:
             with self._lock:
                 self._ensure_open()
+                self._reap_deferred_sends()
                 previous = self._remote_metadata.get(remote_name)
                 if previous != metadata:
                     if previous is not None:
@@ -314,13 +336,11 @@ class NixlRuntime:
             raise NixlError(f"NIXL H2H scatter WRITE failed: {exc}") from exc
         finally:
             with self._lock:
-                if handle is not None:
-                    try:
-                        self._agent.release_xfer_handle(handle)
-                    except Exception as exc:
-                        logger.warning("failed to release NIXL transfer handle: %s", exc)
-                for registration in frame_registrations:
-                    self._deregister_registration(registration.registrations)
+                if handle is None:
+                    for registration in frame_registrations:
+                        self._deregister_registration(registration.registrations)
+                elif not self._release_send_resources(handle, frame_registrations):
+                    self._deferred_sends.append((handle, frame_registrations))
 
     @staticmethod
     def _validate_send_metadata(
@@ -373,6 +393,7 @@ class NixlRuntime:
             self._closed = True
         self._send_executor.shutdown(wait=True, cancel_futures=True)
         with self._lock:
+            self._reap_deferred_sends()
             for state in self._receives.values():
                 self._deregister_registration(state.scratch.registrations)
             self._receives.clear()
