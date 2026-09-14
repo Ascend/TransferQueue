@@ -16,9 +16,11 @@
 import math
 from typing import Any
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+from transfer_queue.storage.payload_transfer import parse_payload_transfer_config
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
@@ -35,6 +37,8 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
     required_node_resource = conf.backend.SimpleStorage.get("required_node_resource", None)
+    payload_transfer_config = conf.backend.SimpleStorage.get("payload_transfer")
+    payload_transfer_backend, _ = parse_payload_transfer_config(payload_transfer_config)
     scheduling_strategies = get_node_round_robin_scheduling_strategies(
         num_data_storage_units, required_node_resource=required_node_resource
     )
@@ -50,6 +54,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
+            payload_transfer=payload_transfer_config,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(
@@ -60,5 +65,10 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
+    if payload_transfer_backend == "nixl-ucx":
+        infos = ray.get([storage.get_payload_transfer_info.remote() for storage in simple_storage_handles.values()])
+        conf.backend[backend_name].payload_transfer_infos = {info["id"]: info for info in infos if info is not None}
+    else:
+        conf.backend[backend_name].payload_transfer_infos = {}
 
     return simple_storage_handles

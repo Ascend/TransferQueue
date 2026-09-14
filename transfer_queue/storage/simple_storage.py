@@ -17,6 +17,7 @@ import os
 import pickle
 import time
 import weakref
+from collections.abc import Mapping
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -25,6 +26,7 @@ import psutil
 import ray
 import zmq
 
+from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -166,17 +168,23 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    def __init__(self, storage_unit_size: int | None = None):
+    def __init__(
+        self,
+        storage_unit_size: int | None = None,
+        payload_transfer: Mapping[str, object] | None = None,
+    ):
         """Initialize a SimpleStorageUnit with the specified size.
 
         Args:
             storage_unit_size: Maximum number of elements that can be stored in this storage unit.
                 If None, the storage unit has unlimited capacity.
+            payload_transfer: Backend and optional backend-specific settings.
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
         self.storage_unit_size = storage_unit_size
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
+        self.payload_transfer = create_payload_transfer(payload_transfer)
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -204,6 +212,7 @@ class SimpleStorageUnit:
             self.proxy_thread,
             self.zmq_context,
             self.put_get_socket,
+            self.payload_transfer,
         )
 
     def _init_zmq_socket(self) -> None:
@@ -311,23 +320,38 @@ class SimpleStorageUnit:
                 try:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
-                    # Process request
-                    if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="PUT_DATA"):
-                            response_msg = self._handle_put(request_msg)
-                    elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="GET_DATA"):
-                            response_msg = self._handle_get(request_msg)
-                    elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
+                    metric_op = {
+                        ZMQRequestType.PUT_DATA: "PUT_DATA",
+                        ZMQRequestType.GET_DATA: "GET_DATA",
+                        ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
+                        ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
+                    }.get(operation)
+                    if metric_op is not None:
+                        with monitor.measure(op_type=metric_op):
+                            response_msg = self.payload_transfer.handle_request(
+                                request_msg,
+                                storage_id=self.storage_unit_id,
+                                load_data=self._load_data,
+                                store_data=self._put_decoded_data,
+                            )
+                    else:
+                        response_msg = self.payload_transfer.handle_request(
+                            request_msg,
+                            storage_id=self.storage_unit_id,
+                            load_data=self._load_data,
+                            store_data=self._put_decoded_data,
+                        )
+
+                    if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
-                    elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
                         response_msg = self._handle_get_metrics()
-                    elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_save_checkpoint(request_msg)
-                    elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                    elif response_msg is None and operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_load_checkpoint(request_msg)
-                    else:
+                    elif response_msg is None:
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
                             sender_id=self.storage_unit_id,
@@ -357,129 +381,45 @@ class SimpleStorageUnit:
         poller.unregister(worker_socket)
         worker_socket.close(linger=0)
 
-    def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """
-        Handle put request, add or update data into storage unit.
+    def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
+        """Validate parsed data and store it."""
+        if data_parser is not None:
+            if not callable(data_parser):
+                raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
+            original_keys = set(field_data)
+            original_lengths = {key: self._field_length(value) for key, value in field_data.items()}
+            field_data = data_parser(field_data)
+            if not isinstance(field_data, dict):
+                raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
+            if set(field_data) != original_keys:
+                raise ValueError(
+                    f"data_parser must not change dict keys. Original keys: {sorted(original_keys)}, "
+                    f"got: {sorted(field_data)}"
+                )
+            for key, value in field_data.items():
+                original_length = original_lengths[key]
+                new_length = self._field_length(value)
+                if original_length is not None and new_length is not None and original_length != new_length:
+                    raise ValueError(
+                        f"data_parser changed the number of elements for key '{key}': "
+                        f"expected {original_length}, got {new_length}"
+                    )
+        self.storage_data.put_data(field_data, global_indexes)
 
-        Args:
-            data_parts: ZMQMessage from client.
-
-        Returns:
-            Put data success response ZMQMessage.
-        """
+    @staticmethod
+    def _field_length(value: Any) -> int | None:
+        if hasattr(value, "shape") and isinstance(value.shape, tuple | list) and len(value.shape) > 0:
+            return value.shape[0]
         try:
-            global_indexes = data_parts.body["global_indexes"]
-            field_data = data_parts.body["data"]  # field_data should be a dict.
-            data_parser = data_parts.body.get("data_parser", None)
+            return len(value)
+        except Exception:
+            return None
 
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
-            ):
-                if data_parser is not None:
-                    if not callable(data_parser):
-                        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
-
-                    original_keys = set(field_data.keys())
-                    original_lengths = {}
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            original_lengths[k] = v.shape[0]
-                        else:
-                            try:
-                                original_lengths[k] = len(v)
-                            except Exception:
-                                original_lengths[k] = None
-
-                    field_data = data_parser(field_data)
-
-                    if not isinstance(field_data, dict):
-                        raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
-
-                    new_keys = set(field_data.keys())
-                    if new_keys != original_keys:
-                        raise ValueError(
-                            f"data_parser must not change dict keys. "
-                            f"Original keys: {sorted(original_keys)}, got: {sorted(new_keys)}"
-                        )
-
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            new_len = v.shape[0]
-                        else:
-                            try:
-                                new_len = len(v)
-                            except Exception:
-                                new_len = None
-
-                        orig_len = original_lengths[k]
-                        if orig_len is not None and new_len is not None and orig_len != new_len:
-                            raise ValueError(
-                                f"data_parser changed the number of elements for key '{k}': "
-                                f"expected {orig_len}, got {new_len}"
-                            )
-                self.storage_data.put_data(field_data, global_indexes)
-
-            # After put operation finish, send a message to the client
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_DATA_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={},
-            )
-
-            return response_msg
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.PUT_ERROR,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "message": f"Failed to put data into storage unit id "
-                    f"#{self.storage_unit_id}, detail error message: {str(e)}"
-                },
-            )
-
-    def _handle_get(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """
-        Handle get request, return data from storage unit.
-
-        Args:
-            data_parts: ZMQMessage from client.
-
-        Returns:
-            Get data success response ZMQMessage, containing target data.
-        """
+    def _load_data(self, fields: list[str], global_indexes: list[int]) -> dict[str, list]:
         try:
-            fields = data_parts.body["fields"]
-            global_indexes = data_parts.body["global_indexes"]
-
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
-            ):
-                result_data = self.storage_data.get_data(fields, global_indexes)
-
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "data": result_data,
-                },
-            )
-        except Exception as e:
-            key_not_found = isinstance(e, StorageKeyNotFoundError)
-            log = logger.debug if key_not_found else logger.error
-            log(
-                f"[{self.storage_unit_id}]: _handle_get error, "
-                f"fields={fields}, global_indexes={global_indexes}: {type(e).__name__}: {e}"
-            )
-            marker = f"[{KEY_NOT_FOUND_MARKER}] " if key_not_found else ""
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_ERROR,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "message": f"{marker}Failed to get data from storage unit id #{self.storage_unit_id}, "
-                    f"detail error message: {str(e)}"
-                },
-            )
-        return response_msg
+            return self.storage_data.get_data(fields, global_indexes)
+        except StorageKeyNotFoundError as exc:
+            raise StorageKeyNotFoundError(f"{KEY_NOT_FOUND_MARKER}: {exc}") from exc
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -691,6 +631,7 @@ class SimpleStorageUnit:
         proxy_thread: Thread | None,
         zmq_context: zmq.Context | None,
         put_get_socket: zmq.Socket | None,
+        payload_transfer: PayloadTransfer,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")
@@ -711,6 +652,8 @@ class SimpleStorageUnit:
             worker_thread.join(timeout=5)
         if proxy_thread and proxy_thread.is_alive():
             proxy_thread.join(timeout=5)
+
+        payload_transfer.close()
 
         logger.info("SimpleStorageUnit resources shutdown complete.")
 
@@ -742,3 +685,10 @@ class SimpleStorageUnit:
             ZMQServerInfo containing connection details for this storage unit.
         """
         return self.zmq_server_info
+
+    def get_payload_transfer_info(self) -> dict[str, Any] | None:
+        """Return bootstrap-safe transfer endpoint metadata."""
+        info = self.payload_transfer.bootstrap_info()
+        if info is None:
+            return None
+        return {"id": self.storage_unit_id, **info}

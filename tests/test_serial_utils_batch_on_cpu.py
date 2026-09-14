@@ -22,6 +22,8 @@
 * ``batch_decode_from``
 """
 
+import struct
+
 import numpy as np
 import pytest
 import torch
@@ -40,6 +42,15 @@ def test_calc_packed_size_then_pack_unpack_roundtrip():
     serial_utils.pack_into(buf, items)
     recovered = serial_utils.unpack_from(buf)
     assert [bytes(mv) for mv in recovered] == items
+
+
+def test_initialize_packed_frame_table_leaves_payload_for_direct_receive():
+    items = [b"hello", b"world!"]
+    buf = bytearray(serial_utils.calc_packed_size(items))
+    serial_utils.initialize_packed_frame_table(buf, [len(item) for item in items])
+    payload_start = serial_utils._PACK_HEADER_SIZE + len(items) * serial_utils._PACK_ENTRY_SIZE
+    buf[payload_start:] = b"helloworld!"
+    assert [bytes(mv) for mv in serial_utils.unpack_from(buf)] == items
 
 
 def test_pack_into_writes_only_within_its_slice():
@@ -62,6 +73,17 @@ def test_unpack_from_zero_item_buffer():
     buf = bytearray(sz)
     serial_utils.pack_into(buf, items)
     assert serial_utils.unpack_from(buf) == []
+
+
+def test_unpack_from_rejects_invalid_frame_bounds():
+    items = [b"payload"]
+    buf = bytearray(serial_utils.calc_packed_size(items))
+    serial_utils.pack_into(buf, items)
+
+    # Corrupt the frame offset so it points into the frame table.
+    struct.pack_into("<I", buf, serial_utils._PACK_HEADER_SIZE, 4)
+    with pytest.raises(ValueError, match="outside the payload"):
+        serial_utils.unpack_from(buf)
 
 
 # ============================================================================

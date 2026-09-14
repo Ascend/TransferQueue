@@ -462,12 +462,42 @@ def pack_into(target_buffer: bytestr, items: Sequence[bytestr]) -> None:
 def unpack_from(source_buffer: bytestr) -> list[memoryview]:
     """Split a packed buffer back into N memoryview slices over ``source_buffer``."""
     mv = memoryview(source_buffer)
+    if mv.nbytes < _PACK_HEADER_SIZE:
+        raise ValueError("unpack_from: payload is shorter than its header")
     item_count = struct.unpack_from(_PACK_HEADER_FMT, mv, 0)[0]
+    payload_start = _PACK_HEADER_SIZE + item_count * _PACK_ENTRY_SIZE
+    if payload_start > mv.nbytes:
+        raise ValueError("unpack_from: frame table exceeds payload size")
+
     result: list[memoryview] = []
     for i in range(item_count):
         offset, length = struct.unpack_from(_PACK_ENTRY_FMT, mv, _PACK_HEADER_SIZE + i * _PACK_ENTRY_SIZE)
+        if offset < payload_start or length > mv.nbytes - offset:
+            raise ValueError(f"unpack_from: frame {i} is outside the payload")
         result.append(mv[offset : offset + length])
     return result
+
+
+def initialize_packed_frame_table(target_buffer: bytestr, frame_sizes: Sequence[int]) -> None:
+    """Write only the packed frame header/table into a receive buffer.
+
+    The frame payload bytes are filled directly by a scatter/gather receive,
+    so this avoids copying them into a second contiguous buffer.
+    """
+    if any(size < 0 for size in frame_sizes):
+        raise ValueError("frame sizes must be non-negative")
+    target_mv = memoryview(target_buffer)
+    payload_start = _PACK_HEADER_SIZE + len(frame_sizes) * _PACK_ENTRY_SIZE
+    required = payload_start + sum(frame_sizes)
+    if target_mv.nbytes < required:
+        raise ValueError(f"frame table target has {target_mv.nbytes} bytes, requires {required}")
+    struct.pack_into(_PACK_HEADER_FMT, target_mv, 0, len(frame_sizes))
+    entry_offset = _PACK_HEADER_SIZE
+    payload_offset = payload_start
+    for size in frame_sizes:
+        struct.pack_into(_PACK_ENTRY_FMT, target_mv, entry_offset, payload_offset, size)
+        entry_offset += _PACK_ENTRY_SIZE
+        payload_offset += size
 
 
 def batch_encode_into(

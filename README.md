@@ -211,6 +211,9 @@ pip install TransferQueue
    pip install dist/*.whl
    ```
 
+For the optional SimpleStorage NIXL-UCX Host payload path, see
+[the NIXL-UCX payload guide](docs/nixl_ucx_payload.md).
+
 <h2 id="performance">📊 Performance</h2>
 
 ### Simple Case: Regular Tensor
