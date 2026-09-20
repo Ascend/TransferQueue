@@ -354,6 +354,28 @@ class StorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
+    async def update_data(
+        self,
+        metadata: BatchMeta,
+        field_names: list[str],
+        values: TensorDict | None = None,
+        parser: Callable[[Any, Any], Any] | None = None,
+        empty: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """Apply empty or parser(old, new) on the unit that holds each sample.
+
+        Args:
+            metadata: Samples to update.
+            field_names: Fields to rewrite.
+            values: New values as a TensorDict aligned with ``metadata``, or None for empty.
+            parser: Called per sample per field as ``parser(old, new)``. Ignored when empty.
+            empty: If True, store None for each named field and ignore values/parser.
+
+        Returns:
+            field_schema of the stored values, keyed by field name.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support update_data")
+
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Save storage state into checkpoint_dir.
 
@@ -798,6 +820,19 @@ class KVStorageManager(StorageManager):
             metadata.global_indexes,
             field_schema,
             per_field_custom_backend_meta,
+        )
+
+    async def update_data(
+        self,
+        metadata: BatchMeta,
+        field_names: list[str],
+        values: TensorDict | None = None,
+        parser: Callable[[Any, Any], Any] | None = None,
+        empty: bool = False,
+    ) -> dict[str, dict[str, Any]]:
+        """kv_update is only implemented for SimpleStorage."""
+        raise NotImplementedError(
+            "kv_update is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:

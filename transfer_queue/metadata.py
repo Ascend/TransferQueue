@@ -461,10 +461,20 @@ class BatchMeta:
         if batch_size != self.size:
             raise ValueError(f"add_fields batch size mismatch: self.size={self.size} vs tensor_dict={batch_size}")
 
-        field_schema = extract_field_schema(tensor_dict)
+        return self.apply_field_schema(extract_field_schema(tensor_dict), set_all_ready=set_all_ready)
 
-        for key, value in field_schema.items():
-            self.field_schema[key] = value
+    def apply_field_schema(self, field_schema: dict[str, dict[str, Any]], set_all_ready: bool = True) -> "BatchMeta":
+        """Merge a field_schema into this batch in place.
+
+        The only place that keeps ``field_names`` and ``is_ready`` in step with
+        ``field_schema`` and ``production_status``; callers holding a schema from storage
+        should go through here rather than writing the derived state themselves.
+
+        Args:
+            field_schema: Per-field metadata to add or overwrite.
+            set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME. Default is True.
+        """
+        self.field_schema.update(field_schema)
 
         if set_all_ready:
             self.production_status[:] = 1

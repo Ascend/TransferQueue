@@ -608,6 +608,61 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id))
 
 
+def kv_update(
+    key: str,
+    partition_id: str,
+    fields: str | list[str],
+    *,
+    values: Any | dict[str, Any] | None = None,
+    parser: Callable[[Any, Any], Any] | None = None,
+    empty: bool = False,
+) -> KVBatchMeta:
+    """Update fields of an existing key by combining the stored value with a new one.
+
+    A custom ``parser(old, new)`` runs once per sample per field on the SimpleStorage
+    unit that holds the row, then writes the return value back. ``empty=True``
+    stores ``None`` instead and must not be given ``values`` or ``parser``.
+    ``kv_empty()`` is the same as ``kv_update(..., empty=True)``.
+
+    Args:
+        key: Existing user-specified key. The key is not created if it is missing.
+        partition_id: Partition that holds the key.
+        fields: One field name, or a list of field names, to update.
+        values: New value for a single field, or ``{field: new}`` for several.
+            Must be omitted when ``empty=True``.
+        parser: ``parser(old, new) -> stored``. Required unless ``empty=True``.
+            Only SimpleStorage executes parsers; KV backends reject the call.
+            ``old`` is ``None`` when the field has never been written.
+        empty: If True, store None for each named field.
+
+    Returns:
+        KVBatchMeta for the updated sample, including every field stored for it.
+
+    Raises:
+        ValueError: If the key is missing, ``empty=True`` is given values or a
+            parser, a custom parser is given no values, or ``fields`` / ``values``
+            do not line up.
+        TypeError: If ``parser`` is missing or not callable when ``empty`` is False.
+        NotImplementedError: If the storage backend is not SimpleStorage.
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(
+        async_kv_update(
+            key=key,
+            partition_id=partition_id,
+            fields=fields,
+            values=values,
+            parser=parser,
+            empty=empty,
+        )
+    )
+
+
+def kv_empty(key: str, partition_id: str, fields: str | list[str]) -> KVBatchMeta:
+    """Store None for the named fields of an existing key. Same as kv_update(..., empty=True)."""
+    return kv_update(key=key, partition_id=partition_id, fields=fields, empty=True)
+
+
 # ==================== KV Interface API ====================
 async def async_kv_put(
     key: str,
@@ -987,6 +1042,98 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
 
     if batch_meta.size > 0:
         await tq_client.async_clear_samples(batch_meta)
+
+
+def _normalize_kv_update_args(
+    fields: str | list[str],
+    values: Any | dict[str, Any] | None,
+    parser: Callable[[Any, Any], Any] | None,
+    empty: bool = False,
+) -> tuple[list[str], TensorDict | None, Callable[[Any, Any], Any] | None, bool]:
+    """Validate kv_update arguments and wrap new values as a one-row TensorDict."""
+    if isinstance(fields, str):
+        field_names = [fields]
+    elif isinstance(fields, list) and fields and all(isinstance(f, str) for f in fields):
+        field_names = list(fields)
+    else:
+        raise TypeError("fields must be a field name or a non-empty list of field names")
+
+    if empty:
+        if values is not None:
+            raise ValueError("kv_update with empty=True must not specify values")
+        if parser is not None:
+            raise ValueError("kv_update with empty=True must not specify parser")
+        return field_names, None, None, True
+
+    if not callable(parser):
+        raise TypeError("parser must be callable unless empty=True")
+    if values is None:
+        raise ValueError("kv_update with a custom parser requires values")
+
+    if isinstance(fields, str):
+        value_map = {fields: values}
+    else:
+        if not isinstance(values, dict):
+            raise TypeError("values must be a dict mapping field name to new value when updating multiple fields")
+        missing = [name for name in field_names if name not in values]
+        extra = [name for name in values if name not in field_names]
+        if missing or extra:
+            raise ValueError(
+                f"fields and values must name the same columns; fields={field_names}, extra={extra}, missing={missing}"
+            )
+        value_map = values
+
+    batch: dict[str, Any] = {}
+    for field_name, value in value_map.items():
+        if isinstance(value, torch.Tensor):
+            if value.is_nested:
+                raise ValueError("nested tensors are not supported for single-key kv_update")
+            batch[field_name] = value.unsqueeze(0)
+        else:
+            batch[field_name] = NonTensorStack(value)
+    return field_names, TensorDict(batch, batch_size=[1]), parser, False
+
+
+async def async_kv_update(
+    key: str,
+    partition_id: str,
+    fields: str | list[str],
+    *,
+    values: Any | dict[str, Any] | None = None,
+    parser: Callable[[Any, Any], Any] | None = None,
+    empty: bool = False,
+) -> KVBatchMeta:
+    """Asynchronously update fields of an existing key. See ``kv_update``."""
+    field_names, value_batch, bound_parser, use_empty = _normalize_kv_update_args(fields, values, parser, empty)
+
+    tq_client = _maybe_create_tq_client()
+    batch_meta = await tq_client.async_kv_retrieve_meta(keys=[key], partition_id=partition_id, create=False)
+
+    if batch_meta.size == 0:
+        raise ValueError("keys or partition were not found!")
+    if batch_meta.size != 1:
+        raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match with input `key` size of 1!")
+
+    batch_meta = await tq_client.async_update(
+        metadata=batch_meta,
+        field_names=field_names,
+        values=value_batch,
+        parser=bound_parser,
+        empty=use_empty,
+    )
+
+    return KVBatchMeta(
+        keys=[key],
+        tags=batch_meta.custom_meta,
+        partition_id=partition_id,
+        fields=batch_meta.field_names,
+        extra_info=batch_meta.extra_info,
+    )
+
+
+async def async_kv_empty(key: str, partition_id: str, fields: str | list[str]) -> KVBatchMeta:
+    """Store None for the named fields of an existing key. Same as async_kv_update(..., empty=True)."""
+    return await async_kv_update(key=key, partition_id=partition_id, fields=fields, empty=True)
 
 
 # ==================== Low-Level Native API ====================

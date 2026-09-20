@@ -24,7 +24,7 @@ from transfer_queue.interface import _normalize_kv_update_args
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import _build_update_field_schema
-from transfer_queue.storage.simple_storage import StorageUnitData
+from transfer_queue.storage.simple_storage import HybridStorageUnitData, StorageUnitData
 
 
 def _concat(old, new):
@@ -123,6 +123,21 @@ def test_apply_update_missing_field_passes_none_as_old():
     data.apply_update([1], ["fresh"], {"fresh": [torch.tensor([8])]}, record, False)
     assert seen == [None]
     assert torch.equal(data.field_data["fresh"][1], torch.tensor([8]))
+
+
+def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
+    """With SSD offload on, the parser must see the stored tensor, not its file reference."""
+    data = HybridStorageUnitData(
+        storage_size=4, threshold_bytes=64, ssd_path=str(tmp_path), run_id="run", unit_id="unit"
+    )
+    prompt = torch.arange(32)
+    data.put_data({"tokens": [prompt]}, [0])
+    assert data.ssd_active_values == 1, "precondition: the prompt must live on SSD"
+
+    data.apply_update([0], ["tokens"], {"tokens": [torch.tensor([99])]}, _concat, False)
+
+    assert torch.equal(data.get_data(["tokens"], [0])["tokens"][0], torch.cat([prompt, torch.tensor([99])]))
+    assert data.ssd_active_values == 1, "the replaced SSD file must be released, not leaked"
 
 
 def test_build_update_field_schema_orders_shapes_across_units():

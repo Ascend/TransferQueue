@@ -1110,6 +1110,133 @@ class TestKVE2ECornerCases:
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
 
+class TestKVUpdateE2E:
+    """kv_update: SimpleStorage runs parsers on the unit; KV backends reject."""
+
+    def test_concat_then_empty(self, controller, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        key = "sample_update"
+
+        tq_api.kv_put(key=key, partition_id=partition_id, fields={"tokens": torch.tensor([1, 2, 3])}, tag={"step": 1})
+
+        def concat(old, new):
+            return torch.cat([old, new])
+
+        meta = tq_api.kv_update(
+            key=key, partition_id=partition_id, fields="tokens", values=torch.tensor([4, 5]), parser=concat
+        )
+        assert "tokens" in meta.fields
+
+        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
+        assert_tensor_equal(retrieved["tokens"][0], torch.tensor([1, 2, 3, 4, 5]))
+
+        tq_api.kv_empty(key=key, partition_id=partition_id, fields="tokens")
+        emptied = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
+        assert emptied["tokens"][0] is None
+
+        partition = get_controller_partition(controller, partition_id)
+        col = partition.field_name_mapping["tokens"]
+        global_idx = partition.keys_mapping[key]
+        assert partition.production_status[global_idx, col] == 1
+        # The column now holds None, so the controller must not still describe it as a tensor.
+        assert partition.field_metadata["tokens"].is_non_tensor is True
+
+        tq_api.kv_clear(keys=key, partition_id=partition_id)
+
+    def test_concat_prompt_and_response_keeps_field_name(self, tq_api, backend_name):
+        """prompt_ids already stored; update appends response_ids; field stays sequence_ids."""
+        if backend_name != "SimpleStorage":
+            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        key = "sample_seq"
+        prompt_ids = torch.tensor([10, 11, 12])
+        response_ids = torch.tensor([20, 21])
+
+        tq_api.kv_put(key=key, partition_id=partition_id, fields={"sequence_ids": prompt_ids})
+        tq_api.kv_update(
+            key=key,
+            partition_id=partition_id,
+            fields="sequence_ids",
+            values=response_ids,
+            parser=lambda old, new: torch.cat([old, new]),
+        )
+
+        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
+        assert "sequence_ids" in retrieved
+        assert "prompt_ids" not in retrieved
+        assert "response_ids" not in retrieved
+        assert_tensor_equal(retrieved["sequence_ids"][0], torch.tensor([10, 11, 12, 20, 21]))
+
+        tq_api.kv_clear(keys=key, partition_id=partition_id)
+
+    def test_update_multiple_fields_at_once(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        key = "sample_multi"
+
+        tq_api.kv_put(
+            key=key,
+            partition_id=partition_id,
+            fields={"a": torch.tensor([1, 2]), "b": torch.tensor([10])},
+        )
+        tq_api.kv_update(
+            key=key,
+            partition_id=partition_id,
+            fields=["a", "b"],
+            values={"a": torch.tensor([3]), "b": torch.tensor([20, 30])},
+            parser=lambda old, new: torch.cat([old, new]),
+        )
+
+        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
+        assert_tensor_equal(retrieved["a"][0], torch.tensor([1, 2, 3]))
+        assert_tensor_equal(retrieved["b"][0], torch.tensor([10, 20, 30]))
+
+        tq_api.kv_empty(key=key, partition_id=partition_id, fields=["a", "b"])
+        emptied = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
+        assert emptied["a"][0] is None
+        assert emptied["b"][0] is None
+
+        tq_api.kv_clear(keys=key, partition_id=partition_id)
+
+    def test_missing_key_and_empty_with_values(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+
+        with pytest.raises(ValueError, match="must not specify values"):
+            tq_api.kv_update(
+                key="no_such", partition_id="test_partition", fields="tokens", values=torch.tensor([1]), empty=True
+            )
+        with pytest.raises(ValueError, match="not found"):
+            tq_api.kv_update(
+                key="no_such",
+                partition_id="test_partition",
+                fields="tokens",
+                values=torch.tensor([1]),
+                parser=lambda old, new: new,
+            )
+
+    def test_kv_backend_rejects(self, tq_api, backend_name):
+        if backend_name == "SimpleStorage":
+            pytest.skip("rejection is the KV-backend contract")
+
+        tq_api.kv_put(key="k", partition_id="test_partition", fields={"tokens": torch.tensor([1])})
+        with pytest.raises(NotImplementedError, match="kv_update is not supported"):
+            tq_api.kv_update(
+                key="k",
+                partition_id="test_partition",
+                fields="tokens",
+                values=torch.tensor([2]),
+                parser=lambda old, new: new,
+            )
+        tq_api.kv_clear(keys="k", partition_id="test_partition")
+
+
 def run_tests():
     """Run all e2e tests manually for debugging."""
     pytest.main([__file__, "-v", "-s"])

@@ -253,28 +253,36 @@ class FieldMeta:
             # Update newly provided per_sample_shapes
             self.per_sample_shapes.update(new_per_sample_shapes)
 
-        else:
-            if not new_is_non_tensor:
-                # newly input is regular tensor
-                new_shape = incoming.get("shape", None)
-                if new_shape is None:
-                    raise ValueError("Receiving a regular tensor without 'shape'!")
-                if self.is_nested:
-                    # we need to update incoming shape into per_sample_shapes
-                    for gi in incoming_global_indexes:
-                        self.per_sample_shapes[gi] = new_shape
-                else:
-                    if self.is_non_tensor is not None and not self.is_non_tensor:
-                        # original data is also regular tensor
-                        assert self.shape is not None
-                        if self.shape != new_shape:
-                            for gi in self.global_indexes:
-                                self.per_sample_shapes[gi] = self.shape
-                            for gi in incoming_global_indexes:
-                                self.per_sample_shapes[gi] = new_shape
+        elif new_is_non_tensor:
+            # Some samples now hold plain objects (e.g. kv_update empty stores None), so no
+            # single dtype/shape describes the column any more. dtype is kept so a later
+            # tensor write still has to agree with the one this field was created with.
+            self.is_non_tensor = True
+            self.is_nested = False
+            self.shape = None
+            self.per_sample_shapes.clear()
 
-                            self.shape = None
-                            self.is_nested = True
+        else:
+            # newly input is regular tensor
+            new_shape = incoming.get("shape", None)
+            if new_shape is None:
+                raise ValueError("Receiving a regular tensor without 'shape'!")
+            if self.is_nested:
+                # we need to update incoming shape into per_sample_shapes
+                for gi in incoming_global_indexes:
+                    self.per_sample_shapes[gi] = new_shape
+            else:
+                if self.is_non_tensor is not None and not self.is_non_tensor:
+                    # original data is also regular tensor
+                    assert self.shape is not None
+                    if self.shape != new_shape:
+                        for gi in self.global_indexes:
+                            self.per_sample_shapes[gi] = self.shape
+                        for gi in incoming_global_indexes:
+                            self.per_sample_shapes[gi] = new_shape
+
+                        self.shape = None
+                        self.is_nested = True
 
         self.global_indexes.update(incoming_global_indexes)
 

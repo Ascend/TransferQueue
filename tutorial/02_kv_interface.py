@@ -56,10 +56,10 @@ if not ray.is_initialized():
 def demonstrate_kv_api():
     """
     Demonstrate the Key-Value (KV) semantic API:
-    kv_put & kv_batch_put -> kv_list -> kv_batch_get -> kv_clear
+    kv_put & kv_batch_put -> kv_update -> kv_list -> kv_batch_get -> kv_clear
     """
     print("=" * 80)
-    print("Key-Value Semantic API Demo: kv_put/kv_batch_put → kv_list → kv_batch_get → kv_clear")
+    print("Key-Value Semantic API Demo: kv_put/kv_batch_put → kv_update → kv_list → kv_batch_get → kv_clear")
     print("=" * 80)
 
     # Step 1: Put a single key-value pair with kv_put
@@ -153,8 +153,22 @@ def demonstrate_kv_api():
     tq.kv_put(key=key_for_update_tags, partition_id=partition_id, fields=None, tag=tag_update)
     print(f"  ✓ Update success: Samples '0_0' now has tag as {tag_update}.")
 
-    # Step 5: List all keys and tags in a partition
-    print("\n[Step 5] Listing all keys and tags in partition...")
+    # Step 5: Concatenate a field with kv_update, then empty it
+    print("\n[Step 5] Updating a field with kv_update (concat, then empty)...")
+    tq.kv_put(key=key, partition_id=partition_id, fields={"scratch": torch.tensor([1, 2])})
+    tq.kv_update(
+        key=key,
+        partition_id=partition_id,
+        fields="scratch",
+        values=torch.tensor([3, 4]),
+        parser=lambda old, new: torch.cat([old, new]),
+    )
+    print("  ✓ kv_update concat: scratch of '0_0' is now [1, 2, 3, 4].")
+    tq.kv_empty(key=key, partition_id=partition_id, fields="scratch")
+    print("  ✓ tq.kv_empty: scratch of '0_0' is stored as None (key remains).")
+
+    # Step 6: List all keys and tags in a partition
+    print("\n[Step 6] Listing all keys and tags in partition...")
 
     partition_info = tq.kv_list()
     print(f"  Found {len(partition_info.keys())} partitions: '{list(partition_info.keys())}'")
@@ -162,16 +176,16 @@ def demonstrate_kv_api():
         for k, t in keys_and_tags.items():
             print(f"Partition: {pid}, - key='{k}' | tag={t}")
 
-    # Step 6: Retrieve specific fields using kv_batch_get
-    print("\n[Step 6] Retrieving specific fields (Column) with kv_batch_get...")
+    # Step 7: Retrieve specific fields using kv_batch_get
+    print("\n[Step 7] Retrieving specific fields (Column) with kv_batch_get...")
     print("  Fetching only 'input_ids' to save bandwidth (ignoring 'attention_mask' and 'response').")
 
     all_keys = list(partition_info[partition_id].keys())
     retrieved_input_ids = tq.kv_batch_get(keys=all_keys, partition_id=partition_id, select_fields="input_ids")
     print(f"  ✓ Successfully retrieved only {list(retrieved_input_ids.keys())} field for all samples.")
 
-    # # Step 7: Retrieve all fields using kv_batch_get
-    print("\n[Step 7] Retrieving all fields with kv_batch_get...")
+    # Step 8: Retrieve all fields using kv_batch_get
+    print("\n[Step 8] Retrieving all fields with kv_batch_get...")
     retrieved_all = tq.kv_batch_get(keys=all_keys, partition_id=partition_id)
     print(f"  Retrieved all fields for {all_keys}:")
     print(f"  Fields: {list(retrieved_all.keys())}")
@@ -179,8 +193,8 @@ def demonstrate_kv_api():
         f"  Note: We cannot retrieve fields {list(response_batch.keys())}, since they only available in {append_keys}"
     )
 
-    # Step 8: Clear specific keys
-    print("\n[Step 8] Clearing keys from partition...")
+    # Step 9: Clear specific keys
+    print("\n[Step 9] Clearing keys from partition...")
     keys_to_clear = all_keys[:2]  # Delete the first 2 keys
     tq.kv_clear(keys=keys_to_clear, partition_id=partition_id)
     print(f"  ✓ Cleared keys: {keys_to_clear}")
@@ -202,9 +216,10 @@ def main():
         Key Methods:
         1. (async_)kv_put          - Insert/Update a multi-column sample by key, with optional metadata tag
         2. (async_)kv_batch_put    - Put multiple key-value pairs efficiently in batch
-        3. (async_)kv_batch_get    - Retrieve samples (by keys), supporting column selection (by fields)
-        4. (async_)kv_list         - List keys and tags (metadata) in a partition
-        5. (async_)kv_clear        - Remove key-value pairs from storage
+        3. (async_)kv_update       - Rewrite fields with parser(old, new), or empty=True / tq.kv_empty to store None
+        4. (async_)kv_batch_get    - Retrieve samples (by keys), supporting column selection (by fields)
+        5. (async_)kv_list         - List keys and tags (metadata) in a partition
+        6. (async_)kv_clear        - Remove key-value pairs from storage
 
         Key Features:
         ✓ Redis-style Semantics  - Familiar KV interface (Put/Get/List) for zero learning curve
