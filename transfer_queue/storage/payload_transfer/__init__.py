@@ -16,6 +16,7 @@
 """Payload transfer strategies for SimpleStorage."""
 
 from transfer_queue.storage.payload_transfer.base import (
+    DeferredResponse,
     PayloadTransfer,
     PayloadTransferError,
 )
@@ -25,6 +26,7 @@ from transfer_queue.storage.payload_transfer.factory import (
 )
 
 __all__ = [
+    "DeferredResponse",
     "PayloadTransfer",
     "PayloadTransferError",
     "create_payload_transfer",

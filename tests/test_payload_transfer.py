@@ -35,12 +35,12 @@ from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
 def test_payload_descriptor_preserves_frame_layout():
-    descriptor = PayloadDescriptor("framed", 4 + 8 * 2 + 5, (2, 3))
+    descriptor = PayloadDescriptor("framed", 5, (2, 3))
     descriptor.validate()
     assert PayloadDescriptor.from_dict(descriptor.to_dict()) == descriptor
 
-    with pytest.raises(PayloadTransferError, match="packed payload length"):
-        PayloadDescriptor("framed", 5, (2, 3)).validate()
+    with pytest.raises(PayloadTransferError, match="payload length mismatch"):
+        PayloadDescriptor("framed", 6, (2, 3)).validate()
 
 
 def test_payload_descriptor_requires_frame_layout_and_rejects_negative_lengths():
