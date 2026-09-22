@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -26,6 +28,13 @@ if TYPE_CHECKING:
 
 class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
+
+
+@dataclass(frozen=True)
+class DeferredResponse:
+    """A response that the SimpleStorage worker must send after completion."""
+
+    future: Future[ZMQMessage]
 
 
 class PayloadTransfer(ABC):
@@ -64,7 +73,7 @@ class PayloadTransfer(ABC):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
-    ) -> ZMQMessage | None:
+    ) -> ZMQMessage | DeferredResponse | None:
         """Handle a strategy-owned request on a SimpleStorageUnit."""
 
     def bootstrap_info(self) -> dict[str, Any] | None:

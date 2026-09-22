@@ -15,9 +15,12 @@
 
 import os
 import pickle
+import socket
 import time
 import weakref
 from collections.abc import Mapping
+from concurrent.futures import Future
+from queue import Empty, SimpleQueue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -26,7 +29,7 @@ import psutil
 import ray
 import zmq
 
-from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
+from transfer_queue.storage.payload_transfer import DeferredResponse, PayloadTransfer, create_payload_transfer
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -51,6 +54,50 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 
 # Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+
+def _queue_deferred_response(
+    identity: bytes,
+    response: DeferredResponse,
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    wakeup: socket.socket,
+    shutdown_event: Event,
+) -> None:
+    """Wake the owning worker when an asynchronous response becomes ready."""
+    routing_identity = bytes(identity)
+
+    def ready(future: Future[ZMQMessage]) -> None:
+        if shutdown_event.is_set():
+            return
+        completions.put((routing_identity, future))
+        try:
+            wakeup.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass
+
+    response.future.add_done_callback(ready)
+
+
+def _drain_deferred_responses(
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    worker_socket: zmq.Socket,
+    storage_id: str,
+) -> None:
+    """Send completed responses from the only thread that owns the ZMQ socket."""
+    while True:
+        try:
+            identity, future = completions.get_nowait()
+        except Empty:
+            return
+        try:
+            response = future.result()
+        except Exception as exc:
+            response = ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_GET_ERROR,
+                sender_id=storage_id,
+                body={"message": f"{storage_id}, deferred response failed: {exc}."},
+            )
+        worker_socket.send_multipart([identity] + response.serialize(), copy=False)
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -289,6 +336,12 @@ class SimpleStorageUnit:
 
         poller = zmq.Poller()
         poller.register(worker_socket, zmq.POLLIN)
+        wakeup_reader, wakeup_writer = socket.socketpair()
+        wakeup_reader.setblocking(False)
+        wakeup_writer.setblocking(False)
+        wakeup_fd = wakeup_reader.fileno()
+        poller.register(wakeup_fd, zmq.POLLIN)
+        deferred_completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]] = SimpleQueue()
 
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
@@ -307,6 +360,18 @@ class SimpleStorageUnit:
 
             if self._shutdown_event.is_set():
                 break
+
+            if wakeup_fd in socks:
+                try:
+                    while wakeup_reader.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                try:
+                    _drain_deferred_responses(deferred_completions, worker_socket, self.storage_unit_id)
+                except zmq.ZMQError as exc:
+                    logger.warning(f"[{self.storage_unit_id}]: deferred response send failed: {exc}")
+                    break
 
             if worker_socket in socks:
                 # Messages received from proxy: [identity, serialized_msg_frame1, ...]
@@ -374,11 +439,22 @@ class SimpleStorageUnit:
                         },
                     )
 
-                # Send response back with identity for routing
-                worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                if isinstance(response_msg, DeferredResponse):
+                    _queue_deferred_response(
+                        bytes(identity),
+                        response_msg,
+                        deferred_completions,
+                        wakeup_writer,
+                        self._shutdown_event,
+                    )
+                else:
+                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
+        poller.unregister(wakeup_fd)
         poller.unregister(worker_socket)
+        wakeup_reader.close()
+        wakeup_writer.close()
         worker_socket.close(linger=0)
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
