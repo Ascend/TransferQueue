@@ -73,3 +73,68 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     restored = data_dump.read_row_index(tmp_path / "dump")["rows"]["key"]["tag"]["nested"][0].value
     torch.testing.assert_close(restored, batch[0])
     assert restored.untyped_storage().nbytes() == restored.numel() * restored.element_size()
+
+
+@pytest.fixture
+def empty_dump_client(monkeypatch):
+    monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
+    monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: object())
+
+
+def test_failed_publication_preserves_previous_dump(empty_dump_client, monkeypatch, tmp_path):
+    dump = tmp_path / "dump"
+    data_dump.dump_data_by_key(dump, [], "old")
+    rename = type(dump).rename
+
+    def fail_publish(path, target):
+        if path == tmp_path / "dump.tmp":
+            raise OSError("publication failed")
+        return rename(path, target)
+
+    monkeypatch.setattr(type(dump), "rename", fail_publish)
+    with pytest.raises(OSError, match="publication failed"):
+        data_dump.dump_data_by_key(dump, [], "new")
+    assert data_dump.read_row_index(dump)["partition_id"] == "old"
+    assert not (tmp_path / "dump.tmp").exists()
+
+
+@pytest.mark.parametrize("next_operation", ["read", "load", "dump"])
+def test_interrupted_publication_recovers_on_next_access(empty_dump_client, monkeypatch, tmp_path, next_operation):
+    dump = tmp_path / "dump"
+    data_dump.dump_data_by_key(dump, [], "old")
+    rename = type(dump).rename
+
+    def interrupt_publish(path, target):
+        if path == tmp_path / "dump.tmp":
+            raise KeyboardInterrupt
+        return rename(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(dump), "rename", interrupt_publish)
+        with pytest.raises(KeyboardInterrupt):
+            data_dump.dump_data_by_key(dump, [], "new")
+    assert not dump.exists()
+    assert (tmp_path / "dump.old").exists()
+    if next_operation == "read":
+        assert data_dump.read_row_index(dump)["partition_id"] == "old"
+    elif next_operation == "load":
+        assert data_dump.load_data_by_key(dump)["keys"] == 0
+        assert data_dump.read_row_index(dump)["partition_id"] == "old"
+    else:
+        data_dump.dump_data_by_key(dump, [], "replacement")
+        assert data_dump.read_row_index(dump)["partition_id"] == "replacement"
+
+
+def test_backup_cleanup_failure_does_not_fail_published_dump(empty_dump_client, monkeypatch, tmp_path):
+    dump = tmp_path / "dump"
+    data_dump.dump_data_by_key(dump, [], "old")
+    rmtree = data_dump.shutil.rmtree
+
+    def fail_cleanup(path):
+        if path == tmp_path / "dump.old":
+            raise OSError("cleanup failed")
+        return rmtree(path)
+
+    monkeypatch.setattr(data_dump.shutil, "rmtree", fail_cleanup)
+    data_dump.dump_data_by_key(dump, [], "new")
+    assert data_dump.read_row_index(dump)["partition_id"] == "new"
