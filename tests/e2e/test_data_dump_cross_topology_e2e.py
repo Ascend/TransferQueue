@@ -28,9 +28,6 @@ Run with:
 """
 
 import os
-import shutil
-import uuid
-from pathlib import Path
 
 import pytest
 import ray
@@ -41,8 +38,6 @@ from tensordict import TensorDict
 import transfer_queue as tq
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
-
-_DEFAULT_DUMP_ROOT = "/apdcephfs_hldy/share_303541817/tq_dump_tests"
 
 
 def _tq_config(num_storage_units: int) -> OmegaConf:
@@ -70,11 +65,8 @@ def ray_init():
 
 
 @pytest.fixture
-def dump_dir(request):
-    root = Path(os.environ.get("TQ_DUMP_TEST_ROOT", _DEFAULT_DUMP_ROOT)) / uuid.uuid4().hex
-    root.mkdir(parents=True)
-    yield root / "dump"
-    shutil.rmtree(root, ignore_errors=True)
+def dump_dir(dump_test_root, request):
+    return dump_test_root / request.node.name / "dump"
 
 
 def _row_input_ids(row: int) -> torch.Tensor:

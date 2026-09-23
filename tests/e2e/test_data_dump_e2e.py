@@ -17,8 +17,7 @@
 
 Each storage unit writes its own shard from the node it runs on, so
 ``TQ_DUMP_TEST_ROOT`` must point at a filesystem shared by the whole cluster.
-A node-local path such as pytest's ``tmp_path`` fails on a multi-node cluster
-with ``FileNotFoundError``.
+Single-node runs default to pytest-managed temporary storage.
 
 Run with:
     pytest tests/e2e/test_data_dump_e2e.py -v
@@ -27,8 +26,6 @@ Run with:
 import json
 import os
 import shutil
-import uuid
-from pathlib import Path
 
 import pytest
 import ray
@@ -41,7 +38,6 @@ import transfer_queue as tq
 os.environ["RAY_DEDUP_LOGS"] = "0"
 
 _NUM_STORAGE_UNITS = 4
-_DEFAULT_DUMP_ROOT = "/apdcephfs_hldy/share_303541817/tq_dump_tests"
 
 
 def _tq_config(num_storage_units: int) -> OmegaConf:
@@ -95,17 +91,9 @@ def cleanup_partitions(controller):
         pass
 
 
-@pytest.fixture(scope="module")
-def shared_root():
-    root = Path(os.environ.get("TQ_DUMP_TEST_ROOT", _DEFAULT_DUMP_ROOT)) / uuid.uuid4().hex
-    root.mkdir(parents=True)
-    yield root
-    shutil.rmtree(root, ignore_errors=True)
-
-
 @pytest.fixture
-def dump_dir(shared_root, request):
-    case = shared_root / request.node.name.replace("/", "_")
+def dump_dir(dump_test_root, request):
+    case = dump_test_root / request.node.name.replace("/", "_")
     yield case / "dump"
     shutil.rmtree(case, ignore_errors=True)
 
