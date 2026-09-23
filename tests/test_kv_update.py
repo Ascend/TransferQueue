@@ -23,7 +23,10 @@ from transfer_queue.controller import DataPartitionStatus
 from transfer_queue.interface import _normalize_kv_update_args
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import KVStorageManager
+from transfer_queue.storage.managers.mooncake_manager import MooncakeStorageManager
+from transfer_queue.storage.managers.ray_storage_manager import RayStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import _build_update_field_schema
+from transfer_queue.storage.managers.yuanrong_manager import YuanrongStorageManager
 from transfer_queue.storage.simple_storage import HybridStorageUnitData, StorageUnitData
 
 
@@ -203,16 +206,25 @@ def test_empty_marks_the_controller_field_non_tensor():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "manager_cls", [MooncakeStorageManager, YuanrongStorageManager, RayStorageManager, KVStorageManager]
+)
 @patch("transfer_queue.storage.managers.base.StorageClientFactory.create")
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
-async def test_kv_backend_rejects_update(mock_create):
+async def test_kv_backends_reject_update(mock_create, manager_cls):
+    """Every KV backend must refuse kv_update by name; only SimpleStorage implements it."""
     mock_create.return_value = MagicMock()
-    manager = KVStorageManager(controller_info=MagicMock(), config={"client_name": "YuanrongStorageClient"})
+    # Each manager validates its own config before reaching update_data.
+    config = {
+        KVStorageManager: {"client_name": "YuanrongStorageClient"},
+        YuanrongStorageManager: {"worker_port": 31501},
+    }.get(manager_cls, {})
+    manager = manager_cls(controller_info=MagicMock(), config=config)
     meta = BatchMeta(
         global_indexes=[0],
         partition_ids=["p"],
         field_schema={"x": {"dtype": torch.int64, "shape": (1,), "is_nested": False, "is_non_tensor": False}},
         production_status=np.ones(1, dtype=np.int8),
     )
-    with pytest.raises(NotImplementedError, match="kv_update is not supported for KV-based backends"):
+    with pytest.raises(NotImplementedError, match=f"not supported by {manager_cls.__name__}"):
         await manager.update_data(meta, ["x"], empty=True)

@@ -830,9 +830,13 @@ class KVStorageManager(StorageManager):
         parser: Callable[[Any, Any], Any] | None = None,
         empty: bool = False,
     ) -> dict[str, dict[str, Any]]:
-        """kv_update is only implemented for SimpleStorage."""
+        """kv_update is only implemented for SimpleStorage.
+
+        A KV backend stores each sample-field under its own key and offers no hook to run
+        parser(old, new) where the value lives, so read-modify-write cannot be made atomic.
+        """
         raise NotImplementedError(
-            "kv_update is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
+            f"kv_update is not supported by {type(self).__name__}; it requires the SimpleStorage backend."
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
