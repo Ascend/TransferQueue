@@ -85,7 +85,7 @@ class SSDEncodedSample:
 
     payload: memoryview
     codec: str
-    dtype: str | None = None
+    dtype: str | np.dtype[Any] | None = None
     shape: tuple[int, ...] | None = None
 
 
@@ -96,7 +96,7 @@ class _SSDValueRef:
     path: Path
     size_bytes: int
     codec: str
-    dtype: str | None = None
+    dtype: str | np.dtype[Any] | None = None
     shape: tuple[int, ...] | None = None
 
 
@@ -482,7 +482,7 @@ class HybridStorageUnitData(StorageUnitData):
             return SSDEncodedSample(
                 payload=payload,
                 codec="numpy",
-                dtype=str(array.dtype),
+                dtype=array.dtype,
                 shape=tuple(array.shape),
             )
         if isinstance(value, bytes):
