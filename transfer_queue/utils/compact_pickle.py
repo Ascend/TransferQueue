@@ -21,7 +21,10 @@ import torch
 
 
 class Pickler(pickle.Pickler):
+    """Clone tensor leaves during pickling, including those inside arbitrary containers."""
+
     def reducer_override(self, value):
+        """Serialize tensor values independently of their source storage."""
         # Tensor views can retain an entire batch, including unselected keys. This
         # also handles tensors nested in picklable payload objects or metadata.
         if isinstance(value, torch.Tensor):
@@ -30,4 +33,5 @@ class Pickler(pickle.Pickler):
 
 
 def dump(value, file):
+    """Write a standard pickle containing only the selected tensor values."""
     Pickler(file, protocol=pickle.HIGHEST_PROTOCOL).dump(value)

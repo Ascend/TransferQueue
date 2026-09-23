@@ -13,38 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Selective data dump: persist the rows behind a set of keys, and read them back.
+"""Persist selected rows and restore them by key without checkpointing controller state.
 
-This is deliberately not a checkpoint. It stores payload and the metadata needed to
-address it by key, and nothing about the controller: no index manager, no sampler, no
-partition snapshot. Restoring therefore goes through the ordinary ``kv_batch_put``
-path, which means a dump taken with N storage units restores into a system with M
-storage units. Use ``save_checkpoint`` when you need a full system image instead.
+Version 2 stores independent row records in each storage-unit shard. The manifest
+maps source indexes to byte offsets, so current owner units can read only their rows
+when restoring into a different topology. Version 1 remains readable via KV puts.
 
 Layout::
 
     <dump_dir>/
-        dump_info.json                # partition, counts, shard count
+        dump_info.json                # version, partition, counts
         row_index.pt                  # key -> {global_index, fields, tag}
         shards/
-            shard_info.json           # [{position, storage_unit_id, rows}]
-            shard_<N>_<su_id>.pkl     # {field_data: {field: {gidx: value}}, global_indexes}
+            shard_info.json           # unit, row count, source index -> [offset, length]
+            shard_<N>_<su_id>.pkl      # independent {global_index, fields} records
 """
 
 import json
 import os
+import pickle
 import shutil
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
 import torch
+from tensordict import TensorDict
 
+from transfer_queue.storage.dump_io import read_dump_row
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.tensor_utils import pack_field_values
 
 logger = get_logger(__name__)
 
-DUMP_FORMAT_VERSION = 1
+DUMP_FORMAT_VERSION = 2
 
 _DUMP_INFO_FILE = "dump_info.json"
 _ROW_INDEX_FILE = "row_index.pt"
@@ -132,7 +135,13 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         indexes_with_data = sorted(row["global_index"] for row in rows.values() if row["fields"])
 
         shard_records = (
-            client.dump_rows_by_index(str(tmp_dir / _SHARD_SUBDIR), indexes_with_data) if indexes_with_data else []
+            client.dump_rows_by_index(
+                str(tmp_dir / _SHARD_SUBDIR),
+                indexes_with_data,
+                {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]},
+            )
+            if indexes_with_data
+            else []
         )
         shard_dir = tmp_dir / _SHARD_SUBDIR
         shard_dir.mkdir(parents=True, exist_ok=True)
@@ -222,100 +231,147 @@ def read_row_index(dump_dir: str | Path) -> dict[str, Any]:
 
 
 def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
-    """Restore a dump into the running TransferQueue.
+    """Merge selected rows into the running system, preserving existing key indexes.
 
-    Rows are written back through ``kv_batch_put``, so restoring merges by key: rows
-    outside the dump are untouched, and the number of storage units may differ from
-    the one used to write the dump. Global indexes are reallocated, which is safe
-    because a dump is addressed by key.
-
-    Shards are processed one at a time. Every field of a row lives in the shard of the
-    unit that owned it, so a shard is self-contained and peak memory stays at one shard.
+    SimpleStorage units read their assigned version-2 records directly and in parallel.
+    Version-1 dumps and other backends use the compatible KV put path. New keys receive
+    current indexes; unrelated rows and fields remain untouched. Writers and clears for
+    these keys must be paused during restore. Failure may leave partial payload writes;
+    retry the same dump after correcting the failure.
 
     Args:
-        dump_dir: Directory previously written by ``dump_data_by_key``.
+        dump_dir: Directory previously written by ``dump_data_by_key``. For direct
+            distributed loading it must be accessible from every storage unit.
 
     Returns:
         ``{"keys", "rows_with_data", "shards", "bytes"}``.
 
     Raises:
-        RuntimeError: TransferQueue is not initialized.
+        RuntimeError: TransferQueue is not initialized or a storage unit fails.
         FileNotFoundError: The dump is incomplete.
-        ValueError: A shard disagrees with the row index.
+        ValueError: The manifest or a row disagrees with the row index.
     """
-    from transfer_queue.interface import _TQ_CONTROLLER, kv_batch_put
+    from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
 
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
-    dump_dir = Path(dump_dir)
+    dump_dir = Path(dump_dir).absolute()
     _recover_dump(dump_dir)
     info_path = dump_dir / _DUMP_INFO_FILE
     if not info_path.exists():
         raise FileNotFoundError(f"{_DUMP_INFO_FILE} not found in {dump_dir}")
     with open(info_path, encoding="utf-8") as f:
         dump_info = json.load(f)
-    if dump_info["format_version"] != DUMP_FORMAT_VERSION:
+    if dump_info["format_version"] not in (1, DUMP_FORMAT_VERSION):
         raise ValueError(
             f"Unsupported dump format version {dump_info['format_version']} in {dump_dir}; "
-            f"this build reads version {DUMP_FORMAT_VERSION}"
+            f"this build reads versions 1 and {DUMP_FORMAT_VERSION}"
         )
 
     row_index = read_row_index(dump_dir)
     partition_id = row_index["partition_id"]
     rows = row_index["rows"]
 
-    key_by_index = {row["global_index"]: key for key, row in rows.items()}
-    fields_by_index = {row["global_index"]: row["fields"] for key, row in rows.items()}
-
     shard_dir = dump_dir / _SHARD_SUBDIR
-    shard_info_path = shard_dir / _SHARD_INFO_FILE
-    if not shard_info_path.exists():
-        raise FileNotFoundError(f"{_SHARD_INFO_FILE} not found in {shard_dir}")
-    with open(shard_info_path, encoding="utf-8") as f:
+    with open(shard_dir / _SHARD_INFO_FILE, encoding="utf-8") as f:
         shard_records = json.load(f)
-
-    from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
-
-    restored_indexes: set[int] = set()
+    if (
+        len(rows) != dump_info["num_keys"]
+        or len(shard_records) != dump_info["num_shards"]
+        or partition_id != dump_info["partition_id"]
+    ):
+        raise ValueError("Dump manifest disagrees with the row index")
+    keys_by_index = {row["global_index"]: key for key, row in rows.items() if row["fields"]}
+    if len(keys_by_index) != dump_info["num_rows_with_data"]:
+        raise ValueError("Dump row count disagrees with the row index")
+    shards = []
+    seen = set()
     for record in shard_records:
-        shard_path = shard_dir / f"shard_{record['position']}_{record['storage_unit_id']}.pkl"
-        if not shard_path.exists():
-            raise FileNotFoundError(f"Missing dump shard: {shard_path}")
+        path = shard_dir / f"shard_{record['position']}_{record['storage_unit_id']}.pkl"
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing dump shard: {path}")
+        records = []
+        if dump_info["format_version"] == 2:
+            size = path.stat().st_size
+            offsets = record["row_offsets"]
+            if len(offsets) != record["rows"]:
+                raise ValueError(f"Dump shard row count mismatch: {path}")
+            for source_index, (offset, length) in offsets.items():
+                source_index = int(source_index)
+                if source_index not in keys_by_index or source_index in seen:
+                    raise ValueError(f"Unexpected or duplicated row {source_index} in {path}")
+                if offset < 0 or length <= 0 or offset + length > size:
+                    raise ValueError(f"Invalid row range for {source_index} in {path}")
+                key = keys_by_index[source_index]
+                records.append(
+                    {
+                        "key": key,
+                        "source_index": source_index,
+                        "fields": rows[key]["fields"],
+                        "offset": offset,
+                        "length": length,
+                    }
+                )
+                seen.add(source_index)
+        shards.append({"path": str(path), "records": records})
+    if dump_info["format_version"] == 2 and seen != set(keys_by_index):
+        raise ValueError("Dump shards do not contain every produced row")
 
-        for signature, batch in AsyncSimpleStorageManager.read_shard(str(shard_path), fields_by_index).items():
-            global_indexes = batch["global_indexes"]
-            batch_keys = [key_by_index[global_index] for global_index in global_indexes]
-            kv_batch_put(
-                keys=batch_keys,
-                partition_id=partition_id,
-                fields=batch["fields"],
-                tags=[rows[key]["tag"] for key in batch_keys],
-            )
-            restored_indexes.update(global_indexes)
-
-    # Rows that had no produced field yet were never sent to a storage unit; recreate
-    # them from the row index so a caller holding their keys still finds them.
-    keys_without_data = [key for key, row in rows.items() if not row["fields"]]
-    if keys_without_data:
-        kv_batch_put(
-            keys=keys_without_data,
-            partition_id=partition_id,
-            fields=None,
-            tags=[rows[key]["tag"] for key in keys_without_data],
-        )
-
-    if len(restored_indexes) != dump_info["num_rows_with_data"]:
-        raise ValueError(
-            f"Dump restore row count mismatch in {dump_dir}: shards yielded {len(restored_indexes)} rows, "
-            f"{_DUMP_INFO_FILE} declares {dump_info['num_rows_with_data']}"
-        )
+    client = _maybe_create_tq_client()
+    if dump_info["format_version"] == 2 and hasattr(getattr(client, "storage_manager", None), "load_rows_by_index"):
+        client.load_rows_by_key(partition_id, rows, shards)
+    else:
+        _load_via_kv(partition_id, rows, shards, dump_info["format_version"])
 
     total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}")
     return {
         "keys": len(rows),
-        "rows_with_data": len(restored_indexes),
+        "rows_with_data": len(keys_by_index),
         "shards": len(shard_records),
         "bytes": total_bytes,
     }
+
+
+def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict], version: int) -> None:
+    """Retain v1 and non-SimpleStorage compatibility without changing their put contract."""
+    from transfer_queue.interface import kv_batch_put
+
+    keys_by_index = {row["global_index"]: key for key, row in rows.items()}
+    restored = set()
+    for shard in shards:
+        with open(shard["path"], "rb") as f:
+            if version == 1:
+                saved = pickle.load(f)
+                records = [
+                    {"key": keys_by_index[index], "source_index": index, "fields": rows[keys_by_index[index]]["fields"]}
+                    for index in saved["global_indexes"]
+                ]
+            else:
+                records = shard["records"]
+            for start in range(0, len(records), 128):
+                groups = defaultdict(list)
+                for record in records[start : start + 128]:
+                    index = record["source_index"]
+                    fields = record["fields"]
+                    if version == 1:
+                        values = {name: saved["field_data"][name][index] for name in fields}
+                    else:
+                        values = read_dump_row(f, record["offset"], record["length"], index, fields)
+                    groups[tuple(fields)].append((record["key"], values))
+                    restored.add(index)
+                for signature, batch in groups.items():
+                    keys = [key for key, _ in batch]
+                    packed = {name: pack_field_values([values[name] for _, values in batch]) for name in signature}
+                    kv_batch_put(
+                        keys,
+                        partition_id,
+                        TensorDict(packed, batch_size=len(keys)),
+                        tags=[rows[key]["tag"] for key in keys],
+                    )
+    if restored != {row["global_index"] for row in rows.values() if row["fields"]}:
+        raise ValueError("Dump restore row count mismatch")
+    keys = [key for key, row in rows.items() if not row["fields"]]
+    if keys:
+        kv_batch_put(keys, partition_id, tags=[rows[key]["tag"] for key in keys])

@@ -1167,12 +1167,18 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in describe_rows_by_key: {str(e)}") from e
 
-    async def async_dump_rows_by_index(self, shard_dir: str, global_indexes: list[int]) -> list[dict[str, Any]]:
+    async def async_dump_rows_by_index(
+        self,
+        shard_dir: str,
+        global_indexes: list[int],
+        fields_by_index: dict[int, list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Asynchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
+            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
 
         Returns:
             One entry per written shard.
@@ -1189,7 +1195,50 @@ class AsyncTransferQueueClient:
             )
         if not hasattr(self.storage_manager, "dump_rows_by_index"):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support selective data dump")
-        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes)
+        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+
+    async def async_load_rows_by_key(
+        self,
+        partition_id: str,
+        rows: dict[str, dict[str, Any]],
+        shards: list[dict[str, Any]],
+    ) -> None:
+        """Allocate current indexes, load payloads at owner units, then publish metadata."""
+        manager = getattr(self, "storage_manager", None)
+        if manager is None or not hasattr(manager, "load_rows_by_index"):
+            raise NotImplementedError("Storage backend does not support direct selective load")
+        if not rows:
+            return
+        keys = list(rows)
+        metadata = await self.async_kv_retrieve_meta(keys, partition_id, create=True)
+        if metadata.size != len(keys):
+            raise RuntimeError("Selective load did not allocate every key")
+        target_indexes = dict(zip(keys, metadata.global_indexes, strict=True))
+        for shard in shards:
+            for record in shard["records"]:
+                record["target_index"] = target_indexes[record["key"]]
+        updates = await manager.load_rows_by_index(shards)
+        await self._publish_loaded_rows(partition_id, updates)
+        metadata.update_custom_meta([rows[key]["tag"] for key in keys])
+        await self.async_set_custom_meta(metadata)
+
+    @with_controller_socket
+    async def _publish_loaded_rows(
+        self,
+        partition_id: str,
+        updates: list[dict[str, Any]],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        # Loading must report a failed metadata update instead of silently succeeding.
+        for update in updates:
+            response = await self._request_controller(
+                socket=socket,
+                request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,
+                response_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+                body={"partition_id": partition_id, **update},
+            )
+            if not response.body.get("success"):
+                raise RuntimeError(f"Controller rejected loaded row metadata for partition {partition_id!r}")
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
@@ -1377,6 +1426,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_list = _make_sync(self.async_kv_list)
         self._describe_rows_by_key = _make_sync(self.async_describe_rows_by_key)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
+        self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1829,12 +1879,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._describe_rows_by_key(partition_id, keys)
 
-    def dump_rows_by_index(self, shard_dir: str, global_indexes: list[int]) -> list[dict[str, Any]]:
+    def dump_rows_by_index(
+        self,
+        shard_dir: str,
+        global_indexes: list[int],
+        fields_by_index: dict[int, list[str]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Synchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
+            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
 
         Returns:
             One entry per written shard.
@@ -1844,7 +1900,16 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 no data for a row it was asked to dump.
             NotImplementedError: If the storage backend does not support dumping.
         """
-        return self._dump_rows_by_index(shard_dir, global_indexes)
+        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+
+    def load_rows_by_key(
+        self,
+        partition_id: str,
+        rows: dict[str, dict[str, Any]],
+        shards: list[dict[str, Any]],
+    ) -> None:
+        """Restore indexed dump records directly on the current storage owner units."""
+        return self._load_rows_by_key(partition_id, rows, shards)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:

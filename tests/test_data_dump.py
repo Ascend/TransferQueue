@@ -15,13 +15,20 @@
 
 """Selective dump integrity and publication tests."""
 
+import asyncio
+import builtins
+import io
 import pickle
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
 from transfer_queue import data_dump, interface
+from transfer_queue.client import AsyncTransferQueueClient
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -49,12 +56,15 @@ def test_dump_excludes_unselected_tensor_storage(unit, tmp_path, row_count):
         )
     )
     assert reply.body["success"]
+    assert set(reply.body["row_offsets"]) == set(indexes)
     with path.open("rb") as f:
-        shard = pickle.load(f)
-    assert shard["global_indexes"] == indexes
-    for index, value in shard["field_data"]["x"].items():
-        torch.testing.assert_close(value, batch[index])
-        assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
+        for index, (offset, length) in reply.body["row_offsets"].items():
+            f.seek(offset)
+            row = pickle.loads(f.read(length))
+            assert row["global_index"] == index
+            value = row["fields"]["x"]
+            torch.testing.assert_close(value, batch[index])
+            assert value.untyped_storage().nbytes() == value.numel() * value.element_size()
     assert path.stat().st_size < row_count * batch[0].numel() * batch.element_size() * 2
     assert unit.storage_data.field_data["x"][0].untyped_storage().nbytes() == batch.numel() * batch.element_size()
 
@@ -138,3 +148,230 @@ def test_backup_cleanup_failure_does_not_fail_published_dump(empty_dump_client, 
     monkeypatch.setattr(data_dump.shutil, "rmtree", fail_cleanup)
     data_dump.dump_data_by_key(dump, [], "new")
     assert data_dump.read_row_index(dump)["partition_id"] == "new"
+
+
+def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch):
+    batch = torch.arange(8 * 4096, dtype=torch.float32).reshape(8, 4096)
+    unit.storage_data.put_data({"x": batch, "stale": batch}, list(range(8)))
+    path = tmp_path / "shard.pkl"
+    reply = unit._handle_dump_rows(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.DUMP_ROWS,
+            sender_id="test",
+            body={
+                "path": str(path),
+                "global_indexes": list(range(8)),
+                "fields_by_index": {index: ["x"] for index in range(8)},
+            },
+        )
+    )
+    assert reply.body["success"]
+    content = path.read_bytes()
+    reads = []
+
+    class TrackedFile(io.BytesIO):
+        name = str(path)
+
+        def read(self, size=-1):
+            reads.append((self.tell(), size))
+            return super().read(size)
+
+    open_file = builtins.open
+    monkeypatch.setattr(
+        builtins,
+        "open",
+        lambda name, *a, **kw: TrackedFile(content) if str(name) == str(path) else open_file(name, *a, **kw),
+    )
+    unit.storage_data = StorageUnitData()
+    unit.storage_data.put_data({"keep": ["value"]}, [101])
+    records = []
+    for source, target in [(1, 101), (6, 106)]:
+        offset, length = reply.body["row_offsets"][source]
+        records.append(
+            {"source_index": source, "target_index": target, "fields": ["x"], "offset": offset, "length": length}
+        )
+    loaded = unit._handle_load_rows(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_ROWS,
+            sender_id="test",
+            body={"shards": [{"path": str(path), "records": records}]},
+        )
+    )
+    assert loaded.body["success"], loaded.body
+    assert reads == [(row["offset"], row["length"]) for row in records]
+    assert loaded.body["bytes_read"] == sum(row["length"] for row in records)
+    assert set(unit.storage_data.field_data) == {"x", "keep"}
+    assert unit.storage_data.field_data["keep"][101] == "value"
+    for row in records:
+        torch.testing.assert_close(unit.storage_data.field_data["x"][row["target_index"]], batch[row["source_index"]])
+    assert sorted(index for update in loaded.body["updates"] for index in update["global_indexes"]) == [101, 106]
+
+
+@pytest.mark.asyncio
+async def test_manager_loads_current_owners_concurrently():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test"
+    manager.storage_unit_infos = dict.fromkeys(["u0", "u1", "u2", "u3"])
+    manager.close = lambda: None
+    started = set()
+    ready = asyncio.Event()
+    seen = []
+
+    async def load(shards, target_storage_unit):
+        started.add(target_storage_unit)
+        if len(started) == 4:
+            ready.set()
+        await asyncio.wait_for(ready.wait(), timeout=2)
+        for shard in shards:
+            for row in shard["records"]:
+                assert target_storage_unit == f"u{row['target_index'] % 4}"
+                seen.append(row["source_index"])
+        return {"updates": [], "bytes_read": 0}
+
+    manager._load_selected_rows = load
+    records = [{"source_index": i, "target_index": 31 - i} for i in range(16)]
+    assert await manager.load_rows_by_index([{"path": "shard.pkl", "records": records}]) == []
+    assert sorted(seen) == list(range(16))
+
+
+@pytest.mark.asyncio
+async def test_failed_load_does_not_publish_ready_metadata():
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client.close = lambda: None
+    client.storage_manager = SimpleNamespace(load_rows_by_index=AsyncMock(side_effect=RuntimeError("read failed")))
+    client.async_kv_retrieve_meta = AsyncMock(return_value=BatchMeta(global_indexes=[9], partition_ids=["p"]))
+    client._publish_loaded_rows = AsyncMock()
+    client.async_set_custom_meta = AsyncMock()
+    with pytest.raises(RuntimeError, match="read failed"):
+        await client.async_load_rows_by_key("p", {"k": {"tag": {}}}, [])
+    client._publish_loaded_rows.assert_not_called()
+    client.async_set_custom_meta.assert_not_called()
+
+
+@pytest.mark.parametrize("problem", ["wrong_index", "truncated", "missing_field"])
+def test_unit_rejects_invalid_records(unit, tmp_path, problem):
+    path = tmp_path / "row.pkl"
+    path.write_bytes(pickle.dumps({"global_index": 1, "fields": {"x": "value"}}))
+    record = {"source_index": 1, "target_index": 2, "offset": 0, "length": path.stat().st_size, "fields": ["x"]}
+    if problem == "wrong_index":
+        record["source_index"] = 3
+    elif problem == "truncated":
+        record["length"] += 1
+    else:
+        record["fields"] = ["missing"]
+    reply = unit._handle_load_rows(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_ROWS,
+            sender_id="test",
+            body={"shards": [{"path": str(path), "records": [record]}]},
+        )
+    )
+    assert not reply.body["success"]
+    assert not unit.storage_data._active_keys
+
+
+def test_version_two_falls_back_to_kv_for_other_backends(unit, monkeypatch, tmp_path):
+    unit.storage_data.put_data({"x": [torch.tensor([7, 8])]}, [10])
+    rows = {
+        "k": {"global_index": 10, "fields": ["x"], "tag": {"tag": 1}},
+        "empty": {"global_index": 11, "fields": [], "tag": {}},
+    }
+
+    def dump(shard_dir, indexes, fields_by_index):
+        directory = type(tmp_path)(shard_dir)
+        directory.mkdir(parents=True)
+        response = unit._handle_dump_rows(
+            ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS,
+                sender_id="test",
+                body={
+                    "path": str(directory / "shard_0_unit.pkl"),
+                    "global_indexes": indexes,
+                    "fields_by_index": fields_by_index,
+                },
+            )
+        )
+        assert response.body["success"]
+        return [
+            {
+                "position": 0,
+                "storage_unit_id": "unit",
+                "rows": len(indexes),
+                "row_offsets": response.body["row_offsets"],
+            }
+        ]
+
+    client = SimpleNamespace(describe_rows_by_key=lambda *_: rows, dump_rows_by_index=dump, storage_manager=object())
+    monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
+    monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
+    data_dump.dump_data_by_key(tmp_path / "dump", list(rows), "p")
+    calls = []
+    monkeypatch.setattr(interface, "kv_batch_put", lambda *args, **kwargs: calls.append((args, kwargs)))
+    data_dump.load_data_by_key(tmp_path / "dump")
+    assert calls[0][0][:2] == (["k"], "p")
+    torch.testing.assert_close(calls[0][0][2]["x"][0], torch.tensor([7, 8]))
+    assert calls[0][1]["tags"] == [{"tag": 1}]
+    assert calls[1] == ((["empty"], "p"), {"tags": [{}]})
+
+
+@pytest.mark.asyncio
+async def test_load_waits_for_other_units_before_raising():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test"
+    manager.storage_unit_infos = dict.fromkeys(["u0", "u1"])
+    manager.close = lambda: None
+    failed = asyncio.Event()
+    finished = []
+
+    async def load(shards, target_storage_unit):
+        if target_storage_unit == "u0":
+            failed.set()
+            raise RuntimeError("unit failed")
+        await failed.wait()
+        await asyncio.sleep(0)
+        finished.append(target_storage_unit)
+        return {"bytes_read": 0, "updates": []}
+
+    manager._load_selected_rows = load
+    with pytest.raises(RuntimeError, match="unit failed"):
+        await manager.load_rows_by_index([{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}])
+    assert finished == ["u1"]
+
+
+@pytest.mark.asyncio
+async def test_load_rejects_failed_controller_metadata_ack():
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client.close = lambda: None
+    client._request_controller = AsyncMock(return_value=SimpleNamespace(body={"success": False}))
+    with pytest.raises(RuntimeError, match="Controller rejected"):
+        await AsyncTransferQueueClient._publish_loaded_rows.__wrapped__(
+            client,
+            "p",
+            [
+                {"global_indexes": [3], "field_schema": {}},
+            ],
+        )
+
+
+@pytest.mark.asyncio
+async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test"
+    manager.storage_unit_infos = dict.fromkeys(["u0", "u1"])
+    manager.close = lambda: None
+    failed = asyncio.Event()
+    completed = []
+
+    async def dump(path, target_storage_unit, global_indexes, fields_by_index):
+        if target_storage_unit == "u0":
+            failed.set()
+            raise OSError("write failed")
+        await failed.wait()
+        await asyncio.sleep(0)
+        completed.append(target_storage_unit)
+        return {1: [0, 1]}
+
+    manager._dump_single_shard = dump
+    with pytest.raises(OSError, match="write failed"):
+        await manager.dump_rows_by_index(str(tmp_path), [0, 1])
+    assert completed == ["u1"]

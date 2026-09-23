@@ -94,7 +94,7 @@ def _assert_rows_equal(actual: torch.Tensor, expected_rows: list[torch.Tensor]) 
 
 @pytest.mark.parametrize(
     ("dump_units", "load_units"),
-    [(4, 2), (2, 4), (3, 3)],
+    [(4, 2), (2, 4), (3, 3), (1, 4)],
 )
 def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units, load_units):
     # Define test data
@@ -114,7 +114,12 @@ def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units
     # Restore into a different topology
     tq.init(_tq_config(load_units))
     try:
+        _put_rows("bystander", ["unrelated"])
+        _put_rows(partition_id, [keys[3]])
+        old_index = tq.get_client().kv_retrieve_meta([keys[3]], partition_id).global_indexes[0]
         tq.load_data_by_key(dump_dir)
+        assert tq.get_client().kv_retrieve_meta([keys[3]], partition_id).global_indexes == [old_index]
+        assert tq.kv_batch_get(["unrelated"], "bystander", ["input_ids"]).batch_size[0] == 1
 
         # Check restored state: every row readable, payload and tag intact
         retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["input_ids"])

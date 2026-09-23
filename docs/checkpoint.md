@@ -168,3 +168,10 @@ client.load_controller_checkpoint(...)    # (2) controller restored second
 If step (1) partially succeeds and step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
 
 **Workaround**: If `load_checkpoint` raises, call `tq.init()` again to reset the system to a clean state before retrying.
+
+## Exporting selected keys
+
+Use [selective data dumps](data_dump.md) when restoring selected keys into an
+existing system or a different number of storage units. Version-2 SimpleStorage
+restores use the same owner-side I/O pattern as checkpoint load, but read assigned
+row ranges and merge values instead of replacing entire unit and controller state.

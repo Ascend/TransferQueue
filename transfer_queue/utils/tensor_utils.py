@@ -19,6 +19,7 @@ import os
 from functools import reduce
 
 import torch
+from tensordict import NonTensorStack
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
@@ -180,3 +181,53 @@ def merge_contiguous_memory(ptrs: list[int], sizes: list[int]) -> tuple[list[int
     merged_sizes.append(current_size)
 
     return merged_ptrs, merged_sizes
+
+
+def pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
+    """
+    Pack a list of per-sample values into a batched container.
+
+    For pure tensor lists (no None), this tries nested tensor
+    (jagged layout first, then strided fallback), then falls back to
+    ``NonTensorStack``. Scalar tensors are stacked densely.
+    Mixed types, non-tensor values, or lists containing None placeholders
+    are grouped into a ``NonTensorStack``.
+
+    Args:
+        values: List of per-sample values to pack. May contain None for
+            unfilled batch positions.
+
+    Returns:
+        A ``torch.Tensor`` (nested or dense) when all values are tensors,
+        otherwise a ``NonTensorStack``.
+
+    Raises:
+        ValueError: If *values* is empty.
+    """
+    if not values:
+        raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
+    non_none = [v for v in values if v is not None]
+    if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
+        if len(non_none) == len(values):
+            # Scalar tensors cannot be represented as jagged nested tensors;
+            # stack them densely to avoid noisy fallback warnings.
+            if all(v.dim() == 0 for v in non_none):
+                return torch.stack(non_none)
+            # Pure tensor list — try nested tensor
+            try:
+                return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+            except (RuntimeError, TypeError) as e:
+                logger.warning(
+                    f"Failed to pack nested tensor with jagged layout. "
+                    f"Falling back to strided layout. Detailed error: {e}"
+                )
+                try:
+                    return torch.nested.as_nested_tensor(values, layout=torch.strided)
+                except (RuntimeError, TypeError) as e2:
+                    logger.warning(
+                        f"Failed to pack nested tensor with strided layout. "
+                        f"Falling back to NonTensorStack. Detailed error: {e2}"
+                    )
+                    return NonTensorStack(*values)
+        # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
+    return NonTensorStack(*values)

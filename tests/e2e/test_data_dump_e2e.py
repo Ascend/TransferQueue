@@ -23,9 +23,13 @@ Run with:
     pytest tests/e2e/test_data_dump_e2e.py -v
 """
 
+import builtins
 import json
 import os
+import pickle
 import shutil
+from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 import ray
@@ -413,3 +417,90 @@ class TestDumpErrors:
 
         with pytest.raises(ValueError, match="Unsupported dump format version"):
             tq.load_data_by_key(dump_dir)
+
+
+def test_direct_load_bypasses_caller_payload_io(tq_system, dump_dir, controller, monkeypatch):
+    partition = "direct_load"
+    keys = [f"key-{i}" for i in range(16)]
+    _put_rows(partition, keys)
+    tq.dump_data_by_key(dump_dir, keys, partition)
+    before = _keys_mapping(controller, partition)
+    tq.kv_put(keys[0], partition, fields=TensorDict({"extra": torch.tensor([[42]])}, batch_size=1), tag={"keep": True})
+    _put_rows(partition, ["bystander"])
+    client = tq.get_client()
+    manager = client.storage_manager
+    original_load = manager._load_selected_rows
+    responses = []
+
+    async def load(*args, **kwargs):
+        response = await original_load(*args, **kwargs)
+        responses.append((kwargs["target_storage_unit"], response))
+        return response
+
+    real_open = builtins.open
+
+    def no_payload_open(path, *args, **kwargs):
+        if isinstance(path, (str, Path)) and Path(path).name.startswith("shard_") and str(path).endswith(".pkl"):
+            raise AssertionError("Caller opened a payload shard")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", no_payload_open)
+    monkeypatch.setattr(manager, "_load_selected_rows", load)
+    monkeypatch.setattr(manager, "put_data", AsyncMock(side_effect=AssertionError("Caller sent payload through put")))
+    tq.load_data_by_key(dump_dir)
+    assert len({unit for unit, _ in responses}) == _NUM_STORAGE_UNITS
+    shard_bytes = sum(path.stat().st_size for path in (dump_dir / "shards").glob("shard_*.pkl"))
+    assert sum(response["bytes_read"] for _, response in responses) == shard_bytes
+    after = _keys_mapping(controller, partition)
+    assert all(after[key] == before[key] for key in keys)
+    assert "bystander" in after
+    actual = tq.kv_batch_get(keys, partition, select_fields=["input_ids"])
+    _assert_rows_equal(actual["input_ids"], [_row_input_ids(i) for i in range(16)])
+    extra = tq.kv_batch_get([keys[0]], partition, select_fields=["extra"])
+    _assert_rows_equal(extra["extra"], [torch.tensor([42])])
+    snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
+    assert snapshot.custom_meta[after[keys[0]]]["keep"]
+    assert snapshot.custom_meta[after[keys[0]]]["idx"] == 0
+
+
+def test_version_one_dump_remains_readable(tq_system, dump_dir, controller):
+    partition = "legacy"
+    dump_dir.mkdir(parents=True)
+    (dump_dir / "shards").mkdir()
+    torch.save(
+        {
+            "partition_id": partition,
+            "rows": {
+                "k": {"global_index": 100, "fields": ["x"], "tag": {"old": True}},
+                "empty": {"global_index": 101, "fields": [], "tag": {}},
+            },
+        },
+        dump_dir / "row_index.pt",
+    )
+    (dump_dir / "dump_info.json").write_text(
+        json.dumps(
+            {"format_version": 1, "partition_id": partition, "num_keys": 2, "num_rows_with_data": 1, "num_shards": 1}
+        )
+    )
+    (dump_dir / "shards" / "shard_info.json").write_text(
+        json.dumps([{"position": 0, "storage_unit_id": "old", "rows": 1}])
+    )
+    with (dump_dir / "shards" / "shard_0_old.pkl").open("wb") as f:
+        pickle.dump({"global_indexes": [100], "field_data": {"x": {100: torch.tensor([7, 8])}}}, f)
+    tq.load_data_by_key(dump_dir)
+    assert sorted(_keys_mapping(controller, partition)) == ["empty", "k"]
+    _assert_rows_equal(tq.kv_batch_get(["k"], partition, select_fields=["x"])["x"], [torch.tensor([7, 8])])
+
+
+def test_corrupt_shard_keeps_new_rows_unproduced(tq_system, dump_dir, controller):
+    partition = "corrupt"
+    _put_rows(partition, ["key"])
+    tq.dump_data_by_key(dump_dir, ["key"], partition)
+    path = next((dump_dir / "shards").glob("shard_*.pkl"))
+    path.write_bytes(b"!" * path.stat().st_size)
+    ray.get(controller.clear_partition.remote(partition))
+    with pytest.raises(RuntimeError, match="failed to load rows"):
+        tq.load_data_by_key(dump_dir)
+    snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
+    assert "key" in snapshot.keys_mapping
+    assert not snapshot.field_metadata
