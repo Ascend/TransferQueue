@@ -39,6 +39,7 @@ from typing import Any
 
 import torch
 
+from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -135,7 +136,7 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         # torch.save rather than json: a tag is an arbitrary picklable dict, and this
         # path must not fail on a tag that happens to hold a tensor.
         with open(tmp_dir / _ROW_INDEX_FILE, "wb") as f:
-            torch.save({"partition_id": partition_id, "rows": rows}, f)
+            torch.save({"partition_id": partition_id, "rows": rows}, f, pickle_module=compact_pickle)
             _fsync_file(f)
 
         with open(tmp_dir / _DUMP_INFO_FILE, "w", encoding="utf-8") as f:

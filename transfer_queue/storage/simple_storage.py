@@ -47,6 +47,7 @@ import ray
 import torch
 import zmq
 
+from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -1331,7 +1332,7 @@ class SimpleStorageUnit:
                 "global_indexes": sorted(dumped_indexes),
             }
             with open(path, "wb") as f:
-                pickle.dump(shard, f, protocol=pickle.HIGHEST_PROTOCOL)
+                compact_pickle.dump(shard, f)
                 # Report success only once the shard is on disk. Without this the call
                 # returns while the payload is still dirty page cache, and a node that
                 # dies before writeback leaves a dump whose manifest claims rows that
