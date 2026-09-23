@@ -60,8 +60,8 @@ _TQ_CLIENT: Any = None
 _TQ_STORAGE: Any = None
 _TQ_CONTROLLER: Any = None
 
-# Storage worker and proxy joins may take up to 10 seconds; leave time for Ray
-# dispatch and SSD cleanup without allowing close() to block indefinitely.
+# Idle workers and proxies observe shutdown within one second; leave time for
+# Ray dispatch, in-flight work, and SSD cleanup before forcing termination.
 _SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S = 15
 
 

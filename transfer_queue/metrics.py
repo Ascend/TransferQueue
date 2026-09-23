@@ -100,7 +100,6 @@ class TQMetricsExporter:
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
-        self._storage_ssd_fallback_values_seen: dict[str, int] = {}
         self._metrics_endpoint: str = ""
 
         # Plain-dict snapshot pushed by the controller via update_controller_snapshot().
@@ -218,8 +217,8 @@ class TQMetricsExporter:
             ["storage_unit_id"],
             registry=r,
         )
-        self.storage_ssd_fallback_values = Counter(
-            "tq_storage_ssd_fallback_values",
+        self.storage_ssd_fallback_values = Gauge(
+            "tq_storage_ssd_fallback_values_total",
             "Values retained in memory because SSD encoding was unavailable",
             ["storage_unit_id"],
             registry=r,
@@ -462,18 +461,9 @@ class TQMetricsExporter:
                 )
                 self.storage_ssd_active_values.labels(storage_unit_id=label).set(metrics.get("ssd_active_values", 0))
                 self.storage_ssd_active_bytes.labels(storage_unit_id=label).set(metrics.get("ssd_active_bytes", 0))
-                fallback_values = metrics.get("ssd_fallback_values_total", 0)
-                previous_fallback_values = self._storage_ssd_fallback_values_seen.get(label, 0)
-                # Storage units report lifetime totals. Advance the exporter counter only
-                # by unseen events, treating a lower value as a storage-unit restart.
-                fallback_delta = (
-                    fallback_values - previous_fallback_values
-                    if fallback_values >= previous_fallback_values
-                    else fallback_values
+                self.storage_ssd_fallback_values.labels(storage_unit_id=label).set(
+                    metrics.get("ssd_fallback_values_total", 0)
                 )
-                if fallback_delta:
-                    self.storage_ssd_fallback_values.labels(storage_unit_id=label).inc(fallback_delta)
-                self._storage_ssd_fallback_values_seen[label] = fallback_values
 
                 self.storage_requests_arrived.labels(storage_unit_id=label).set(metrics.get("requests_arrived", 0))
                 for op_type, arrived in (metrics.get("arrivals_by_op") or {}).items():

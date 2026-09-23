@@ -546,12 +546,15 @@ class HybridStorageUnitData(StorageUnitData):
             super().put_data(field_data, global_indexes)
             return
 
+        unique_global_indexes = set(global_indexes)
+        has_duplicate_indexes = len(unique_global_indexes) != len(global_indexes)
+
         for field, values in field_data.items():
             prepared_values, entries, fallback_values = self._prepare_field_values(values)
 
             stored_field = self.field_data.get(field, {})
             old_ssd_values = []
-            for global_index in set(global_indexes):
+            for global_index in unique_global_indexes:
                 old_value = stored_field.get(global_index)
                 if isinstance(old_value, _SSDValueRef):
                     old_ssd_values.append(old_value)
@@ -562,13 +565,22 @@ class HybridStorageUnitData(StorageUnitData):
                     self._ssd_store.unlink(entry)
                 raise
 
-            self._ssd_active_values += len(entries) - len(old_ssd_values)
+            obsolete_ssd_values = old_ssd_values
+            if has_duplicate_indexes:
+                retained_ssd_paths = set()
+                for global_index in unique_global_indexes:
+                    retained_value = self.field_data[field][global_index]
+                    if isinstance(retained_value, _SSDValueRef):
+                        retained_ssd_paths.add(retained_value.path)
+                obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
+
+            self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
             self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
-                value.size_bytes for value in old_ssd_values
+                value.size_bytes for value in obsolete_ssd_values
             )
             self._ssd_fallback_values_total += fallback_values
-            for old_value in old_ssd_values:
-                self._ssd_store.unlink(old_value)
+            for obsolete_value in obsolete_ssd_values:
+                self._ssd_store.unlink(obsolete_value)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Read mixed memory- and SSD-backed samples in request order."""
@@ -923,7 +935,8 @@ class SimpleStorageUnit:
         while not self._shutdown_event.is_set():
             monitor = self._metrics if self._metrics is not None else perf_monitor
             try:
-                socks = dict(poller.poll(TQ_STORAGE_POLLER_TIMEOUT * 1000))
+                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
             except zmq.error.ContextTerminated:
                 # ZMQ context was terminated, exit gracefully
                 logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")

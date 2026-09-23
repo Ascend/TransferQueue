@@ -140,7 +140,7 @@ Steps:
 | `tq_storage_ssd_offload_enabled` | Gauge | `storage_unit_id` | `1` when SSD offload is enabled, otherwise `0` |
 | `tq_storage_ssd_active_values` | Gauge | `storage_unit_id` | Active field values stored on SSD |
 | `tq_storage_ssd_active_bytes` | Gauge | `storage_unit_id` | Logical bytes held by active SSD-backed values |
-| `tq_storage_ssd_fallback_values_total` | Counter | `storage_unit_id` | Values retained in memory because SSD encoding was unavailable |
+| `tq_storage_ssd_fallback_values_total` | Gauge | `storage_unit_id` | Cumulative values retained in memory because SSD encoding was unavailable |
 | `tq_storage_request_ops` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
 | `tq_storage_request_latency_avg` | Gauge | `storage_unit_id`, `op_type` | Average request latency (seconds) |
 | `tq_storage_request_latency_p50` | Gauge | `storage_unit_id`, `op_type` | P50 request latency (seconds) |

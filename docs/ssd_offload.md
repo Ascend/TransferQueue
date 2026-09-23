@@ -112,12 +112,12 @@ The following value types can be stored on SSD:
 |------------|--------------------|
 | Dense PyTorch tensor | Raw tensor bytes, dtype, and shape |
 | NumPy array without object dtype | Raw array bytes, dtype, and shape |
+| NumPy array with object dtype | Pickle payload |
 | `bytes` | Original bytes |
 | Other Python value that `pickle` can serialize | Pickle payload |
 
-Nested or sparse PyTorch tensors, NumPy arrays with object dtype, and values
-that cannot be encoded remain in memory. A non-CPU tensor is copied to CPU
-before it is written to SSD.
+Nested or sparse PyTorch tensors and values that cannot be encoded remain in
+memory. A non-CPU tensor is copied to CPU before it is written to SSD.
 
 GET reads SSD-backed values and reconstructs their original types. SSD file
 references are internal and are not returned to the application.

@@ -657,6 +657,52 @@ def test_hybrid_checkpoint_copies_ssd_values_without_materializing(tmp_path, mon
         storage.close()
 
 
+def test_hybrid_checkpoint_load_failure_preserves_existing_state(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "target-ssd"),
+        run_id="target-run",
+        unit_id="target-unit",
+    )
+    checkpoint_storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "checkpoint-ssd"),
+        run_id="checkpoint-run",
+        unit_id="checkpoint-unit",
+    )
+    checkpoint_path = tmp_path / "storage_unit.pkl"
+    try:
+        storage.put_data({"value": [b"original" * 16]}, [1])
+        original_files = set((tmp_path / "target-ssd").rglob("*.bin"))
+
+        checkpoint_storage.put_data({"value": [b"x" * 100, b"y" * 100]}, [2, 3])
+        checkpoint_storage.save_checkpoint(checkpoint_path, "checkpoint-unit")
+
+        import_file = storage._ssd_store.import_file
+        import_count = 0
+
+        def fail_on_second_import(source, metadata):
+            nonlocal import_count
+            import_count += 1
+            if import_count == 2:
+                raise OSError("injected checkpoint import failure")
+            return import_file(source, metadata)
+
+        monkeypatch.setattr(storage._ssd_store, "import_file", fail_on_second_import)
+
+        with pytest.raises(OSError, match="injected checkpoint import failure"):
+            storage.load_checkpoint(checkpoint_path)
+
+        assert storage.get_data(["value"], [1]) == {"value": [b"original" * 16]}
+        assert storage.active_key_count == 1
+        assert set((tmp_path / "target-ssd").rglob("*.bin")) == original_files
+    finally:
+        storage.close()
+        checkpoint_storage.close()
+
+
 def test_hybrid_storage_loads_legacy_logical_checkpoint(tmp_path):
     storage = HybridStorageUnitData(
         storage_size=1,
@@ -701,9 +747,18 @@ def test_hybrid_storage_round_trips_supported_codecs(tmp_path):
         torch.arange(40, dtype=torch.float32),
     ]
     arrays = np.arange(64, dtype=np.float32).reshape(2, 32)
+    structured = np.zeros((2, 8), dtype=[("index", "<i4"), ("score", "<f8")])
+    structured["index"] = np.arange(16).reshape(2, 8)
+    structured["score"] = np.arange(16, dtype=np.float64).reshape(2, 8) / 2
     objects = [{"payload": "a" * 100}, {"payload": "b" * 100}]
     try:
-        fields = {"tensor": values, "variable": variable, "array": arrays, "object": objects}
+        fields = {
+            "tensor": values,
+            "variable": variable,
+            "array": arrays,
+            "structured": structured,
+            "object": objects,
+        }
         storage.put_data(fields, [1, 2])
         assert all(
             isinstance(value, _SSDValueRef)
@@ -712,6 +767,7 @@ def test_hybrid_storage_round_trips_supported_codecs(tmp_path):
         )
         assert {entry.codec for entry in storage.field_data["tensor"].values()} == {"tensor"}
         assert {entry.codec for entry in storage.field_data["array"].values()} == {"numpy"}
+        assert {entry.codec for entry in storage.field_data["structured"].values()} == {"numpy"}
         assert {entry.codec for entry in storage.field_data["object"].values()} == {"pickle"}
 
         result = storage.get_data(list(fields), [1, 2])
@@ -721,6 +777,9 @@ def test_hybrid_storage_round_trips_supported_codecs(tmp_path):
         torch.testing.assert_close(result["variable"][1], variable[1])
         np.testing.assert_array_equal(result["array"][0], arrays[0])
         np.testing.assert_array_equal(result["array"][1], arrays[1])
+        np.testing.assert_array_equal(result["structured"][0], structured[0])
+        np.testing.assert_array_equal(result["structured"][1], structured[1])
+        assert result["structured"][0].dtype == structured.dtype
         assert result["object"] == objects
     finally:
         storage.close()

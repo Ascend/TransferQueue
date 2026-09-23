@@ -116,7 +116,7 @@ class TestMetricDefinitions:
             "tq_storage_ssd_offload_enabled",
             "tq_storage_ssd_active_values",
             "tq_storage_ssd_active_bytes",
-            "tq_storage_ssd_fallback_values",
+            "tq_storage_ssd_fallback_values_total",
             "tq_storage_requests_arrived",
             "tq_storage_arrivals_by_op",
             "tq_storage_accept_queue_backlog",
@@ -350,8 +350,9 @@ class TestStorageMetricsCollection:
         assert exporter.storage_ssd_active_bytes.labels(storage_unit_id="SU_001")._value.get() == 4 * 1024 * 1024 * 1024
         assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 7
 
+        exporter._query_storage_unit.return_value["ssd_fallback_values_total"] = 9
         exporter.collect_storage_metrics()
-        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 7
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 9
 
     def test_arrival_counters_are_exported(self):
         """Arrival counts reach Prometheus, so a dashboard can compare them with completions."""
