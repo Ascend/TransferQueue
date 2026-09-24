@@ -15,8 +15,9 @@ tq.load_data_by_key("/shared/dumps/selected")
 ```
 
 Pause writes and clears for these keys during both operations. A dump is not an
-atomic snapshot of concurrent writers. Multiple publishers must not use the same
-dump directory concurrently.
+atomic snapshot of concurrent writers. Calls on the same dump path are serialized
+by an exclusive lock in a stable sibling `.lock` file. Different dump paths remain
+independent, and storage units within a load still read in parallel.
 
 ## Distributed I/O
 
@@ -92,7 +93,13 @@ SimpleStorage.
 Publication writes and syncs `.tmp`, moves the old directory to `.old`, publishes
 the new directory, and syncs its parent before deleting the backup. If publication
 is interrupted while the main directory is absent, the next dump, load or row-index
-read recovers `.old`. A backup-cleanup error does not invalidate a published dump.
+read recovers `.old`. Readers perform recovery only while holding the same lock as
+publishers, so a healthy rename window is never mistaken for a crashed writer.
+The load keeps the lock through all remote reads; a pending load marker continues
+to prevent replacement after a timeout or client exit. Do not delete the sibling
+lock file: unlinking it can create two independent locks for the same dump.
+The shared filesystem must provide cross-node advisory locking (not local-only
+locks). A backup-cleanup error does not invalidate a published dump.
 
 Restore is not transactional: payload writes before a failure remain. Every load
 has a unique ID. The controller blocks clearing/reusing its destination indexes

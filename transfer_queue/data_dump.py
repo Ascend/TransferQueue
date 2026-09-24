@@ -29,11 +29,13 @@ Layout::
             shard_<N>_<su_id>.pkl      # independent {global_index, fields} records
 """
 
+import fcntl
 import json
 import os
 import pickle
 import shutil
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -76,6 +78,20 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+@contextmanager
+def _dump_lock(dump_dir: str | Path):
+    """Serialize publication and recovery using a stable sibling inode shared by all callers."""
+    directory = Path(dump_dir).resolve()
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = directory.with_name(directory.name + ".lock")
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield directory
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _recover_dump(dump_dir: Path) -> None:
     old_dir = dump_dir.with_name(dump_dir.name + ".old")
     if not dump_dir.exists() and old_dir.exists():
@@ -91,7 +107,7 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
 
     The directory is replaced wholesale. The previous dump is retained as ``.old``
     until publication is durable, and recovered on the next access after interruption.
-    Only one writer may publish to a given directory at a time.
+    Access to the same directory is serialized with a sibling file lock.
 
     .. note::
         **Multi-node limitation**: dump_dir must reside on a shared network filesystem
@@ -113,6 +129,11 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         RuntimeError: TransferQueue is not initialized, the partition or a key does not
             exist, or a storage unit holds no data for a row it was asked to dump.
     """
+    with _dump_lock(dump_dir) as directory:
+        return _dump_data_by_key(directory, keys, partition_id)
+
+
+def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dict[str, int]:
     from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
 
     if _TQ_CONTROLLER is None:
@@ -237,6 +258,11 @@ def read_row_index(dump_dir: str | Path) -> dict[str, Any]:
     Raises:
         FileNotFoundError: The row index is missing.
     """
+    with _dump_lock(dump_dir) as directory:
+        return _read_row_index(directory)
+
+
+def _read_row_index(dump_dir: Path) -> dict[str, Any]:
     dump_dir = Path(dump_dir)
     _recover_dump(dump_dir)
     row_index_path = dump_dir / _ROW_INDEX_FILE
@@ -266,6 +292,11 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
         FileNotFoundError: The dump is incomplete.
         ValueError: The manifest or a row disagrees with the row index.
     """
+    with _dump_lock(dump_dir) as directory:
+        return _load_data_by_key(directory)
+
+
+def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
     from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
 
     if _TQ_CONTROLLER is None:
@@ -290,7 +321,7 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
             f"this build reads versions 1 through {DUMP_FORMAT_VERSION}"
         )
 
-    row_index = read_row_index(dump_dir)
+    row_index = _read_row_index(dump_dir)
     partition_id = row_index["partition_id"]
     rows = row_index["rows"]
 
@@ -432,6 +463,11 @@ def recover_data_load(dump_dir: str | Path) -> None:
     units can report completion; a lost unit requires restarting the whole TQ system.
     Partial payload writes remain, but subsequent index reuse is safe after success.
     """
+    with _dump_lock(dump_dir) as directory:
+        return _recover_data_load(directory)
+
+
+def _recover_data_load(dump_dir: Path) -> None:
     from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
 
     if _TQ_CONTROLLER is None:
