@@ -69,6 +69,10 @@ class StorageKVClient(ABC):
         """Clear key-value pairs in the storage backend."""
         raise NotImplementedError("Subclasses must implement clear")
 
+    def close(self) -> None:
+        """Release resources owned by the backend client, if any."""
+        return None
+
 
 class StorageClientFactory:
     """
