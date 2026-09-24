@@ -17,6 +17,9 @@
 
 import pickle
 
+import torch
+from tensordict import NonTensorStack
+
 
 def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
     """Read and validate exactly one record against its expected index and fields."""
@@ -28,3 +31,44 @@ def read_dump_row(file, offset: int, length: int, global_index: int, fields: lis
     if row["global_index"] != global_index or set(row["fields"]) != set(fields):
         raise ValueError(f"Dump row {global_index} disagrees with the row index in {file.name}")
     return row["fields"]
+
+
+def validate_dump_values(values: dict, schema: dict, source_index: int) -> None:
+    """Validate persisted tensor values without changing their type or dtype."""
+    for name, value in values.items():
+        field = schema[name]
+        if field["is_non_tensor"]:
+            continue
+        shape = field["per_sample_shapes"][source_index] if field["is_nested"] else field["shape"]
+        actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+        # Existing dense scalar fields use a one-element metadata shape.
+        scalar = actual_shape == () and tuple(shape) == (1,) and not field["is_nested"]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype != field["dtype"]
+            or (actual_shape != tuple(shape) and not scalar)
+        ):
+            raise ValueError(f"Dump field {name!r} disagrees with its saved schema at row {source_index}")
+
+
+def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: list[int], names: tuple) -> dict:
+    """Remap only the selected nested shapes to the current destination indexes."""
+    selected = {}
+    for name in names:
+        field = dict(schema[name])
+        if field["is_nested"]:
+            field["per_sample_shapes"] = {
+                target: field["per_sample_shapes"][source]
+                for source, target in zip(source_indexes, target_indexes, strict=True)
+            }
+        selected[name] = field
+    return selected
+
+
+def pack_dump_field(values: list, schema: dict):
+    """Build fallback KV batches according to the original field contract."""
+    if schema["is_non_tensor"]:
+        return NonTensorStack(*values)
+    if schema["is_nested"]:
+        return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+    return torch.stack(values)

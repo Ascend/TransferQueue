@@ -25,7 +25,7 @@ owner and concurrently asks those units to write their records. Only units holdi
 selected rows participate. Tensor storage is compacted during serialization, so a
 row view cannot include the rest of its original batch, including inside tags.
 
-On version-2 SimpleStorage restore:
+On version-3 SimpleStorage restore:
 
 1. The caller reads the row index and shard manifest and validates all file ranges.
 2. The controller resolves existing keys and allocates indexes for new keys.
@@ -55,7 +55,7 @@ These count application reads, not filesystem read-ahead or physical disk traffi
 
 ## Format and compatibility
 
-New dumps use `format_version: 2`:
+New dumps use `format_version: 3`:
 
 ```text
 dump_info.json
@@ -72,10 +72,17 @@ index and a field/value mapping. `shard_info.json` records each source index's
 current indexes without controller resolution. `row_index.pt` remains readable
 with `read_row_index` without opening payload shards.
 
-Version-1 dumps remain readable using the prior caller-side KV put path. Restoring
+Version 3 also saves the original field schemas and only the selected nested row
+shapes. Restore uses that schema regardless of target topology or batch boundaries;
+non-tensor fields remain non-tensor even when a batch happens to contain only tensors.
+Destination type conflicts are rejected before payload writes.
+
+Version-1 dumps remain readable using the prior caller-side KV put path. Version-2
+dumps retain direct reads, but lack original schemas and use the older inference
+behavior; exact field-type preservation cannot be guaranteed for those files. Restoring
 to a backend without direct selective loading also uses KV puts. These compatibility
 paths do not provide distributed file reads. Old builds that only understand
-version 1 cannot read version-2 dumps. Export of nonempty dumps currently requires
+versions 1 or 2 cannot read version-3 dumps. Export of nonempty dumps currently requires
 SimpleStorage.
 
 ## Failure behavior

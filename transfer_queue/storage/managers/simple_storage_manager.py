@@ -868,7 +868,7 @@ class AsyncSimpleStorageManager(StorageManager):
             for unit_id, group in self._group_by_hash([row["target_index"] for row in rows]).items():
                 assignments[unit_id].append(
                     {
-                        "path": shard["path"],
+                        **shard,
                         "records": [rows[pos] for pos in group.batch_positions],
                     }
                 )

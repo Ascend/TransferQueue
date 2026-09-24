@@ -1124,48 +1124,68 @@ class AsyncTransferQueueClient:
                     return False
         return True
 
+    async def _request_controller(
+        self,
+        socket: zmq.asyncio.Socket | None,
+        request_type: ZMQRequestType,
+        response_type: ZMQRequestType,
+        body: dict[str, Any],
+    ) -> ZMQMessage:
+        """Send one controller request and validate its response type."""
+        assert socket is not None
+        request_msg = ZMQMessage.create(
+            request_type=request_type,  # type: ignore[arg-type]
+            sender_id=self.client_id,
+            receiver_id=self._controller.id,
+            body=body,
+        )
+        await socket.send_multipart(request_msg.serialize())
+        response_serialized = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(response_serialized)
+        logger.debug(f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}")
+        if response_msg.request_type != response_type:
+            message = response_msg.body.get("message", "Unknown error")
+            raise RuntimeError(
+                f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
+                f"from controller {self._controller.id}: {message}"
+            )
+        return response_msg
+
     # ==================== Selective Data Dump API ====================
     @with_controller_socket
-    async def async_describe_rows_by_key(
+    async def async_describe_data_dump(
         self,
         partition_id: str,
         keys: list[str],
         socket: zmq.asyncio.Socket | None = None,
-    ) -> dict[str, dict[str, Any]]:
-        """Asynchronously fetch the row metadata a selective dump needs, via ZMQ RPC.
+    ) -> dict[str, Any]:
+        """Fetch selected rows and their original field schemas without payloads."""
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY,
+            response_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+            body={"partition_id": partition_id, "keys": keys},
+        )
+        return {name: response.body[name] for name in ("partition_id", "rows", "field_schema")}
 
-        Args:
-            partition_id: Partition that owns ``keys``.
-            keys: Keys to describe, already deduplicated by the caller.
-            socket: ZMQ socket injected by @with_controller_socket.
+    async def async_describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Fetch key-addressed row metadata, preserving the existing row-only API."""
+        return (await self.async_describe_data_dump(partition_id, keys))["rows"]
 
-        Returns:
-            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``.
-
-        Raises:
-            RuntimeError: If the RPC fails, or the partition or a key is unknown.
-        """
-        try:
-            assert socket is not None
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY,  # type: ignore[arg-type]
-                sender_id=self.client_id,
-                receiver_id=self._controller.id,
-                body={"partition_id": partition_id, "keys": keys},
-            )
-            await socket.send_multipart(request_msg.serialize())
-            response_serialized = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(response_serialized)
-            if response_msg.request_type != ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE:
-                raise RuntimeError(
-                    f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
-                    f"from controller during row description"
-                )
-            if not response_msg.body["success"]:
-                raise RuntimeError(response_msg.body["message"])
-            return response_msg.body["rows"]
-        except Exception as e:
-            raise RuntimeError(f"[{self.client_id}]: Error in describe_rows_by_key: {str(e)}") from e
+    @with_controller_socket
+    async def async_validate_dump_schema(
+        self,
+        partition_id: str,
+        field_schema: dict,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
+            response_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE,
+            body={"partition_id": partition_id, "field_schema": field_schema},
+        )
 
     async def async_dump_rows_by_index(
         self,
@@ -1425,6 +1445,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
         self._describe_rows_by_key = _make_sync(self.async_describe_rows_by_key)
+        self._describe_data_dump = _make_sync(self.async_describe_data_dump)
+        self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
@@ -1878,6 +1900,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
             RuntimeError: If the RPC fails, or the partition or a key is unknown.
         """
         return self._describe_rows_by_key(partition_id, keys)
+
+    def describe_data_dump(self, partition_id: str, keys: list[str]) -> dict[str, Any]:
+        """Fetch the row index and selected field schemas for a selective dump."""
+        return self._describe_data_dump(partition_id, keys)
+
+    def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        return self._validate_dump_schema(partition_id, field_schema)
 
     def dump_rows_by_index(
         self,

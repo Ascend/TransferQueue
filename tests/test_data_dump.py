@@ -73,8 +73,10 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     batch = torch.arange(64 * 4096).reshape(64, 4096)
     tag = {"nested": [SimpleNamespace(value=batch[0])]}
     client = SimpleNamespace(
-        describe_rows_by_key=lambda *_: {
-            "key": {"global_index": 0, "fields": [], "tag": tag},
+        describe_data_dump=lambda *_: {
+            "partition_id": "p",
+            "rows": {"key": {"global_index": 0, "fields": [], "tag": tag}},
+            "field_schema": {},
         }
     )
     monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
@@ -88,7 +90,9 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
 @pytest.fixture
 def empty_dump_client(monkeypatch):
     monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
-    monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: object())
+    monkeypatch.setattr(
+        interface, "_maybe_create_tq_client", lambda: SimpleNamespace(validate_dump_schema=lambda *_: None)
+    )
 
 
 def test_failed_publication_preserves_previous_dump(empty_dump_client, monkeypatch, tmp_path):
@@ -301,7 +305,18 @@ def test_version_two_falls_back_to_kv_for_other_backends(unit, monkeypatch, tmp_
             }
         ]
 
-    client = SimpleNamespace(describe_rows_by_key=lambda *_: rows, dump_rows_by_index=dump, storage_manager=object())
+    client = SimpleNamespace(
+        describe_data_dump=lambda *_: {
+            "partition_id": "p",
+            "rows": rows,
+            "field_schema": {
+                "x": {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False},
+            },
+        },
+        validate_dump_schema=lambda *_: None,
+        dump_rows_by_index=dump,
+        storage_manager=object(),
+    )
     monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
     monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
     data_dump.dump_data_by_key(tmp_path / "dump", list(rows), "p")
@@ -375,3 +390,15 @@ async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
     with pytest.raises(OSError, match="write failed"):
         await manager.dump_rows_by_index(str(tmp_path), [0, 1])
     assert completed == ["u1"]
+
+
+def test_rejected_schema_does_not_mark_new_row_ready():
+    from transfer_queue.controller import DataPartitionStatus
+
+    partition = DataPartitionStatus("p")
+    schema = {"x": {"dtype": torch.int64, "shape": (1,), "is_non_tensor": False, "is_nested": False}}
+    assert partition.update_production_status([0], ["x"], schema)
+    conflict = {"x": {**schema["x"], "dtype": torch.float32}}
+    assert not partition.update_production_status([1], ["x"], conflict)
+    assert partition.production_status[1, partition.field_name_mapping["x"]] == 0
+    assert partition.field_metadata["x"].global_indexes == {0}

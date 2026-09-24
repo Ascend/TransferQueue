@@ -33,7 +33,7 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
 
@@ -129,5 +129,34 @@ def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units
         snapshot = ray.get(controller.get_partition_snapshot.remote(partition_id))
         for row, key in enumerate(keys):
             assert snapshot.custom_meta[snapshot.keys_mapping[key]]["idx"] == row
+    finally:
+        tq.close()
+
+
+@pytest.mark.parametrize("row_count", [2, 127, 128, 129, 130])
+def test_preserves_nontensor_schema_across_topology(ray_init, dump_dir, row_count):
+    keys = [f"k{i}" for i in range(row_count)]
+    values = [torch.tensor([i], dtype=torch.int64) for i in range(row_count - 1)] + [torch.tensor([1.5])]
+    if row_count > 2:
+        values[-2] = None
+    tq.init(_tq_config(1))
+    try:
+        tq.kv_batch_put(keys, "mixed", TensorDict({"x": NonTensorStack(*values)}, batch_size=row_count))
+        tq.dump_data_by_key(dump_dir, keys, "mixed")
+    finally:
+        tq.close()
+    tq.init(_tq_config(2))
+    try:
+        tq.load_data_by_key(dump_dir)
+        schema = tq.get_client().kv_retrieve_meta(keys, "mixed").field_schema["x"]
+        assert schema["is_non_tensor"]
+        assert schema["dtype"] is None
+        assert not schema["is_nested"]
+        for key, expected in zip(keys, values, strict=True):
+            value = tq.kv_batch_get([key], "mixed", ["x"])["x"][0]
+            if expected is None:
+                assert value is None
+            else:
+                torch.testing.assert_close(value, expected)
     finally:
         tq.close()

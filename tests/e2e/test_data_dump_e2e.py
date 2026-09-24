@@ -504,3 +504,13 @@ def test_corrupt_shard_keeps_new_rows_unproduced(tq_system, dump_dir, controller
     snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
     assert "key" in snapshot.keys_mapping
     assert not snapshot.field_metadata
+
+
+def test_incompatible_schema_rejected_before_writes(tq_system, dump_dir, controller):
+    tq.kv_batch_put(["k"], "schema", TensorDict({"x": torch.tensor([[3]], dtype=torch.int64)}, batch_size=1))
+    tq.dump_data_by_key(dump_dir, ["k"], "schema")
+    tq.get_client().clear_partition("schema")
+    tq.kv_batch_put(["k"], "schema", TensorDict({"x": torch.tensor([[1.5]])}, batch_size=1))
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        tq.load_data_by_key(dump_dir)
+    _assert_rows_equal(tq.kv_batch_get(["k"], "schema", ["x"])["x"], [torch.tensor([1.5])])
