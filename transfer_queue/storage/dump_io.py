@@ -72,3 +72,13 @@ def pack_dump_field(values: list, schema: dict):
     if schema["is_nested"]:
         return torch.nested.as_nested_tensor(values, layout=torch.jagged)
     return torch.stack(values)
+
+
+class RestorePendingError(RuntimeError):
+    """The controller still reserves indexes until remote restore activity is settled."""
+
+    def __init__(self, restore_id: str):
+        self.restore_id = restore_id
+        super().__init__(
+            f"Restore {restore_id} has an unknown outcome; run recover_data_load before retrying or clearing"
+        )

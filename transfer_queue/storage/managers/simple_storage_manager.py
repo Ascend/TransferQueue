@@ -860,7 +860,9 @@ class AsyncSimpleStorageManager(StorageManager):
             for pos, ((su_id, _), offsets) in enumerate(zip(targets, row_offsets, strict=True))
         ]
 
-    async def load_rows_by_index(self, shards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def load_rows_by_index(
+        self, shards: list[dict[str, Any]], restore: dict | None = None
+    ) -> list[dict[str, Any]]:
         """Have current owner units read assigned byte ranges concurrently."""
         assignments = defaultdict(list)
         for shard in shards:
@@ -873,10 +875,15 @@ class AsyncSimpleStorageManager(StorageManager):
                     }
                 )
         results = await asyncio.gather(
-            *(self._load_selected_rows(shards, target_storage_unit=unit_id) for unit_id, shards in assignments.items()),
+            *(
+                self._load_selected_rows(
+                    shards, target_storage_unit=unit_id, **({"restore": restore} if restore else {})
+                )
+                for unit_id, shards in assignments.items()
+            ),
             return_exceptions=True,
         )
-        # Wait for every unit before returning an error; callers may retry or clean up.
+        # Local RPC completion is not remote completion; the controller retains reservations on timeout.
         for result in results:
             if isinstance(result, BaseException):
                 raise result
@@ -893,13 +900,14 @@ class AsyncSimpleStorageManager(StorageManager):
         self,
         shards: list[dict[str, Any]],
         target_storage_unit: str,
+        restore: dict | None = None,
         socket: zmq.Socket = None,
     ) -> dict[str, Any]:
         request = ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"shards": shards},
+            body={"shards": shards, "restore": restore},
         )
         await socket.send_multipart(request.serialize(), copy=False)
         response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
@@ -908,6 +916,23 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
             )
         return response.body
+
+    async def report_restore(self, restore: dict) -> None:
+        """Ask units to resend cached terminal results; unknown units cannot grant release."""
+        await asyncio.gather(
+            *(self._report_restore_unit(restore, target_storage_unit=unit) for unit in self.storage_unit_infos),
+            return_exceptions=True,
+        )
+
+    @with_storage_unit_socket
+    async def _report_restore_unit(self, restore: dict, target_storage_unit: str, socket: zmq.Socket = None) -> None:
+        request = ZMQMessage.create(
+            request_type=ZMQRequestType.REPORT_RESTORE, sender_id=self.storage_manager_id, body=restore
+        )
+        await socket.send_multipart(request.serialize())
+        response = ZMQMessage.deserialize(await socket.recv_multipart())
+        if response.request_type != ZMQRequestType.REPORT_RESTORE_RESPONSE or not response.body.get("success"):
+            raise RuntimeError("Storage unit could not report its restore result")
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.

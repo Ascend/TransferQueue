@@ -34,8 +34,10 @@ On version-3 SimpleStorage restore:
 4. Each target unit reads only its assigned byte ranges and merges those values
    into local storage. Records are processed in batches of at most 128 rows per
    shard; the caller never reads or forwards their payloads.
-5. After all units succeed, the client publishes returned field schemas through
-   the controller and merges tags using the normal metadata update path.
+5. Each unit claims permission from the controller before writing, then reports
+   completion directly. The client commits the saved schemas and tags only after
+   every unit has completed. The controller reserves the destination partition
+   until commit or confirmed cancellation.
 
 The number of source units can differ from the number of destination units.
 Even a dump with one source shard can restore across several target units because
@@ -47,7 +49,7 @@ storage unit. Local temporary storage suffices for single-node deployments.
 | Operation | State | Payload I/O | Unit count on restore |
 | --- | --- | --- | --- |
 | Checkpoint | Entire controller and storage state | Each unit reads/writes its whole file | Must match |
-| Selective v2 dump | Selected fields and tags, merged by key | Each owner unit reads/writes its records | May differ |
+| Selective v3 dump | Selected fields and tags, merged by key | Each owner unit reads/writes its records | May differ |
 
 `DUMP_ROWS` and `LOAD_ROWS` are included in storage operation metrics. Unit logs
 record loaded rows and bytes; the manager logs total bytes and participating units.
@@ -79,9 +81,9 @@ Destination type conflicts are rejected before payload writes.
 
 Version-1 dumps remain readable using the prior caller-side KV put path. Version-2
 dumps retain direct reads, but lack original schemas and use the older inference
-behavior; exact field-type preservation cannot be guaranteed for those files. Restoring
-to a backend without direct selective loading also uses KV puts. These compatibility
-paths do not provide distributed file reads. Old builds that only understand
+behavior; exact field-type preservation cannot be guaranteed for those files.
+Restoring to a backend without direct selective loading uses KV puts. Version-1
+and KV fallback restores do not provide distributed file reads. Old builds that only understand
 versions 1 or 2 cannot read version-3 dumps. Export of nonempty dumps currently requires
 SimpleStorage.
 
@@ -92,11 +94,30 @@ the new directory, and syncs its parent before deleting the backup. If publicati
 is interrupted while the main directory is absent, the next dump, load or row-index
 read recovers `.old`. A backup-cleanup error does not invalidate a published dump.
 
-Restore is not transactional. All unit requests are awaited before returning an
-error, and failed storage requests prevent publication of new ready metadata.
-Earlier payload writes or earlier metadata updates can remain after a failure;
-existing produced rows may already contain restored values. Correct the cause and
-retry the same dump with writers paused. No unrelated partition is cleared.
+Restore is not transactional: payload writes before a failure remain. Every load
+has a unique ID. The controller blocks clearing/reusing its destination indexes
+and conflicting KV puts while an operation is unresolved. Units must claim that ID
+before writing; cancellation rejects requests that have not yet claimed permission.
+A receive timeout never releases a writer that has already claimed permission.
+
+`RestorePendingError` means remote work is still running or its outcome is unknown.
+The dump also retains a sibling `.restore` marker so an interrupted client cannot
+silently allow its files to be replaced. After an interruption, call:
+
+```python
+tq.recover_data_load("/shared/dumps/selected")
+```
+
+Recovery cancels unclaimed work, asks units to resend terminal results, and releases
+indexes only after every claimed worker has finished. It does not publish partial
+restores as ready or undo payload writes. Retry recovery while a unit is still busy;
+a lost unit requires stopping the old TQ actors and restarting the whole TQ system.
+Restarting only the controller while old storage actors run is unsupported. After
+recovery succeeds, retry the dump or clear its keys. Unknown operations remain
+reserved rather than guessing that a timeout stopped remote execution.
+
+Writers that already hold low-level metadata must remain paused throughout recovery.
+The reservation covers the destination partition, so unrelated partitions can proceed.
 
 ## Tests
 

@@ -15,8 +15,8 @@
 
 """Persist selected rows and restore them by key without checkpointing controller state.
 
-Version 3 preserves field schemas alongside independent row records in each storage-unit shard. The manifest
-maps source indexes to byte offsets, so current owner units can read only their rows
+Version 3 preserves field schemas alongside independent row records in each shard.
+The manifest maps source indexes to byte offsets, so current owner units read only their rows
 when restoring into a different topology. Version 1 remains readable via KV puts.
 
 Layout::
@@ -36,11 +36,12 @@ import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import torch
 from tensordict import TensorDict
 
-from transfer_queue.storage.dump_io import pack_dump_field, read_dump_row, validate_dump_values
+from transfer_queue.storage.dump_io import RestorePendingError, pack_dump_field, read_dump_row, validate_dump_values
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.tensor_utils import pack_field_values
@@ -118,7 +119,13 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
     unique_keys = list(dict.fromkeys(keys))
-    dump_dir = Path(dump_dir).absolute()
+    dump_dir = Path(dump_dir).resolve()
+    client = _maybe_create_tq_client()
+    if hasattr(client, "check_data_loads"):
+        client.check_data_loads(str(dump_dir))
+    marker = dump_dir.with_name(dump_dir.name + ".restore")
+    if marker.exists():
+        raise RestorePendingError(marker.read_text().strip())
     _recover_dump(dump_dir)
     tmp_dir = dump_dir.parent / (dump_dir.name + ".tmp")
     old_dir = dump_dir.with_name(dump_dir.name + ".old")
@@ -127,7 +134,6 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
     tmp_dir.mkdir(parents=True)
 
     try:
-        client = _maybe_create_tq_client()
         row_index = (
             client.describe_data_dump(partition_id, unique_keys)
             if unique_keys
@@ -245,8 +251,8 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
     SimpleStorage units read their assigned indexed records directly and in parallel.
     Version-1 dumps and other backends use the compatible KV put path. New keys receive
     current indexes; unrelated rows and fields remain untouched. Writers and clears for
-    these keys must be paused during restore. Failure may leave partial payload writes;
-    retry the same dump after correcting the failure.
+    these keys must be paused during restore. Failure may leave partial payload writes.
+    On RestorePendingError, call recover_data_load before retrying or clearing.
 
     Args:
         dump_dir: Directory previously written by ``dump_data_by_key``. For direct
@@ -265,7 +271,13 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
-    dump_dir = Path(dump_dir).absolute()
+    dump_dir = Path(dump_dir).resolve()
+    client = _maybe_create_tq_client()
+    if hasattr(client, "check_data_loads"):
+        client.check_data_loads(str(dump_dir))
+    marker = dump_dir.with_name(dump_dir.name + ".restore")
+    if marker.exists():
+        raise RestorePendingError(marker.read_text().strip())
     _recover_dump(dump_dir)
     info_path = dump_dir / _DUMP_INFO_FILE
     if not info_path.exists():
@@ -334,7 +346,21 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
     if dump_info["format_version"] >= 3:
         client.validate_dump_schema(partition_id, row_index["field_schema"])
     if dump_info["format_version"] >= 2 and hasattr(getattr(client, "storage_manager", None), "load_rows_by_index"):
-        client.load_rows_by_key(partition_id, rows, shards)
+        restore_id = uuid4().hex
+        if rows:
+            with marker.open("x") as f:
+                f.write(restore_id)
+                _fsync_file(f)
+            _fsync_directory(marker.parent)
+        try:
+            client.load_rows_by_key(partition_id, rows, shards, str(dump_dir), restore_id)
+        except RestorePendingError:
+            raise
+        except Exception:
+            marker.unlink(missing_ok=True)
+            raise
+        else:
+            marker.unlink(missing_ok=True)
     else:
         _load_via_kv(partition_id, rows, shards, dump_info["format_version"])
 
@@ -396,3 +422,22 @@ def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict], ve
     keys = [key for key, row in rows.items() if not row["fields"]]
     if keys:
         kv_batch_put(keys, partition_id, tags=[rows[key]["tag"] for key in keys])
+
+
+def recover_data_load(dump_dir: str | Path) -> None:
+    """Settle an interrupted restore before retrying or releasing destination indexes.
+
+    This cancels work that has not claimed permission and waits for known writers.
+    Running or unreachable units keep the reservation. Retry recovery once those
+    units can report completion; a lost unit requires restarting the whole TQ system.
+    Partial payload writes remain, but subsequent index reuse is safe after success.
+    """
+    from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
+
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+    dump_dir = Path(dump_dir).resolve()
+    marker = dump_dir.with_name(dump_dir.name + ".restore")
+    ids = [marker.read_text().strip()] if marker.exists() else []
+    _maybe_create_tq_client().recover_data_load(str(dump_dir), ids)
+    marker.unlink(missing_ok=True)

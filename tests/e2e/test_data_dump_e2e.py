@@ -514,3 +514,31 @@ def test_incompatible_schema_rejected_before_writes(tq_system, dump_dir, control
     with pytest.raises(RuntimeError, match="dtype mismatch"):
         tq.load_data_by_key(dump_dir)
     _assert_rows_equal(tq.kv_batch_get(["k"], "schema", ["x"])["x"], [torch.tensor([1.5])])
+
+
+def test_running_restore_blocks_clear_and_dump_until_recovery(tq_system, dump_dir, controller):
+    _put_rows("reserved", ["key"])
+    tq.dump_data_by_key(dump_dir, ["key"], "reserved")
+    client = tq.get_client()
+    manager = client.storage_manager
+    rows = tq.read_row_index(dump_dir)["rows"]
+    tq.save_checkpoint(dump_dir.parent / "checkpoint")
+    units = list(manager.storage_unit_infos)
+    metadata = ray.get(
+        controller.begin_restore.remote("running-test", str(dump_dir.resolve()), "reserved", rows, units, {})
+    )
+    owner = units[metadata.global_indexes[0] % len(units)]
+    ray.get(controller.restore_unit.remote("running-test", owner, "claim"))
+    with pytest.raises(RuntimeError, match="unresolved"):
+        client.clear_partition("reserved")
+    with pytest.raises(tq.RestorePendingError):
+        tq.dump_data_by_key(dump_dir, ["key"], "reserved")
+    with pytest.raises(tq.RestorePendingError):
+        tq.load_checkpoint(dump_dir.parent / "checkpoint")
+    with pytest.raises(tq.RestorePendingError):
+        tq.recover_data_load(dump_dir)
+    ray.get(controller.restore_unit.remote("running-test", owner, "complete", {"success": False}))
+    tq.recover_data_load(dump_dir)
+    client.clear_partition("reserved")
+    tq.load_data_by_key(dump_dir)
+    assert tq.kv_batch_get(["key"], "reserved", ["input_ids"]).batch_size[0] == 1

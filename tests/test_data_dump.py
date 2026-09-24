@@ -20,14 +20,11 @@ import builtins
 import io
 import pickle
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 import torch
 
 from transfer_queue import data_dump, interface
-from transfer_queue.client import AsyncTransferQueueClient
-from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
@@ -194,7 +191,7 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
         records.append(
             {"source_index": source, "target_index": target, "fields": ["x"], "offset": offset, "length": length}
         )
-    loaded = unit._handle_load_rows(
+    loaded = unit._load_rows(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -238,20 +235,6 @@ async def test_manager_loads_current_owners_concurrently():
     assert sorted(seen) == list(range(16))
 
 
-@pytest.mark.asyncio
-async def test_failed_load_does_not_publish_ready_metadata():
-    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
-    client.close = lambda: None
-    client.storage_manager = SimpleNamespace(load_rows_by_index=AsyncMock(side_effect=RuntimeError("read failed")))
-    client.async_kv_retrieve_meta = AsyncMock(return_value=BatchMeta(global_indexes=[9], partition_ids=["p"]))
-    client._publish_loaded_rows = AsyncMock()
-    client.async_set_custom_meta = AsyncMock()
-    with pytest.raises(RuntimeError, match="read failed"):
-        await client.async_load_rows_by_key("p", {"k": {"tag": {}}}, [])
-    client._publish_loaded_rows.assert_not_called()
-    client.async_set_custom_meta.assert_not_called()
-
-
 @pytest.mark.parametrize("problem", ["wrong_index", "truncated", "missing_field"])
 def test_unit_rejects_invalid_records(unit, tmp_path, problem):
     path = tmp_path / "row.pkl"
@@ -263,7 +246,7 @@ def test_unit_rejects_invalid_records(unit, tmp_path, problem):
         record["length"] += 1
     else:
         record["fields"] = ["missing"]
-    reply = unit._handle_load_rows(
+    reply = unit._load_rows(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -351,21 +334,6 @@ async def test_load_waits_for_other_units_before_raising():
     with pytest.raises(RuntimeError, match="unit failed"):
         await manager.load_rows_by_index([{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}])
     assert finished == ["u1"]
-
-
-@pytest.mark.asyncio
-async def test_load_rejects_failed_controller_metadata_ack():
-    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
-    client.close = lambda: None
-    client._request_controller = AsyncMock(return_value=SimpleNamespace(body={"success": False}))
-    with pytest.raises(RuntimeError, match="Controller rejected"):
-        await AsyncTransferQueueClient._publish_loaded_rows.__wrapped__(
-            client,
-            "p",
-            [
-                {"global_indexes": [3], "field_schema": {}},
-            ],
-        )
 
 
 @pytest.mark.asyncio
