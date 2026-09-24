@@ -33,6 +33,37 @@ from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes
 
 logger = get_logger(__name__)
 
+
+def _ensure_accelerator_context() -> None:
+    """Bind the calling thread to an accelerator device context.
+
+    Ascend ACL contexts are thread-local, so Mooncake register/unregister fails
+    with INVALID_PARAMS on a ThreadPoolExecutor worker that never set a device.
+    """
+    npu = getattr(torch, "npu", None)
+    if npu is None:
+        try:
+            import torch_npu  # noqa: F401
+        except Exception:  # pragma: no cover - accelerator optional
+            return
+        npu = getattr(torch, "npu", None)
+    if npu is None or not npu.is_available():
+        return
+
+    try:
+        npu.set_device(npu.current_device())
+    except Exception:
+        pass
+
+    # Force context creation once per process.
+    if not getattr(_ensure_accelerator_context, "_initialized", False):
+        try:
+            torch.zeros(1, device="npu")
+        except Exception:  # pragma: no cover - best effort
+            pass
+        _ensure_accelerator_context._initialized = True
+
+
 MOONCAKE_STORE_IMPORTED: bool = True
 try:
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -121,6 +152,8 @@ class MooncakeStoreClient(StorageKVClient):
             hard_pin = not offload_enabled
         self.replica_config.with_hard_pin = bool(hard_pin)
 
+        _ensure_accelerator_context()
+
         self._store = MooncakeDistributedStore()
         ret = self._store.setup(
             self.local_hostname,
@@ -173,7 +206,10 @@ class MooncakeStoreClient(StorageKVClient):
 
         tensor_futures: list[Future[None]] = []
         bytes_futures: list[Future[list[int]]] = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=_ensure_accelerator_context,
+        ) as executor:
             if not use_gdr_path:
                 for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
                     batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
@@ -373,7 +409,10 @@ class MooncakeStoreClient(StorageKVClient):
                 results[idx] = val
 
         futures = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=_ensure_accelerator_context,
+        ) as executor:
             for i in range(0, len(cpu_tensor_indices), BATCH_SIZE_LIMIT):
                 batch_keys = cpu_tensor_keys[i : i + BATCH_SIZE_LIMIT]
                 batch_shapes = cpu_tensor_shapes[i : i + BATCH_SIZE_LIMIT]
