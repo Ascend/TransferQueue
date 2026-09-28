@@ -1286,6 +1286,10 @@ class AsyncTransferQueueClient:
         """Cancel unclaimed loads and release only operations whose claimed workers have finished."""
         response = await self._restore_rpc(ZMQRequestType.LIST_RESTORES, {"dump_dir": dump_dir})
         for restore_id in set(response["restore_ids"]) | set(restore_ids or []):
+            if not hasattr(self.storage_manager, "report_restore"):
+                raise NotImplementedError(
+                    f"{type(self.storage_manager).__name__} does not support selective load recovery"
+                )
             await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
             await self.storage_manager.report_restore(self._restore_context(restore_id))
             result = await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})

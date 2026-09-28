@@ -16,11 +16,13 @@
 """Restore reservations prevent late writes from corrupting reused indexes."""
 
 from threading import RLock
+from unittest.mock import AsyncMock
 
 import pytest
 import torch
 import zmq
 
+from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import PartitionIndexManager, TransferQueueController
 from transfer_queue.sampler import SequentialSampler
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
@@ -44,6 +46,22 @@ def controller():
 
 def begin(controller, restore_id="r"):
     return controller.begin_restore(restore_id, "/dump", "p", {"k": {"fields": ["x"], "tag": {}}}, ["u"], {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("active_ids", "saved_ids"), [([], []), (["r"], []), ([], ["r"])])
+async def test_recovery_checks_backend_before_cancelling(active_ids, saved_ids):
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client.storage_manager = object()
+    client._restore_rpc = AsyncMock(return_value={"restore_ids": active_ids})
+
+    if active_ids or saved_ids:
+        with pytest.raises(NotImplementedError, match="does not support selective load recovery"):
+            await client.async_recover_data_load("/dump", saved_ids)
+    else:
+        await client.async_recover_data_load("/dump", saved_ids)
+
+    client._restore_rpc.assert_awaited_once_with(ZMQRequestType.LIST_RESTORES, {"dump_dir": "/dump"})
 
 
 def test_cancel_before_claim_rejects_late_load_and_late_begin(controller):
