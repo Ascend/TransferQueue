@@ -1790,7 +1790,7 @@ class TransferQueueController:
                 ),
                 "tag": partition.custom_meta.get(global_index, {}),
             }
-            for key, global_index in zip(keys, global_indexes, strict=True)
+            for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True)
         }
 
     def _assert_not_restoring(self, partition_id: str | None = None) -> None:
