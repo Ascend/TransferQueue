@@ -847,18 +847,18 @@ class AsyncSimpleStorageManager(StorageManager):
             ),
             return_exceptions=True,
         )
-        for result in row_offsets:
-            if isinstance(result, BaseException):
-                raise result
+        shards = []
+        total_rows = 0
+        for pos, ((su_id, _), offsets) in enumerate(zip(targets, row_offsets, strict=True)):
+            if isinstance(offsets, BaseException):
+                raise offsets
+            total_rows += len(offsets)
+            shards.append({"position": pos, "storage_unit_id": su_id, "rows": len(offsets), "row_offsets": offsets})
 
         logger.info(
-            f"[{self.storage_manager_id}]: dumped {sum(len(offsets) for offsets in row_offsets)} rows "
-            f"across {len(targets)} shards to {shard_dir_path}"
+            f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"
         )
-        return [
-            {"position": pos, "storage_unit_id": su_id, "rows": len(offsets), "row_offsets": offsets}
-            for pos, ((su_id, _), offsets) in enumerate(zip(targets, row_offsets, strict=True))
-        ]
+        return shards
 
     async def load_rows_by_index(
         self, shards: list[dict[str, Any]], restore: dict | None = None
@@ -884,16 +884,20 @@ class AsyncSimpleStorageManager(StorageManager):
             return_exceptions=True,
         )
         # Local RPC completion is not remote completion; the controller retains reservations on timeout.
+        updates = []
+        bytes_read = 0
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+            bytes_read += result["bytes_read"]
+            updates.extend(result["updates"])
         logger.info(
             "[%s]: loaded %s bytes across %s units",
             self.storage_manager_id,
-            sum(result["bytes_read"] for result in results),
+            bytes_read,
             len(assignments),
         )
-        return [update for result in results for update in result["updates"]]
+        return updates
 
     @with_storage_unit_socket
     async def _load_selected_rows(
