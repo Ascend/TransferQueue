@@ -440,7 +440,7 @@ def test_direct_load_bypasses_caller_payload_io(tq_system, dump_dir, controller,
     real_open = builtins.open
 
     def no_payload_open(path, *args, **kwargs):
-        if isinstance(path, (str, Path)) and Path(path).name.startswith("shard_") and str(path).endswith(".pkl"):
+        if isinstance(path, str | Path) and Path(path).name.startswith("shard_") and str(path).endswith(".pkl"):
             raise AssertionError("Caller opened a payload shard")
         return real_open(path, *args, **kwargs)
 
