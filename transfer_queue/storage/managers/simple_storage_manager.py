@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable
 
 import torch
 import zmq
@@ -38,6 +38,7 @@ from transfer_queue.storage.simple_storage import (
 )
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.storage_routing import RoutingGroup, group_by_storage_unit
 from transfer_queue.utils.tensor_utils import pack_field_values
 from transfer_queue.utils.zmq_utils import (
     TQ_SOCKET_POOL_SIZE,
@@ -105,13 +106,6 @@ with_storage_unit_probe_socket = with_zmq_socket(
     get_pool=lambda self: self.storage_probe_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
-
-
-class RoutingGroup(NamedTuple):
-    """Routing result for a single storage unit."""
-
-    global_indexes: list[int]  # global indexes routed to this SU
-    batch_positions: list[int]  # corresponding positions in the original batch
 
 
 @StorageManagerFactory.register("SimpleStorage")
@@ -219,15 +213,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
         NOTE: Dynamic SU scaling requires a data migration mechanism (not yet supported).
         """
-        storage_unit_keys = list(self.storage_unit_infos.keys())
-        num_units = len(storage_unit_keys)
-        gi_lists: dict[str, list[int]] = defaultdict(list)
-        pos_lists: dict[str, list[int]] = defaultdict(list)
-        for pos, global_idx in enumerate(global_indexes):
-            key = storage_unit_keys[global_idx % num_units]
-            gi_lists[key].append(global_idx)
-            pos_lists[key].append(pos)
-        return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+        return group_by_storage_unit(global_indexes, list(self.storage_unit_infos))
 
     def _describe_storage_unit(self, storage_unit_id: str) -> str:
         """Return ``ip:port`` for a storage unit, for use in diagnostics.

@@ -39,6 +39,7 @@ from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.storage_routing import group_by_storage_unit
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -1818,11 +1819,10 @@ class TransferQueueController:
                 partition.validate_field_schema(schema)
             keys = list(rows)
             metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
-            active_units = {
-                units[index % len(units)]
-                for key, index in zip(keys, metadata.global_indexes, strict=True)
-                if rows[key]["fields"]
-            }
+            data_indexes = [
+                index for key, index in zip(keys, metadata.global_indexes, strict=True) if rows[key]["fields"]
+            ]
+            active_units = group_by_storage_unit(data_indexes, units)
             metadata.update_custom_meta([rows[key]["tag"] for key in keys])
             self._restores[restore_id] = {
                 "partition_id": partition_id,

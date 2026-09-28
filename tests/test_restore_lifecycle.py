@@ -27,6 +27,7 @@ from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import PartitionIndexManager, TransferQueueController
 from transfer_queue.sampler import SequentialSampler
 from transfer_queue.storage.dump_io import RestorePendingError
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -280,6 +281,32 @@ def test_unknown_restore_stays_pending_until_explicit_cancellation(controller):
     assert controller.finish_restore("unknown", commit=False) == {"finished": True, "committed": False}
     with pytest.raises(RuntimeError, match="already committed or cancelled"):
         begin(controller, "unknown")
+
+
+@pytest.mark.parametrize("units", [["only"], ["u0", "u1"], ["u2", "u0", "u1"]])
+@pytest.mark.parametrize("has_payload", [True, False])
+def test_restore_reserves_only_current_storage_owners(controller, units, has_payload):
+    controller.kv_retrieve_meta(["other"], "unrelated", create=True)
+    existing = controller.kv_retrieve_meta(["keep", "gap", "empty", "last"], "p", create=True)
+    controller.clear_meta([existing.global_indexes[1]], ["p"])
+    rows = {
+        key: {"fields": ["x"] if has_payload and key != "empty" else [], "tag": {}}
+        for key in ["last", "new", "empty", "keep"]
+    }
+    metadata = controller.begin_restore("r", "/dump", "p", rows, units, {})
+    indexes = [index for key, index in zip(rows, metadata.global_indexes, strict=True) if rows[key]["fields"]]
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_unit_infos = dict.fromkeys(units)
+    manager.close = lambda: None
+    routed = manager._group_by_hash(indexes)
+    assert set(controller._restores["r"]["units"]) == set(routed)
+    assert metadata.global_indexes[0] == existing.global_indexes[-1]
+    assert metadata.global_indexes[-1] == existing.global_indexes[0]
+    for unit, group in routed.items():
+        assert [indexes[pos] for pos in group.batch_positions] == group.global_indexes
+        controller.restore_unit("r", unit, "claim")
+        controller.restore_unit("r", unit, "complete", {"success": True, "updates": []})
+    assert controller.finish_restore("r", commit=True) == {"finished": True, "committed": True}
 
 
 @pytest.mark.asyncio
