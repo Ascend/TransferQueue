@@ -80,6 +80,16 @@ shapes. Restore uses that schema regardless of target topology or batch boundari
 non-tensor fields remain non-tensor even when a batch happens to contain only tensors.
 Destination type conflicts are rejected before payload writes.
 
+Legacy imports can leave nested fields with missing row shapes, for example when a
+later checkpoint chunk wraps tensor values in `NonTensorStack`. Export asks the owner
+units to inspect those values while writing their records. The caller merges only
+shape/type metadata before publishing the dump; payloads still stay on the units.
+Missing tensor shapes are filled from the actual values and their dtype is checked.
+If a missing-shape row contains `None` or an object, the entire selected field is
+saved as non-tensor, with a warning, so every unit restores the same field contract.
+Fields already declared non-tensor remain non-tensor. This repairs the exported
+schema without mutating live controller metadata or inventing shapes for objects.
+
 Version-1 dumps remain readable using the prior caller-side KV put path. Version-2
 dumps retain direct reads, but lack original schemas and use the older inference
 behavior; exact field-type preservation cannot be guaranteed for those files.

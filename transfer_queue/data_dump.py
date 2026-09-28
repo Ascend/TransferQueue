@@ -165,6 +165,19 @@ def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dic
             }
         )
         rows = row_index["rows"]
+        field_schema = row_index["field_schema"]
+        missing_shapes = {}
+        for row in rows.values():
+            index = row["global_index"]
+            names = [
+                name
+                for name in row["fields"]
+                if field_schema[name].get("is_nested")
+                and not field_schema[name].get("is_non_tensor")
+                and field_schema[name].get("per_sample_shapes", {}).get(index) is None
+            ]
+            if names:
+                missing_shapes[index] = names
 
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.
@@ -175,10 +188,12 @@ def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dic
                 str(tmp_dir / _SHARD_SUBDIR),
                 indexes_with_data,
                 {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]},
+                **({"missing_shapes": missing_shapes} if missing_shapes else {}),
             )
             if indexes_with_data
             else []
         )
+        _complete_dump_schema(field_schema, missing_shapes, shard_records)
         shard_dir = tmp_dir / _SHARD_SUBDIR
         shard_dir.mkdir(parents=True, exist_ok=True)
         with open(shard_dir / _SHARD_INFO_FILE, "w", encoding="utf-8") as f:
@@ -240,6 +255,39 @@ def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dic
         "shards": len(shard_records),
         "bytes": total_bytes,
     }
+
+
+def _complete_dump_schema(field_schema: dict, missing_shapes: dict[int, list[str]], shards: list[dict]) -> None:
+    """Complete legacy nested metadata before publishing any dump manifest."""
+    recovered = {}
+    for shard in shards:
+        for index, fields in shard.pop("recovered_schema", {}).items():
+            if index in recovered:
+                raise ValueError(f"Duplicated schema recovery for row {index}")
+            recovered[index] = fields
+    if set(recovered) != set(missing_shapes):
+        raise ValueError("Storage units did not return every requested missing row schema")
+    for index, names in missing_shapes.items():
+        if set(recovered[index]) != set(names):
+            raise ValueError(f"Recovered schema fields disagree for row {index}")
+
+    non_tensor_fields = {name for fields in recovered.values() for name, meta in fields.items() if meta is None}
+    for name in non_tensor_fields:
+        field_schema[name] = {"is_non_tensor": True, "is_nested": False, "shape": None, "dtype": None}
+        logger.warning(
+            "Dump field %r contains non-tensor values missing from legacy nested metadata; preserving as non-tensor",
+            name,
+        )
+    for index, fields in recovered.items():
+        for name, meta in fields.items():
+            if name in non_tensor_fields:
+                continue
+            field = field_schema[name]
+            if meta["dtype"] != field["dtype"]:
+                raise ValueError(f"Dump field {name!r} dtype mismatch at row {index}")
+            field["per_sample_shapes"][index] = tuple(meta["shape"])
+    if recovered:
+        logger.info("Recovered missing dump schemas for %s rows", len(recovered))
 
 
 def read_row_index(dump_dir: str | Path) -> dict[str, Any]:

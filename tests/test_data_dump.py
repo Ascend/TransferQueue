@@ -25,6 +25,7 @@ import pytest
 import torch
 
 from transfer_queue import data_dump, interface
+from transfer_queue.storage.dump_io import validate_dump_values
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
@@ -345,16 +346,80 @@ async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
     failed = asyncio.Event()
     completed = []
 
-    async def dump(path, target_storage_unit, global_indexes, fields_by_index):
+    async def dump(path, target_storage_unit, global_indexes, fields_by_index, missing_shapes):
         if target_storage_unit == "u0":
             failed.set()
             raise OSError("write failed")
         await failed.wait()
         await asyncio.sleep(0)
         completed.append(target_storage_unit)
-        return {1: [0, 1]}
+        return {"row_offsets": {1: [0, 1]}}
 
     manager._dump_single_shard = dump
     with pytest.raises(OSError, match="write failed"):
         await manager.dump_rows_by_index(str(tmp_path), [0, 1])
     assert completed == ["u1"]
+
+
+def test_dump_recovers_shapes_from_units_without_forwarding_payloads(unit, tmp_path):
+    unit.storage_data.put_data({"x": [torch.arange(2), torch.arange(3)], "y": [None, {"key": "value"}]}, [9, 10])
+    response = unit._handle_dump_rows(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.DUMP_ROWS,
+            sender_id="test",
+            body={
+                "path": str(tmp_path / "shard.pkl"),
+                "global_indexes": [9, 10],
+                "missing_shapes": {9: ["x", "y"], 10: ["x", "y"]},
+            },
+        )
+    )
+    assert response.body["success"]
+    assert response.body["recovered_schema"] == {
+        9: {"x": {"shape": (2,), "dtype": torch.int64}, "y": None},
+        10: {"x": {"shape": (3,), "dtype": torch.int64}, "y": None},
+    }
+
+
+@pytest.mark.parametrize("reverse_units", [False, True])
+def test_missing_shapes_merge_consistently_across_units(reverse_units):
+    schema = {
+        "x": {"dtype": torch.int64, "is_nested": True, "is_non_tensor": False, "per_sample_shapes": {1: None, 2: None}},
+    }
+    shards = [
+        {"recovered_schema": {1: {"x": {"shape": (2,), "dtype": torch.int64}}}},
+        {"recovered_schema": {2: {"x": None}}},
+    ]
+    if reverse_units:
+        shards.reverse()
+    data_dump._complete_dump_schema(schema, {1: ["x"], 2: ["x"]}, shards)
+    assert schema["x"] == {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+    assert all("recovered_schema" not in shard for shard in shards)
+
+
+@pytest.mark.parametrize("problem", ["missing", "wrong_field", "wrong_dtype"])
+def test_dump_rejects_incomplete_schema_recovery(problem):
+    schema = {"x": {"dtype": torch.int64, "is_nested": True, "is_non_tensor": False, "per_sample_shapes": {9: None}}}
+    recovered = {9: {"x": {"shape": (2,), "dtype": torch.int64}}}
+    if problem == "missing":
+        recovered = {}
+    elif problem == "wrong_field":
+        recovered[9] = {"other": recovered[9]["x"]}
+    else:
+        recovered[9]["x"]["dtype"] = torch.float32
+    with pytest.raises(ValueError):
+        data_dump._complete_dump_schema(schema, {9: ["x"]}, [{"recovered_schema": recovered}])
+
+
+def test_saved_missing_tensor_shape_is_reported_as_invalid_dump():
+    schema = {
+        "x": {
+            "dtype": torch.int64,
+            "shape": None,
+            "is_nested": True,
+            "is_non_tensor": False,
+            "per_sample_shapes": {1: None},
+        }
+    }
+    with pytest.raises(ValueError, match="has no saved shape at row 1"):
+        validate_dump_values({"x": torch.arange(2)}, schema, 1)

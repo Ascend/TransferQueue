@@ -1194,6 +1194,7 @@ class AsyncTransferQueueClient:
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
+        missing_shapes: dict[int, list[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Asynchronously dump the given rows into per-storage-unit shards.
 
@@ -1201,6 +1202,7 @@ class AsyncTransferQueueClient:
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
             One entry per written shard.
@@ -1217,7 +1219,9 @@ class AsyncTransferQueueClient:
             )
         if not hasattr(self.storage_manager, "dump_rows_by_index"):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support selective data dump")
-        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+        return await self.storage_manager.dump_rows_by_index(
+            shard_dir, global_indexes, fields_by_index, **({"missing_shapes": missing_shapes} if missing_shapes else {})
+        )
 
     def _restore_context(self, restore_id: str) -> dict:
         return {
@@ -1973,6 +1977,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
+        missing_shapes: dict[int, list[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Synchronously dump the given rows into per-storage-unit shards.
 
@@ -1980,6 +1985,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
             One entry per written shard.
@@ -1989,7 +1995,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 no data for a row it was asked to dump.
             NotImplementedError: If the storage backend does not support dumping.
         """
-        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index, missing_shapes=missing_shapes)
 
     def load_rows_by_key(
         self, partition_id: str, rows: dict, shards: list[dict], dump_dir: str = "", restore_id: str | None = None

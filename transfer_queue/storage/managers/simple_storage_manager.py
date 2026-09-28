@@ -760,15 +760,21 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
+        missing_shapes: dict[int, list[str]] | None = None,
         socket: zmq.Socket = None,
-    ) -> dict[int, list[int]]:
+    ) -> dict[str, Any]:
         """Ask one storage unit to write the rows it owns into a shard file."""
         try:
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"path": path, "global_indexes": global_indexes, "fields_by_index": fields_by_index},
+                body={
+                    "path": path,
+                    "global_indexes": global_indexes,
+                    "fields_by_index": fields_by_index,
+                    "missing_shapes": missing_shapes or {},
+                },
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -785,7 +791,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 raise RuntimeError(
                     f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
                 )
-            return response_msg.body["row_offsets"]
+            return response_msg.body
         except Exception as e:
             raise RuntimeError(
                 f"[{self.storage_manager_id}]: Error dumping shard from storage unit {target_storage_unit}: {str(e)}"
@@ -796,6 +802,7 @@ class AsyncSimpleStorageManager(StorageManager):
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
+        missing_shapes: dict[int, list[str]] | None = None,
     ) -> list[dict[str, Any]]:
         """Dump the given rows into one shard per storage unit, in parallel.
 
@@ -807,6 +814,7 @@ class AsyncSimpleStorageManager(StorageManager):
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
             One entry per written shard: ``{"position", "storage_unit_id", "rows", "row_offsets"}``.
@@ -821,13 +829,16 @@ class AsyncSimpleStorageManager(StorageManager):
         targets = [(su_id, group.global_indexes) for su_id, group in routing.items()]
         paths = [str(shard_dir_path / f"shard_{pos}_{su_id}.pkl") for pos, (su_id, _) in enumerate(targets)]
 
-        row_offsets = await asyncio.gather(
+        results = await asyncio.gather(
             *(
                 self._dump_single_shard(
                     path,
                     target_storage_unit=su_id,
                     global_indexes=indexes,
                     fields_by_index={index: fields_by_index[index] for index in indexes} if fields_by_index else None,
+                    missing_shapes={index: missing_shapes[index] for index in indexes if index in missing_shapes}
+                    if missing_shapes
+                    else None,
                 )
                 for path, (su_id, indexes) in zip(paths, targets, strict=True)
             ),
@@ -835,11 +846,20 @@ class AsyncSimpleStorageManager(StorageManager):
         )
         shards = []
         total_rows = 0
-        for pos, ((su_id, _), offsets) in enumerate(zip(targets, row_offsets, strict=True)):
-            if isinstance(offsets, BaseException):
-                raise offsets
+        for pos, ((su_id, _), result) in enumerate(zip(targets, results, strict=True)):
+            if isinstance(result, BaseException):
+                raise result
+            offsets = result["row_offsets"]
             total_rows += len(offsets)
-            shards.append({"position": pos, "storage_unit_id": su_id, "rows": len(offsets), "row_offsets": offsets})
+            shards.append(
+                {
+                    "position": pos,
+                    "storage_unit_id": su_id,
+                    "rows": len(offsets),
+                    "row_offsets": offsets,
+                    "recovered_schema": result.get("recovered_schema", {}),
+                }
+            )
 
         logger.info(
             f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"

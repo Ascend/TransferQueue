@@ -39,7 +39,9 @@ def validate_dump_values(values: dict, schema: dict, source_index: int) -> None:
         field = schema[name]
         if field["is_non_tensor"]:
             continue
-        shape = field["per_sample_shapes"][source_index] if field["is_nested"] else field["shape"]
+        shape = field.get("per_sample_shapes", {}).get(source_index) if field["is_nested"] else field["shape"]
+        if shape is None:
+            raise ValueError(f"Dump field {name!r} has no saved shape at row {source_index}")
         actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
         # Existing dense scalar fields use a one-element metadata shape.
         scalar = actual_shape == () and tuple(shape) == (1,) and not field["is_nested"]

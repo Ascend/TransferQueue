@@ -1317,6 +1317,7 @@ class SimpleStorageUnit:
             if missing:
                 raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
             row_offsets = {}
+            recovered_schema = {}
             with open(path, "wb") as f:
                 for index in sorted(indexes):
                     described_fields = request.body.get("fields_by_index")
@@ -1329,6 +1330,15 @@ class SimpleStorageUnit:
                     else:
                         # Reused global indexes can retain fields no longer present in metadata.
                         fields = {name: self.storage_data.field_data[name][index] for name in described_fields[index]}
+                    missing_fields = request.body.get("missing_shapes", {}).get(index, [])
+                    if missing_fields:
+                        # Inspect values already being written; only shape/type metadata leaves the unit.
+                        recovered_schema[index] = {
+                            name: {"shape": tuple(fields[name].shape), "dtype": fields[name].dtype}
+                            if isinstance(fields[name], torch.Tensor)
+                            else None
+                            for name in missing_fields
+                        }
                     offset = f.tell()
                     compact_pickle.dump({"global_index": index, "fields": fields}, f)
                     row_offsets[index] = [offset, f.tell() - offset]
@@ -1338,7 +1348,13 @@ class SimpleStorageUnit:
             return ZMQMessage.create(
                 request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,
-                body={"success": True, "dumped_rows": len(indexes), "missing_rows": [], "row_offsets": row_offsets},
+                body={
+                    "success": True,
+                    "dumped_rows": len(indexes),
+                    "missing_rows": [],
+                    "row_offsets": row_offsets,
+                    "recovered_schema": recovered_schema,
+                },
             )
         except Exception as e:
             logger.error("[%s]: dump rows failed: %s", self.storage_unit_id, e)

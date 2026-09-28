@@ -492,6 +492,72 @@ def test_version_one_dump_remains_readable(tq_system, dump_dir, controller):
     _assert_rows_equal(tq.kv_batch_get(["k"], partition, select_fields=["x"])["x"], [torch.tensor([7, 8])])
 
 
+@pytest.mark.parametrize("row_count", [3, 127, 128, 129, 130])
+@pytest.mark.parametrize("last_kind", ["tensor", "none", "object"])
+def test_legacy_chunks_with_missing_nested_shapes_roundtrip(tq_system, dump_dir, controller, row_count, last_kind):
+    partition = "legacy_nested"
+    keys = [f"k{i}" for i in range(row_count)]
+    tensors = [torch.arange(i % 3 + 1, dtype=torch.int64) for i in range(row_count)]
+    last = tensors[-1] if last_kind == "tensor" else None if last_kind == "none" else {"pixels": tensors[-1]}
+    expected = [*tensors[:-1], last]
+    chunk = dump_dir.parent / "legacy-chunk.pt"
+    chunk.parent.mkdir(parents=True)
+    first = TensorDict(
+        {
+            "input_ids": torch.nested.as_nested_tensor(tensors[:-1], layout=torch.jagged),
+            "multi_modal_inputs#images": torch.nested.as_nested_tensor(tensors[:-1], layout=torch.jagged),
+            "wrapped": NonTensorStack(*tensors[:-1]),
+        },
+        batch_size=row_count - 1,
+    )
+    tail = TensorDict(
+        {
+            name: NonTensorStack(value)
+            for name, value in {
+                "input_ids": last,
+                "multi_modal_inputs#images": last,
+                "wrapped": tensors[-1],
+            }.items()
+        },
+        batch_size=1,
+    )
+    # Legacy wrappers reload each saved TensorDict without normalizing its container type.
+    for chunk_keys, fields in [(keys[:-1], first), (keys[-1:], tail)]:
+        torch.save({"keys": chunk_keys, "fields": fields}, chunk)
+        saved = torch.load(chunk, weights_only=False)
+        tq.kv_batch_put(saved["keys"], partition, saved["fields"], tags=[{"key": key} for key in chunk_keys])
+
+    snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
+    last_index = snapshot.keys_mapping[keys[-1]]
+    assert last_index in snapshot.field_metadata["input_ids"].global_indexes
+    assert last_index not in snapshot.field_metadata["input_ids"].per_sample_shapes
+    for target in [dump_dir, dump_dir.parent / "second-dump"]:
+        tq.dump_data_by_key(target, keys, partition)
+        index = tq.read_row_index(target)
+        for name in ["input_ids", "multi_modal_inputs#images"]:
+            schema = index["field_schema"][name]
+            assert schema["is_non_tensor"] == (last_kind != "tensor")
+            if last_kind == "tensor":
+                assert schema["is_nested"]
+                for key, value in zip(keys, expected, strict=True):
+                    assert tuple(schema["per_sample_shapes"][index["rows"][key]["global_index"]]) == tuple(value.shape)
+        assert index["field_schema"]["wrapped"]["is_non_tensor"]
+        tq.kv_clear(keys, partition)
+        tq.load_data_by_key(target)
+        for start in range(0, row_count, 128):
+            end = min(start + 128, row_count)
+            restored = tq.kv_batch_get(
+                keys[start:end], partition, ["input_ids", "multi_modal_inputs#images", "wrapped"]
+            )
+            for name in ["input_ids", "multi_modal_inputs#images"]:
+                for value, reference in zip(restored[name], expected[start:end], strict=True):
+                    torch.testing.assert_close(value, reference)
+            for value, reference in zip(restored["wrapped"], tensors[start:end], strict=True):
+                torch.testing.assert_close(value, reference)
+        tags = tq.kv_list(partition)[partition]
+        assert tags == {key: {"key": key} for key in keys}
+
+
 def test_corrupt_shard_keeps_new_rows_unproduced(tq_system, dump_dir, controller):
     partition = "corrupt"
     _put_rows(partition, ["key"])

@@ -2393,7 +2393,7 @@ class TransferQueueController:
                 continue
             schema = meta.to_batch_schema(indexes)
             if schema.get("is_nested"):
-                schema["per_sample_shapes"] = {index: meta.per_sample_shapes[index] for index in indexes}
+                schema["per_sample_shapes"] = {index: meta.per_sample_shapes.get(index) for index in indexes}
             field_schema[name] = schema
         return self._make_response(
             request_msg,
