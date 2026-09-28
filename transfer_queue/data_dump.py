@@ -455,19 +455,22 @@ def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict], ve
         kv_batch_put(keys, partition_id, tags=[rows[key]["tag"] for key in keys])
 
 
-def recover_data_load(dump_dir: str | Path) -> None:
+def recover_data_load(dump_dir: str | Path, *, cancel: bool = False) -> bool:
     """Settle an interrupted restore before retrying or releasing destination indexes.
 
-    This cancels work that has not claimed permission and waits for known writers.
-    Running or unreachable units keep the reservation. Retry recovery once those
-    units can report completion; a lost unit requires restarting the whole TQ system.
-    Partial payload writes remain, but subsequent index reuse is safe after success.
+    By default, commit loads once every unit reports success. Use ``cancel=True``
+    to deny unclaimed work and wait for claimed workers without publishing metadata.
+    Running or unknown work raises RestorePendingError and keeps the dump protected.
+
+    Returns:
+        True if all loads committed or none needed recovery; False if any load was
+        cancelled or failed. Partial payload writes remain after cancellation.
     """
     with _dump_lock(dump_dir) as directory:
-        return _recover_data_load(directory)
+        return _recover_data_load(directory, cancel=cancel)
 
 
-def _recover_data_load(dump_dir: Path) -> None:
+def _recover_data_load(dump_dir: Path, *, cancel: bool = False) -> bool:
     from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
 
     if _TQ_CONTROLLER is None:
@@ -475,5 +478,6 @@ def _recover_data_load(dump_dir: Path) -> None:
     dump_dir = Path(dump_dir).resolve()
     marker = dump_dir.with_name(dump_dir.name + ".restore")
     ids = [marker.read_text().strip()] if marker.exists() else []
-    _maybe_create_tq_client().recover_data_load(str(dump_dir), ids)
+    committed = _maybe_create_tq_client().recover_data_load(str(dump_dir), ids, cancel=cancel)
     marker.unlink(missing_ok=True)
+    return committed

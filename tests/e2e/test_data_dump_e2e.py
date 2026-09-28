@@ -530,6 +530,46 @@ def test_regular_put_keeps_legacy_tensor_nontensor_acceptance(tq_system, control
     assert snapshot.field_metadata["x"].global_indexes == set(metadata.global_indexes)
 
 
+@pytest.mark.parametrize("lost_reply", ["load", "commit"])
+def test_recovery_commits_after_lost_reply(tq_system, dump_dir, monkeypatch, lost_reply):
+    import zmq
+
+    from transfer_queue.utils.zmq_utils import ZMQRequestType
+
+    _put_rows("lost_reply", ["key"])
+    tq.dump_data_by_key(dump_dir, ["key"], "lost_reply")
+    client = tq.get_client()
+    client.clear_partition("lost_reply")
+    manager = client.storage_manager
+    original_load = manager._load_selected_rows
+    original_rpc = client._restore_rpc
+    loads = []
+
+    async def load(*args, **kwargs):
+        loads.append(kwargs["target_storage_unit"])
+        result = await original_load(*args, **kwargs)
+        if lost_reply == "load":
+            raise zmq.error.Again()
+        return result
+
+    async def rpc(action, body):
+        result = await original_rpc(action, body)
+        if lost_reply == "commit" and action == ZMQRequestType.FINISH_RESTORE and body["commit"]:
+            raise zmq.error.Again()
+        return result
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(manager, "_load_selected_rows", load)
+        patcher.setattr(client, "_restore_rpc", rpc)
+        with pytest.raises(tq.RestorePendingError):
+            tq.load_data_by_key(dump_dir)
+    assert dump_dir.with_name(dump_dir.name + ".restore").exists()
+    assert tq.recover_data_load(dump_dir) is True
+    assert not dump_dir.with_name(dump_dir.name + ".restore").exists()
+    assert len(loads) == 1
+    _assert_rows_equal(tq.kv_batch_get(["key"], "lost_reply", ["input_ids"])["input_ids"], [_row_input_ids(0)])
+
+
 def test_running_restore_blocks_clear_and_dump_until_recovery(tq_system, dump_dir, controller):
     _put_rows("reserved", ["key"])
     tq.dump_data_by_key(dump_dir, ["key"], "reserved")

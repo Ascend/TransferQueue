@@ -1011,7 +1011,7 @@ class TransferQueueController:
         self.index_manager = PartitionIndexManager()  # partition_id -> global_indexes
         self._restore_lock = RLock()
         self._restores: dict[str, dict[str, Any]] = {}
-        self._cancelled_restores: set[str] = set()
+        self._restore_outcomes: dict[str, bool] = {}
         self._clearing_indexes: set[int] = set()
 
         # Connected storage managers tracking
@@ -1806,8 +1806,8 @@ class TransferQueueController:
     ):
         """Reserve a destination partition until every possible remote writer is settled."""
         with self._restore_lock:
-            if restore_id in self._cancelled_restores:
-                raise RuntimeError("Restore was already cancelled")
+            if restore_id in self._restore_outcomes:
+                raise RuntimeError("Restore was already committed or cancelled")
             if restore_id in self._restores:
                 return self._restores[restore_id]["metadata"]
             self._assert_not_restoring(partition_id)
@@ -1838,6 +1838,8 @@ class TransferQueueController:
         """Grant one execution and record its terminal result; unknown IDs never grant writes."""
         with self._restore_lock:
             restore = self._restores.get(restore_id)
+            if restore_id in self._restore_outcomes and action == "complete":
+                return
             if restore is None or unit_id not in restore["units"]:
                 raise RuntimeError("Restore is no longer active")
             state = restore["units"][unit_id]
@@ -1852,15 +1854,17 @@ class TransferQueueController:
                 raise RuntimeError(f"Invalid restore transition {state} -> {action}")
 
     def finish_restore(self, restore_id: str, commit: bool) -> dict:
-        """Release indexes only after all claimed writers terminate; cancel unclaimed work."""
+        """Settle a restore after its workers terminate, retaining the outcome for lost replies."""
         with self._restore_lock:
+            if restore_id in self._restore_outcomes:
+                return {"finished": True, "committed": self._restore_outcomes[restore_id]}
             restore = self._restores.get(restore_id)
             if restore is None:
                 if commit:
-                    raise RuntimeError("Restore is no longer active; metadata was not committed by this request")
-                self._cancelled_restores.add(restore_id)
-                return {"finished": True}
-            if not commit:
+                    return {"finished": False}
+                self._restore_outcomes[restore_id] = False
+                return {"finished": True, "committed": False}
+            if not commit or "failed" in restore["units"].values():
                 restore["aborting"] = True
                 for unit, state in restore["units"].items():
                     if state == "pending":
@@ -1868,9 +1872,8 @@ class TransferQueueController:
             running = [unit for unit, state in restore["units"].items() if state in ("pending", "running")]
             if running:
                 return {"finished": False, "units": running}
-            if commit:
-                if restore["aborting"] or any(state != "done" for state in restore["units"].values()):
-                    raise RuntimeError("Restore has failed or was cancelled")
+            committed = commit and not restore["aborting"]
+            if committed:
                 partition = self.partitions[restore["partition_id"]]
                 updates = [update for group in restore["updates"].values() for update in group]
                 for update in updates:
@@ -1880,10 +1883,10 @@ class TransferQueueController:
                         raise RuntimeError("Controller rejected restored metadata")
                 metadata = restore["metadata"]
                 partition.set_custom_meta(dict(zip(metadata.global_indexes, metadata.custom_meta, strict=True)))
-            else:
-                self._cancelled_restores.add(restore_id)
+            # Retain only the terminal outcome, never payloads or per-row metadata.
+            self._restore_outcomes[restore_id] = committed
             del self._restores[restore_id]
-            return {"finished": True}
+            return {"finished": True, "committed": committed}
 
     def list_restores(self, dump_dir: str | None) -> list[str]:
         """Find unfinished operations for a dump, including after the initiating client exits."""

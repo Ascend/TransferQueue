@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import multiprocessing
 import threading
 import time
 from unittest.mock import patch
@@ -28,6 +29,78 @@ from tensordict import TensorDict
 import transfer_queue as tq
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.zmq_utils import ZMQMessage
+
+
+def _check_claimed_load_survives_receive_timeout(tmp_path):
+    import transfer_queue.storage.managers.simple_storage_manager as manager_module
+
+    ray.init(namespace="review_claimed_timeout")
+    try:
+        tq.init(
+            OmegaConf.create(
+                {
+                    "backend": {
+                        "storage_backend": "SimpleStorage",
+                        "SimpleStorage": {
+                            "num_data_storage_units": 1,
+                            "total_storage_size": 20,
+                        },
+                    }
+                }
+            )
+        )
+        tq.kv_batch_put(["key"], "p", TensorDict({"x": torch.tensor([[7]])}, batch_size=1), tags=[{"saved": True}])
+        dump_dir = tmp_path / "dump"
+        tq.dump_data_by_key(dump_dir, ["key"], "p")
+        tq.get_client().clear_partition("p")
+        actor = ray.get_actor("TransferQueueStorageUnit#0")
+        claimed = tmp_path / "claimed"
+        release = tmp_path / "release"
+
+        def pause_after_claim(unit):
+            original = unit._load_rows
+
+            def delayed(request):
+                claimed.touch()
+                deadline = time.monotonic() + 10
+                while not release.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return original(request)
+
+            unit._load_rows = delayed
+
+        ray.get(actor.__ray_call__.remote(pause_after_claim))
+        with patch.object(manager_module, "TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 0.5):
+            with pytest.raises(tq.RestorePendingError):
+                tq.load_data_by_key(dump_dir)
+        assert claimed.exists()
+        assert dump_dir.with_name(dump_dir.name + ".restore").exists()
+        with pytest.raises(RuntimeError, match="unresolved"):
+            tq.get_client().clear_partition("p")
+        with pytest.raises(tq.RestorePendingError):
+            tq.dump_data_by_key(dump_dir, ["key"], "p")
+        release.touch()
+        assert tq.recover_data_load(dump_dir) is True
+        assert not dump_dir.with_name(dump_dir.name + ".restore").exists()
+        assert tq.kv_batch_get(["key"], "p", ["x"])["x"][0].item() == 7
+        assert tq.get_client().kv_retrieve_meta(["key"], "p").custom_meta == [{"saved": True}]
+    finally:
+        tq.close()
+        ray.shutdown()
+
+
+def test_claimed_load_survives_receive_timeout(tmp_path):
+    # Dynamic Ray actor instrumentation must not affect later in-process unit mocks.
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(target=_check_claimed_load_survives_receive_timeout, args=(tmp_path,))
+    process.start()
+    try:
+        process.join(60)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(10)
 
 
 def test_cancelled_delayed_load_cannot_overwrite_reused_index(tmp_path):
@@ -92,8 +165,9 @@ def test_cancelled_delayed_load_cannot_overwrite_reused_index(tmp_path):
                 ctx.term()
 
         with patch.object(manager, "_load_selected_rows", timeout_load):
-            with pytest.raises(zmq.error.Again):
+            with pytest.raises(tq.RestorePendingError):
                 tq.load_data_by_key(tmp_path / "dump")
+        assert tq.recover_data_load(tmp_path / "dump", cancel=True) is False
         value = tq.kv_batch_get(["key"], "p", ["x"])["x"][0].item()
 
         assert value == 2

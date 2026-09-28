@@ -16,6 +16,7 @@
 """Restore reservations prevent late writes from corrupting reused indexes."""
 
 from threading import RLock
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -25,6 +26,7 @@ import zmq
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import PartitionIndexManager, TransferQueueController
 from transfer_queue.sampler import SequentialSampler
+from transfer_queue.storage.dump_io import RestorePendingError
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -39,7 +41,7 @@ def controller():
     controller.sampler = SequentialSampler()
     controller._restore_lock = RLock()
     controller._restores = {}
-    controller._cancelled_restores = set()
+    controller._restore_outcomes = {}
     controller._clearing_indexes = set()
     return controller
 
@@ -72,10 +74,10 @@ def test_cancel_before_claim_rejects_late_load_and_late_begin(controller):
     assert current.global_indexes == metadata.global_indexes
     with pytest.raises(RuntimeError, match="no longer active"):
         controller.restore_unit("r", "u", "claim")
-    with pytest.raises(RuntimeError, match="already cancelled"):
+    with pytest.raises(RuntimeError, match="already committed or cancelled"):
         begin(controller)
     controller.finish_restore("not-arrived", commit=False)
-    with pytest.raises(RuntimeError, match="already cancelled"):
+    with pytest.raises(RuntimeError, match="already committed or cancelled"):
         begin(controller, "not-arrived")
 
 
@@ -255,3 +257,83 @@ def test_lost_claim_ack_can_be_settled_without_writing(controller):
         ZMQMessage.create(request_type=ZMQRequestType.REPORT_RESTORE, sender_id="test", body={"restore_id": "r"})
     ).body["success"]
     assert controller.finish_restore("r", commit=False)["finished"]
+
+
+def test_failed_unit_cancels_pending_units_but_waits_for_running_units(controller):
+    rows = {f"k{i}": {"fields": ["x"], "tag": {}} for i in range(3)}
+    controller.begin_restore("r", "/dump", "p", rows, ["u0", "u1", "u2"], {})
+    controller.restore_unit("r", "u0", "claim")
+    controller.restore_unit("r", "u1", "claim")
+    controller.restore_unit("r", "u0", "complete", {"success": False})
+    assert not controller.finish_restore("r", commit=True)["finished"]
+    with pytest.raises(RuntimeError, match="cannot start"):
+        controller.restore_unit("r", "u2", "claim")
+    with pytest.raises(RuntimeError, match="unresolved"):
+        controller.clear_partition("p")
+    controller.restore_unit("r", "u1", "complete", {"success": True, "updates": []})
+    assert controller.finish_restore("r", commit=True) == {"finished": True, "committed": False}
+    assert not controller.partitions["p"].field_metadata
+
+
+def test_unknown_restore_stays_pending_until_explicit_cancellation(controller):
+    assert not controller.finish_restore("unknown", commit=True)["finished"]
+    assert controller.finish_restore("unknown", commit=False) == {"finished": True, "committed": False}
+    with pytest.raises(RuntimeError, match="already committed or cancelled"):
+        begin(controller, "unknown")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", ["running_timeout", "lost_load_reply", "lost_commit_reply", "lost_complete"])
+async def test_pending_load_can_commit_without_replaying_payload(controller, interruption):
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client._restore_context = lambda restore_id: {"restore_id": restore_id}
+    completed = {}
+    fail_commit_reply = interruption == "lost_commit_reply"
+
+    async def rpc(action, body):
+        nonlocal fail_commit_reply
+        if action == ZMQRequestType.BEGIN_RESTORE:
+            return {"metadata": controller.begin_restore(**body)}
+        if action == ZMQRequestType.LIST_RESTORES:
+            return {"restore_ids": controller.list_restores(body["dump_dir"])}
+        result = controller.finish_restore(**body)
+        if body["commit"] and result["finished"] and fail_commit_reply:
+            fail_commit_reply = False
+            raise zmq.error.Again()
+        return result
+
+    async def load(shards, context):
+        controller.restore_unit("r", "u", "claim")
+        index = controller._restores["r"]["metadata"].global_indexes[0]
+        schema = {"x": {"dtype": torch.int64, "shape": (1,), "is_nested": False, "is_non_tensor": False}}
+        completed.update(success=True, updates=[{"global_indexes": [index], "field_schema": schema}])
+        if interruption in ("lost_load_reply", "lost_commit_reply"):
+            controller.restore_unit("r", "u", "complete", completed)
+        if interruption in ("running_timeout", "lost_load_reply"):
+            raise zmq.error.Again()
+
+    async def report(context):
+        controller.restore_unit("r", "u", "complete", completed)
+
+    client._restore_rpc = rpc
+    client.storage_manager = SimpleNamespace(
+        storage_unit_infos={"u": None}, load_rows_by_index=AsyncMock(side_effect=load), report_restore=report
+    )
+    rows = {"k": {"fields": ["x"], "tag": {"saved": True}}}
+    with pytest.raises(RestorePendingError):
+        await client.async_load_rows_by_key("p", rows, [], "/dump", "r")
+    if "r" in controller._restores:
+        assert not controller._restores["r"]["aborting"]
+        with pytest.raises(RuntimeError, match="unresolved"):
+            controller.clear_partition("p")
+    assert await client.async_recover_data_load("/dump", ["r"]) is True
+    assert await client.async_recover_data_load("/dump", ["r"]) is True
+    client.storage_manager.load_rows_by_index.assert_awaited_once()
+    partition = controller.partitions["p"]
+    index = partition.keys_mapping["k"]
+    assert partition.production_status[index, partition.field_name_mapping["x"]] == 1
+    assert partition.custom_meta[index] == {"saved": True}
+    # Duplicate finalization must not publish metadata again after the key is cleared.
+    controller.clear_partition("p")
+    assert controller.finish_restore("r", commit=True) == {"finished": True, "committed": True}
+    assert "p" not in controller.partitions

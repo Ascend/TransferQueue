@@ -106,25 +106,36 @@ has a unique ID. The controller blocks clearing/reusing its destination indexes
 and conflicting KV puts while an operation is unresolved. Units must claim that ID
 before writing; cancellation rejects requests that have not yet claimed permission.
 A receive timeout never releases a writer that has already claimed permission.
+Timeouts leave the operation pending, even if every unit later succeeds. They do
+not cancel it or require changing the timeout used by ordinary puts and gets.
 
 `RestorePendingError` means remote work is still running or its outcome is unknown.
 The dump also retains a sibling `.restore` marker so an interrupted client cannot
 silently allow its files to be replaced. After an interruption, call:
 
 ```python
-tq.recover_data_load("/shared/dumps/selected")
+committed = tq.recover_data_load("/shared/dumps/selected")
 ```
 
-Recovery cancels unclaimed work, asks units to resend terminal results, and releases
-indexes only after every claimed worker has finished. It does not publish partial
-restores as ready or undo payload writes. Retry recovery while a unit is still busy;
-a lost unit requires stopping the old TQ actors and restarting the whole TQ system.
-Restarting only the controller while old storage actors run is unsupported. After
-recovery succeeds, retry the dump or clear its keys. Unknown operations remain
-reserved rather than guessing that a timeout stopped remote execution.
+Recovery asks units to resend terminal results and commits schemas and tags only
+when all units succeeded. It returns `True` for committed loads (or no pending
+load), and `False` for a failed or cancelled load after all claimed workers stopped.
+Running or unknown work raises `RestorePendingError`; retry recovery later without
+reloading payloads. The controller remembers terminal outcomes so a lost commit
+reply can be confirmed safely by retrying recovery.
+
+To abandon the load explicitly, use `recover_data_load(dump_dir, cancel=True)`.
+This denies unclaimed work and retains the reservation until claimed workers stop.
+Cancellation cannot undo a load that has already committed. A failed unit also
+cancels remaining unclaimed work; partial payload writes are never rolled back.
+After cancellation settles, retry the load or clear its keys. A lost unit requires
+stopping the old TQ actors and restarting the whole TQ system; restarting only the
+controller while old storage actors run is unsupported.
 
 Writers that already hold low-level metadata must remain paused throughout recovery.
-The reservation covers the destination partition, so unrelated partitions can proceed.
+The controller reservation covers only the destination partition. Each storage unit
+still serves requests on one worker thread: other partitions using that unit can
+wait behind a load. The 128-row batches bound memory, not request latency.
 
 ## Tests
 

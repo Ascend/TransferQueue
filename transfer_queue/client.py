@@ -1232,6 +1232,18 @@ class AsyncTransferQueueClient:
         response = await self._request_controller(socket, request_type, response_type, body)
         return response.body
 
+    async def _finish_data_load(self, restore_id: str, *, commit: bool) -> bool:
+        """Keep the reservation when completion is pending or its reply is lost."""
+        try:
+            result = await self._restore_rpc(
+                ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": commit}
+            )
+        except (zmq.error.Again, TimeoutError) as error:
+            raise RestorePendingError(restore_id) from error
+        if not result["finished"]:
+            raise RestorePendingError(restore_id)
+        return result["committed"]
+
     async def async_load_rows_by_key(
         self,
         partition_id: str,
@@ -1265,36 +1277,39 @@ class AsyncTransferQueueClient:
                 for record in shard["records"]:
                     record["target_index"] = target_indexes[record["key"]]
             await manager.load_rows_by_index(shards, self._restore_context(restore_id))
-            result = await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": True})
-            if not result["finished"]:
-                raise RestorePendingError(restore_id)
+            if not await self._finish_data_load(restore_id, commit=True):
+                raise RuntimeError("Restore failed or was cancelled")
+        except RestorePendingError:
+            raise
+        except (zmq.error.Again, TimeoutError) as error:
+            raise RestorePendingError(restore_id) from error
         except BaseException as error:
             try:
-                result = await asyncio.shield(
-                    self._restore_rpc(
-                        ZMQRequestType.FINISH_RESTORE,
-                        {"restore_id": restore_id, "commit": False},
-                    )
-                )
+                await asyncio.shield(self._finish_data_load(restore_id, commit=False))
             except BaseException:
-                raise RestorePendingError(restore_id) from error
-            if not result["finished"]:
                 raise RestorePendingError(restore_id) from error
             raise
 
-    async def async_recover_data_load(self, dump_dir: str, restore_ids: list[str] | None = None) -> None:
-        """Cancel unclaimed loads and release only operations whose claimed workers have finished."""
+    async def async_recover_data_load(
+        self, dump_dir: str, restore_ids: list[str] | None = None, *, cancel: bool = False
+    ) -> bool:
+        """Finish successful loads, or explicitly cancel; return whether all loads committed."""
         response = await self._restore_rpc(ZMQRequestType.LIST_RESTORES, {"dump_dir": dump_dir})
+        committed = True
         for restore_id in set(response["restore_ids"]) | set(restore_ids or []):
             if not hasattr(self.storage_manager, "report_restore"):
                 raise NotImplementedError(
                     f"{type(self.storage_manager).__name__} does not support selective load recovery"
                 )
-            await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
+            if cancel:
+                try:
+                    await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
+                except (zmq.error.Again, TimeoutError) as error:
+                    raise RestorePendingError(restore_id) from error
             await self.storage_manager.report_restore(self._restore_context(restore_id))
-            result = await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
-            if not result["finished"]:
-                raise RestorePendingError(restore_id)
+            outcome = await self._finish_data_load(restore_id, commit=not cancel)
+            committed = committed and outcome
+        return committed
 
     async def async_check_data_loads(self, dump_dir: str | None = None) -> None:
         """Reject replacing a dump whose files may still be read by a storage unit."""
@@ -1982,9 +1997,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """Restore selected payloads while the controller reserves destination indexes."""
         return self._load_rows_by_key(partition_id, rows, shards, dump_dir, restore_id)
 
-    def recover_data_load(self, dump_dir: str, restore_ids: list[str] | None = None) -> None:
-        """Settle an interrupted load before retrying, clearing, or replacing its dump."""
-        return self._recover_data_load(dump_dir, restore_ids)
+    def recover_data_load(self, dump_dir: str, restore_ids: list[str] | None = None, *, cancel: bool = False) -> bool:
+        """Finish or cancel interrupted loads; return whether every load committed."""
+        return self._recover_data_load(dump_dir, restore_ids, cancel=cancel)
 
     def check_data_loads(self, dump_dir: str | None = None) -> None:
         """Reject replacing a dump while a remote restore may still read it."""
