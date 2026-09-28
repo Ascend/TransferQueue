@@ -358,15 +358,3 @@ async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
     with pytest.raises(OSError, match="write failed"):
         await manager.dump_rows_by_index(str(tmp_path), [0, 1])
     assert completed == ["u1"]
-
-
-def test_rejected_schema_does_not_mark_new_row_ready():
-    from transfer_queue.controller import DataPartitionStatus
-
-    partition = DataPartitionStatus("p")
-    schema = {"x": {"dtype": torch.int64, "shape": (1,), "is_non_tensor": False, "is_nested": False}}
-    assert partition.update_production_status([0], ["x"], schema)
-    conflict = {"x": {**schema["x"], "dtype": torch.float32}}
-    assert not partition.update_production_status([1], ["x"], conflict)
-    assert partition.production_status[1, partition.field_name_mapping["x"]] == 0
-    assert partition.field_metadata["x"].global_indexes == {0}

@@ -130,6 +130,47 @@ def test_restore_cannot_start_in_the_middle_of_clear(controller):
     begin(controller)
 
 
+def test_restore_rejects_schema_before_allocating_indexes(controller):
+    metadata = controller.kv_retrieve_meta(["existing"], "p", create=True)
+    partition = controller.partitions["p"]
+    schema = {"x": {"dtype": torch.int64, "shape": (1,), "is_non_tensor": False, "is_nested": False}}
+    assert partition.update_production_status(metadata.global_indexes, [], schema)
+    conflict = {"x": {**schema["x"], "dtype": torch.float32}}
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        controller.begin_restore("r", "/dump", "p", {"new": {"fields": ["x"], "tag": {}}}, ["u"], conflict)
+    assert set(partition.keys_mapping) == {"existing"}
+    assert not controller.list_restores("/dump")
+
+
+def test_restore_validates_all_updates_before_publishing_readiness(controller):
+    metadata = controller.kv_retrieve_meta(["existing"], "p", create=True)
+    partition = controller.partitions["p"]
+    schema = {"x": {"dtype": torch.int64, "shape": (1,), "is_non_tensor": False, "is_nested": False}}
+    assert partition.update_production_status(metadata.global_indexes, [], schema)
+    restored = begin(controller)
+    controller.restore_unit("r", "u", "claim")
+    controller.restore_unit(
+        "r",
+        "u",
+        "complete",
+        {
+            "success": True,
+            "updates": [
+                {"global_indexes": restored.global_indexes, "field_schema": {"y": schema["x"]}},
+                {
+                    "global_indexes": restored.global_indexes,
+                    "field_schema": {"x": {**schema["x"], "dtype": torch.float32}},
+                },
+            ],
+        },
+    )
+    with pytest.raises(ValueError, match="dtype mismatch"):
+        controller.finish_restore("r", commit=True)
+    assert "y" not in partition.field_metadata
+    assert not partition.production_status[restored.global_indexes].any()
+    assert controller.finish_restore("r", commit=False)["finished"]
+
+
 def test_unit_rejects_cancelled_permission_before_reading(controller):
     begin(controller)
     controller.finish_restore("r", commit=False)

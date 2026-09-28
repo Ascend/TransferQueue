@@ -516,6 +516,20 @@ def test_incompatible_schema_rejected_before_writes(tq_system, dump_dir, control
     _assert_rows_equal(tq.kv_batch_get(["k"], "schema", ["x"])["x"], [torch.tensor([1.5])])
 
 
+@pytest.mark.parametrize("tensor_first", [True, False])
+def test_regular_put_keeps_legacy_tensor_nontensor_acceptance(tq_system, controller, tensor_first):
+    values = [torch.tensor([[7]]), NonTensorStack("text")]
+    if not tensor_first:
+        values.reverse()
+    for key, value in zip(["first", "second"], values, strict=True):
+        tq.kv_batch_put([key], "legacy_put", TensorDict({"x": value}, batch_size=1))
+    metadata = tq.get_client().kv_retrieve_meta(["first", "second"], "legacy_put")
+    assert metadata.is_ready
+    assert metadata.field_names == ["x"]
+    snapshot = ray.get(controller.get_partition_snapshot.remote("legacy_put"))
+    assert snapshot.field_metadata["x"].global_indexes == set(metadata.global_indexes)
+
+
 def test_running_restore_blocks_clear_and_dump_until_recovery(tq_system, dump_dir, controller):
     _put_rows("reserved", ["key"])
     tq.dump_data_by_key(dump_dir, ["key"], "reserved")

@@ -540,12 +540,13 @@ class DataPartitionStatus:
                 required_fields = len(self.field_name_mapping)
                 self.ensure_fields_capacity(required_fields)
 
-            # Validate all field updates before changing readiness or field metadata.
-            self.validate_field_schema(field_schema)
-            self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
+            # Update production status
             if self.production_status is not None and global_indices and field_names:
                 field_indices = [self.field_name_mapping.get(f) for f in field_names]
                 self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
+
+            # Update field metadata
+            self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
