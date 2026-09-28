@@ -23,7 +23,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -185,6 +185,23 @@ def extract_field_schema(data: TensorDict) -> dict[str, dict[str, Any]]:
         # For nested tensors, record per-sample shapes
         if is_nested:
             field_meta["per_sample_shapes"] = [tuple(t.shape) for t in value.unbind()]
+        elif isinstance(value, NonTensorStack):
+            # A legacy chunk may wrap tensor rows without changing their values. Keep
+            # its non-tensor declaration; existing tensor fields can use this hint.
+            values = value.tolist()
+            if values and all(isinstance(item, torch.Tensor) and not item.is_nested for item in values):
+                dtype = values[0].dtype
+                if all(item.dtype == dtype for item in values):
+                    shapes = [tuple(item.shape) for item in values]
+                    nested = any(shape != shapes[0] for shape in shapes)
+                    field_meta["tensor_schema"] = {
+                        "dtype": dtype,
+                        "shape": None if nested else shapes[0] or (1,),
+                        "is_nested": nested,
+                        "is_non_tensor": False,
+                    }
+                    if nested:
+                        field_meta["tensor_schema"]["per_sample_shapes"] = shapes
 
         field_schema[field_name] = field_meta
 

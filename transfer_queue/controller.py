@@ -224,6 +224,20 @@ class FieldMeta:
         Raises:
             ValueError: If incoming dtype conflicts with existing dtype.
         """
+        if self.is_non_tensor:
+            self.global_indexes.update(incoming_global_indexes)
+            return
+        if incoming.get("is_non_tensor"):
+            tensor_schema = incoming.get("tensor_schema")
+            if tensor_schema is None or tensor_schema["dtype"] != self.dtype:
+                self.is_non_tensor = True
+                self.is_nested = False
+                self.dtype = self.shape = None
+                self.per_sample_shapes.clear()
+                self.global_indexes.update(incoming_global_indexes)
+                return
+            incoming = tensor_schema
+
         # dtype consistency check
         new_dtype = incoming.get("dtype")
         if new_dtype is not None:

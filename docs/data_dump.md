@@ -89,6 +89,10 @@ If a missing-shape row contains `None` or an object, the entire selected field i
 saved as non-tensor, with a warning, so every unit restores the same field contract.
 Fields already declared non-tensor remain non-tensor. This repairs the exported
 schema without mutating live controller metadata or inventing shapes for objects.
+New puts also carry tensor shape hints for homogeneous tensor values wrapped in
+`NonTensorStack`. An existing tensor field uses those hints to keep its shape map
+complete; real mixed values make the field non-tensor. A field originally declared
+non-tensor stays non-tensor when later batches contain only tensors.
 
 Version-1 dumps remain readable using the prior caller-side KV put path. Version-2
 dumps retain direct reads, but lack original schemas and use the older inference

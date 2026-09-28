@@ -494,7 +494,10 @@ def test_version_one_dump_remains_readable(tq_system, dump_dir, controller):
 
 @pytest.mark.parametrize("row_count", [3, 127, 128, 129, 130])
 @pytest.mark.parametrize("last_kind", ["tensor", "none", "object"])
-def test_legacy_chunks_with_missing_nested_shapes_roundtrip(tq_system, dump_dir, controller, row_count, last_kind):
+@pytest.mark.parametrize("legacy_metadata", [False, True])
+def test_legacy_chunks_with_missing_nested_shapes_roundtrip(
+    tq_system, dump_dir, controller, row_count, last_kind, legacy_metadata, monkeypatch
+):
     partition = "legacy_nested"
     keys = [f"k{i}" for i in range(row_count)]
     tensors = [torch.arange(i % 3 + 1, dtype=torch.int64) for i in range(row_count)]
@@ -530,9 +533,44 @@ def test_legacy_chunks_with_missing_nested_shapes_roundtrip(tq_system, dump_dir,
     snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
     last_index = snapshot.keys_mapping[keys[-1]]
     assert last_index in snapshot.field_metadata["input_ids"].global_indexes
-    assert last_index not in snapshot.field_metadata["input_ids"].per_sample_shapes
+    if last_kind == "tensor":
+        assert tuple(snapshot.field_metadata["input_ids"].per_sample_shapes[last_index]) == tuple(tensors[-1].shape)
+    else:
+        assert snapshot.field_metadata["input_ids"].is_non_tensor
+        assert not snapshot.field_metadata["input_ids"].is_nested
+    if legacy_metadata:
+        from transfer_queue.controller import FieldMeta
+
+        # Existing controller checkpoints can retain the old incomplete nested schema.
+        checkpoint = dump_dir.parent / "legacy-controller.pkl"
+        tq.get_client().save_controller_checkpoint(str(checkpoint))
+        with checkpoint.open("rb") as file:
+            state = pickle.load(file)
+        for name in ["input_ids", "multi_modal_inputs#images"]:
+            state["partitions"][partition].field_metadata[name] = FieldMeta(
+                global_indexes=set(snapshot.keys_mapping.values()),
+                dtype=torch.int64,
+                is_nested=True,
+                is_non_tensor=False,
+                per_sample_shapes={
+                    snapshot.keys_mapping[key]: tuple(value.shape)
+                    for key, value in zip(keys[:-1], tensors[:-1], strict=True)
+                },
+            )
+        with checkpoint.open("wb") as file:
+            pickle.dump(state, file)
+        tq.get_client().load_controller_checkpoint(str(checkpoint))
+    open_file = builtins.open
+
+    def no_shard_read(path, *args, **kwargs):
+        if isinstance(path, str | Path) and Path(path).name.startswith("shard_") and str(path).endswith(".pkl"):
+            pytest.fail("Dump schema repair read a payload shard in the caller")
+        return open_file(path, *args, **kwargs)
+
     for target in [dump_dir, dump_dir.parent / "second-dump"]:
-        tq.dump_data_by_key(target, keys, partition)
+        with monkeypatch.context() as patcher:
+            patcher.setattr(builtins, "open", no_shard_read)
+            tq.dump_data_by_key(target, keys, partition)
         index = tq.read_row_index(target)
         for name in ["input_ids", "multi_modal_inputs#images"]:
             schema = index["field_schema"][name]
@@ -542,6 +580,10 @@ def test_legacy_chunks_with_missing_nested_shapes_roundtrip(tq_system, dump_dir,
                 for key, value in zip(keys, expected, strict=True):
                     assert tuple(schema["per_sample_shapes"][index["rows"][key]["global_index"]]) == tuple(value.shape)
         assert index["field_schema"]["wrapped"]["is_non_tensor"]
+        if legacy_metadata and last_kind != "tensor" and target == dump_dir:
+            with pytest.raises(RuntimeError, match="tensor/non-tensor type mismatch"):
+                tq.load_data_by_key(target)
+            assert not target.with_name(target.name + ".restore").exists()
         tq.kv_clear(keys, partition)
         tq.load_data_by_key(target)
         for start in range(0, row_count, 128):

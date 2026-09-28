@@ -423,3 +423,82 @@ def test_saved_missing_tensor_shape_is_reported_as_invalid_dump():
     }
     with pytest.raises(ValueError, match="has no saved shape at row 1"):
         validate_dump_values({"x": torch.arange(2)}, schema, 1)
+
+
+@pytest.mark.parametrize("value", [torch.arange(4), None, {"image": torch.arange(4)}])
+@pytest.mark.parametrize("wrapped_first", [False, True])
+def test_field_metadata_merges_wrapped_values_without_incomplete_nested_shapes(value, wrapped_first):
+    from tensordict import NonTensorStack, TensorDict
+
+    from transfer_queue.controller import DataPartitionStatus
+    from transfer_queue.metadata import extract_field_schema
+
+    batches = [
+        TensorDict(
+            {"x": torch.nested.as_nested_tensor([torch.arange(2), torch.arange(3)], layout=torch.jagged)}, batch_size=2
+        ),
+        TensorDict({"x": NonTensorStack(value)}, batch_size=1),
+    ]
+    if wrapped_first:
+        batches.reverse()
+    partition = DataPartitionStatus("p")
+    offset = 0
+    for batch in batches:
+        indexes = list(range(offset, offset + batch.batch_size[0]))
+        schema = extract_field_schema(batch)
+        for field in schema.values():
+            for part in [field, field.get("tensor_schema", {})]:
+                if "per_sample_shapes" in part:
+                    part["per_sample_shapes"] = dict(zip(indexes, part["per_sample_shapes"], strict=True))
+        assert partition.update_production_status(indexes, [], schema)
+        offset += batch.batch_size[0]
+    meta = partition.field_metadata["x"]
+    if not wrapped_first and isinstance(value, torch.Tensor):
+        assert meta.is_nested
+        assert not meta.is_non_tensor
+        assert meta.per_sample_shapes == {0: (2,), 1: (3,), 2: (4,)}
+    else:
+        assert meta.is_non_tensor
+        assert not meta.is_nested
+        assert meta.dtype is None
+        assert not meta.per_sample_shapes
+    assert meta.global_indexes == {0, 1, 2}
+
+
+@pytest.mark.parametrize("shape", [(), (1,), (4,)])
+def test_wrapped_tensor_hints_preserve_dense_fields(shape):
+    from tensordict import NonTensorStack, TensorDict
+
+    from transfer_queue.controller import DataPartitionStatus
+    from transfer_queue.metadata import extract_field_schema
+
+    partition = DataPartitionStatus("p")
+    value = torch.ones(shape, dtype=torch.int64)
+    first = extract_field_schema(TensorDict({"x": value.unsqueeze(0)}, batch_size=1))
+    second = extract_field_schema(TensorDict({"x": NonTensorStack(value)}, batch_size=1))
+    assert second["x"]["is_non_tensor"]
+    assert partition.update_production_status([0], [], first)
+    assert partition.update_production_status([1], [], second)
+    meta = partition.field_metadata["x"]
+    assert not meta.is_nested
+    assert not meta.is_non_tensor
+    assert tuple(meta.shape) == (shape or (1,))
+    assert meta.dtype == torch.int64
+
+
+def test_schema_hints_do_not_iterate_broadcast_nontensor_data(monkeypatch):
+    from tensordict import NonTensorData, TensorDict
+
+    from transfer_queue.metadata import extract_field_schema
+
+    data = TensorDict({"x": NonTensorData(data={"kind": "image"}, batch_size=(2,))}, batch_size=2)
+    original = NonTensorData.__getitem__
+
+    def bounded_getitem(self, index):
+        assert index == 0, "Schema extraction tried to iterate broadcast NonTensorData"
+        return original(self, index)
+
+    monkeypatch.setattr(NonTensorData, "__getitem__", bounded_getitem)
+    field = extract_field_schema(data)["x"]
+    assert field["is_non_tensor"]
+    assert "tensor_schema" not in field
