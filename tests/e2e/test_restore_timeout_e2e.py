@@ -32,8 +32,6 @@ from transfer_queue.utils.zmq_utils import ZMQMessage
 
 
 def _check_claimed_load_survives_receive_timeout(tmp_path):
-    import transfer_queue.storage.managers.simple_storage_manager as manager_module
-
     ray.init(namespace="review_claimed_timeout")
     try:
         tq.init(
@@ -70,7 +68,10 @@ def _check_claimed_load_survives_receive_timeout(tmp_path):
             unit._load_rows = delayed
 
         ray.get(actor.__ray_call__.remote(pause_after_claim))
-        with patch.object(manager_module, "TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 0.5):
+        # The pool fixes each socket's timeout at connect, so shorten the live pool itself;
+        # patching the module constant would only reach sockets opened after this point.
+        pool = tq.get_client().storage_manager.storage_rpc_pool
+        with patch.object(pool, "_timeout", 1), patch.object(pool, "_idle", {}):
             with pytest.raises(tq.RestorePendingError):
                 tq.load_data_by_key(dump_dir)
         assert claimed.exists()
