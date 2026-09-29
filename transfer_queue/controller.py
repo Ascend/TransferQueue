@@ -1725,6 +1725,48 @@ class TransferQueueController:
 
         return keys
 
+    # ==================== Selective Data Dump API ====================
+
+    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Describe the key-addressed rows a selective dump needs, without copying them.
+
+        Returns only metadata, so the caller can write a row index and route the payload
+        dump to the storage units that hold it. Deliberately avoids ``to_snapshot``: a
+        dump needs a handful of lookups per key, not a deep copy of the whole partition.
+
+        Args:
+            partition_id: Partition that owns ``keys``.
+            keys: Keys to describe, already deduplicated by the caller.
+
+        Returns:
+            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``. ``fields``
+            is empty for a row that exists in metadata but has no produced field yet.
+
+        Raises:
+            KeyError: The partition or any key does not exist.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            raise KeyError(f"partition {partition_id!r} does not exist; existing partitions: {sorted(self.partitions)}")
+
+        global_indexes = partition.kv_retrieve_indexes(keys)
+        missing_keys = [key for key, index in zip(keys, global_indexes, strict=True) if index is None]
+        if missing_keys:
+            raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
+
+        return {
+            key: {
+                "global_index": global_index,
+                "fields": sorted(
+                    field_name
+                    for field_name, field_meta in partition.field_metadata.items()
+                    if global_index in field_meta.global_indexes
+                ),
+                "tag": partition.custom_meta.get(global_index, {}),
+            }
+            for key, global_index in zip(keys, global_indexes, strict=True)
+        }
+
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
@@ -1948,6 +1990,7 @@ class TransferQueueController:
             ZMQRequestType.KV_RETRIEVE_META: self._handle_kv_retrieve_meta_request,
             ZMQRequestType.KV_RETRIEVE_KEYS: self._handle_kv_retrieve_keys_request,
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
+            ZMQRequestType.DESCRIBE_ROWS_BY_KEY: self._handle_describe_rows_by_key_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2163,6 +2206,15 @@ class TransferQueueController:
             request_msg,
             ZMQRequestType.KV_LIST_RESPONSE,
             {"partition_info": partition_info, "message": message},
+        )
+
+    def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
+        return self._make_response(
+            request_msg,
+            ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+            {"success": True, "rows": rows},
         )
 
     def _handle_save_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:

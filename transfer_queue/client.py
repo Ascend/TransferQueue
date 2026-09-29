@@ -1124,6 +1124,73 @@ class AsyncTransferQueueClient:
                     return False
         return True
 
+    # ==================== Selective Data Dump API ====================
+    @with_controller_socket
+    async def async_describe_rows_by_key(
+        self,
+        partition_id: str,
+        keys: list[str],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Asynchronously fetch the row metadata a selective dump needs, via ZMQ RPC.
+
+        Args:
+            partition_id: Partition that owns ``keys``.
+            keys: Keys to describe, already deduplicated by the caller.
+            socket: ZMQ socket injected by @with_controller_socket.
+
+        Returns:
+            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``.
+
+        Raises:
+            RuntimeError: If the RPC fails, or the partition or a key is unknown.
+        """
+        try:
+            assert socket is not None
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY,  # type: ignore[arg-type]
+                sender_id=self.client_id,
+                receiver_id=self._controller.id,
+                body={"partition_id": partition_id, "keys": keys},
+            )
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            if response_msg.request_type != ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE:
+                raise RuntimeError(
+                    f"[{self.client_id}]: Unexpected response type {response_msg.request_type} "
+                    f"from controller during row description"
+                )
+            if not response_msg.body["success"]:
+                raise RuntimeError(response_msg.body["message"])
+            return response_msg.body["rows"]
+        except Exception as e:
+            raise RuntimeError(f"[{self.client_id}]: Error in describe_rows_by_key: {str(e)}") from e
+
+    async def async_dump_rows_by_index(self, shard_dir: str, global_indexes: list[int]) -> list[dict[str, Any]]:
+        """Asynchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            global_indexes: Global indexes to dump.
+
+        Returns:
+            One entry per written shard.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before dump operations."
+            )
+        if not hasattr(self.storage_manager, "dump_rows_by_index"):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support selective data dump")
+        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes)
+
     # ==================== Checkpoint API ====================
     @with_controller_socket
     async def async_save_controller_checkpoint(
@@ -1308,6 +1375,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
+        self._describe_rows_by_key = _make_sync(self.async_describe_rows_by_key)
+        self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1743,6 +1812,39 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._kv_list(partition_id=partition_id)
+
+    # ==================== Selective Data Dump API ====================
+    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Synchronously fetch the row metadata a selective dump needs, via ZMQ RPC.
+
+        Args:
+            partition_id: Partition that owns ``keys``.
+            keys: Keys to describe, already deduplicated by the caller.
+
+        Returns:
+            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``.
+
+        Raises:
+            RuntimeError: If the RPC fails, or the partition or a key is unknown.
+        """
+        return self._describe_rows_by_key(partition_id, keys)
+
+    def dump_rows_by_index(self, shard_dir: str, global_indexes: list[int]) -> list[dict[str, Any]]:
+        """Synchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            global_indexes: Global indexes to dump.
+
+        Returns:
+            One entry per written shard.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        return self._dump_rows_by_index(shard_dir, global_indexes)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:
