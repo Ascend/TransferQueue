@@ -1209,16 +1209,18 @@ class AsyncTransferQueueClient:
         response = await self._request_controller(socket, request_type, response_type, body)
         return response.body
 
-    async def _finish_data_load(self, restore_id: str, *, commit: bool) -> bool:
+    async def _finish_data_load(
+        self, restore_id: str, *, commit: bool, report_errors: dict[str, str] | None = None
+    ) -> bool:
         """Keep the reservation when completion is pending or its reply is lost."""
         try:
             result = await self._restore_rpc(
                 ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": commit}
             )
         except (zmq.error.Again, TimeoutError) as error:
-            raise RestorePendingError(restore_id) from error
+            raise RestorePendingError(restore_id, report_errors=report_errors) from error
         if not result["finished"]:
-            raise RestorePendingError(restore_id)
+            raise RestorePendingError(restore_id, report_errors=report_errors)
         return result["committed"]
 
     async def async_load_rows_by_key(
@@ -1283,8 +1285,8 @@ class AsyncTransferQueueClient:
                     await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
                 except (zmq.error.Again, TimeoutError) as error:
                     raise RestorePendingError(restore_id) from error
-            await self.storage_manager.report_restore(self._restore_context(restore_id))
-            outcome = await self._finish_data_load(restore_id, commit=not cancel)
+            report_errors = await self.storage_manager.report_restore(self._restore_context(restore_id))
+            outcome = await self._finish_data_load(restore_id, commit=not cancel, report_errors=report_errors)
             committed = committed and outcome
         return committed
 

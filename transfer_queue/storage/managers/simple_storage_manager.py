@@ -926,12 +926,23 @@ class AsyncSimpleStorageManager(StorageManager):
             )
         return response.body
 
-    async def report_restore(self, restore: dict) -> None:
-        """Ask units to resend cached terminal results; unknown units cannot grant release."""
-        await asyncio.gather(
-            *(self._report_restore_unit(restore, target_storage_unit=unit) for unit in self.storage_unit_infos),
+    async def report_restore(self, restore: dict) -> dict[str, str]:
+        """Wait for all unit reports and return failures without discarding successful reports."""
+        units = list(self.storage_unit_infos)
+        results = await asyncio.gather(
+            *(self._report_restore_unit(restore, target_storage_unit=unit) for unit in units),
             return_exceptions=True,
         )
+        errors = {}
+        for unit, result in zip(units, results, strict=True):
+            if isinstance(result, Exception):
+                errors[unit] = f"{type(result).__name__}: {result}"
+                logger.warning(
+                    "Restore %s: unit %s could not report completion: %s", restore["restore_id"], unit, errors[unit]
+                )
+            elif isinstance(result, BaseException):
+                raise result
+        return errors
 
     @with_storage_unit_socket
     async def _report_restore_unit(self, restore: dict, target_storage_unit: str, socket: zmq.Socket = None) -> None:
@@ -941,7 +952,10 @@ class AsyncSimpleStorageManager(StorageManager):
         await socket.send_multipart(request.serialize())
         response = ZMQMessage.deserialize(await socket.recv_multipart())
         if response.request_type != ZMQRequestType.REPORT_RESTORE_RESPONSE or not response.body.get("success"):
-            raise RuntimeError("Storage unit could not report its restore result")
+            message = response.body.get("message", f"Unexpected response: {response.request_type}")
+            raise RuntimeError(
+                f"Restore {restore['restore_id']}: storage unit {target_storage_unit} report failed: {message}"
+            )
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.

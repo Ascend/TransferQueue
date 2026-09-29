@@ -79,8 +79,10 @@ def pack_dump_field(values: list, schema: dict):
 class RestorePendingError(RuntimeError):
     """The controller still reserves indexes until remote restore activity is settled."""
 
-    def __init__(self, restore_id: str):
+    def __init__(self, restore_id: str, *, report_errors: dict[str, str] | None = None):
         self.restore_id = restore_id
-        super().__init__(
-            f"Restore {restore_id} has an unknown outcome; run recover_data_load before retrying or clearing"
-        )
+        self.report_errors = report_errors or {}
+        message = f"Restore {restore_id} has an unknown outcome; run recover_data_load before retrying or clearing"
+        if self.report_errors:
+            message += f". Unit report failures: {self.report_errors}"
+        super().__init__(message)

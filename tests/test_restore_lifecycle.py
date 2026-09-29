@@ -15,6 +15,7 @@
 
 """Restore reservations prevent late writes from corrupting reused indexes."""
 
+import asyncio
 from threading import RLock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -49,6 +50,72 @@ def controller():
 
 def begin(controller, restore_id="r"):
     return controller.begin_restore(restore_id, "/dump", "p", {"k": {"fields": ["x"], "tag": {}}}, ["u"], {})
+
+
+@pytest.mark.asyncio
+async def test_report_failures_preserve_other_unit_reports(caplog):
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_unit_infos = dict.fromkeys(["rejected", "slow", "timeout"])
+    manager.close = lambda: None
+    failed = asyncio.Event()
+    completed = []
+
+    async def report(restore, target_storage_unit):
+        if target_storage_unit == "rejected":
+            failed.set()
+            raise RuntimeError("Invalid restore transition pending -> complete")
+        await failed.wait()
+        if target_storage_unit == "timeout":
+            raise zmq.error.Again()
+        await asyncio.sleep(0)
+        completed.append(target_storage_unit)
+
+    manager._report_restore_unit = report
+    errors = await manager.report_restore({"restore_id": "r"})
+    assert completed == ["slow"]
+    assert set(errors) == {"rejected", "timeout"}
+    assert "pending -> complete" in errors["rejected"]
+    assert "Again" in errors["timeout"]
+    assert "Restore r: unit rejected" in caplog.text
+    assert "pending -> complete" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_report_preserves_controller_rejection_message():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test"
+    manager.close = lambda: None
+    response = ZMQMessage.create(
+        request_type=ZMQRequestType.REPORT_RESTORE_RESPONSE,
+        sender_id="u",
+        body={"success": False, "message": "Invalid restore transition pending -> complete"},
+    )
+    socket = SimpleNamespace(send_multipart=AsyncMock(), recv_multipart=AsyncMock(return_value=response.serialize()))
+    with pytest.raises(RuntimeError, match="Restore r: storage unit u report failed: Invalid restore transition"):
+        await manager._report_restore_unit.__wrapped__(manager, {"restore_id": "r"}, "u", socket=socket)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", [None, False, True, "timeout"])
+async def test_recovery_surfaces_report_errors_only_while_outcome_is_unknown(outcome):
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    errors = {"u": "RuntimeError: completion rejected"}
+    client.storage_manager = SimpleNamespace(report_restore=AsyncMock(return_value=errors))
+    client._restore_context = lambda restore_id: {"restore_id": restore_id}
+    reply = {"finished": outcome is not None, "committed": outcome}
+    client._restore_rpc = AsyncMock(
+        side_effect=[
+            {"restore_ids": ["r"]},
+            zmq.error.Again() if outcome == "timeout" else reply,
+        ]
+    )
+    if outcome is None or outcome == "timeout":
+        with pytest.raises(RestorePendingError, match="completion rejected") as error:
+            await client.async_recover_data_load("/dump")
+        assert error.value.report_errors == errors
+    else:
+        assert await client.async_recover_data_load("/dump") is outcome
+    assert client._restore_rpc.await_args.args == (ZMQRequestType.FINISH_RESTORE, {"restore_id": "r", "commit": True})
 
 
 @pytest.mark.asyncio
