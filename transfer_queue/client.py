@@ -1220,7 +1220,12 @@ class AsyncTransferQueueClient:
         except (zmq.error.Again, TimeoutError) as error:
             raise RestorePendingError(restore_id, report_errors=report_errors) from error
         if not result["finished"]:
-            raise RestorePendingError(restore_id, report_errors=report_errors)
+            raise RestorePendingError(
+                restore_id,
+                reason=result.get("reason", "unknown_outcome"),
+                unit_states=result.get("unit_states"),
+                report_errors=report_errors,
+            )
         return result["committed"]
 
     async def async_load_rows_by_key(

@@ -1861,6 +1861,15 @@ class TransferQueueController:
                 if state != "pending" or restore["aborting"]:
                     raise RuntimeError(f"Restore unit cannot start in state {state}")
                 restore["units"][unit_id] = "running"
+            elif (
+                action == "complete"
+                and state == "pending"
+                and result is not None
+                and result.get("claim_failed") is True
+                and result.get("success") is False
+            ):
+                # The claim may never have arrived; this worker confirms it did not write.
+                restore["units"][unit_id] = "failed"
             elif action == "complete" and state in ("running", "done", "failed") and result is not None:
                 restore["units"][unit_id] = "done" if result["success"] else "failed"
                 restore["updates"][unit_id] = result.get("updates", [])
@@ -1875,7 +1884,7 @@ class TransferQueueController:
             restore = self._restores.get(restore_id)
             if restore is None:
                 if commit:
-                    return {"finished": False}
+                    return {"finished": False, "reason": "unknown_restore"}
                 self._restore_outcomes[restore_id] = False
                 return {"finished": True, "committed": False}
             if not commit or "failed" in restore["units"].values():
@@ -1883,9 +1892,14 @@ class TransferQueueController:
                 for unit, state in restore["units"].items():
                     if state == "pending":
                         restore["units"][unit] = "cancelled"
-            running = [unit for unit, state in restore["units"].items() if state in ("pending", "running")]
-            if running:
-                return {"finished": False, "units": running}
+            unfinished = {unit: state for unit, state in restore["units"].items() if state in ("pending", "running")}
+            if unfinished:
+                return {
+                    "finished": False,
+                    "reason": "unfinished_units",
+                    "units": list(unfinished),
+                    "unit_states": unfinished,
+                }
             committed = commit and not restore["aborting"]
             if committed:
                 partition = self.partitions[restore["partition_id"]]

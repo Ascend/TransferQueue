@@ -104,6 +104,48 @@ def test_claimed_load_survives_receive_timeout(tmp_path):
             process.join(10)
 
 
+def test_whole_system_restart_explains_and_cancels_orphan_marker(tmp_path):
+    ray.init(namespace="restart_recovery")
+    config = OmegaConf.create(
+        {
+            "backend": {
+                "storage_backend": "SimpleStorage",
+                "SimpleStorage": {
+                    "num_data_storage_units": 1,
+                    "total_storage_size": 20,
+                },
+            }
+        }
+    )
+    dump_dir = tmp_path / "dump"
+    marker = tmp_path / "dump.restore"
+    try:
+        tq.init(config)
+        tq.kv_put("key", "p", {"x": torch.tensor([7])})
+        tq.dump_data_by_key(dump_dir, ["key"], "p")
+        controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+        rows = tq.read_row_index(dump_dir)["rows"]
+        units = list(tq.get_client().storage_manager.storage_unit_infos)
+        ray.get(controller.begin_restore.remote("interrupted", str(dump_dir.resolve()), "p", rows, units, {}))
+        marker.write_text("interrupted")
+        tq.close()
+        tq.init(config)
+        for _ in range(2):
+            with pytest.raises(tq.RestorePendingError, match="cancel=True") as error:
+                tq.recover_data_load(dump_dir)
+            assert error.value.reason == "unknown_restore"
+            assert marker.exists()
+        tq.kv_put("unrelated", "other", {"x": torch.tensor([99])})
+        tq.save_checkpoint(tmp_path / "checkpoint")
+        assert tq.recover_data_load(dump_dir, cancel=True) is False
+        assert not marker.exists()
+        tq.load_data_by_key(dump_dir)
+        assert tq.kv_batch_get(["key"], "p", ["x"])["x"][0].item() == 7
+    finally:
+        tq.close()
+        ray.shutdown()
+
+
 def test_cancelled_delayed_load_cannot_overwrite_reused_index(tmp_path):
     ray.init(namespace="review_timeout")
     tq.init(

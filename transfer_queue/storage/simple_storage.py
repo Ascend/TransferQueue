@@ -1420,7 +1420,11 @@ class SimpleStorageUnit:
         except zmq.error.Again as e:
             # A lost claim ACK may leave the controller in running state even though
             # this worker will not write; retain a terminal result for recovery.
-            self._restore_results[context["restore_id"]] = {"success": False, "message": str(e)}
+            self._restore_results[context["restore_id"]] = {
+                "success": False,
+                "claim_failed": True,
+                "message": f"Restore claim was not acknowledged; payload was not written: {e}",
+            }
             return ZMQMessage.create(
                 request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,

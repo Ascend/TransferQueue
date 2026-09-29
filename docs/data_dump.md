@@ -134,9 +134,26 @@ committed = tq.recover_data_load("/shared/dumps/selected")
 Recovery asks units to resend terminal results and commits schemas and tags only
 when all units succeeded. It returns `True` for committed loads (or no pending
 load), and `False` for a failed or cancelled load after all claimed workers stopped.
-Running or unknown work raises `RestorePendingError`; retry recovery later without
-reloading payloads. The controller remembers terminal outcomes so a lost commit
-reply can be confirmed safely by retrying recovery.
+Unresolved work raises `RestorePendingError`, which includes `reason`, `unit_states`
+and `report_errors`. Reports that fail retain the unit ID and original error message.
+The controller remembers terminal outcomes so a lost commit reply can be confirmed
+safely by retrying recovery; a redundant report failure cannot reverse that outcome.
+
+- `running` units have claimed permission but have not reported completion. Retry
+  recovery later; a reporting timeout does not prove that a worker has stopped.
+- `pending` units have not claimed permission. A request may still be queued, so
+  recovery does not automatically cancel it. If the initiating client exited before
+  sending all requests, use `recover_data_load(dump_dir, cancel=True)` to abandon the
+  operation; simply repeating recovery cannot dispatch the missing requests.
+- `reason="unknown_restore"` means the controller has no record of the ID in the
+  `.restore` marker. If the initiating client has stopped, use explicit cancellation.
+  After a whole-system restart, first ensure all old actors have stopped, then cancel
+  the stale operation. This marker blocks its dump path, not the new controller's
+  unrelated partitions or checkpoints.
+
+A unit whose claim timed out caches a failure confirming that it did not write.
+Recovery accepts this failure even when the claim never reached the controller,
+cancels unclaimed work and waits for any other claimed workers to finish.
 
 To abandon the load explicitly, use `recover_data_load(dump_dir, cancel=True)`.
 This denies unclaimed work and retains the reservation until claimed workers stop.
@@ -145,6 +162,13 @@ cancels remaining unclaimed work; partial payload writes are never rolled back.
 After cancellation settles, retry the load or clear its keys. A lost unit requires
 stopping the old TQ actors and restarting the whole TQ system; restarting only the
 controller while old storage actors run is unsupported.
+After restarting, cancel the old marker before loading the dump again:
+
+```python
+# Run only after all old TQ actors have stopped and the new system is initialized.
+tq.recover_data_load(dump_dir, cancel=True)
+tq.load_data_by_key(dump_dir)
+```
 
 Writers that already hold low-level metadata must remain paused throughout recovery.
 The controller reservation covers only the destination partition. Each storage unit

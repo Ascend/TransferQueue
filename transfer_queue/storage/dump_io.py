@@ -77,12 +77,37 @@ def pack_dump_field(values: list, schema: dict):
 
 
 class RestorePendingError(RuntimeError):
-    """The controller still reserves indexes until remote restore activity is settled."""
+    """Recovery is unresolved; expose unit states and reporting failures without releasing protection."""
 
-    def __init__(self, restore_id: str, *, report_errors: dict[str, str] | None = None):
+    def __init__(
+        self,
+        restore_id: str,
+        *,
+        reason: str = "unknown_outcome",
+        unit_states: dict[str, str] | None = None,
+        report_errors: dict[str, str] | None = None,
+    ):
         self.restore_id = restore_id
+        self.reason = reason
+        self.unit_states = unit_states or {}
         self.report_errors = report_errors or {}
-        message = f"Restore {restore_id} has an unknown outcome; run recover_data_load before retrying or clearing"
+        message = f"Restore {restore_id} is unresolved ({reason})"
+        if reason == "unknown_restore":
+            message += (
+                "; the controller has no record of this ID. If the initiating client has stopped, "
+                "or the whole TQ system was restarted after stopping all old actors, "
+                "use recover_data_load(dump_dir, cancel=True) to discard the stale operation"
+            )
+        elif self.unit_states:
+            message += f"; unit states: {self.unit_states}. Pending units have not claimed permission; "
+            message += "running units have not reported completion. Retry recover_data_load to await completion"
+            if "pending" in self.unit_states.values():
+                message += (
+                    "; if the initiating client exited before dispatching all requests, "
+                    "use recover_data_load(dump_dir, cancel=True) instead of retrying indefinitely"
+                )
+        else:
+            message += "; the remote outcome is unknown. Run recover_data_load before retrying or clearing"
         if self.report_errors:
             message += f". Unit report failures: {self.report_errors}"
         super().__init__(message)

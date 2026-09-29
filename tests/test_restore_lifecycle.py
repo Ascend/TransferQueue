@@ -52,6 +52,125 @@ def begin(controller, restore_id="r"):
     return controller.begin_restore(restore_id, "/dump", "p", {"k": {"fields": ["x"], "tag": {}}}, ["u"], {})
 
 
+@pytest.fixture
+def recovery(controller):
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client._restore_context = lambda restore_id: {"restore_id": restore_id}
+    cls = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = cls.__new__(cls)
+    unit.storage_unit_id = "u"
+    unit._restore_results = {}
+    unit._restore_controller_request = lambda context, action, result=None: controller.restore_unit(
+        context["restore_id"], "u", action, result
+    )
+    unit._load_rows = lambda *_: pytest.fail("Unacknowledged claim must not write payload")
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "manager"
+    manager.storage_unit_infos = {"u": None}
+    manager.close = lambda: None
+
+    async def report(context, target_storage_unit):
+        request = ZMQMessage.create(request_type=ZMQRequestType.REPORT_RESTORE, sender_id="test", body=context)
+        response = unit._handle_report_restore(request)
+        socket = SimpleNamespace(
+            send_multipart=AsyncMock(), recv_multipart=AsyncMock(return_value=response.serialize())
+        )
+        await manager._report_restore_unit.__wrapped__(manager, context, target_storage_unit, socket=socket)
+
+    async def rpc(action, body):
+        if action == ZMQRequestType.LIST_RESTORES:
+            return {"restore_ids": controller.list_restores(body["dump_dir"])}
+        assert action == ZMQRequestType.FINISH_RESTORE
+        return controller.finish_restore(**body)
+
+    manager._report_restore_unit = report
+    client._restore_rpc = rpc
+    client.storage_manager = manager
+    return client, unit
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_arrived", [False, True])
+async def test_default_recovery_settles_failed_claim_without_payload(controller, recovery, claim_arrived):
+    client, unit = recovery
+    begin(controller)
+    original_request = unit._restore_controller_request
+
+    def lose_claim_reply(context, action, result=None):
+        if claim_arrived:
+            original_request(context, action, result)
+        raise zmq.error.Again()
+
+    unit._restore_controller_request = lose_claim_reply
+    response = unit._handle_load_rows(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_ROWS,
+            sender_id="test",
+            body={"restore": {"restore_id": "r"}, "shards": []},
+        )
+    )
+    assert not response.body["success"]
+    unit._restore_controller_request = original_request
+    assert await client.async_recover_data_load("/dump", ["r"]) is False
+    assert not unit._restore_results
+    assert not controller.list_restores("/dump")
+    with pytest.raises(RuntimeError, match="no longer active"):
+        controller.restore_unit("r", "u", "claim")
+    controller.clear_partition("p")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_pending_recovery_explains_options_without_cancelling_delayed_load(controller, recovery, cancel):
+    client, _ = recovery
+    begin(controller)
+    with pytest.raises(RestorePendingError, match="cancel=True") as error:
+        await client.async_recover_data_load("/dump")
+    assert error.value.reason == "unfinished_units"
+    assert error.value.unit_states == {"u": "pending"}
+    assert not controller._restores["r"]["aborting"]
+    if cancel:
+        assert await client.async_recover_data_load("/dump", cancel=True) is False
+        with pytest.raises(RuntimeError, match="no longer active"):
+            controller.restore_unit("r", "u", "claim")
+    else:
+        controller.restore_unit("r", "u", "claim")
+        controller.restore_unit("r", "u", "complete", {"success": True, "updates": []})
+        assert await client.async_recover_data_load("/dump") is True
+
+
+@pytest.mark.asyncio
+async def test_failed_pending_claim_keeps_other_running_unit_reserved(controller, recovery):
+    client, unit = recovery
+    rows = {key: {"fields": ["x"], "tag": {}} for key in ["a", "b"]}
+    controller.begin_restore("r", "/dump", "p", rows, ["u", "other"], {})
+    controller.restore_unit("r", "other", "claim")
+    unit._restore_results["r"] = {"success": False, "claim_failed": True, "message": "claim request lost"}
+    with pytest.raises(RestorePendingError) as error:
+        await client.async_recover_data_load("/dump")
+    assert error.value.unit_states == {"other": "running"}
+    with pytest.raises(RuntimeError, match="unresolved"):
+        controller.clear_partition("p")
+    controller.restore_unit("r", "other", "complete", {"success": True, "updates": []})
+    assert await client.async_recover_data_load("/dump") is False
+    assert not controller.partitions["p"].field_metadata
+
+
+@pytest.mark.parametrize(
+    "unit,result",
+    [
+        ("u", {"success": True, "claim_failed": True}),
+        ("u", {"success": False}),
+        ("foreign", {"success": False, "claim_failed": True}),
+    ],
+)
+def test_pending_unit_cannot_report_success_or_unconfirmed_failure(controller, unit, result):
+    begin(controller)
+    with pytest.raises(RuntimeError):
+        controller.restore_unit("r", unit, "complete", result)
+    assert controller._restores["r"]["units"] == {"u": "pending"}
+
+
 @pytest.mark.asyncio
 async def test_report_failures_preserve_other_unit_reports(caplog):
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
