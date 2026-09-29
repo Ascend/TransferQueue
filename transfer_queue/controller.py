@@ -2357,15 +2357,6 @@ class TransferQueueController:
             {"partition_info": partition_info, "message": message},
         )
 
-    def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        params = request_msg.body
-        rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
-        return self._make_response(
-            request_msg,
-            ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
-            {"success": True, "rows": rows},
-        )
-
     def _handle_save_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         self.save_checkpoint(request_msg.body["path"])
         return self._make_response(
@@ -2380,20 +2371,6 @@ class TransferQueueController:
             request_msg,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
             {"success": True},
-        )
-
-    def _make_response(
-        self,
-        request_msg: ZMQMessage,
-        response_type: ZMQRequestType,
-        body: dict[str, Any],
-    ) -> ZMQMessage:
-        """Build a controller response addressed to the request sender."""
-        return ZMQMessage.create(
-            request_type=response_type,
-            sender_id=self.controller_id,
-            receiver_id=request_msg.sender_id,
-            body=body,
         )
 
     def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:

@@ -15,7 +15,6 @@
 
 import asyncio
 import os
-import socket
 import time
 import warnings
 from collections import defaultdict

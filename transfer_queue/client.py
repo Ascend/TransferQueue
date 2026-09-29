@@ -1126,33 +1126,6 @@ class AsyncTransferQueueClient:
                     return False
         return True
 
-    async def _request_controller(
-        self,
-        socket: zmq.asyncio.Socket | None,
-        request_type: ZMQRequestType,
-        response_type: ZMQRequestType,
-        body: dict[str, Any],
-    ) -> ZMQMessage:
-        """Send one controller request and validate its response type."""
-        assert socket is not None
-        request_msg = ZMQMessage.create(
-            request_type=request_type,  # type: ignore[arg-type]
-            sender_id=self.client_id,
-            receiver_id=self._controller.id,
-            body=body,
-        )
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
-        logger.debug(f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}")
-        if response_msg.request_type != response_type:
-            message = response_msg.body.get("message", "Unknown error")
-            raise RuntimeError(
-                f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
-                f"from controller {self._controller.id}: {message}"
-            )
-        return response_msg
-
     # ==================== Selective Data Dump API ====================
     @with_controller_socket
     async def async_describe_data_dump(
