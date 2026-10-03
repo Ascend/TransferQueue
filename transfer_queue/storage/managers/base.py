@@ -238,8 +238,7 @@ class StorageManager(ABC):
         """
 
         if not self.controller_info:
-            logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
-            return
+            raise RuntimeError(f"No controller connected for storage manager {self.storage_manager_id}")
 
         normalized_field_schema = {}
         for field_name, field in field_schema.items():
@@ -285,29 +284,38 @@ class StorageManager(ABC):
                     f"to controller id #{self.controller_info.id} successfully."
                 )
 
-                # One deadline for the whole wait, so unrelated traffic on this socket cannot
-                # extend it and a quiet controller still gets the full budget.
-                deadline = time.monotonic() + TQ_DATA_UPDATE_RESPONSE_TIMEOUT
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        raise TimeoutError(
-                            f"no ACK from controller {self.controller_info.id} after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s"
-                        )
-                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=remaining)
-                    response_msg = ZMQMessage.deserialize(messages)
-
-                    if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        logger.debug(
-                            f"[{self.storage_manager_id}]: Get data status update ACK response "
-                            f"from controller id #{response_msg.sender_id} successfully."
-                        )
-                        return
-            except Exception as e:
-                # Logged rather than raised, so a slow controller does not fail the put. Close
-                # the socket: a late ACK would otherwise be read as the next lessee's reply.
-                logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
+                try:
+                    messages = await asyncio.wait_for(
+                        sock.recv_multipart(copy=False), timeout=TQ_DATA_UPDATE_RESPONSE_TIMEOUT
+                    )
+                except asyncio.TimeoutError as e:
+                    raise TimeoutError(
+                        f"no ACK from controller {self.controller_info.id} after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s"
+                    ) from e
+                response_msg = ZMQMessage.deserialize(messages)
+                if response_msg.sender_id != self.controller_info.id:
+                    raise RuntimeError(
+                        f"Unexpected data status update sender {response_msg.sender_id}; "
+                        f"expected {self.controller_info.id}"
+                    )
+                if response_msg.request_type != ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:
+                    raise RuntimeError(
+                        f"Controller data status update failed: {response_msg.request_type}: "
+                        f"{response_msg.body.get('message', 'unexpected response')}"
+                    )
+                if response_msg.body.get("success") is not True:
+                    raise RuntimeError(
+                        f"Controller rejected data status update: "
+                        f"{response_msg.body.get('message', 'success is not true')}"
+                    )
+                logger.debug(
+                    f"[{self.storage_manager_id}]: Get data status update ACK response "
+                    f"from controller id #{response_msg.sender_id} successfully."
+                )
+            except BaseException:
+                # A failed or cancelled wait must not leave a late ACK for the next lessee.
                 sock.close(linger=0)
+                raise
 
     @abstractmethod
     async def put_data(
