@@ -717,9 +717,12 @@ class AsyncSimpleStorageManager(StorageManager):
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
+        for su_id, result in zip(routing, results, strict=True):
+            if isinstance(result, BaseException):
+                # Keep controller ownership until every physical clear has succeeded.
+                raise RuntimeError(
+                    f"[{self.storage_manager_id}]: Failed to clear storage unit {su_id}: {result}"
+                ) from result
 
     @with_storage_unit_socket
     async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
