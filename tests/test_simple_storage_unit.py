@@ -28,6 +28,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import pickle
 import time
 from pathlib import Path
@@ -599,6 +600,39 @@ def test_failed_ssd_overwrite_preserves_old_value(tmp_path, monkeypatch):
         assert storage._ssd_active_bytes == len(old_value)
         assert old_path.exists()
         assert list(tmp_path.rglob("*.bin")) == [old_path]
+    finally:
+        storage.close()
+
+
+def test_failed_ssd_write_on_second_field_leaves_every_field_unchanged(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data({"a": [b"a" * 100], "b": [b"b" * 100]}, [1])
+        old_files = set(tmp_path.rglob("*.bin"))
+
+        write_values = storage._ssd_store.write_values
+        calls = []
+
+        def fail_second_field(encoded_values):
+            calls.append(encoded_values)
+            if len(calls) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write_values(encoded_values)
+
+        monkeypatch.setattr(storage._ssd_store, "write_values", fail_second_field)
+        with pytest.raises(OSError, match="No space left"):
+            storage.put_data({"a": [b"A" * 100], "b": [b"B" * 100]}, [1])
+
+        assert storage.get_data(["a", "b"], [1]) == {"a": [b"a" * 100], "b": [b"b" * 100]}
+        assert set(tmp_path.rglob("*.bin")) == old_files
+        assert storage.ssd_active_values == 2
+        assert storage.ssd_active_bytes == 200
     finally:
         storage.close()
 

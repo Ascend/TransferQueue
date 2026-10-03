@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -141,6 +142,39 @@ def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
 
     assert torch.equal(data.get_data(["tokens"], [0])["tokens"][0], torch.cat([prompt, torch.tensor([99])]))
     assert data.ssd_active_values == 1, "the replaced SSD file must be released, not leaked"
+
+
+def test_apply_update_is_atomic_when_a_later_field_fails_to_reach_ssd(tmp_path, monkeypatch):
+    """Concat is not idempotent, so a partly applied update would double-apply on retry."""
+    data = HybridStorageUnitData(
+        storage_size=4, threshold_bytes=64, ssd_path=str(tmp_path), run_id="run", unit_id="unit"
+    )
+    try:
+        prompt, mask = torch.arange(32), torch.ones(32, dtype=torch.int64)
+        data.put_data({"tokens": [prompt], "mask": [mask]}, [0])
+        old_files = set(tmp_path.rglob("*.bin"))
+
+        write_values = data._ssd_store.write_values
+        calls = []
+
+        def fail_second_field(encoded_values):
+            calls.append(encoded_values)
+            if len(calls) == 2:
+                raise OSError(errno.ENOSPC, "No space left on device")
+            return write_values(encoded_values)
+
+        monkeypatch.setattr(data._ssd_store, "write_values", fail_second_field)
+        new_data = {"tokens": [torch.tensor([99])], "mask": [torch.tensor([1])]}
+        with pytest.raises(OSError, match="No space left"):
+            data.apply_update([0], ["tokens", "mask"], new_data, _concat, False)
+
+        stored = data.get_data(["tokens", "mask"], [0])
+        assert torch.equal(stored["tokens"][0], prompt)
+        assert torch.equal(stored["mask"][0], mask)
+        assert set(tmp_path.rglob("*.bin")) == old_files
+        assert (data.ssd_active_values, data.ssd_active_bytes) == (2, prompt.nbytes + mask.nbytes)
+    finally:
+        data.close()
 
 
 def test_build_update_field_schema_orders_shapes_across_units():

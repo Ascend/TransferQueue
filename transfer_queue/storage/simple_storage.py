@@ -222,6 +222,7 @@ class StorageUnitData:
                     f"StorageUnitData put_data: field '{f}' values length {len(values)} "
                     f"!= global_indexes length {len(global_indexes)}, length mismatch"
                 )
+        for f, values in field_data.items():
             if f not in self.field_data:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
@@ -239,8 +240,9 @@ class StorageUnitData:
     ) -> dict[str, dict[str, Any]]:
         """Read each (field, index), compute the stored value, then write once.
 
-        Missing fields yield ``old=None``. All parser calls finish before any write,
-        so a raise leaves storage unchanged.
+        Missing fields yield ``old=None``. All parser calls finish before one
+        ``put_data`` that writes every field or none, so a raise from a parser or
+        an SSD write leaves storage unchanged.
 
         Returns:
             Per-sample description of the stored values, keyed by field name.
@@ -597,38 +599,47 @@ class HybridStorageUnitData(StorageUnitData):
         unique_global_indexes = set(global_indexes)
         has_duplicate_indexes = len(unique_global_indexes) != len(global_indexes)
 
-        for field, values in field_data.items():
-            prepared_values, entries, fallback_values = self._prepare_field_values(values)
-
+        old_ssd_values = []
+        for field in field_data:
             stored_field = self.field_data.get(field, {})
-            old_ssd_values = []
             for global_index in unique_global_indexes:
                 old_value = stored_field.get(global_index)
                 if isinstance(old_value, _SSDValueRef):
                     old_ssd_values.append(old_value)
-            try:
-                super().put_data({field: prepared_values}, global_indexes)
-            except Exception:
-                for entry in entries:
-                    self._ssd_store.unlink(entry)
-                raise
 
-            obsolete_ssd_values = old_ssd_values
-            if has_duplicate_indexes:
-                retained_ssd_paths = set()
+        # Write every field's files before replacing any value: kv_update parsers are not
+        # idempotent, so a failure on a later field must not leave earlier fields committed.
+        prepared_data = {}
+        entries: list[_SSDValueRef] = []
+        fallback_values = 0
+        try:
+            for field, values in field_data.items():
+                prepared_data[field], field_entries, field_fallback_values = self._prepare_field_values(values)
+                entries.extend(field_entries)
+                fallback_values += field_fallback_values
+            super().put_data(prepared_data, global_indexes)
+        except Exception:
+            for entry in entries:
+                self._ssd_store.unlink(entry)
+            raise
+
+        obsolete_ssd_values = old_ssd_values
+        if has_duplicate_indexes:
+            retained_ssd_paths = set()
+            for field in field_data:
                 for global_index in unique_global_indexes:
                     retained_value = self.field_data[field][global_index]
                     if isinstance(retained_value, _SSDValueRef):
                         retained_ssd_paths.add(retained_value.path)
-                obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
+            obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
 
-            self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
-            self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
-                value.size_bytes for value in obsolete_ssd_values
-            )
-            self._ssd_fallback_values_total += fallback_values
-            for obsolete_value in obsolete_ssd_values:
-                self._ssd_store.unlink(obsolete_value)
+        self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
+        self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
+            value.size_bytes for value in obsolete_ssd_values
+        )
+        self._ssd_fallback_values_total += fallback_values
+        for obsolete_value in obsolete_ssd_values:
+            self._ssd_store.unlink(obsolete_value)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Read mixed memory- and SSD-backed samples in request order."""
