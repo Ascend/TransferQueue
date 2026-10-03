@@ -59,6 +59,9 @@ logger = get_logger(__name__)
 _TQ_CLIENT: Any = None
 _TQ_STORAGE: Any = None
 _TQ_CONTROLLER: Any = None
+# True only in the process whose init() created the controller. Other processes
+# attach to the same named actor, so their close() must not tear it down.
+_TQ_IS_OWNER = False
 
 # Idle workers and proxies observe shutdown within one second; leave time for
 # Ray dispatch, in-flight work, and SSD cleanup before forcing termination.
@@ -147,7 +150,8 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     It should be called once at the beginning of the program before any data operations.
 
     If a controller already exists, reuse it and only initialize the client;
-    the provided `conf` will be ignored in this case.
+    the provided `conf` will be ignored in this case. Only the process that
+    created the controller tears TransferQueue down in `close()`.
 
     Args:
         conf: Optional custom config merged with default `config.yaml`.
@@ -196,10 +200,11 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
 
     try:
-        global _TQ_CONTROLLER
+        global _TQ_CONTROLLER, _TQ_IS_OWNER
         _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace="transfer_queue"
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
+        _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
@@ -241,10 +246,9 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
 def close():
     """Close the TransferQueue system.
 
-    This function cleans up the TransferQueue system, including:
-    - Closing the client and its associated resources
-    - Cleaning up distributed storage (only for the process that initialized it)
-    - Killing the controller actor
+    Every process closes its client and drops its handles. Only the process whose
+    `init()` created TransferQueue also cleans up distributed storage and kills the
+    controller actor; processes that attached leave them running and may `init()` again.
 
     Note:
         This function should be called when the TransferQueue system is no longer needed.
@@ -252,6 +256,7 @@ def close():
     global _TQ_CLIENT
     global _TQ_STORAGE
     global _TQ_CONTROLLER
+    global _TQ_IS_OWNER
 
     try:
         if _TQ_STORAGE:
@@ -311,12 +316,13 @@ def close():
         _TQ_CLIENT.close()
         _TQ_CLIENT = None
 
-    if _TQ_CONTROLLER:
+    if _TQ_CONTROLLER and _TQ_IS_OWNER:
         try:
             ray.kill(_TQ_CONTROLLER)
         except Exception:
             pass
-        _TQ_CONTROLLER = None
+    _TQ_CONTROLLER = None
+    _TQ_IS_OWNER = False
 
 
 # ==================== Metrics API ====================
