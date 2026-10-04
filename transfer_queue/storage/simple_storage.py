@@ -32,11 +32,14 @@ import math
 import os
 import pickle
 import shutil
+import socket
 import time
 import weakref
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
+from queue import Empty, SimpleQueue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -47,7 +50,7 @@ import ray
 import torch
 import zmq
 
-from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
+from transfer_queue.storage.payload_transfer import DeferredResponse, PayloadTransfer, create_payload_transfer
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -121,6 +124,52 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+
+def _queue_deferred_response(
+    identity: bytes | bytearray | zmq.Frame,
+    response: DeferredResponse,
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    wakeup: socket.socket,
+    shutdown_event: Event,
+) -> None:
+    """Wake the owning worker when an asynchronous response becomes ready."""
+    routing_identity = bytes(identity)
+
+    def ready(future: Future[ZMQMessage]) -> None:
+        if shutdown_event.is_set():
+            return
+        completions.put((routing_identity, future))
+        try:
+            wakeup.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass
+
+    response.future.add_done_callback(ready)
+
+
+def _drain_deferred_responses(
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    worker_socket: zmq.Socket,
+    storage_id: str,
+    measurements: dict[Future[ZMQMessage], ExitStack],
+) -> None:
+    """Send completed responses from the only thread that owns the ZMQ socket."""
+    while True:
+        try:
+            identity, future = completions.get_nowait()
+        except Empty:
+            return
+        with measurements.pop(future):
+            try:
+                response = future.result()
+            except Exception as exc:
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_GET_ERROR,
+                    sender_id=storage_id,
+                    body={"message": f"{storage_id}, deferred response failed: {exc}."},
+                )
+        worker_socket.send_multipart([identity] + response.serialize(), copy=False)
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -943,6 +992,13 @@ class SimpleStorageUnit:
 
         poller = zmq.Poller()
         poller.register(worker_socket, zmq.POLLIN)
+        wakeup_reader, wakeup_writer = socket.socketpair()
+        wakeup_reader.setblocking(False)
+        wakeup_writer.setblocking(False)
+        wakeup_fd = wakeup_reader.fileno()
+        poller.register(wakeup_fd, zmq.POLLIN)
+        deferred_completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]] = SimpleQueue()
+        deferred_measurements: dict[Future[ZMQMessage], ExitStack] = {}
 
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
@@ -963,13 +1019,43 @@ class SimpleStorageUnit:
             if self._shutdown_event.is_set():
                 break
 
+            if wakeup_fd in socks:
+                # Wakeup bytes only signal work; the queue owns the responses.
+                try:
+                    while wakeup_reader.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                try:
+                    _drain_deferred_responses(
+                        deferred_completions, worker_socket, self.storage_unit_id, deferred_measurements
+                    )
+                except zmq.ZMQError as exc:
+                    logger.warning(f"[{self.storage_unit_id}]: deferred response send failed: {exc}")
+                    break
+
             if worker_socket in socks:
                 # Keep request handling in a separate scope so payload references are
                 # released before the worker waits for the next request.
-                self._process_one_worker_request(worker_socket, monitor)
+                identity, response_msg = self._process_one_worker_request(worker_socket, monitor, deferred_measurements)
+                if isinstance(response_msg, DeferredResponse):
+                    _queue_deferred_response(
+                        identity,
+                        response_msg,
+                        deferred_completions,
+                        wakeup_writer,
+                        self._shutdown_event,
+                    )
+                else:
+                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
+        for measurement in deferred_measurements.values():
+            measurement.close()
+        poller.unregister(wakeup_fd)
         poller.unregister(worker_socket)
+        wakeup_reader.close()
+        wakeup_writer.close()
         worker_socket.close(linger=0)
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
@@ -997,8 +1083,13 @@ class SimpleStorageUnit:
                     )
         self.storage_data.put_data(field_data, global_indexes)
 
-    def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
-        """Process one storage request and send its response."""
+    def _process_one_worker_request(
+        self,
+        worker_socket: zmq.Socket,
+        monitor: Any,
+        deferred_measurements: dict[Future[ZMQMessage], ExitStack],
+    ) -> tuple[bytes | zmq.Frame, ZMQMessage | DeferredResponse]:
+        """Process one storage request and return its response for the worker socket."""
         # Messages received from proxy: [identity, serialized_msg_frame1, ...]
         messages = worker_socket.recv_multipart(copy=False)
         identity = messages[0]
@@ -1018,12 +1109,13 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"undecodable request: {type(e).__name__}: {e}"},
             )
-            worker_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
-            return
+            return identity, error_msg
 
         operation = request_msg.request_type
         started = time.perf_counter()
 
+        measurement = ExitStack()
+        measurement_deferred = False
         try:
             # Count each logical PUT/GET once at its first message; NIXL commit/cancel
             # messages continue that request and must not inflate arrivals.
@@ -1042,20 +1134,17 @@ class SimpleStorageUnit:
                 ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
             }.get(operation)
             if metric_op is not None:
-                with monitor.measure(op_type=metric_op):
-                    response_msg = self.payload_transfer.handle_request(
-                        request_msg,
-                        storage_id=self.storage_unit_id,
-                        load_data=self._load_data,
-                        store_data=self._put_decoded_data,
-                    )
-            else:
-                response_msg = self.payload_transfer.handle_request(
-                    request_msg,
-                    storage_id=self.storage_unit_id,
-                    load_data=self._load_data,
-                    store_data=self._put_decoded_data,
-                )
+                measurement.enter_context(monitor.measure(op_type=metric_op))
+            response_msg = self.payload_transfer.handle_request(
+                request_msg,
+                storage_id=self.storage_unit_id,
+                load_data=self._load_data,
+                store_data=self._put_decoded_data,
+            )
+            if isinstance(response_msg, DeferredResponse):
+                # Keep the request timing open until its asynchronous transfer finishes.
+                deferred_measurements[response_msg.future] = measurement
+                measurement_deferred = True
 
             if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="CLEAR_DATA"):
@@ -1088,6 +1177,13 @@ class SimpleStorageUnit:
                 },
             )
 
+        finally:
+            if not measurement_deferred:
+                measurement.close()
+
+        if isinstance(response_msg, DeferredResponse):
+            return identity, response_msg
+
         response_frames = response_msg.serialize()
         if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
             # This end serializes the get response, so its frames give the true wire size.
@@ -1099,7 +1195,7 @@ class SimpleStorageUnit:
                 f"samples={len(request_msg.body.get('global_indexes', []))} "
                 f"fields={list(request_msg.body.get('fields', []))}",
             )
-        worker_socket.send_multipart([identity] + response_frames, copy=False)
+        return identity, response_msg
 
     @staticmethod
     def _field_length(value: Any) -> int | None:
@@ -1186,6 +1282,9 @@ class SimpleStorageUnit:
                 "non_overflow_drop_delta": stats.non_overflow_drop_delta,
                 "samples": stats.samples,
             }
+        payload_metrics = self.payload_transfer.diagnostics
+        if payload_metrics:
+            metrics["payload_transfer"] = payload_metrics
 
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:

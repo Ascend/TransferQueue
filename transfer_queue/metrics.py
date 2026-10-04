@@ -279,6 +279,29 @@ class TQMetricsExporter:
             ["storage_unit_id"],
             registry=r,
         )
+        # Remote runtime snapshots use gauges, like the request snapshots below.
+        self.storage_payload_metrics = {
+            name: Gauge(f"tq_storage_payload_{name}", description, ["storage_unit_id"], registry=r)
+            for name, description in {
+                "receive_buffer_cache_bytes": "Configured receive buffer cache capacity in bytes",
+                "registered_bytes": "Registered payload backing bytes",
+                "idle_receive_bytes": "Cached unused receive bytes",
+                "pending_receive_bytes": "Prepared receive bytes",
+                "leased_receive_bytes": "Receive bytes still referenced by data readers",
+                "quarantined_bytes": "Receive bytes retained after uncertain writes or cleanup failures",
+                "receive_buffer_registrations": "Cumulative receive buffer registrations",
+                "receive_buffer_reuses": "Cumulative receive buffer cache hits",
+                "receive_buffer_evictions": "Cumulative receive buffer deregistrations",
+                "outstanding_sends": "Queued and running payload sends",
+                "sender_executors": "Retained sender executors",
+                "failed_send_peers": "Failed native sender sessions",
+                "failed_get_targets": "GET targets stopped after uncertain completion",
+                "queue_wait_seconds": "Cumulative queue wait for started sends in seconds",
+                "registration_seconds": "Cumulative memory registration time in seconds",
+                "data_transfer_seconds": "Cumulative native time for writes reaching a terminal status, in seconds",
+                "total_seconds": "Cumulative started send time including queue wait and cleanup, in seconds",
+            }.items()
+        }
 
         # ---- Storage request metrics (collected via ZMQ, exposed as gauges) ----
         # P50/P99 are pre-computed on the storage unit side and sent via ZMQ,
@@ -488,6 +511,16 @@ class TQMetricsExporter:
                             pass
                     else:
                         gauge.labels(storage_unit_id=label).set(accept_queue.get(key, 0))
+
+                payload_metrics = metrics.get("payload_transfer", {})
+                for name, gauge in self.storage_payload_metrics.items():
+                    if name in payload_metrics:
+                        gauge.labels(storage_unit_id=label).set(payload_metrics[name])
+                    else:
+                        try:
+                            gauge.remove(label)
+                        except (KeyError, ValueError):
+                            pass
 
                 # Per-operation request stats
                 for op_type, op_data in metrics.get("op_stats", {}).items():

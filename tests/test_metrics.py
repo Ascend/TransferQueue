@@ -456,6 +456,32 @@ class TestStorageMetricsCollection:
         assert exporter.storage_capacity.labels(storage_unit_id="SU_002")._value.get() == 500
         assert call_count == 2
 
+    def test_payload_metrics_collected_and_removed_when_backend_no_longer_reports_them(self):
+        exporter = TQMetricsExporter()
+        exporter._storage_unit_infos = {"storage": MagicMock()}
+        snapshot = {
+            "storage_unit_id": "storage",
+            "payload_transfer": {"idle_receive_bytes": 128, "queue_wait_seconds": 2.5},
+        }
+        exporter._query_storage_unit = MagicMock(return_value=snapshot)
+
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            == 128
+        )
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_queue_wait_seconds", {"storage_unit_id": "storage"})
+            == 2.5
+        )
+
+        snapshot.pop("payload_transfer")
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            is None
+        )
+
     def test_storage_metrics_skips_capacity_when_none(self):
         """When capacity is None (unlimited storage), capacity/utilization
         gauges must not be populated, but other metrics still are.
