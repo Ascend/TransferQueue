@@ -457,6 +457,32 @@ class TestStorageMetricsCollection:
         assert exporter.storage_capacity.labels(storage_unit_id="SU_002")._value.get() == 500
         assert call_count == 2
 
+    def test_payload_metrics_collected_and_removed_when_backend_no_longer_reports_them(self):
+        exporter = TQMetricsExporter()
+        exporter._storage_unit_infos = {"storage": MagicMock()}
+        snapshot = {
+            "storage_unit_id": "storage",
+            "payload_transfer": {"idle_receive_bytes": 128, "queue_wait_seconds": 2.5},
+        }
+        exporter._query_storage_unit = MagicMock(return_value=snapshot)
+
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            == 128
+        )
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_queue_wait_seconds", {"storage_unit_id": "storage"})
+            == 2.5
+        )
+
+        snapshot.pop("payload_transfer")
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            is None
+        )
+
     def test_storage_metrics_skips_capacity_when_none(self):
         """When capacity is None (unlimited storage), capacity/utilization
         gauges must not be populated, but other metrics still are.
@@ -567,11 +593,25 @@ class TestStorageWorkerArrivals:
 
     @staticmethod
     def dispatch(worker, operation, body):
+        from queue import SimpleQueue
+
+        from transfer_queue.storage.payload_transfer import DeferredResponse
+        from transfer_queue.storage.simple_storage import _drain_deferred_responses
+
         unit, monitor = worker
         request = ZMQMessage.create(request_type=operation, sender_id="manager", body=body)
         socket = MagicMock()
         socket.recv_multipart.return_value = [b"manager"] + request.serialize()
-        unit._process_one_worker_request(socket, monitor)
+        measurements = {}
+        identity, response = unit._process_one_worker_request(socket, monitor, measurements)
+        if isinstance(response, DeferredResponse):
+            assert response.future.done()
+            completions = SimpleQueue()
+            completions.put((bytes(identity), response.future))
+            _drain_deferred_responses(completions, socket, unit.storage_unit_id, measurements)
+        else:
+            socket.send_multipart([identity] + response.serialize(), copy=False)
+        assert measurements == {}
         sent = socket.send_multipart.call_args.args[0]
         assert sent[0] == b"manager"
         return ZMQMessage.deserialize(sent[1:])
@@ -609,7 +649,7 @@ class TestStorageWorkerArrivals:
     @pytest.mark.parametrize("finish", ["COMMIT", "CANCEL"])
     def test_nixl_counts_prepare_once_and_skips_continuations(self, worker, operation, finish):
         from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer, PayloadDescriptor
-        from transfer_queue.utils.serial_utils import calc_packed_size, encode, pack_into
+        from transfer_queue.utils.serial_utils import encode
 
         unit, monitor = worker
         unit.storage_data.put_data({"value": [42]}, [0])
@@ -619,12 +659,9 @@ class TestStorageWorkerArrivals:
         transfer._runtime = MagicMock()
         unit.payload_transfer = transfer
         frames = encode({"value": [42]})
-        payload = bytearray(calc_packed_size(frames))
-        pack_into(payload, frames)
-        descriptor = PayloadDescriptor("payload", len(payload), tuple(memoryview(frame).nbytes for frame in frames))
-        received = Future()
-        received.set_result(memoryview(payload))
-        transfer._runtime.receive.return_value = received
+        frame_sizes = tuple(memoryview(frame).nbytes for frame in frames)
+        descriptor = PayloadDescriptor("payload", sum(frame_sizes), frame_sizes)
+        transfer._runtime.receive.return_value = tuple(memoryview(frame) for frame in frames)
         sent = Future()
         sent.set_result(None)
         transfer._runtime.send.return_value = sent

@@ -76,6 +76,14 @@ or GID, add the corresponding variables to `ucx_env_vars`.
 If NIXL initialization or a transfer fails, TQ reports the error directly and does not fall back to ZMQ.
 If the transport is not restricted, or if `UCX_TLS` includes `tcp`, UCX may use TCP.
 
+### Receive Buffer Cache
+
+Set `payload_transfer.receive_buffer_cache_mb` to limit idle registered buffers **per runtime**,
+in MB (1024² bytes). The default is `256`; `0` disables caching. Larger payloads still transfer,
+but their buffers are released when no longer referenced. Live data, in-flight transfers and
+fault-retained memory are outside this limit. A smaller cache saves idle memory at the cost of
+more registrations; account for all runtimes on a node when increasing it.
+
 ### Common UCX Configuration
 
 | Variable | Purpose | Reference value |
@@ -116,6 +124,19 @@ validation only confirm that the NIXL-UCX path is usable; to confirm RDMA, also 
 `rc_*` indicates RDMA, while a TCP lane indicates that TCP is being used.
 
 ## Common Issues
+
+### A NIXL Session Has Failed
+
+An uncertain WRITE retains its buffers until teardown and stops the affected peer session.
+Recreate the runtime through the owning worker's error handling. Confirmed pre-WRITE failures
+and local decode errors after completion do not fail the GET session.
+
+PUT cancellation waits for its running send. GET cancellation after COMMIT waits within the
+remaining timeout: a matching completion or pre-WRITE error releases the receiver; an unknown
+result quarantines it and stops that GET target. Cancellation still propagates to the caller.
+
+With metrics enabled, `tq_storage_payload_*` reports cache, leased and quarantined bytes,
+queue wait and sender resources.
 
 ### RDMA Devices Are Ready, but NIXL-UCX Fails to Start
 
