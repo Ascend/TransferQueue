@@ -24,7 +24,8 @@ under the lock without repeating its keys and partition.
 
 ``kv_global_lock`` and ``async_kv_global_lock`` do the same across the Ray cluster through
 ``TransferQueueLockManager`` actors that split keys by hash, under a lease that renews
-automatically. Take a global lock before a local one, never inside it.
+automatically. Take a global lock before a local one, never inside it. ``kv_global_locked``
+and ``async_kv_global_locked`` mirror the local wrappers.
 """
 
 import asyncio
@@ -428,6 +429,30 @@ async def async_kv_global_lock(
     finally:
         _release_lease(lease)
         _holding_global.set(False)
+
+
+def kv_global_locked(
+    fn, keys: str | list[str], partition_id: str, *, lock_timeout: float | None = None, lease_s: float = 30, **kwargs
+):
+    """Call ``fn(keys, partition_id, **kwargs)`` under ``kv_global_lock(keys, partition_id)``.
+
+    Same calling convention as ``kv_local_locked``. If the lease was lost by the time ``fn``
+    returns, its result is discarded and ``LockLostError`` is raised.
+    """
+    if inspect.iscoroutinefunction(fn):
+        raise TypeError("kv_global_locked would release the lock before the coroutine runs; use async_kv_global_locked")
+    with kv_global_lock(keys, partition_id, timeout=lock_timeout, lease_s=lease_s):
+        return fn(keys, partition_id, **kwargs)
+
+
+async def async_kv_global_locked(
+    fn, keys: str | list[str], partition_id: str, *, lock_timeout: float | None = None, lease_s: float = 30, **kwargs
+):
+    """Async version of ``kv_global_locked``; ``fn`` must be a coroutine function such as ``tq.async_kv_batch_get``."""
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError("async_kv_global_locked needs a coroutine function; a sync call would block the event loop")
+    async with async_kv_global_lock(keys, partition_id, timeout=lock_timeout, lease_s=lease_s):
+        return await fn(keys, partition_id, **kwargs)
 
 
 def kv_lock_list(partition_id: str | None = None) -> dict:

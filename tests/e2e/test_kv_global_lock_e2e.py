@@ -274,6 +274,28 @@ def test_nesting_and_ordering_rules():
     wait_until(lambda: holders() == set())
 
 
+def test_locked_wrappers_hold_the_lock_during_the_call_and_release_on_error():
+    def fn(keys, partition_id, **kwargs):
+        return holders(), partition_id, kwargs
+
+    async def async_fn(keys, partition_id, **kwargs):
+        return holders(), partition_id, kwargs
+
+    def boom(keys, partition_id):
+        raise ValueError("boom")
+
+    assert tq.kv_global_locked(fn, ["u", "v"], P, lock_timeout=5, lease_s=2, x=1) == ({"u", "v"}, P, {"x": 1})
+    assert asyncio.run(tq.async_kv_global_locked(async_fn, "u", P, lock_timeout=5)) == ({"u"}, P, {})
+    with pytest.raises(ValueError, match="boom"):
+        tq.kv_global_locked(boom, "u", P)
+    wait_until(lambda: holders() == set())
+
+    with pytest.raises(TypeError, match="async_kv_global_locked"):
+        tq.kv_global_locked(async_fn, "u", P)
+    with pytest.raises(TypeError, match="coroutine function"):
+        asyncio.run(tq.async_kv_global_locked(fn, "u", P))
+
+
 def actors_named(prefix):
     return [a["name"] for a in ray.util.list_named_actors(all_namespaces=True) if a["name"].startswith(prefix)]
 
