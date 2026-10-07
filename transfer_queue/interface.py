@@ -45,6 +45,8 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
+from transfer_queue.kv_lock import _detach_lock_managers
+from transfer_queue.lock_manager import TransferQueueLockManager
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
@@ -62,6 +64,7 @@ _TQ_CONTROLLER: Any = None
 # True only in the process whose init() created the controller. Other processes
 # attach to the same named actor, so their close() must not tear it down.
 _TQ_IS_OWNER = False
+_TQ_LOCK_MANAGERS: list = []  # set only in the owner, which kills them in close()
 
 # Idle workers and proxies observe shutdown within one second; leave time for
 # Ray dispatch, in-flight work, and SSD cleanup before forcing termination.
@@ -198,14 +201,24 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             sampler = globals()[final_conf.controller.sampler]
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
+    num_lock_shards = final_conf.controller.num_lock_shards
+    if not isinstance(num_lock_shards, int) or num_lock_shards < 1:
+        raise ValueError(f"controller.num_lock_shards must be an integer >= 1, got {num_lock_shards!r}")
 
     try:
-        global _TQ_CONTROLLER, _TQ_IS_OWNER
+        global _TQ_CONTROLLER, _TQ_IS_OWNER, _TQ_LOCK_MANAGERS
         _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace="transfer_queue"
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
+        # Created here rather than on first lock: a non-detached actor dies with its creator.
+        _TQ_LOCK_MANAGERS = [
+            TransferQueueLockManager.options(  # type: ignore[attr-defined]
+                name=f"TransferQueueLockManager_{i}", namespace="transfer_queue", get_if_exists=True
+            ).remote(num_lock_shards)
+            for i in range(num_lock_shards)
+        ]
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
@@ -257,6 +270,7 @@ def close():
     global _TQ_STORAGE
     global _TQ_CONTROLLER
     global _TQ_IS_OWNER
+    global _TQ_LOCK_MANAGERS
 
     try:
         if _TQ_STORAGE:
@@ -316,12 +330,16 @@ def close():
         _TQ_CLIENT.close()
         _TQ_CLIENT = None
 
-    if _TQ_CONTROLLER and _TQ_IS_OWNER:
-        try:
-            ray.kill(_TQ_CONTROLLER)
-        except Exception:
-            pass
+    # The owner kills the lock managers, so releasing first would only hand keys to doomed waiters.
+    _detach_lock_managers(release=not _TQ_IS_OWNER)
+    if _TQ_IS_OWNER:
+        for actor in (_TQ_CONTROLLER, *_TQ_LOCK_MANAGERS):
+            try:
+                ray.kill(actor)
+            except Exception:
+                pass
     _TQ_CONTROLLER = None
+    _TQ_LOCK_MANAGERS = []
     _TQ_IS_OWNER = False
 
 

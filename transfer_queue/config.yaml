@@ -12,6 +12,8 @@ controller:
   sampler: SequentialSampler
   # Whether return an empty BatchMeta to prevent request blocking when no enough data is available
   polling_mode: False
+  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
+  num_lock_shards: 8
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 
