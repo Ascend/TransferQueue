@@ -19,10 +19,12 @@
 ``(partition_id, key)``, shared by every thread and asyncio task of this process. They
 are advisory: KV calls never check them. They do not exclude other processes or Ray
 actors. Waiters on a key are served in FIFO order. Nesting is rejected; pass all keys
-to a single call.
+to a single call. ``kv_local_locked`` and ``async_kv_local_locked`` run one KV call
+under the lock without repeating its keys and partition.
 """
 
 import asyncio
+import inspect
 import os
 import threading
 import time
@@ -176,6 +178,31 @@ async def async_kv_local_lock(keys: str | list[str], partition_id: str, timeout:
     finally:
         _release_all(acquired)
         _holding.set(False)
+
+
+def kv_local_locked(fn, keys: str | list[str], partition_id: str, *, lock_timeout: float | None = None, **kwargs):
+    """Call ``fn(keys, partition_id, **kwargs)`` under ``kv_local_lock(keys, partition_id)``.
+
+    ``fn`` is any KV call such as ``tq.kv_batch_put``, or a user helper with the same
+    leading ``(keys, partition_id)`` arguments, e.g. one doing get -> compute -> put::
+
+        meta = tq.kv_local_locked(tq.kv_batch_put, ["a", "b"], "train", fields=td, lock_timeout=5)
+        tq.kv_local_locked(increment, "counter", "train")
+    """
+    if inspect.iscoroutinefunction(fn):
+        raise TypeError("kv_local_locked would release the lock before the coroutine runs; use async_kv_local_locked")
+    with kv_local_lock(keys, partition_id, timeout=lock_timeout):
+        return fn(keys, partition_id, **kwargs)
+
+
+async def async_kv_local_locked(
+    fn, keys: str | list[str], partition_id: str, *, lock_timeout: float | None = None, **kwargs
+):
+    """Async version of ``kv_local_locked``; ``fn`` must be a coroutine function such as ``tq.async_kv_batch_get``."""
+    if not inspect.iscoroutinefunction(fn):
+        raise TypeError("async_kv_local_locked needs a coroutine function; a sync call would block the event loop")
+    async with async_kv_local_lock(keys, partition_id, timeout=lock_timeout):
+        return await fn(keys, partition_id, **kwargs)
 
 
 def _reset_after_fork() -> None:
