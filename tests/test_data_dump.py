@@ -15,7 +15,6 @@
 
 """Selective dump integrity and publication tests."""
 
-import asyncio
 import builtins
 import io
 import pickle
@@ -26,18 +25,15 @@ import torch
 
 from transfer_queue import data_dump, interface
 from transfer_queue.storage.dump_io import validate_dump_values
-from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
 @pytest.fixture
 def unit():
-    cls = SimpleStorageUnit.__ray_metadata__.modified_class
-    unit = cls.__new__(cls)
-    unit.storage_unit_id = "test_unit"
-    unit.storage_data = StorageUnitData()
-    return unit
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    yield unit
+    unit.shutdown()
 
 
 @pytest.mark.parametrize("row_count", [1, 32])
@@ -188,33 +184,6 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
     assert sorted(index for update in loaded.body["updates"] for index in update["global_indexes"]) == [101, 106]
 
 
-@pytest.mark.asyncio
-async def test_manager_loads_current_owners_concurrently():
-    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
-    manager.storage_manager_id = "test"
-    manager.storage_unit_infos = dict.fromkeys(["u0", "u1", "u2", "u3"])
-    manager.close = lambda: None
-    started = set()
-    ready = asyncio.Event()
-    seen = []
-
-    async def load(shards, target_storage_unit):
-        started.add(target_storage_unit)
-        if len(started) == 4:
-            ready.set()
-        await asyncio.wait_for(ready.wait(), timeout=2)
-        for shard in shards:
-            for row in shard["records"]:
-                assert target_storage_unit == f"u{row['target_index'] % 4}"
-                seen.append(row["source_index"])
-        return {"updates": [], "bytes_read": 0}
-
-    manager._load_selected_rows = load
-    records = [{"source_index": i, "target_index": 31 - i} for i in range(16)]
-    assert await manager.load_rows_by_index("p", [{"path": "shard.pkl", "records": records}]) == 0
-    assert sorted(seen) == list(range(16))
-
-
 @pytest.mark.parametrize("problem", ["wrong_index", "truncated", "missing_field"])
 def test_unit_rejects_invalid_records(unit, tmp_path, problem):
     path = tmp_path / "row.pkl"
@@ -246,62 +215,6 @@ def test_load_refuses_other_backends_before_registering_keys(monkeypatch, tmp_pa
     monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
     with pytest.raises(NotImplementedError, match="does not support selective data load"):
         interface.load_data_by_key(tmp_path)
-
-
-@pytest.mark.asyncio
-async def test_load_waits_for_other_units_before_raising():
-    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
-    manager.storage_manager_id = "test"
-    manager.storage_unit_infos = dict.fromkeys(["u0", "u1"])
-    manager.close = lambda: None
-    failed = asyncio.Event()
-    finished = []
-
-    async def load(shards, target_storage_unit):
-        if target_storage_unit == "u0":
-            failed.set()
-            raise RuntimeError("unit failed")
-        await failed.wait()
-        await asyncio.sleep(0)
-        finished.append(target_storage_unit)
-        return {"bytes_read": 0, "updates": [{"global_indexes": [1], "field_schema": {}}]}
-
-    async def notify(*args):
-        notified.append(args)
-
-    notified = []
-    manager._load_selected_rows = load
-    manager.notify_data_update = notify
-    with pytest.raises(RuntimeError, match="unit failed"):
-        await manager.load_rows_by_index(
-            "p", [{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}]
-        )
-    assert finished == ["u1"]
-    assert not notified
-
-
-@pytest.mark.asyncio
-async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
-    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
-    manager.storage_manager_id = "test"
-    manager.storage_unit_infos = dict.fromkeys(["u0", "u1"])
-    manager.close = lambda: None
-    failed = asyncio.Event()
-    completed = []
-
-    async def dump(path, target_storage_unit, global_indexes, fields_by_index):
-        if target_storage_unit == "u0":
-            failed.set()
-            raise OSError("write failed")
-        await failed.wait()
-        await asyncio.sleep(0)
-        completed.append(target_storage_unit)
-        return {"row_offsets": {1: [0, 1]}, "row_schema": {}}
-
-    manager._dump_single_shard = dump
-    with pytest.raises(OSError, match="write failed"):
-        await manager.dump_rows_by_index(str(tmp_path), [0, 1])
-    assert completed == ["u1"]
 
 
 def test_dump_reports_every_rows_stored_types(unit, tmp_path):

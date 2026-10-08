@@ -101,6 +101,9 @@ checkpoint_dir/
 ]
 ```
 
+Loading unpickles the controller state and every storage unit file, which can run
+arbitrary code. Load only checkpoints from directories that you trust.
+
 ## Atomic Checkpoint Replacement
 
 `save_checkpoint` writes to `<checkpoint_dir>.tmp`, renames the existing `checkpoint_dir` to `<checkpoint_dir>.old`, renames `.tmp` into `checkpoint_dir`, then deletes `.old`. This keeps the old checkpoint recoverable until the new one is fully in place; a failure partway through restores `.old` automatically, and the directory stays a plain folder (no symlink).

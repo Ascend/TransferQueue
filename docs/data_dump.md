@@ -71,6 +71,9 @@ index and a field/value mapping. `shard_info.json` records each source index's
 `[offset, length]`. Source indexes only locate records; they are never reused as
 current indexes without controller resolution.
 
+Loading unpickles `row_index.pt` and every shard record, which can run arbitrary
+code. Load only dumps from directories that you trust.
+
 A dump also saves a schema for each selected field. The controller supplies the
 declared type; while writing their records, the owner units report each row's dtype
 and shape, which the caller merges without seeing payloads. Controller metadata can

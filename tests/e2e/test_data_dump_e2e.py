@@ -23,6 +23,7 @@ Run with:
     pytest tests/e2e/test_data_dump_e2e.py -v
 """
 
+import asyncio
 import builtins
 import json
 import os
@@ -609,6 +610,91 @@ def test_failed_load_publishes_no_metadata_and_retry_is_idempotent(tq_system, du
     assert snapshot.keys_mapping["key"] == index
     _assert_rows_equal(tq.kv_batch_get(["key"], "retry", ["input_ids"])["input_ids"], [_row_input_ids(0)])
     assert tq.kv_list("retry")["retry"] == {"key": {"idx": 0}}
+
+
+def test_load_reaches_every_owner_unit_concurrently(tq_system, monkeypatch):
+    manager = tq.get_client().storage_manager
+    units = list(manager.storage_unit_infos)
+    seen = []
+
+    async def load_all():
+        started, ready = set(), asyncio.Event()
+
+        async def load(shards, target_storage_unit):
+            started.add(target_storage_unit)
+            if len(started) == len(units):
+                ready.set()
+            # Every unit waits for all the others, so this finishes only if they run at once.
+            await asyncio.wait_for(ready.wait(), timeout=2)
+            for shard in shards:
+                for row in shard["records"]:
+                    assert target_storage_unit == units[row["target_index"] % len(units)]
+                    seen.append(row["source_index"])
+            return {"updates": [], "bytes_read": 0}
+
+        monkeypatch.setattr(manager, "_load_selected_rows", load)
+        records = [{"source_index": i, "target_index": 31 - i} for i in range(16)]
+        return await manager.load_rows_by_index("p", [{"path": "shard.pkl", "records": records}])
+
+    assert asyncio.run(load_all()) == 0
+    assert sorted(seen) == list(range(16))
+
+
+def test_load_waits_for_other_units_before_raising(tq_system, monkeypatch):
+    manager = tq.get_client().storage_manager
+    units = list(manager.storage_unit_infos)
+    finished, notified = [], []
+
+    async def load_with_one_failure():
+        failed = asyncio.Event()
+
+        async def load(shards, target_storage_unit):
+            if target_storage_unit == units[0]:
+                failed.set()
+                raise RuntimeError("unit failed")
+            await failed.wait()
+            await asyncio.sleep(0)
+            finished.append(target_storage_unit)
+            return {"bytes_read": 0, "updates": [{"global_indexes": [1], "field_schema": {}}]}
+
+        async def notify(*args):
+            notified.append(args)
+
+        monkeypatch.setattr(manager, "_load_selected_rows", load)
+        monkeypatch.setattr(manager, "notify_data_update", notify)
+        await manager.load_rows_by_index(
+            "p", [{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}]
+        )
+
+    with pytest.raises(RuntimeError, match="unit failed"):
+        asyncio.run(load_with_one_failure())
+    assert finished == [units[1]]
+    assert not notified
+
+
+def test_dump_waits_for_writers_before_cleanup_can_start(tq_system, dump_dir, monkeypatch):
+    manager = tq.get_client().storage_manager
+    units = list(manager.storage_unit_infos)
+    completed = []
+
+    async def dump_with_one_failure():
+        failed = asyncio.Event()
+
+        async def dump(path, target_storage_unit, global_indexes, fields_by_index):
+            if target_storage_unit == units[0]:
+                failed.set()
+                raise OSError("write failed")
+            await failed.wait()
+            await asyncio.sleep(0)
+            completed.append(target_storage_unit)
+            return {"row_offsets": {1: [0, 1]}, "row_schema": {}}
+
+        monkeypatch.setattr(manager, "_dump_single_shard", dump)
+        await manager.dump_rows_by_index(str(dump_dir), [0, 1])
+
+    with pytest.raises(OSError, match="write failed"):
+        asyncio.run(dump_with_one_failure())
+    assert completed == [units[1]]
 
 
 def test_dump_and_load_do_not_use_the_put_get_timeout_pool(tq_system, dump_dir, monkeypatch):
