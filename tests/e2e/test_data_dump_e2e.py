@@ -26,7 +26,6 @@ Run with:
 import builtins
 import json
 import os
-import pickle
 import shutil
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -473,11 +472,8 @@ def test_direct_load_bypasses_caller_payload_io(tq_system, dump_dir, controller,
 
 @pytest.mark.parametrize("row_count", [3, 127, 128, 129, 130])
 @pytest.mark.parametrize("last_kind", ["tensor", "none", "object"])
-@pytest.mark.parametrize("legacy_metadata", [False, True])
-def test_legacy_chunks_with_missing_nested_shapes_roundtrip(
-    tq_system, dump_dir, controller, row_count, last_kind, legacy_metadata, monkeypatch
-):
-    partition = "legacy_nested"
+def test_chunks_with_a_wrapped_last_row_roundtrip(tq_system, dump_dir, row_count, last_kind, monkeypatch):
+    partition = "wrapped_last_row"
     keys = [f"k{i}" for i in range(row_count)]
     tensors = [torch.arange(i % 3 + 1, dtype=torch.int64) for i in range(row_count)]
     last = tensors[-1] if last_kind == "tensor" else None if last_kind == "none" else {"pixels": tensors[-1]}
@@ -509,41 +505,11 @@ def test_legacy_chunks_with_missing_nested_shapes_roundtrip(
         saved = torch.load(chunk, weights_only=False)
         tq.kv_batch_put(saved["keys"], partition, saved["fields"], tags=[{"key": key} for key in chunk_keys])
 
-    snapshot = ray.get(controller.get_partition_snapshot.remote(partition))
-    last_index = snapshot.keys_mapping[keys[-1]]
-    assert last_index in snapshot.field_metadata["input_ids"].global_indexes
-    if last_kind == "tensor":
-        assert tuple(snapshot.field_metadata["input_ids"].per_sample_shapes[last_index]) == tuple(tensors[-1].shape)
-    else:
-        assert snapshot.field_metadata["input_ids"].is_non_tensor
-        assert not snapshot.field_metadata["input_ids"].is_nested
-    if legacy_metadata:
-        from transfer_queue.controller import FieldMeta
-
-        # Existing controller checkpoints can retain the old incomplete nested schema.
-        checkpoint = dump_dir.parent / "legacy-controller.pkl"
-        tq.get_client().save_controller_checkpoint(str(checkpoint))
-        with checkpoint.open("rb") as file:
-            state = pickle.load(file)
-        for name in ["input_ids", "multi_modal_inputs#images"]:
-            state["partitions"][partition].field_metadata[name] = FieldMeta(
-                global_indexes=set(snapshot.keys_mapping.values()),
-                dtype=torch.int64,
-                is_nested=True,
-                is_non_tensor=False,
-                per_sample_shapes={
-                    snapshot.keys_mapping[key]: tuple(value.shape)
-                    for key, value in zip(keys[:-1], tensors[:-1], strict=True)
-                },
-            )
-        with checkpoint.open("wb") as file:
-            pickle.dump(state, file)
-        tq.get_client().load_controller_checkpoint(str(checkpoint))
     open_file = builtins.open
 
     def no_shard_read(path, *args, **kwargs):
         if isinstance(path, str | Path) and Path(path).name.startswith("shard_") and str(path).endswith(".pkl"):
-            pytest.fail("Dump schema repair read a payload shard in the caller")
+            pytest.fail("The dump schema merge read a payload shard in the caller")
         return open_file(path, *args, **kwargs)
 
     for target in [dump_dir, dump_dir.parent / "second-dump"]:
@@ -559,7 +525,8 @@ def test_legacy_chunks_with_missing_nested_shapes_roundtrip(
                 for key, value in zip(keys, expected, strict=True):
                     assert tuple(schema["per_sample_shapes"][index["rows"][key]["global_index"]]) == tuple(value.shape)
         assert index["field_schema"]["wrapped"]["is_non_tensor"]
-        if legacy_metadata and last_kind != "tensor" and target == dump_dir:
+        # The controller still declares a tensor field, which the dump does not change.
+        if last_kind != "tensor" and target == dump_dir:
             with pytest.raises(RuntimeError, match="tensor/non-tensor type mismatch"):
                 tq.load_data_by_key(target)
         tq.kv_clear(keys, partition)
@@ -602,18 +569,21 @@ def test_incompatible_schema_rejected_before_writes(tq_system, dump_dir, control
     _assert_rows_equal(tq.kv_batch_get(["k"], "schema", ["x"])["x"], [torch.tensor([1.5])])
 
 
-@pytest.mark.parametrize("tensor_first", [True, False])
-def test_regular_put_keeps_legacy_tensor_nontensor_acceptance(tq_system, controller, tensor_first):
-    values = [torch.tensor([[7]]), NonTensorStack("text")]
-    if not tensor_first:
-        values.reverse()
-    for key, value in zip(["first", "second"], values, strict=True):
-        tq.kv_batch_put([key], "legacy_put", TensorDict({"x": value}, batch_size=1))
-    metadata = tq.get_client().kv_retrieve_meta(["first", "second"], "legacy_put")
-    assert metadata.is_ready
-    assert metadata.field_names == ["x"]
-    snapshot = ray.get(controller.get_partition_snapshot.remote("legacy_put"))
-    assert snapshot.field_metadata["x"].global_indexes == set(metadata.global_indexes)
+@pytest.mark.parametrize("last", ["text", torch.tensor([3.0, 4.0, 5.0])], ids=["string", "ragged"])
+def test_dense_field_with_a_wrapped_later_row_roundtrips(tq_system, dump_dir, last):
+    partition = "dense_then_wrapped"
+    first = torch.tensor([[1.0, 2.0]])
+    tq.kv_batch_put(["first"], partition, TensorDict({"x": first}, batch_size=1))
+    tq.kv_batch_put(["last"], partition, TensorDict({"x": NonTensorStack(last)}, batch_size=1))
+    tq.dump_data_by_key(dump_dir, ["first", "last"], partition)
+    tq.kv_clear(["first", "last"], partition)
+    tq.load_data_by_key(dump_dir)
+    restored = list(tq.kv_batch_get(["first", "last"], partition, ["x"])["x"])
+    torch.testing.assert_close(restored[0], first[0])
+    if isinstance(last, str):
+        assert restored[1] == last
+    else:
+        torch.testing.assert_close(restored[1], last)
 
 
 def test_failed_load_publishes_no_metadata_and_retry_is_idempotent(tq_system, dump_dir, controller, monkeypatch):

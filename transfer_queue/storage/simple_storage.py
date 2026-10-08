@@ -1311,7 +1311,7 @@ class SimpleStorageUnit:
             if missing:
                 raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
             row_offsets = {}
-            recovered_schema = {}
+            row_schema = {}
             with open(path, "wb") as f:
                 for index in sorted(indexes):
                     described_fields = request.body.get("fields_by_index")
@@ -1324,15 +1324,12 @@ class SimpleStorageUnit:
                     else:
                         # Reused global indexes can retain fields no longer present in metadata.
                         fields = {name: self.storage_data.field_data[name][index] for name in described_fields[index]}
-                    missing_fields = request.body.get("missing_shapes", {}).get(index, [])
-                    if missing_fields:
-                        # Inspect values already being written; only shape/type metadata leaves the unit.
-                        recovered_schema[index] = {
-                            name: {"shape": tuple(fields[name].shape), "dtype": fields[name].dtype}
-                            if isinstance(fields[name], torch.Tensor)
-                            else None
-                            for name in missing_fields
-                        }
+                    # Controller metadata can trail the stored values, so report what each
+                    # row actually holds; only type metadata leaves the unit.
+                    row_schema[index] = {
+                        name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+                        for name, value in fields.items()
+                    }
                     offset = f.tell()
                     compact_pickle.dump({"global_index": index, "fields": fields}, f)
                     row_offsets[index] = [offset, f.tell() - offset]
@@ -1347,7 +1344,7 @@ class SimpleStorageUnit:
                     "dumped_rows": len(indexes),
                     "missing_rows": [],
                     "row_offsets": row_offsets,
-                    "recovered_schema": recovered_schema,
+                    "row_schema": row_schema,
                 },
             )
         except Exception as e:

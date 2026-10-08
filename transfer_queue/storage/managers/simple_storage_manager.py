@@ -836,7 +836,6 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
-        missing_shapes: dict[int, list[str]] | None = None,
         socket: zmq.Socket = None,
     ) -> dict[str, Any]:
         """Ask one storage unit to write the rows it owns into a shard file."""
@@ -849,7 +848,6 @@ class AsyncSimpleStorageManager(StorageManager):
                     "path": path,
                     "global_indexes": global_indexes,
                     "fields_by_index": fields_by_index,
-                    "missing_shapes": missing_shapes or {},
                 },
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
@@ -878,8 +876,7 @@ class AsyncSimpleStorageManager(StorageManager):
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
-        missing_shapes: dict[int, list[str]] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Dump the given rows into one shard per storage unit, in parallel.
 
         Each unit pickles its own rows in its own process, so the payload never passes
@@ -890,10 +887,11 @@ class AsyncSimpleStorageManager(StorageManager):
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
-            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
-            One entry per written shard: ``{"position", "storage_unit_id", "rows", "row_offsets"}``.
+            ``{"shards", "row_schema"}``: one ``{"position", "storage_unit_id", "rows",
+            "row_offsets"}`` entry per written shard, and each dumped row's
+            ``{field: (dtype, shape) or None}`` as the owner unit holds it.
 
         Raises:
             RuntimeError: A unit holds no data for a row it was asked to dump.
@@ -912,35 +910,33 @@ class AsyncSimpleStorageManager(StorageManager):
                     target_storage_unit=su_id,
                     global_indexes=indexes,
                     fields_by_index={index: fields_by_index[index] for index in indexes} if fields_by_index else None,
-                    missing_shapes={index: missing_shapes[index] for index in indexes if index in missing_shapes}
-                    if missing_shapes
-                    else None,
                 )
                 for path, (su_id, indexes) in zip(paths, targets, strict=True)
             ),
             return_exceptions=True,
         )
         shards = []
+        row_schema = {}
         total_rows = 0
         for pos, ((su_id, _), result) in enumerate(zip(targets, results, strict=True)):
             if isinstance(result, BaseException):
                 raise result
             offsets = result["row_offsets"]
             total_rows += len(offsets)
+            row_schema.update(result["row_schema"])
             shards.append(
                 {
                     "position": pos,
                     "storage_unit_id": su_id,
                     "rows": len(offsets),
                     "row_offsets": offsets,
-                    "recovered_schema": result.get("recovered_schema", {}),
                 }
             )
 
         logger.info(
             f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"
         )
-        return shards
+        return {"shards": shards, "row_schema": row_schema}
 
     async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
         """Have current owner units read assigned byte ranges concurrently, then publish metadata.

@@ -244,19 +244,16 @@ class StorageManager(ABC):
         normalized_field_schema = {}
         for field_name, field in field_schema.items():
             field_copy = field.copy()
-            schemas = [field_copy]
-            if "tensor_schema" in field_copy:
-                field_copy["tensor_schema"] = dict(field_copy["tensor_schema"])
-                schemas.append(field_copy["tensor_schema"])
-            for schema in schemas:
-                per_sample_shapes = schema.get("per_sample_shapes")
-                if isinstance(per_sample_shapes, list | tuple):
-                    if len(per_sample_shapes) != len(global_indexes):
-                        raise ValueError(
-                            f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                            f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
-                        )
-                    schema["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
+            per_sample_shapes = field_copy.get("per_sample_shapes", None)
+            if isinstance(per_sample_shapes, list | tuple):
+                if len(per_sample_shapes) != len(global_indexes):
+                    raise ValueError(
+                        f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
+                    )
+                field_copy["per_sample_shapes"] = {
+                    global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
+                }
             normalized_field_schema[field_name] = field_copy
 
         request_msg = ZMQMessage.create(

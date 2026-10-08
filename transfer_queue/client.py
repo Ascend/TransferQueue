@@ -1132,7 +1132,7 @@ class AsyncTransferQueueClient:
         keys: list[str],
         socket: zmq.asyncio.Socket | None = None,
     ) -> dict[str, Any]:
-        """Fetch selected rows and their original field schemas without payloads."""
+        """Fetch selected rows and their fields' declared types without payloads."""
         response = await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY,
@@ -1165,18 +1165,17 @@ class AsyncTransferQueueClient:
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
-        missing_shapes: dict[int, list[str]] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Asynchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
-            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
-            One entry per written shard.
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
 
         Raises:
             RuntimeError: If the storage manager is not initialized, or a unit holds
@@ -1190,9 +1189,7 @@ class AsyncTransferQueueClient:
             )
         if not hasattr(self.storage_manager, "dump_rows_by_index"):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support selective data dump")
-        return await self.storage_manager.dump_rows_by_index(
-            shard_dir, global_indexes, fields_by_index, **({"missing_shapes": missing_shapes} if missing_shapes else {})
-        )
+        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
 
     async def async_load_rows_by_key(
         self,
@@ -1874,25 +1871,24 @@ class TransferQueueClient(AsyncTransferQueueClient):
         shard_dir: str,
         global_indexes: list[int],
         fields_by_index: dict[int, list[str]] | None = None,
-        missing_shapes: dict[int, list[str]] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         """Synchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
             global_indexes: Global indexes to dump.
             fields_by_index: Produced fields to persist; omitted for a raw storage dump.
-            missing_shapes: Fields whose row shapes must be recovered from stored values.
 
         Returns:
-            One entry per written shard.
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
 
         Raises:
             RuntimeError: If the storage manager is not initialized, or a unit holds
                 no data for a row it was asked to dump.
             NotImplementedError: If the storage backend does not support dumping.
         """
-        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index, missing_shapes=missing_shapes)
+        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
 
     def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
         """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""

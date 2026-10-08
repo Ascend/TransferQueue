@@ -259,22 +259,19 @@ def test_version_two_falls_back_to_kv_for_other_backends(unit, monkeypatch, tmp_
             )
         )
         assert response.body["success"]
-        return [
-            {
-                "position": 0,
-                "storage_unit_id": "unit",
-                "rows": len(indexes),
-                "row_offsets": response.body["row_offsets"],
-            }
-        ]
+        shard = {
+            "position": 0,
+            "storage_unit_id": "unit",
+            "rows": len(indexes),
+            "row_offsets": response.body["row_offsets"],
+        }
+        return {"shards": [shard], "row_schema": response.body["row_schema"]}
 
     client = SimpleNamespace(
         describe_data_dump=lambda *_: {
             "partition_id": "p",
             "rows": rows,
-            "field_schema": {
-                "x": {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False},
-            },
+            "field_schema": {"x": {"is_nested": False, "is_non_tensor": False}},
         },
         validate_dump_schema=lambda *_: None,
         dump_rows_by_index=dump,
@@ -333,14 +330,14 @@ async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
     failed = asyncio.Event()
     completed = []
 
-    async def dump(path, target_storage_unit, global_indexes, fields_by_index, missing_shapes):
+    async def dump(path, target_storage_unit, global_indexes, fields_by_index):
         if target_storage_unit == "u0":
             failed.set()
             raise OSError("write failed")
         await failed.wait()
         await asyncio.sleep(0)
         completed.append(target_storage_unit)
-        return {"row_offsets": {1: [0, 1]}}
+        return {"row_offsets": {1: [0, 1]}, "row_schema": {}}
 
     manager._dump_single_shard = dump
     with pytest.raises(OSError, match="write failed"):
@@ -348,54 +345,63 @@ async def test_dump_waits_for_writers_before_cleanup_can_start(tmp_path):
     assert completed == ["u1"]
 
 
-def test_dump_recovers_shapes_from_units_without_forwarding_payloads(unit, tmp_path):
+def test_dump_reports_every_rows_stored_types(unit, tmp_path):
     unit.storage_data.put_data({"x": [torch.arange(2), torch.arange(3)], "y": [None, {"key": "value"}]}, [9, 10])
     response = unit._handle_dump_rows(
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
-            body={
-                "path": str(tmp_path / "shard.pkl"),
-                "global_indexes": [9, 10],
-                "missing_shapes": {9: ["x", "y"], 10: ["x", "y"]},
-            },
+            body={"path": str(tmp_path / "shard.pkl"), "global_indexes": [9, 10]},
         )
     )
     assert response.body["success"]
-    assert response.body["recovered_schema"] == {
-        9: {"x": {"shape": (2,), "dtype": torch.int64}, "y": None},
-        10: {"x": {"shape": (3,), "dtype": torch.int64}, "y": None},
+    assert response.body["row_schema"] == {
+        9: {"x": (torch.int64, (2,)), "y": None},
+        10: {"x": (torch.int64, (3,)), "y": None},
     }
 
 
-@pytest.mark.parametrize("reverse_units", [False, True])
-def test_missing_shapes_merge_consistently_across_units(reverse_units):
-    schema = {
-        "x": {"dtype": torch.int64, "is_nested": True, "is_non_tensor": False, "per_sample_shapes": {1: None, 2: None}},
-    }
-    shards = [
-        {"recovered_schema": {1: {"x": {"shape": (2,), "dtype": torch.int64}}}},
-        {"recovered_schema": {2: {"x": None}}},
-    ]
-    if reverse_units:
-        shards.reverse()
-    data_dump._complete_dump_schema(schema, {1: ["x"], 2: ["x"]}, shards)
-    assert schema["x"] == {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
-    assert all("recovered_schema" not in shard for shard in shards)
+_DENSE = {"is_nested": False, "is_non_tensor": False}
+_NON_TENSOR = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
 
 
-@pytest.mark.parametrize("problem", ["missing", "wrong_field", "wrong_dtype"])
-def test_dump_rejects_incomplete_schema_recovery(problem):
-    schema = {"x": {"dtype": torch.int64, "is_nested": True, "is_non_tensor": False, "per_sample_shapes": {9: None}}}
-    recovered = {9: {"x": {"shape": (2,), "dtype": torch.int64}}}
-    if problem == "missing":
-        recovered = {}
-    elif problem == "wrong_field":
-        recovered[9] = {"other": recovered[9]["x"]}
-    else:
-        recovered[9]["x"]["dtype"] = torch.float32
-    with pytest.raises(ValueError):
-        data_dump._complete_dump_schema(schema, {9: ["x"]}, [{"recovered_schema": recovered}])
+@pytest.mark.parametrize(
+    ("declared", "rows", "expected"),
+    [
+        # A dense field whose later row a put wrapped as a string.
+        (_DENSE, [(torch.float32, (2,)), None], _NON_TENSOR),
+        # ... or as a tensor of another dtype.
+        (_DENSE, [(torch.float32, (2,)), (torch.int64, (2,))], _NON_TENSOR),
+        # ... or as a tensor of another shape.
+        (
+            _DENSE,
+            [(torch.float32, (2,)), (torch.float32, (3,))],
+            {
+                "dtype": torch.float32,
+                "shape": None,
+                "is_nested": True,
+                "is_non_tensor": False,
+                "per_sample_shapes": {0: (2,), 1: (3,)},
+            },
+        ),
+        (_DENSE, [(torch.int64, ()), (torch.int64, ())], {**_DENSE, "dtype": torch.int64, "shape": (1,)}),
+        (
+            {"is_nested": True, "is_non_tensor": False},
+            [(torch.int64, (2,)), (torch.int64, (2,))],
+            {
+                "dtype": torch.int64,
+                "shape": None,
+                "is_nested": True,
+                "is_non_tensor": False,
+                "per_sample_shapes": {0: (2,), 1: (2,)},
+            },
+        ),
+        ({"is_nested": False, "is_non_tensor": True}, [(torch.int64, (2,)), (torch.int64, (2,))], _NON_TENSOR),
+    ],
+)
+def test_dump_schema_follows_the_stored_rows(declared, rows, expected):
+    row_schema = {index: {"x": meta} for index, meta in enumerate(rows)}
+    assert data_dump._dump_field_schema({"x": declared}, row_schema) == {"x": expected}
 
 
 def test_saved_missing_tensor_shape_is_reported_as_invalid_dump():
@@ -410,82 +416,3 @@ def test_saved_missing_tensor_shape_is_reported_as_invalid_dump():
     }
     with pytest.raises(ValueError, match="has no saved shape at row 1"):
         validate_dump_values({"x": torch.arange(2)}, schema, 1)
-
-
-@pytest.mark.parametrize("value", [torch.arange(4), None, {"image": torch.arange(4)}])
-@pytest.mark.parametrize("wrapped_first", [False, True])
-def test_field_metadata_merges_wrapped_values_without_incomplete_nested_shapes(value, wrapped_first):
-    from tensordict import NonTensorStack, TensorDict
-
-    from transfer_queue.controller import DataPartitionStatus
-    from transfer_queue.metadata import extract_field_schema
-
-    batches = [
-        TensorDict(
-            {"x": torch.nested.as_nested_tensor([torch.arange(2), torch.arange(3)], layout=torch.jagged)}, batch_size=2
-        ),
-        TensorDict({"x": NonTensorStack(value)}, batch_size=1),
-    ]
-    if wrapped_first:
-        batches.reverse()
-    partition = DataPartitionStatus("p")
-    offset = 0
-    for batch in batches:
-        indexes = list(range(offset, offset + batch.batch_size[0]))
-        schema = extract_field_schema(batch)
-        for field in schema.values():
-            for part in [field, field.get("tensor_schema", {})]:
-                if "per_sample_shapes" in part:
-                    part["per_sample_shapes"] = dict(zip(indexes, part["per_sample_shapes"], strict=True))
-        assert partition.update_production_status(indexes, [], schema)
-        offset += batch.batch_size[0]
-    meta = partition.field_metadata["x"]
-    if not wrapped_first and isinstance(value, torch.Tensor):
-        assert meta.is_nested
-        assert not meta.is_non_tensor
-        assert meta.per_sample_shapes == {0: (2,), 1: (3,), 2: (4,)}
-    else:
-        assert meta.is_non_tensor
-        assert not meta.is_nested
-        assert meta.dtype is None
-        assert not meta.per_sample_shapes
-    assert meta.global_indexes == {0, 1, 2}
-
-
-@pytest.mark.parametrize("shape", [(), (1,), (4,)])
-def test_wrapped_tensor_hints_preserve_dense_fields(shape):
-    from tensordict import NonTensorStack, TensorDict
-
-    from transfer_queue.controller import DataPartitionStatus
-    from transfer_queue.metadata import extract_field_schema
-
-    partition = DataPartitionStatus("p")
-    value = torch.ones(shape, dtype=torch.int64)
-    first = extract_field_schema(TensorDict({"x": value.unsqueeze(0)}, batch_size=1))
-    second = extract_field_schema(TensorDict({"x": NonTensorStack(value)}, batch_size=1))
-    assert second["x"]["is_non_tensor"]
-    assert partition.update_production_status([0], [], first)
-    assert partition.update_production_status([1], [], second)
-    meta = partition.field_metadata["x"]
-    assert not meta.is_nested
-    assert not meta.is_non_tensor
-    assert tuple(meta.shape) == (shape or (1,))
-    assert meta.dtype == torch.int64
-
-
-def test_schema_hints_do_not_iterate_broadcast_nontensor_data(monkeypatch):
-    from tensordict import NonTensorData, TensorDict
-
-    from transfer_queue.metadata import extract_field_schema
-
-    data = TensorDict({"x": NonTensorData(data={"kind": "image"}, batch_size=(2,))}, batch_size=2)
-    original = NonTensorData.__getitem__
-
-    def bounded_getitem(self, index):
-        assert index == 0, "Schema extraction tried to iterate broadcast NonTensorData"
-        return original(self, index)
-
-    monkeypatch.setattr(NonTensorData, "__getitem__", bounded_getitem)
-    field = extract_field_schema(data)["x"]
-    assert field["is_non_tensor"]
-    assert "tensor_schema" not in field

@@ -223,20 +223,6 @@ class FieldMeta:
         Raises:
             ValueError: If incoming dtype conflicts with existing dtype.
         """
-        if self.is_non_tensor:
-            self.global_indexes.update(incoming_global_indexes)
-            return
-        if incoming.get("is_non_tensor"):
-            tensor_schema = incoming.get("tensor_schema")
-            if tensor_schema is None or tensor_schema["dtype"] != self.dtype:
-                self.is_non_tensor = True
-                self.is_nested = False
-                self.dtype = self.shape = None
-                self.per_sample_shapes.clear()
-                self.global_indexes.update(incoming_global_indexes)
-                return
-            incoming = tensor_schema
-
         # dtype consistency check
         new_dtype = incoming.get("dtype")
         if new_dtype is not None:
@@ -2255,15 +2241,12 @@ class TransferQueueController:
         params = request_msg.body
         rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
         partition = self.partitions[params["partition_id"]]
-        field_schema = {}
-        for name, meta in partition.field_metadata.items():
-            indexes = [row["global_index"] for row in rows.values() if name in row["fields"]]
-            if not indexes:
-                continue
-            schema = meta.to_batch_schema(indexes)
-            if schema.get("is_nested"):
-                schema["per_sample_shapes"] = {index: meta.per_sample_shapes.get(index) for index in indexes}
-            field_schema[name] = schema
+        # Only the declared types: row dtypes and shapes come from the storage units.
+        field_schema = {
+            name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
+            for name, meta in partition.field_metadata.items()
+            if any(name in row["fields"] for row in rows.values())
+        }
         return self._make_response(
             request_msg,
             ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,

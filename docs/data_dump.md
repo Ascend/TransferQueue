@@ -73,24 +73,15 @@ index and a field/value mapping. `shard_info.json` records each source index's
 current indexes without controller resolution. `row_index.pt` remains readable
 with `read_row_index` without opening payload shards.
 
-A dump also saves the original field schemas and only the selected nested row
-shapes. Restore uses that schema regardless of target topology or batch boundaries;
-non-tensor fields remain non-tensor even when a batch happens to contain only tensors.
-Destination type conflicts are rejected before payload writes.
-
-Legacy imports can leave nested fields with missing row shapes, for example when a
-later checkpoint chunk wraps tensor values in `NonTensorStack`. Export asks the owner
-units to inspect those values while writing their records. The caller merges only
-shape/type metadata before publishing the dump; payloads still stay on the units.
-Missing tensor shapes are filled from the actual values and their dtype is checked.
-If a missing-shape row contains `None` or an object, the entire selected field is
-saved as non-tensor, with a warning, so every unit restores the same field contract.
-Fields already declared non-tensor remain non-tensor. This repairs the exported
-schema without mutating live controller metadata or inventing shapes for objects.
-New puts also carry tensor shape hints for homogeneous tensor values wrapped in
-`NonTensorStack`. An existing tensor field uses those hints to keep its shape map
-complete; real mixed values make the field non-tensor. A field originally declared
-non-tensor stays non-tensor when later batches contain only tensors.
+A dump also saves a schema for each selected field. The controller supplies the
+declared type; while writing their records, the owner units report each row's dtype
+and shape, which the caller merges without seeing payloads. Controller metadata can
+trail the stored values, for example when a later put wraps rows of a tensor field in
+`NonTensorStack`, so a field is saved as non-tensor (with a warning) unless every
+selected row is a tensor of one dtype, and as nested if row shapes differ. A field
+declared non-tensor stays non-tensor. Restore uses that schema regardless of target
+topology or batch boundaries; destination type conflicts are rejected before payload
+writes.
 
 Restoring to a backend without direct selective loading uses KV puts, which do not
 provide distributed file reads. Export of nonempty dumps currently requires SimpleStorage.
