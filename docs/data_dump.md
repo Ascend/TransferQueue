@@ -94,8 +94,10 @@ succeeds. Readers need no lock and no write access.
 
 Restore has the failure semantics of `kv_batch_put`: it is not transactional, and
 payload writes before a failure remain. Metadata is published only after every unit
-has succeeded, so a failed load leaves those writes invisible. Existing keys keep
-their indexes, so retrying the same load is idempotent; clearing the keys abandons it.
+has succeeded, so a failed load leaves those writes invisible. Keys it registered
+stay registered: `kv_list` shows them with empty tags and no readable fields. Those
+keys keep their indexes, so retrying the same load is idempotent and restores the
+tags; clearing the keys abandons it.
 Like an ordinary put, a load does not fence late writes against indexes that are
 cleared and reused while it runs, so keep writers and clears for these keys paused.
 

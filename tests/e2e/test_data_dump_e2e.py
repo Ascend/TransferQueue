@@ -602,6 +602,7 @@ def test_failed_load_publishes_no_metadata_and_retry_is_idempotent(tq_system, du
     snapshot = ray.get(controller.get_partition_snapshot.remote("retry"))
     index = snapshot.keys_mapping["key"]
     assert not snapshot.field_metadata
+    assert tq.kv_list("retry")["retry"] == {"key": {}}
 
     tq.load_data_by_key(dump_dir)
     snapshot = ray.get(controller.get_partition_snapshot.remote("retry"))
