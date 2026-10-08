@@ -159,12 +159,11 @@ def demonstrate_kv_api():
     tq.kv_update(
         key=key,
         partition_id=partition_id,
-        fields="scratch",
-        values=torch.tensor([3, 4]),
-        parser=lambda old, new: torch.cat([old, new]),
+        fields={"scratch": torch.tensor([3, 4])},
+        merge_fn=lambda old, new: torch.cat([old, new]),
     )
     print("  ✓ kv_update concat: scratch of '0_0' is now [1, 2, 3, 4].")
-    tq.kv_empty(key=key, partition_id=partition_id, fields="scratch")
+    tq.kv_empty(keys=key, partition_id=partition_id, fields="scratch")
     print("  ✓ tq.kv_empty: scratch of '0_0' is stored as None (key remains).")
 
     # Step 6: List all keys and tags in a partition
@@ -216,7 +215,7 @@ def main():
         Key Methods:
         1. (async_)kv_put          - Insert/Update a multi-column sample by key, with optional metadata tag
         2. (async_)kv_batch_put    - Put multiple key-value pairs efficiently in batch
-        3. (async_)kv_update       - Rewrite fields with parser(old, new), or empty=True / tq.kv_empty to store None
+        3. (async_)kv_update       - Merge new values into produced fields with merge_fn(old, new)
         4. (async_)kv_batch_get    - Retrieve samples (by keys), supporting column selection (by fields)
         5. (async_)kv_list         - List keys and tags (metadata) in a partition
         6. (async_)kv_clear        - Remove key-value pairs from storage

@@ -213,10 +213,22 @@ GET reads each requested SSD file and reconstructs the value in host memory.
 SSD offload reduces long-lived memory use, but it does not remove temporary
 memory use while values are read or encoded.
 
-### `data_parser` outputs should not share backing storage across samples
+### Dense batches can retain shared backing memory
 
-If a `data_parser` returns differently sized tensor or NumPy views backed by
-the same allocation, an in-memory view can keep the entire allocation resident
-after another view is offloaded. When parsing URLs or file paths, return an
-independently owned value for each sample, or copy retained views before
-returning them.
+SimpleStorage slices dense batches without copying. The rows therefore share
+the batch allocation, and replacing or emptying one row does not release its
+share while another stored row still references that allocation. This is the
+memory trade-off for zero-copy batch distribution; clear or replace every
+sibling row before expecting the full allocation to be released.
+
+The same rule applies when a `data_parser` returns tensor or NumPy views backed
+by one allocation. Return independently owned values when partial release is
+more important than zero-copy storage.
+
+### Atomic multi-field writes require temporary SSD headroom
+
+SimpleStorage writes all replacement files before publishing any of them. This
+keeps a failed multi-field put or merge from exposing a partially updated
+sample, but temporarily requires space for the old files and all new files.
+When sizing the SSD tier, allow for that operation-level peak rather than only
+the final active-byte count.

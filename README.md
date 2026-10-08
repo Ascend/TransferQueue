@@ -116,9 +116,16 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
 - **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
-- **(async_)kv_update**: Rewrite selected fields of an existing key with `parser(old, new)`, or `empty=True` to store `None`. `kv_empty()` is the same as `kv_update(..., empty=True)`. SimpleStorage only.
+- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into already-produced fields with `merge_fn(old, new)`. SimpleStorage only.
+- **(async_)kv_empty**: Store `None` in selected fields while keeping their keys ready. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_clear**: Remove key-value pairs from storage.
+
+`kv_update` preserves each field's tensor/non-tensor type and tensor dtype. A
+timeout has an unknown outcome because a storage unit may commit after the
+caller stops waiting, so non-idempotent merge operations must not be retried
+blindly. Updates are atomic within one storage-unit request; a batch spanning
+multiple units is not a distributed transaction.
 
 **Key Features**
 
