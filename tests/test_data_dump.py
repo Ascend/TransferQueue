@@ -79,8 +79,8 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
     monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
-    data_dump.dump_data_by_key(tmp_path / "dump", ["key"], "p")
-    restored = data_dump.read_row_index(tmp_path / "dump")["rows"]["key"]["tag"]["nested"][0].value
+    interface.dump_data_by_key(tmp_path / "dump", ["key"], "p")
+    restored = data_dump._read_row_index(tmp_path / "dump")["rows"]["key"]["tag"]["nested"][0].value
     torch.testing.assert_close(restored, batch[0])
     assert restored.untyped_storage().nbytes() == restored.numel() * restored.element_size()
 
@@ -99,7 +99,7 @@ def test_failed_dump_leaves_no_staging_directory(empty_dump_client, monkeypatch,
 
     monkeypatch.setattr(data_dump, "_fsync_directory", fail)
     with pytest.raises(OSError, match="disk full"):
-        data_dump.dump_data_by_key(tmp_path / "dump", [], "p")
+        interface.dump_data_by_key(tmp_path / "dump", [], "p")
     assert not list(tmp_path.iterdir())
 
 
@@ -111,13 +111,13 @@ def test_racing_dumps_to_one_path_publish_only_the_first(empty_dump_client, monk
     def publish_another_dump_first(path):
         if path.name.startswith("dump.tmp-") and not raced:
             raced.append(path)
-            data_dump.dump_data_by_key(dump, [], "first")
+            interface.dump_data_by_key(dump, [], "first")
         fsync(path)
 
     monkeypatch.setattr(data_dump, "_fsync_directory", publish_another_dump_first)
     with pytest.raises(OSError):
-        data_dump.dump_data_by_key(dump, [], "second")
-    assert data_dump.read_row_index(dump)["partition_id"] == "first"
+        interface.dump_data_by_key(dump, [], "second")
+    assert data_dump._read_row_index(dump)["partition_id"] == "first"
     assert [path.name for path in tmp_path.iterdir()] == ["dump"]
 
 
@@ -237,56 +237,15 @@ def test_unit_rejects_invalid_records(unit, tmp_path, problem):
     assert not unit.storage_data._active_keys
 
 
-def test_version_two_falls_back_to_kv_for_other_backends(unit, monkeypatch, tmp_path):
-    unit.storage_data.put_data({"x": [torch.tensor([7, 8])]}, [10])
-    rows = {
-        "k": {"global_index": 10, "fields": ["x"], "tag": {"tag": 1}},
-        "empty": {"global_index": 11, "fields": [], "tag": {}},
-    }
-
-    def dump(shard_dir, indexes, fields_by_index):
-        directory = type(tmp_path)(shard_dir)
-        directory.mkdir(parents=True)
-        response = unit._handle_dump_rows(
-            ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS,
-                sender_id="test",
-                body={
-                    "path": str(directory / "shard_0_unit.pkl"),
-                    "global_indexes": indexes,
-                    "fields_by_index": fields_by_index,
-                },
-            )
-        )
-        assert response.body["success"]
-        shard = {
-            "position": 0,
-            "storage_unit_id": "unit",
-            "rows": len(indexes),
-            "row_offsets": response.body["row_offsets"],
-        }
-        return {"shards": [shard], "row_schema": response.body["row_schema"]}
-
+def test_load_refuses_other_backends_before_registering_keys(monkeypatch, tmp_path):
     client = SimpleNamespace(
-        describe_data_dump=lambda *_: {
-            "partition_id": "p",
-            "rows": rows,
-            "field_schema": {"x": {"is_nested": False, "is_non_tensor": False}},
-        },
-        validate_dump_schema=lambda *_: None,
-        dump_rows_by_index=dump,
         storage_manager=object(),
+        kv_retrieve_meta=lambda *_, **__: pytest.fail("registered keys on an unsupported backend"),
     )
     monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
     monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
-    data_dump.dump_data_by_key(tmp_path / "dump", list(rows), "p")
-    calls = []
-    monkeypatch.setattr(interface, "kv_batch_put", lambda *args, **kwargs: calls.append((args, kwargs)))
-    data_dump.load_data_by_key(tmp_path / "dump")
-    assert calls[0][0][:2] == (["k"], "p")
-    torch.testing.assert_close(calls[0][0][2]["x"][0], torch.tensor([7, 8]))
-    assert calls[0][1]["tags"] == [{"tag": 1}]
-    assert calls[1] == ((["empty"], "p"), {"tags": [{}]})
+    with pytest.raises(NotImplementedError, match="does not support selective data load"):
+        interface.load_data_by_key(tmp_path)
 
 
 @pytest.mark.asyncio
@@ -401,7 +360,7 @@ _NON_TENSOR = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor"
 )
 def test_dump_schema_follows_the_stored_rows(declared, rows, expected):
     row_schema = {index: {"x": meta} for index, meta in enumerate(rows)}
-    assert data_dump._dump_field_schema({"x": declared}, row_schema) == {"x": expected}
+    assert data_dump.dump_field_schema({"x": declared}, row_schema) == {"x": expected}
 
 
 def test_saved_missing_tensor_shape_is_reported_as_invalid_dump():

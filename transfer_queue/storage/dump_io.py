@@ -18,7 +18,6 @@
 import pickle
 
 import torch
-from tensordict import NonTensorStack
 
 
 def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
@@ -65,12 +64,3 @@ def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: 
             }
         selected[name] = field
     return selected
-
-
-def pack_dump_field(values: list, schema: dict):
-    """Build fallback KV batches according to the original field contract."""
-    if schema["is_non_tensor"]:
-        return NonTensorStack(*values)
-    if schema["is_nested"]:
-        return torch.nested.as_nested_tensor(values, layout=torch.jagged)
-    return torch.stack(values)

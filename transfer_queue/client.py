@@ -1141,10 +1141,6 @@ class AsyncTransferQueueClient:
         )
         return {name: response.body[name] for name in ("partition_id", "rows", "field_schema")}
 
-    async def async_describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
-        """Fetch key-addressed row metadata, preserving the existing row-only API."""
-        return (await self.async_describe_data_dump(partition_id, keys))["rows"]
-
     @with_controller_socket
     async def async_validate_dump_schema(
         self,
@@ -1187,8 +1183,6 @@ class AsyncTransferQueueClient:
                 f"[{self.client_id}]: Storage manager not initialized. "
                 "Call initialize_storage_manager() before dump operations."
             )
-        if not hasattr(self.storage_manager, "dump_rows_by_index"):
-            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support selective data dump")
         return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
 
     async def async_load_rows_by_key(
@@ -1201,10 +1195,16 @@ class AsyncTransferQueueClient:
 
         Failure semantics match ``kv_batch_put``: new keys stay registered and payload
         writes may be partial, and retrying is idempotent because keys keep their indexes.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit fails.
+            NotImplementedError: If the storage backend does not support selective loads.
         """
-        manager = getattr(self, "storage_manager", None)
-        if manager is None or not hasattr(manager, "load_rows_by_index"):
-            raise NotImplementedError("Storage backend does not support direct selective load")
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before load operations."
+            )
         if not rows:
             return 0
         metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
@@ -1212,7 +1212,7 @@ class AsyncTransferQueueClient:
         for shard in shards:
             for record in shard["records"]:
                 record["target_index"] = target_indexes[record["key"]]
-        bytes_read = await manager.load_rows_by_index(partition_id, shards)
+        bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
         metadata.update_custom_meta([row["tag"] for row in rows.values()])
         await self.async_set_custom_meta(metadata)
         return bytes_read
@@ -1401,7 +1401,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
-        self._describe_rows_by_key = _make_sync(self.async_describe_rows_by_key)
         self._describe_data_dump = _make_sync(self.async_describe_data_dump)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
@@ -1843,23 +1842,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         return self._kv_list(partition_id=partition_id)
 
     # ==================== Selective Data Dump API ====================
-    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
-        """Synchronously fetch the row metadata a selective dump needs, via ZMQ RPC.
-
-        Args:
-            partition_id: Partition that owns ``keys``.
-            keys: Keys to describe, already deduplicated by the caller.
-
-        Returns:
-            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``.
-
-        Raises:
-            RuntimeError: If the RPC fails, or the partition or a key is unknown.
-        """
-        return self._describe_rows_by_key(partition_id, keys)
-
     def describe_data_dump(self, partition_id: str, keys: list[str]) -> dict[str, Any]:
-        """Fetch the row index and selected field schemas for a selective dump."""
+        """Fetch the row index and the selected fields' declared types for a selective dump."""
         return self._describe_data_dump(partition_id, keys)
 
     def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:

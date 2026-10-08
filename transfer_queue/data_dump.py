@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Persist selected rows and restore them by key without checkpointing controller state.
+"""File format of selective dumps written by ``dump_data_by_key``.
 
 Field schemas are saved alongside independent row records in each shard. The manifest
 maps source indexes to byte offsets, so current owner units read only their rows when
@@ -31,26 +31,22 @@ Layout::
 
 import json
 import os
-import shutil
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 import torch
-from tensordict import TensorDict
 
-from transfer_queue.storage.dump_io import pack_dump_field, read_dump_row, validate_dump_values
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
 DUMP_FORMAT_VERSION = 3
+SHARD_SUBDIR = "shards"
 
 _DUMP_INFO_FILE = "dump_info.json"
 _ROW_INDEX_FILE = "row_index.pt"
-_SHARD_SUBDIR = "shards"
 _SHARD_INFO_FILE = "shard_info.json"
 
 
@@ -74,130 +70,7 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -> dict[str, int]:
-    """Dump the rows addressed by ``keys`` into ``dump_dir``.
-
-    Each storage unit pickles the rows it owns in its own process, so the payload never
-    passes through the caller. The caller writes only a small row index.
-
-    The dump is staged in a uniquely named sibling directory and renamed into place
-    once durable. An existing ``dump_dir`` is refused, so a published dump is never
-    replaced: loads need no lock and readers no write access.
-
-    .. note::
-        **Multi-node limitation**: dump_dir must reside on a shared network filesystem
-        (e.g. NFS, GPFS, Lustre) reachable from every storage unit, because each unit
-        writes its own shard from its own node.
-
-    Callers must freeze writers for ``keys`` for the duration: TransferQueue has no
-    atomic snapshot, so a concurrent put can land between the row index and the shards.
-
-    Args:
-        dump_dir: Directory to write the dump into.
-        keys: Keys to dump. Duplicates are dropped, first occurrence wins.
-        partition_id: Partition that owns ``keys``.
-
-    Returns:
-        ``{"keys", "rows_with_data", "shards", "bytes"}``.
-
-    Raises:
-        FileExistsError: ``dump_dir`` already exists.
-        RuntimeError: TransferQueue is not initialized, the partition or a key does not
-            exist, or a storage unit holds no data for a row it was asked to dump.
-    """
-    return _dump_data_by_key(Path(dump_dir).resolve(), keys, partition_id)
-
-
-def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dict[str, int]:
-    from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
-
-    if _TQ_CONTROLLER is None:
-        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
-
-    if dump_dir.exists():
-        raise FileExistsError(f"{dump_dir} already exists; write each dump to a new directory")
-    unique_keys = list(dict.fromkeys(keys))
-    client = _maybe_create_tq_client()
-    # A unique staging name keeps concurrent dumps to the same path from sharing files.
-    tmp_dir = dump_dir.with_name(f"{dump_dir.name}.tmp-{uuid4().hex}")
-    tmp_dir.mkdir(parents=True)
-
-    try:
-        row_index = (
-            client.describe_data_dump(partition_id, unique_keys)
-            if unique_keys
-            else {
-                "partition_id": partition_id,
-                "rows": {},
-                "field_schema": {},
-            }
-        )
-        rows = row_index["rows"]
-
-        # A row whose fields are all still unproduced has nothing for a storage unit to
-        # dump, but it keeps its key and tag so the restore can recreate the row.
-        indexes_with_data = sorted(row["global_index"] for row in rows.values() if row["fields"])
-
-        shard_records = []
-        if indexes_with_data:
-            dumped = client.dump_rows_by_index(
-                str(tmp_dir / _SHARD_SUBDIR),
-                indexes_with_data,
-                {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]},
-            )
-            shard_records = dumped["shards"]
-            row_index["field_schema"] = _dump_field_schema(row_index["field_schema"], dumped["row_schema"])
-        shard_dir = tmp_dir / _SHARD_SUBDIR
-        shard_dir.mkdir(parents=True, exist_ok=True)
-        with open(shard_dir / _SHARD_INFO_FILE, "w", encoding="utf-8") as f:
-            json.dump(shard_records, f)
-            _fsync_file(f)
-        # The shards themselves were synced by the units that wrote them, but their
-        # directory entries were created here, on this node.
-        _fsync_directory(shard_dir)
-
-        # torch.save rather than json: a tag is an arbitrary picklable dict, and this
-        # path must not fail on a tag that happens to hold a tensor.
-        with open(tmp_dir / _ROW_INDEX_FILE, "wb") as f:
-            torch.save(row_index, f, pickle_module=compact_pickle)
-            _fsync_file(f)
-
-        with open(tmp_dir / _DUMP_INFO_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "format_version": DUMP_FORMAT_VERSION,
-                    "partition_id": partition_id,
-                    "num_keys": len(unique_keys),
-                    "num_rows_with_data": len(indexes_with_data),
-                    "num_shards": len(shard_records),
-                },
-                f,
-                indent=2,
-            )
-            _fsync_file(f)
-        # Everything the dump claims is now durable, so the staging directory can be
-        # published. Syncing the parent makes the rename itself survive a crash.
-        _fsync_directory(tmp_dir)
-
-        # rename() refuses a non-empty target, so of two dumps racing to one path only
-        # the first is published.
-        tmp_dir.rename(dump_dir)
-        _fsync_directory(dump_dir.parent)
-    except BaseException:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise
-
-    total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
-    logger.info(f"Dumped {len(unique_keys)} keys of partition {partition_id} to {dump_dir}")
-    return {
-        "keys": len(unique_keys),
-        "rows_with_data": len(indexes_with_data),
-        "shards": len(shard_records),
-        "bytes": total_bytes,
-    }
-
-
-def _dump_field_schema(declared: dict, row_schema: dict[int, dict]) -> dict:
+def dump_field_schema(declared: dict, row_schema: dict[int, dict]) -> dict:
     """Combine each field's declared type with the values its owner units hold.
 
     A put that wraps rows in ``NonTensorStack`` leaves a tensor field's metadata
@@ -230,23 +103,49 @@ def _dump_field_schema(declared: dict, row_schema: dict[int, dict]) -> dict:
     return schema
 
 
-def read_row_index(dump_dir: str | Path) -> dict[str, Any]:
-    """Read a dump's row index without touching its payload.
+def publish_dump(tmp_dir: Path, dump_dir: Path, row_index: dict[str, Any], shard_records: list[dict]) -> None:
+    """Write the manifests next to the unit-written shards, then rename into place.
 
-    Lets a caller answer questions about which keys and fields a dump holds, for
-    example whether a row satisfies the current data contract, before paying to
-    deserialize any shard.
-
-    Args:
-        dump_dir: Directory previously written by ``dump_data_by_key``.
-
-    Returns:
-        ``{"partition_id": str, "rows": {key: {"global_index", "fields", "tag"}}}``.
-
-    Raises:
-        FileNotFoundError: The row index is missing.
+    ``dump_info.json`` is written last and the staging directory is renamed only once
+    everything is durable, so a published dump is always complete.
     """
-    return _read_row_index(Path(dump_dir))
+    shard_dir = tmp_dir / SHARD_SUBDIR
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    with open(shard_dir / _SHARD_INFO_FILE, "w", encoding="utf-8") as f:
+        json.dump(shard_records, f)
+        _fsync_file(f)
+    # The shards themselves were synced by the units that wrote them, but their
+    # directory entries were created here, on this node.
+    _fsync_directory(shard_dir)
+
+    # torch.save rather than json: a tag is an arbitrary picklable dict, and this
+    # path must not fail on a tag that happens to hold a tensor.
+    with open(tmp_dir / _ROW_INDEX_FILE, "wb") as f:
+        torch.save(row_index, f, pickle_module=compact_pickle)
+        _fsync_file(f)
+
+    rows = row_index["rows"]
+    with open(tmp_dir / _DUMP_INFO_FILE, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "format_version": DUMP_FORMAT_VERSION,
+                "partition_id": row_index["partition_id"],
+                "num_keys": len(rows),
+                "num_rows_with_data": sum(1 for row in rows.values() if row["fields"]),
+                "num_shards": len(shard_records),
+            },
+            f,
+            indent=2,
+        )
+        _fsync_file(f)
+    # Everything the dump claims is now durable, so the staging directory can be
+    # published. Syncing the parent makes the rename itself survive a crash.
+    _fsync_directory(tmp_dir)
+
+    # rename() refuses a non-empty target, so of two dumps racing to one path only
+    # the first is published.
+    tmp_dir.rename(dump_dir)
+    _fsync_directory(dump_dir.parent)
 
 
 def _read_row_index(dump_dir: Path) -> dict[str, Any]:
@@ -256,36 +155,17 @@ def _read_row_index(dump_dir: Path) -> dict[str, Any]:
     return torch.load(row_index_path, weights_only=False)
 
 
-def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
-    """Merge selected rows into the running system, preserving existing key indexes.
+def read_dump(dump_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Validate a dump's manifests and return its row index and per-shard records.
 
-    SimpleStorage units read their assigned indexed records directly and in parallel;
-    other backends use the KV put path. New keys receive
-    current indexes; unrelated rows and fields remain untouched. Writers and clears for
-    these keys must be paused during restore. As with ``kv_batch_put``, a failure may
-    leave new keys registered and payload partially written; retrying is idempotent.
-
-    Args:
-        dump_dir: Directory previously written by ``dump_data_by_key``. For direct
-            distributed loading it must be accessible from every storage unit.
-
-    Returns:
-        ``{"keys", "rows_with_data", "shards", "bytes"}``.
+    Only manifests are read; each record locates one row's byte range for the unit
+    that will load it.
 
     Raises:
-        RuntimeError: TransferQueue is not initialized or a storage unit fails.
         FileNotFoundError: The dump is incomplete.
-        ValueError: The manifest or a row disagrees with the row index.
+        ValueError: The format version is unsupported, or a manifest disagrees with
+            the row index.
     """
-    return _load_data_by_key(Path(dump_dir).resolve())
-
-
-def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
-    from transfer_queue.interface import _TQ_CONTROLLER, _maybe_create_tq_client
-
-    if _TQ_CONTROLLER is None:
-        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
-
     info_path = dump_dir / _DUMP_INFO_FILE
     if not info_path.exists():
         raise FileNotFoundError(f"{_DUMP_INFO_FILE} not found in {dump_dir}")
@@ -298,16 +178,15 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
         )
 
     row_index = _read_row_index(dump_dir)
-    partition_id = row_index["partition_id"]
     rows = row_index["rows"]
 
-    shard_dir = dump_dir / _SHARD_SUBDIR
+    shard_dir = dump_dir / SHARD_SUBDIR
     with open(shard_dir / _SHARD_INFO_FILE, encoding="utf-8") as f:
         shard_records = json.load(f)
     if (
         len(rows) != dump_info["num_keys"]
         or len(shard_records) != dump_info["num_shards"]
-        or partition_id != dump_info["partition_id"]
+        or row_index["partition_id"] != dump_info["partition_id"]
     ):
         raise ValueError("Dump manifest disagrees with the row index")
     keys_by_index = {row["global_index"]: key for key, row in rows.items() if row["fields"]}
@@ -344,55 +223,4 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
         shards.append({"path": str(path), "records": records, "field_schema": row_index["field_schema"]})
     if seen != set(keys_by_index):
         raise ValueError("Dump shards do not contain every produced row")
-
-    client = _maybe_create_tq_client()
-    client.validate_dump_schema(partition_id, row_index["field_schema"])
-    if hasattr(getattr(client, "storage_manager", None), "load_rows_by_index"):
-        client.load_rows_by_key(partition_id, rows, shards)
-    else:
-        _load_via_kv(partition_id, rows, shards)
-
-    total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
-    logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}")
-    return {
-        "keys": len(rows),
-        "rows_with_data": len(keys_by_index),
-        "shards": len(shard_records),
-        "bytes": total_bytes,
-    }
-
-
-def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict]) -> None:
-    """Restore into non-SimpleStorage backends without changing their put contract."""
-    from transfer_queue.interface import kv_batch_put
-
-    restored = set()
-    for shard in shards:
-        with open(shard["path"], "rb") as f:
-            records = shard["records"]
-            for start in range(0, len(records), 128):
-                groups = defaultdict(list)
-                for record in records[start : start + 128]:
-                    index = record["source_index"]
-                    fields = record["fields"]
-                    values = read_dump_row(f, record["offset"], record["length"], index, fields)
-                    validate_dump_values(values, shard["field_schema"], index)
-                    groups[tuple(fields)].append((record["key"], values))
-                    restored.add(index)
-                for signature, batch in groups.items():
-                    keys = [key for key, _ in batch]
-                    packed = {
-                        name: pack_dump_field([values[name] for _, values in batch], shard["field_schema"][name])
-                        for name in signature
-                    }
-                    kv_batch_put(
-                        keys,
-                        partition_id,
-                        TensorDict(packed, batch_size=len(keys)),
-                        tags=[rows[key]["tag"] for key in keys],
-                    )
-    if restored != {row["global_index"] for row in rows.values() if row["fields"]}:
-        raise ValueError("Dump restore row count mismatch")
-    keys = [key for key, row in rows.items() if not row["fields"]]
-    if keys:
-        kv_batch_put(keys, partition_id, tags=[rows[key]["tag"] for key in keys])
+    return row_index, shards

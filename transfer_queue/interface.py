@@ -36,6 +36,7 @@ import time
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import ray
 import torch
@@ -43,6 +44,7 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
+from transfer_queue import data_dump
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import KVBatchMeta
@@ -1141,3 +1143,122 @@ def load_checkpoint(
     client.load_controller_checkpoint(str(controller_path))
 
     logger.info(f"Checkpoint loaded from {checkpoint_dir}")
+
+
+# ==================== Selective Data Dump API ====================
+
+
+def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -> dict[str, int]:
+    """Dump the rows addressed by ``keys`` into ``dump_dir``.
+
+    Each storage unit pickles the rows it owns in its own process, so the payload never
+    passes through the caller. The caller writes only a small row index.
+
+    The dump is staged in a uniquely named sibling directory and renamed into place
+    once durable. An existing ``dump_dir`` is refused, so a published dump is never
+    replaced: loads need no lock and readers no write access.
+
+    .. note::
+        **Multi-node limitation**: dump_dir must reside on a shared network filesystem
+        (e.g. NFS, GPFS, Lustre) reachable from every storage unit, because each unit
+        writes its own shard from its own node.
+
+    Callers must freeze writers for ``keys`` for the duration: TransferQueue has no
+    atomic snapshot, so a concurrent put can land between the row index and the shards.
+
+    Args:
+        dump_dir: Directory to write the dump into.
+        keys: Keys to dump. Duplicates are dropped, first occurrence wins.
+        partition_id: Partition that owns ``keys``.
+
+    Returns:
+        ``{"keys", "rows_with_data", "shards", "bytes"}``.
+
+    Raises:
+        FileExistsError: ``dump_dir`` already exists.
+        RuntimeError: TransferQueue is not initialized, the partition or a key does not
+            exist, or a storage unit holds no data for a row it was asked to dump.
+        NotImplementedError: The storage backend does not support selective dumps.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    dump_dir = Path(dump_dir).resolve()
+    if dump_dir.exists():
+        raise FileExistsError(f"{dump_dir} already exists; write each dump to a new directory")
+    unique_keys = list(dict.fromkeys(keys))
+    client = _maybe_create_tq_client()
+    # A unique staging name keeps concurrent dumps to the same path from sharing files.
+    tmp_dir = dump_dir.with_name(f"{dump_dir.name}.tmp-{uuid4().hex}")
+    tmp_dir.mkdir(parents=True)
+
+    try:
+        row_index = (
+            client.describe_data_dump(partition_id, unique_keys)
+            if unique_keys
+            else {"partition_id": partition_id, "rows": {}, "field_schema": {}}
+        )
+        rows = row_index["rows"]
+        # A row whose fields are all still unproduced has nothing for a storage unit to
+        # dump, but it keeps its key and tag so the restore can recreate the row.
+        fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
+        shard_records = []
+        if fields_by_index:
+            dumped = client.dump_rows_by_index(
+                str(tmp_dir / data_dump.SHARD_SUBDIR), sorted(fields_by_index), fields_by_index
+            )
+            shard_records = dumped["shards"]
+            row_index["field_schema"] = data_dump.dump_field_schema(row_index["field_schema"], dumped["row_schema"])
+        data_dump.publish_dump(tmp_dir, dump_dir, row_index, shard_records)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
+    logger.info(f"Dumped {len(unique_keys)} keys of partition {partition_id} to {dump_dir}")
+    return {
+        "keys": len(unique_keys),
+        "rows_with_data": len(fields_by_index),
+        "shards": len(shard_records),
+        "bytes": total_bytes,
+    }
+
+
+def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
+    """Merge selected rows into the running system, preserving existing key indexes.
+
+    SimpleStorage units read their assigned indexed records directly and in parallel.
+    New keys receive current indexes; unrelated rows and fields remain untouched.
+    Writers and clears for these keys must be paused during restore. As with
+    ``kv_batch_put``, a failure may leave new keys registered and payload partially
+    written; retrying is idempotent.
+
+    Args:
+        dump_dir: Directory previously written by ``dump_data_by_key``. It must be
+            accessible from every storage unit.
+
+    Returns:
+        ``{key: tag}`` for every restored key.
+
+    Raises:
+        RuntimeError: TransferQueue is not initialized or a storage unit fails.
+        NotImplementedError: The storage backend is not SimpleStorage.
+        FileNotFoundError: The dump is incomplete.
+        ValueError: The manifest or a row disagrees with the row index.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    client = _maybe_create_tq_client()
+    # Checked up front: the client registers the keys before any unit reads a shard.
+    if not isinstance(client.storage_manager, AsyncSimpleStorageManager):
+        raise NotImplementedError(f"{type(client.storage_manager).__name__} does not support selective data load")
+
+    dump_dir = Path(dump_dir).resolve()
+    row_index, shards = data_dump.read_dump(dump_dir)
+    partition_id = row_index["partition_id"]
+    rows = row_index["rows"]
+    client.validate_dump_schema(partition_id, row_index["field_schema"])
+    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
+    logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
+    return {key: row["tag"] for key, row in rows.items()}

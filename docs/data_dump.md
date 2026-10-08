@@ -10,8 +10,7 @@ import transfer_queue as tq
 
 tq.init()
 tq.dump_data_by_key("/shared/dumps/selected", ["sample-1", "sample-2"], "train")
-index = tq.read_row_index("/shared/dumps/selected")
-tq.load_data_by_key("/shared/dumps/selected")
+tags = tq.load_data_by_key("/shared/dumps/selected")  # {key: tag} of the restored keys
 ```
 
 Pause writes and clears for these keys during both operations. A dump is not an
@@ -70,8 +69,7 @@ shards/
 Each shard is a sequence of independent pickle records containing a source global
 index and a field/value mapping. `shard_info.json` records each source index's
 `[offset, length]`. Source indexes only locate records; they are never reused as
-current indexes without controller resolution. `row_index.pt` remains readable
-with `read_row_index` without opening payload shards.
+current indexes without controller resolution.
 
 A dump also saves a schema for each selected field. The controller supplies the
 declared type; while writing their records, the owner units report each row's dtype
@@ -83,8 +81,8 @@ declared non-tensor stays non-tensor. Restore uses that schema regardless of tar
 topology or batch boundaries; destination type conflicts are rejected before payload
 writes.
 
-Restoring to a backend without direct selective loading uses KV puts, which do not
-provide distributed file reads. Export of nonempty dumps currently requires SimpleStorage.
+Dump and load currently require SimpleStorage. Loading into another backend raises
+`NotImplementedError` before any key is registered.
 
 ## Failure behavior
 

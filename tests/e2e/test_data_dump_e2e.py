@@ -37,6 +37,7 @@ from omegaconf import OmegaConf
 from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
+from transfer_queue.data_dump import _read_row_index
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 
@@ -179,7 +180,7 @@ class TestDumpLoadRoundtrip:
         # Dump + wipe + load
         tq.dump_data_by_key(dump_dir, selected, partition_id)
         ray.get(controller.clear_partition.remote(partition_id))
-        tq.load_data_by_key(dump_dir)
+        assert tq.load_data_by_key(dump_dir) == {key: {"idx": keys.index(key)} for key in selected}
 
         # Check restored state
         snapshot = ray.get(controller.get_partition_snapshot.remote(partition_id))
@@ -234,7 +235,7 @@ class TestDumpLoadRoundtrip:
         tq.load_data_by_key(dump_dir)
 
         # Check restored state: the extra field came back only on its own row
-        rows = tq.read_row_index(dump_dir)["rows"]
+        rows = _read_row_index(dump_dir)["rows"]
         assert "routed_experts" in rows["h1"]["fields"]
         assert "routed_experts" not in rows["h0"]["fields"]
         retrieved = tq.kv_batch_get(keys=["h1"], partition_id=partition_id, select_fields=["routed_experts"])
@@ -298,7 +299,7 @@ class TestDumpLoadRoundtrip:
         assert (dump_dir / "dump_info.json").exists()
 
         # Check that loading it is a no-op rather than an error
-        assert tq.load_data_by_key(dump_dir)["keys"] == 0
+        assert tq.load_data_by_key(dump_dir) == {}
 
     def test_live_partition_survives_a_dump(self, tq_system, dump_dir, controller):
         # Define test data
@@ -322,7 +323,7 @@ class TestDumpLoadRoundtrip:
         with pytest.raises(FileExistsError):
             tq.dump_data_by_key(dump_dir, ["s0"], partition_id)
         assert sorted(path.name for path in dump_dir.parent.iterdir()) == [dump_dir.name]
-        assert tq.read_row_index(dump_dir)["partition_id"] == partition_id
+        assert _read_row_index(dump_dir)["partition_id"] == partition_id
 
     def test_published_dump_loads_from_a_read_only_directory(self, tq_system, dump_dir):
         partition_id = "d_read_only"
@@ -331,7 +332,7 @@ class TestDumpLoadRoundtrip:
         tq.kv_clear(["s0"], partition_id)
         dump_dir.parent.chmod(0o555)
         try:
-            assert sorted(tq.read_row_index(dump_dir)["rows"]) == ["s0"]
+            assert sorted(_read_row_index(dump_dir)["rows"]) == ["s0"]
             tq.load_data_by_key(dump_dir)
             assert sorted(path.name for path in dump_dir.parent.iterdir()) == [dump_dir.name]
         finally:
@@ -355,16 +356,12 @@ class TestRowIndex:
         tq.dump_data_by_key(dump_dir, keys, partition_id)
 
         # Check the index
-        row_index = tq.read_row_index(dump_dir)
+        row_index = _read_row_index(dump_dir)
         assert row_index["partition_id"] == partition_id
         assert sorted(row_index["rows"]) == keys
         for row, key in enumerate(keys):
             assert row_index["rows"][key]["fields"] == ["attention_mask", "input_ids"]
             assert row_index["rows"][key]["tag"] == {"idx": row}
-
-    def test_read_row_index_rejects_a_missing_dump(self, tq_system, dump_dir):
-        with pytest.raises(FileNotFoundError, match="row_index.pt"):
-            tq.read_row_index(dump_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -516,7 +513,7 @@ def test_chunks_with_a_wrapped_last_row_roundtrip(tq_system, dump_dir, row_count
         with monkeypatch.context() as patcher:
             patcher.setattr(builtins, "open", no_shard_read)
             tq.dump_data_by_key(target, keys, partition)
-        index = tq.read_row_index(target)
+        index = _read_row_index(target)
         for name in ["input_ids", "multi_modal_inputs#images"]:
             schema = index["field_schema"][name]
             assert schema["is_non_tensor"] == (last_kind != "tensor")
