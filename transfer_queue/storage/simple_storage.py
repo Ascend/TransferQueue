@@ -47,16 +47,13 @@ import psutil
 import ray
 import torch
 import zmq
-from tensordict import TensorDict
 
-from transfer_queue.metadata import extract_field_schema
 from transfer_queue.storage.dump_io import read_dump_row, select_dump_schema, validate_dump_values
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.tensor_utils import pack_field_values
 from transfer_queue.utils.zmq_utils import (
     STORAGE_CLIENT_IDENTITY_PREFIXES,
     ZMQMessage,
@@ -1377,28 +1374,18 @@ class SimpleStorageUnit:
                                 fields = read_dump_row(
                                     f, row["offset"], row["length"], row["source_index"], row["fields"]
                                 )
-                                if "field_schema" in shard:
-                                    validate_dump_values(fields, shard["field_schema"], row["source_index"])
+                                validate_dump_values(fields, shard["field_schema"], row["source_index"])
                                 groups[tuple(row["fields"])].append((row, fields))
                                 bytes_read += row["length"]
                             for signature, rows in groups.items():
                                 indexes = [row["target_index"] for row, _ in rows]
                                 values = {name: [fields[name] for _, fields in rows] for name in signature}
-                                if "field_schema" in shard:
-                                    schema = select_dump_schema(
-                                        shard["field_schema"],
-                                        [row["source_index"] for row, _ in rows],
-                                        indexes,
-                                        signature,
-                                    )
-                                else:
-                                    packed = {name: pack_field_values(items) for name, items in values.items()}
-                                    schema = extract_field_schema(TensorDict(packed, batch_size=len(rows)))
-                                    for field in schema.values():
-                                        if "per_sample_shapes" in field:
-                                            field["per_sample_shapes"] = dict(
-                                                zip(indexes, field["per_sample_shapes"], strict=True)
-                                            )
+                                schema = select_dump_schema(
+                                    shard["field_schema"],
+                                    [row["source_index"] for row, _ in rows],
+                                    indexes,
+                                    signature,
+                                )
                                 self.storage_data.put_data(values, indexes)
                                 updates.append({"global_indexes": indexes, "field_schema": schema})
             logger.info(

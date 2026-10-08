@@ -165,7 +165,17 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
-            body={"shards": [{"path": str(path), "records": records}]},
+            body={
+                "shards": [
+                    {
+                        "path": str(path),
+                        "records": records,
+                        "field_schema": {
+                            "x": {"dtype": torch.float32, "shape": (4096,), "is_nested": False, "is_non_tensor": False}
+                        },
+                    }
+                ]
+            },
         )
     )
     assert loaded.body["success"], loaded.body
@@ -220,7 +230,7 @@ def test_unit_rejects_invalid_records(unit, tmp_path, problem):
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
-            body={"shards": [{"path": str(path), "records": [record]}]},
+            body={"shards": [{"path": str(path), "records": [record], "field_schema": {"x": {"is_non_tensor": True}}}]},
         )
     )
     assert not reply.body["success"]

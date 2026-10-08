@@ -15,9 +15,9 @@
 
 """Persist selected rows and restore them by key without checkpointing controller state.
 
-Version 3 preserves field schemas alongside independent row records in each shard.
-The manifest maps source indexes to byte offsets, so current owner units read only their rows
-when restoring into a different topology. Version 1 remains readable via KV puts.
+Field schemas are saved alongside independent row records in each shard. The manifest
+maps source indexes to byte offsets, so current owner units read only their rows when
+restoring into a different topology.
 
 Layout::
 
@@ -31,7 +31,6 @@ Layout::
 
 import json
 import os
-import pickle
 import shutil
 from collections import defaultdict
 from pathlib import Path
@@ -44,7 +43,6 @@ from tensordict import TensorDict
 from transfer_queue.storage.dump_io import pack_dump_field, read_dump_row, validate_dump_values
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.tensor_utils import pack_field_values
 
 logger = get_logger(__name__)
 
@@ -276,8 +274,8 @@ def _read_row_index(dump_dir: Path) -> dict[str, Any]:
 def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
     """Merge selected rows into the running system, preserving existing key indexes.
 
-    SimpleStorage units read their assigned indexed records directly and in parallel.
-    Version-1 dumps and other backends use the compatible KV put path. New keys receive
+    SimpleStorage units read their assigned indexed records directly and in parallel;
+    other backends use the KV put path. New keys receive
     current indexes; unrelated rows and fields remain untouched. Writers and clears for
     these keys must be paused during restore. As with ``kv_batch_put``, a failure may
     leave new keys registered and payload partially written; retrying is idempotent.
@@ -308,10 +306,10 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
         raise FileNotFoundError(f"{_DUMP_INFO_FILE} not found in {dump_dir}")
     with open(info_path, encoding="utf-8") as f:
         dump_info = json.load(f)
-    if dump_info["format_version"] not in (1, 2, DUMP_FORMAT_VERSION):
+    if dump_info["format_version"] != DUMP_FORMAT_VERSION:
         raise ValueError(
             f"Unsupported dump format version {dump_info['format_version']} in {dump_dir}; "
-            f"this build reads versions 1 through {DUMP_FORMAT_VERSION}"
+            f"this build reads version {DUMP_FORMAT_VERSION}"
         )
 
     row_index = _read_row_index(dump_dir)
@@ -337,42 +335,37 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
         if not path.is_file():
             raise FileNotFoundError(f"Missing dump shard: {path}")
         records = []
-        if dump_info["format_version"] >= 2:
-            size = path.stat().st_size
-            offsets = record["row_offsets"]
-            if len(offsets) != record["rows"]:
-                raise ValueError(f"Dump shard row count mismatch: {path}")
-            for source_index, (offset, length) in offsets.items():
-                source_index = int(source_index)
-                if source_index not in keys_by_index or source_index in seen:
-                    raise ValueError(f"Unexpected or duplicated row {source_index} in {path}")
-                if offset < 0 or length <= 0 or offset + length > size:
-                    raise ValueError(f"Invalid row range for {source_index} in {path}")
-                key = keys_by_index[source_index]
-                records.append(
-                    {
-                        "key": key,
-                        "source_index": source_index,
-                        "fields": rows[key]["fields"],
-                        "offset": offset,
-                        "length": length,
-                    }
-                )
-                seen.add(source_index)
-        shard = {"path": str(path), "records": records}
-        if dump_info["format_version"] >= 3:
-            shard["field_schema"] = row_index["field_schema"]
-        shards.append(shard)
-    if dump_info["format_version"] >= 2 and seen != set(keys_by_index):
+        size = path.stat().st_size
+        offsets = record["row_offsets"]
+        if len(offsets) != record["rows"]:
+            raise ValueError(f"Dump shard row count mismatch: {path}")
+        for source_index, (offset, length) in offsets.items():
+            source_index = int(source_index)
+            if source_index not in keys_by_index or source_index in seen:
+                raise ValueError(f"Unexpected or duplicated row {source_index} in {path}")
+            if offset < 0 or length <= 0 or offset + length > size:
+                raise ValueError(f"Invalid row range for {source_index} in {path}")
+            key = keys_by_index[source_index]
+            records.append(
+                {
+                    "key": key,
+                    "source_index": source_index,
+                    "fields": rows[key]["fields"],
+                    "offset": offset,
+                    "length": length,
+                }
+            )
+            seen.add(source_index)
+        shards.append({"path": str(path), "records": records, "field_schema": row_index["field_schema"]})
+    if seen != set(keys_by_index):
         raise ValueError("Dump shards do not contain every produced row")
 
     client = _maybe_create_tq_client()
-    if dump_info["format_version"] >= 3:
-        client.validate_dump_schema(partition_id, row_index["field_schema"])
-    if dump_info["format_version"] >= 2 and hasattr(getattr(client, "storage_manager", None), "load_rows_by_index"):
+    client.validate_dump_schema(partition_id, row_index["field_schema"])
+    if hasattr(getattr(client, "storage_manager", None), "load_rows_by_index"):
         client.load_rows_by_key(partition_id, rows, shards)
     else:
-        _load_via_kv(partition_id, rows, shards, dump_info["format_version"])
+        _load_via_kv(partition_id, rows, shards)
 
     total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}")
@@ -384,41 +377,27 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
     }
 
 
-def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict], version: int) -> None:
-    """Retain v1 and non-SimpleStorage compatibility without changing their put contract."""
+def _load_via_kv(partition_id: str, rows: dict[str, Any], shards: list[dict]) -> None:
+    """Restore into non-SimpleStorage backends without changing their put contract."""
     from transfer_queue.interface import kv_batch_put
 
-    keys_by_index = {row["global_index"]: key for key, row in rows.items()}
     restored = set()
     for shard in shards:
         with open(shard["path"], "rb") as f:
-            if version == 1:
-                saved = pickle.load(f)
-                records = [
-                    {"key": keys_by_index[index], "source_index": index, "fields": rows[keys_by_index[index]]["fields"]}
-                    for index in saved["global_indexes"]
-                ]
-            else:
-                records = shard["records"]
+            records = shard["records"]
             for start in range(0, len(records), 128):
                 groups = defaultdict(list)
                 for record in records[start : start + 128]:
                     index = record["source_index"]
                     fields = record["fields"]
-                    if version == 1:
-                        values = {name: saved["field_data"][name][index] for name in fields}
-                    else:
-                        values = read_dump_row(f, record["offset"], record["length"], index, fields)
-                    if version >= 3:
-                        validate_dump_values(values, shard["field_schema"], index)
+                    values = read_dump_row(f, record["offset"], record["length"], index, fields)
+                    validate_dump_values(values, shard["field_schema"], index)
                     groups[tuple(fields)].append((record["key"], values))
                     restored.add(index)
                 for signature, batch in groups.items():
                     keys = [key for key, _ in batch]
                     packed = {
                         name: pack_dump_field([values[name] for _, values in batch], shard["field_schema"][name])
-                        if version >= 3
-                        else pack_field_values([values[name] for _, values in batch])
                         for name in signature
                     }
                     kv_batch_put(

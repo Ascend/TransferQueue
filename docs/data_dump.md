@@ -26,7 +26,7 @@ owner and concurrently asks those units to write their records. Only units holdi
 selected rows participate. Tensor storage is compacted during serialization, so a
 row view cannot include the rest of its original batch, including inside tags.
 
-On version-3 SimpleStorage restore:
+On SimpleStorage restore:
 
 1. The caller reads the row index and shard manifest and validates all file ranges.
 2. The controller resolves existing keys and allocates indexes for new keys.
@@ -48,7 +48,7 @@ storage unit. Local temporary storage suffices for single-node deployments.
 | Operation | State | Payload I/O | Unit count on restore |
 | --- | --- | --- | --- |
 | Checkpoint | Entire controller and storage state | Each unit reads/writes its whole file | Must match |
-| Selective v3 dump | Selected fields and tags, merged by key | Each owner unit reads/writes its records | May differ |
+| Selective dump | Selected fields and tags, merged by key | Each owner unit reads/writes its records | May differ |
 
 `DUMP_ROWS` and `LOAD_ROWS` are included in storage operation metrics. Unit logs
 record loaded rows and bytes; the manager logs total bytes and participating units.
@@ -56,7 +56,7 @@ These count application reads, not filesystem read-ahead or physical disk traffi
 
 ## Format and compatibility
 
-New dumps use `format_version: 3`:
+Dumps use `format_version: 3`, the only version this build reads:
 
 ```text
 dump_info.json
@@ -73,7 +73,7 @@ index and a field/value mapping. `shard_info.json` records each source index's
 current indexes without controller resolution. `row_index.pt` remains readable
 with `read_row_index` without opening payload shards.
 
-Version 3 also saves the original field schemas and only the selected nested row
+A dump also saves the original field schemas and only the selected nested row
 shapes. Restore uses that schema regardless of target topology or batch boundaries;
 non-tensor fields remain non-tensor even when a batch happens to contain only tensors.
 Destination type conflicts are rejected before payload writes.
@@ -92,13 +92,8 @@ New puts also carry tensor shape hints for homogeneous tensor values wrapped in
 complete; real mixed values make the field non-tensor. A field originally declared
 non-tensor stays non-tensor when later batches contain only tensors.
 
-Version-1 dumps remain readable using the prior caller-side KV put path. Version-2
-dumps retain direct reads, but lack original schemas and use the older inference
-behavior; exact field-type preservation cannot be guaranteed for those files.
-Restoring to a backend without direct selective loading uses KV puts. Version-1
-and KV fallback restores do not provide distributed file reads. Old builds that only understand
-versions 1 or 2 cannot read version-3 dumps. Export of nonempty dumps currently requires
-SimpleStorage.
+Restoring to a backend without direct selective loading uses KV puts, which do not
+provide distributed file reads. Export of nonempty dumps currently requires SimpleStorage.
 
 ## Failure behavior
 

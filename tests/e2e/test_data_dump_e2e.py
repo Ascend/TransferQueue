@@ -471,35 +471,6 @@ def test_direct_load_bypasses_caller_payload_io(tq_system, dump_dir, controller,
     assert snapshot.custom_meta[after[keys[0]]]["idx"] == 0
 
 
-def test_version_one_dump_remains_readable(tq_system, dump_dir, controller):
-    partition = "legacy"
-    dump_dir.mkdir(parents=True)
-    (dump_dir / "shards").mkdir()
-    torch.save(
-        {
-            "partition_id": partition,
-            "rows": {
-                "k": {"global_index": 100, "fields": ["x"], "tag": {"old": True}},
-                "empty": {"global_index": 101, "fields": [], "tag": {}},
-            },
-        },
-        dump_dir / "row_index.pt",
-    )
-    (dump_dir / "dump_info.json").write_text(
-        json.dumps(
-            {"format_version": 1, "partition_id": partition, "num_keys": 2, "num_rows_with_data": 1, "num_shards": 1}
-        )
-    )
-    (dump_dir / "shards" / "shard_info.json").write_text(
-        json.dumps([{"position": 0, "storage_unit_id": "old", "rows": 1}])
-    )
-    with (dump_dir / "shards" / "shard_0_old.pkl").open("wb") as f:
-        pickle.dump({"global_indexes": [100], "field_data": {"x": {100: torch.tensor([7, 8])}}}, f)
-    tq.load_data_by_key(dump_dir)
-    assert sorted(_keys_mapping(controller, partition)) == ["empty", "k"]
-    _assert_rows_equal(tq.kv_batch_get(["k"], partition, select_fields=["x"])["x"], [torch.tensor([7, 8])])
-
-
 @pytest.mark.parametrize("row_count", [3, 127, 128, 129, 130])
 @pytest.mark.parametrize("last_kind", ["tensor", "none", "object"])
 @pytest.mark.parametrize("legacy_metadata", [False, True])

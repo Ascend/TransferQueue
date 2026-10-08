@@ -172,8 +172,6 @@ If step (1) partially succeeds and step (2) fails, the system is left in a mixed
 ## Exporting selected keys
 
 Use [selective data dumps](data_dump.md) when restoring selected keys into an
-existing system or a different number of storage units. SimpleStorage restores for
-dump formats v2 and later read assigned row ranges directly on the current storage
-owners and merge values instead of replacing entire unit and controller state.
-New dumps use v3, which also preserves field schemas. Version-1 dumps use the
-caller-side KV put fallback.
+existing system or a different number of storage units. SimpleStorage restores read
+assigned row ranges directly on the current storage owners and merge values instead
+of replacing entire unit and controller state.
