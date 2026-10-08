@@ -542,42 +542,28 @@ class AsyncSimpleStorageManager(StorageManager):
     async def update_data(
         self,
         metadata: BatchMeta,
-        field_names: list[str],
-        values: TensorDict | None = None,
-        parser: Callable[[Any, Any], Any] | None = None,
-        empty: bool = False,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
     ) -> dict[str, dict[str, Any]]:
-        """Send an update to each hashed storage unit and notify the controller.
+        """Merge values on each owner unit and notify the controller.
 
-        The unit reads the old value, applies empty or parser(old, new), and reports
-        the shape it stored per sample; this assembles one batch-level field_schema
-        so production status stays ready.
+        Each unit reports the values it stored; this assembles one batch-level
+        field_schema so production status stays ready.
         """
         logger.debug(f"[{self.storage_manager_id}]: receive update_data request, updating {metadata.size} samples.")
 
         if metadata.size == 0:
             return {}
-        if empty:
-            if values is not None or parser is not None:
-                raise ValueError("empty update must not include values or a parser")
-        else:
-            if values is None or parser is None:
-                raise ValueError("update requires values and a parser unless empty is set")
-            if values.batch_size[0] != metadata.size:
-                raise ValueError(
-                    f"Batch size of values ({values.batch_size[0]}) does not match metadata size ({metadata.size})"
-                )
+        if values.batch_size[0] != metadata.size:
+            raise ValueError(
+                f"Batch size of values ({values.batch_size[0]}) does not match metadata size ({metadata.size})"
+            )
+        field_names = list(values.keys())
 
         routing = self._group_by_hash(metadata.global_indexes)
-        # Parser-backed updates are not replayed: parser(old, new) reads the stored value, so a
-        # second attempt after a lost answer would fold the new value in twice. Empty is a
-        # plain overwrite and stays retryable.
-        max_attempts = 1 if parser is not None else None
         tasks = []
         for su_id, group in routing.items():
-            storage_data = None
-            if values is not None:
-                storage_data = {f: self._select_by_positions(values[f], group.batch_positions) for f in field_names}
+            storage_data = {f: self._select_by_positions(values[f], group.batch_positions) for f in field_names}
             tasks.append(
                 self._request_with_retry(
                     "update",
@@ -586,13 +572,14 @@ class AsyncSimpleStorageManager(StorageManager):
                     partial(
                         self._update_to_single_storage_unit,
                         group.global_indexes,
-                        field_names,
                         storage_data,
-                        parser,
-                        empty,
+                        merge_fn,
+                        {name: metadata.field_schema[name] for name in field_names},
                         target_storage_unit=su_id,
                     ),
-                    max_attempts=max_attempts,
+                    # A merge reads stored state, so a replay after a lost answer
+                    # could fold the same new value in twice.
+                    max_attempts=1,
                 )
             )
 
@@ -612,11 +599,16 @@ class AsyncSimpleStorageManager(StorageManager):
             metadata.global_indexes, list(zip([g.global_indexes for g in routing.values()], described, strict=True))
         )
 
-        await self.notify_data_update(
+        published = await self.notify_data_update(
             metadata.partition_ids[0],
             metadata.global_indexes,
             field_schema,
         )
+        if not published:
+            raise RuntimeError(
+                "Storage update committed, but the controller did not accept its metadata; "
+                "do not retry this merge blindly"
+            )
         return field_schema
 
     @with_storage_unit_socket
@@ -680,22 +672,19 @@ class AsyncSimpleStorageManager(StorageManager):
     async def _update_to_single_storage_unit(
         self,
         global_indexes: list[int],
-        field_names: list[str],
-        storage_data: dict[str, Any] | None,
-        parser: Callable[[Any, Any], Any] | None,
-        empty: bool,
+        storage_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        field_schema: dict[str, dict[str, Any]],
         target_storage_unit: str,
         socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
         """Send an update to one storage unit and return what it stored, per field."""
         body: dict[str, Any] = {
             "global_indexes": global_indexes,
-            "fields": field_names,
-            "empty": empty,
+            "data": storage_data,
+            "merge_fn": merge_fn,
+            "field_schema": field_schema,
         }
-        if not empty:
-            body["data"] = storage_data
-            body["parser"] = parser
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
@@ -724,7 +713,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 time.perf_counter() - started,
                 serialized_bytes,
                 f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
-                f"samples={len(global_indexes)} fields={field_names}",
+                f"samples={len(global_indexes)} fields={list(storage_data)}",
             )
             return response_msg.body.get("stored_shapes", {})
         except zmq.error.Again as e:

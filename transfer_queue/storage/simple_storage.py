@@ -233,35 +233,38 @@ class StorageUnitData:
     def apply_update(
         self,
         global_indexes: list[int],
-        fields: list[str],
-        new_data: dict[str, Any] | None,
-        parser: Callable[[Any, Any], Any] | None,
-        use_empty: bool,
+        new_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        field_schema: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        """Read each (field, index), compute the stored value, then write once.
+        """Merge produced values, validate their types, then write once.
 
-        Missing fields yield ``old=None``. All parser calls finish before one
-        ``put_data`` that writes every field or none, so a raise from a parser or
-        an SSD write leaves storage unchanged.
+        All merge calls and type checks finish before one ``put_data`` call, so
+        a merge error or incompatible result leaves storage unchanged.
 
         Returns:
             Per-sample description of the stored values, keyed by field name.
         """
         computed: dict[str, list] = {}
-        if use_empty:
-            computed = {field: [None] * len(global_indexes) for field in fields}
-        else:
-            if parser is None or new_data is None:
-                raise TypeError("apply_update requires a parser and new values unless use_empty is set")
-            for field in fields:
-                # Read through get_data so SSD-offloaded values reach the parser decoded,
-                # not as file references; indexes never written keep old=None.
-                stored = self.field_data.get(field, {})
-                present = [idx for idx in global_indexes if idx in stored]
-                old_values = dict(zip(present, self.get_data([field], present)[field], strict=True)) if present else {}
-                computed[field] = [
-                    parser(old_values.get(idx), new_data[field][i]) for i, idx in enumerate(global_indexes)
-                ]
+        for field, new_values in new_data.items():
+            stored = self.field_data.get(field, {})
+            missing = [idx for idx in global_indexes if idx not in stored]
+            if missing:
+                raise ValueError(f"Cannot update unproduced field {field!r} for indexes {missing[:20]}")
+            old_values = self.get_data([field], global_indexes)[field]
+            computed[field] = [merge_fn(old, new_values[i]) for i, old in enumerate(old_values)]
+
+            expected = field_schema[field]
+            if expected.get("is_non_tensor"):
+                if any(isinstance(value, torch.Tensor) for value in computed[field]):
+                    raise TypeError(f"Merge result for non-tensor field {field!r} must remain non-tensor")
+            else:
+                for value in computed[field]:
+                    if not isinstance(value, torch.Tensor) or value.dtype != expected["dtype"]:
+                        actual = value.dtype if isinstance(value, torch.Tensor) else type(value).__name__
+                        raise TypeError(
+                            f"Merge result for tensor field {field!r} must keep dtype {expected['dtype']}, got {actual}"
+                        )
         self.put_data(computed, global_indexes)
         return {field: _describe_stored_values(values) for field, values in computed.items()}
 
@@ -607,7 +610,7 @@ class HybridStorageUnitData(StorageUnitData):
                 if isinstance(old_value, _SSDValueRef):
                     old_ssd_values.append(old_value)
 
-        # Write every field's files before replacing any value: kv_update parsers are not
+        # Write every field's files before replacing any value: kv_update merge functions are not
         # idempotent, so a failure on a later field must not leave earlier fields committed.
         prepared_data = {}
         entries: list[_SSDValueRef] = []
@@ -1236,23 +1239,23 @@ class SimpleStorageUnit:
             )
 
     def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Read each field, apply empty or parser(old, new), write once, describe what was stored."""
+        """Merge existing fields, write once, and describe what was stored."""
         try:
             global_indexes = data_parts.body["global_indexes"]
-            fields = data_parts.body["fields"]
-            use_empty = bool(data_parts.body.get("empty", False))
-            parser = data_parts.body.get("parser")
+            merge_fn = data_parts.body.get("merge_fn")
             new_data = data_parts.body.get("data")
+            field_schema = data_parts.body.get("field_schema")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
             ):
-                if not use_empty:
-                    if not callable(parser):
-                        raise TypeError(f"update parser must be callable, got {type(parser).__name__}")
-                    if not isinstance(new_data, dict):
-                        raise TypeError("update data must be a dict of new field values")
-                stored_shapes = self.storage_data.apply_update(global_indexes, fields, new_data, parser, use_empty)
+                if not callable(merge_fn):
+                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+                if not isinstance(new_data, dict) or not new_data:
+                    raise TypeError("update data must be a non-empty dict")
+                if not isinstance(field_schema, dict) or set(field_schema) != set(new_data):
+                    raise ValueError("field_schema must describe every update field")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, field_schema)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]

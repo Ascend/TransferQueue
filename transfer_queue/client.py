@@ -495,19 +495,15 @@ class AsyncTransferQueueClient:
     async def async_update(
         self,
         metadata: BatchMeta,
-        field_names: list[str],
-        values: TensorDict | None = None,
-        parser: Callable[[Any, Any], Any] | None = None,
-        empty: bool = False,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
     ) -> BatchMeta:
-        """Apply empty or parser(old, new) on SimpleStorage units for the named fields.
+        """Merge new values into produced fields on SimpleStorage units.
 
         Args:
             metadata: Samples to update. The key must already exist.
-            field_names: Fields to rewrite.
-            values: New values aligned with ``metadata``, or None when empty.
-            parser: ``parser(old, new) -> stored``. Ignored when empty.
-            empty: Store None for each named field.
+            values: New values aligned with ``metadata``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)``.
 
         Returns:
             The same metadata with field_schema and production status updated.
@@ -523,9 +519,7 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
-        field_schema = await self.storage_manager.update_data(
-            metadata, field_names, values=values, parser=parser, empty=empty
-        )
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn)
         return metadata.apply_field_schema(field_schema)
 
     async def async_get_data(self, metadata: BatchMeta) -> TensorDict:
@@ -1619,16 +1613,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def update(
         self,
         metadata: BatchMeta,
-        field_names: list[str],
-        values: TensorDict | None = None,
-        parser: Callable[[Any, Any], Any] | None = None,
-        empty: bool = False,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
     ) -> BatchMeta:
-        """Synchronously apply empty or parser(old, new) on SimpleStorage units.
+        """Synchronously merge new values into produced fields on SimpleStorage units.
 
         See ``async_update``.
         """
-        return self._update(metadata, field_names, values=values, parser=parser, empty=empty)
+        return self._update(metadata, values, merge_fn)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.

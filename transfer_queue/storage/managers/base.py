@@ -226,7 +226,7 @@ class StorageManager(ABC):
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: dict[int, dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Notify controller that new data is ready.
 
@@ -239,7 +239,7 @@ class StorageManager(ABC):
 
         if not self.controller_info:
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
-            return
+            return False
 
         normalized_field_schema = {}
         for field_name, field in field_schema.items():
@@ -271,9 +271,9 @@ class StorageManager(ABC):
             self._notify_and_wait(request_msg),
             self._notify_loop,
         )
-        await asyncio.wrap_future(thread_future)
+        return await asyncio.wrap_future(thread_future)
 
-    async def _notify_and_wait(self, request_msg: list) -> None:
+    async def _notify_and_wait(self, request_msg: list) -> bool:
         """Send a data status notification to the controller and block until ACK is received."""
         # Acquiring the lease sits outside the handler below: a missing socket name or a dead
         # context is a configuration/lifecycle fault the caller must see, not a slow ACK.
@@ -298,16 +298,18 @@ class StorageManager(ABC):
                     response_msg = ZMQMessage.deserialize(messages)
 
                     if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
+                        success = bool(response_msg.body.get("success"))
                         logger.debug(
-                            f"[{self.storage_manager_id}]: Get data status update ACK response "
-                            f"from controller id #{response_msg.sender_id} successfully."
+                            f"[{self.storage_manager_id}]: Received data status update ACK "
+                            f"from controller id #{response_msg.sender_id}: success={success}."
                         )
-                        return
+                        return success
             except Exception as e:
                 # Logged rather than raised, so a slow controller does not fail the put. Close
                 # the socket: a late ACK would otherwise be read as the next lessee's reply.
                 logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
                 sock.close(linger=0)
+                return False
 
     @abstractmethod
     async def put_data(
@@ -357,24 +359,22 @@ class StorageManager(ABC):
     async def update_data(
         self,
         metadata: BatchMeta,
-        field_names: list[str],
-        values: TensorDict | None = None,
-        parser: Callable[[Any, Any], Any] | None = None,
-        empty: bool = False,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
     ) -> dict[str, dict[str, Any]]:
-        """Apply empty or parser(old, new) on the unit that holds each sample.
+        """Merge new values on the unit that holds each sample.
 
         Args:
             metadata: Samples to update.
-            field_names: Fields to rewrite.
-            values: New values as a TensorDict aligned with ``metadata``, or None for empty.
-            parser: Called per sample per field as ``parser(old, new)``. Ignored when empty.
-            empty: If True, store None for each named field and ignore values/parser.
+            values: New values as a TensorDict aligned with ``metadata``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)``.
 
         Returns:
             field_schema of the stored values, keyed by field name.
         """
-        raise NotImplementedError(f"{self.__class__.__name__} does not support update_data")
+        raise NotImplementedError(
+            f"kv_update is not supported by {self.__class__.__name__}; it requires the SimpleStorage backend"
+        )
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Save storage state into checkpoint_dir.
@@ -820,23 +820,6 @@ class KVStorageManager(StorageManager):
             metadata.global_indexes,
             field_schema,
             per_field_custom_backend_meta,
-        )
-
-    async def update_data(
-        self,
-        metadata: BatchMeta,
-        field_names: list[str],
-        values: TensorDict | None = None,
-        parser: Callable[[Any, Any], Any] | None = None,
-        empty: bool = False,
-    ) -> dict[str, dict[str, Any]]:
-        """kv_update is only implemented for SimpleStorage.
-
-        A KV backend stores each sample-field under its own key and offers no hook to run
-        parser(old, new) where the value lives, so read-modify-write cannot be made atomic.
-        """
-        raise NotImplementedError(
-            f"kv_update is not supported by {type(self).__name__}; it requires the SimpleStorage backend."
         )
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
