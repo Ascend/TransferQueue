@@ -57,15 +57,19 @@ RETRY_DELAY_SECONDS = 1.0
 def _copy_buffer_content_into_tensors(lease, targets: list[Tensor], offsets: list[int]) -> None:
     """Copy each staged region out of the pooled buffer into the caller's tensors.
 
-    A uniform, tightly-packed group (same dtype+shape, laid out contiguously in the
-    target region) is copied in a single strided pass. This is the many-small-key
-    case, where a per-tensor Python loop otherwise dominates the read; ragged groups
-    fall back to a per-tensor copy. Views are dropped even when a copy raises: the
-    pool refuses to return a buffer while an exported view of it is still alive, and
-    an exception would otherwise keep the view alive in its traceback frame.
+    Views are dropped even when a copy raises: the pool refuses to return a buffer while an
+    exported view of it is alive, and an exception would otherwise keep it in its frame.
     """
+    # torch.frombuffer rejects count=0, and an empty tensor has nothing to copy.
+    staged = [(t, off) for t, off in zip(targets, offsets, strict=True) if t.numel()]
+    if not staged:
+        return
+    targets = [t for t, _ in staged]
+    offsets = [off for _, off in staged]
+
     t0 = targets[0]
     numel = t0.numel()
+    # A uniform, tightly packed group copies in one strided pass; ragged groups copy per tensor.
     uniform = len(targets) > 1
     if uniform:
         base_off = t0.storage_offset()
@@ -188,14 +192,17 @@ class MooncakeStoreClient(StorageKVClient):
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
 
+        # Only RDMA reads pay for register_buffer (a kernel op far slower than the transfer it
+        # enables); TCP reads would pay the extra copy-out for no gain, so leave them unpooled.
+        # See https://github.com/Ascend/TransferQueue/issues/169
+        use_pool = MOONCAKE_BUFFER_POOL_IMPORTED and self.protocol == "rdma"
         self._buffer_pool = (
             BufferPool(self._store, max_bytes=self.local_buffer_size, max_regions=MAX_BATCH_WORKER_THREADS)
-            if MOONCAKE_BUFFER_POOL_IMPORTED
+            if use_pool
             else None
         )
-        self._buffer_pool_exhausted_logged = False
-        # Only CPU RDMA reads pay for registration; TCP and GDR reads do not benefit here.
-        if self._buffer_pool is None and self.protocol == "rdma" and self._gdr_staging is None:
+        self._pool_fallback_warned = False
+        if not MOONCAKE_BUFFER_POOL_IMPORTED and self.protocol == "rdma" and self._gdr_staging is None:
             logger.warning(
                 "mooncake.store.BufferPool is unavailable, so every tensor read registers and "
                 "unregisters its own receive buffer. Upgrade to mooncake-transfer-engine >= 0.3.12 "
@@ -203,7 +210,7 @@ class MooncakeStoreClient(StorageKVClient):
             )
         # Claim at most half the registered buffer: mooncake stages its own reads from the
         # same region, so splitting all of it across the reader threads would starve those reads.
-        self._lease_bytes = self.local_buffer_size // (2 * MAX_BATCH_WORKER_THREADS)
+        self._pool_share_bytes = self.local_buffer_size // (2 * MAX_BATCH_WORKER_THREADS)
 
     def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
@@ -475,25 +482,32 @@ class MooncakeStoreClient(StorageKVClient):
         self, batch_keys: list[str], batch_shapes: list[tuple], batch_dtypes: list[torch.dtype], indexes: list[int]
     ) -> tuple[list[Tensor], list[int]]:
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
-        batch_buffer_tensors, batch_buffer_ptrs, region_ptrs, region_sizes = allocate_empty_tensors(
-            batch_dtypes, batch_shapes
-        )
+        batch_buffer_tensors, batch_buffer_ptrs, _, _ = allocate_empty_tensors(batch_dtypes, batch_shapes)
 
         if self._buffer_pool is None:
-            self._read_into_registered_tensors(batch_keys, batch_buffer_ptrs, batch_nbytes, region_ptrs, region_sizes)
+            self._read_into_registered_tensors(batch_keys, batch_buffer_ptrs, batch_nbytes)
             return batch_buffer_tensors, indexes
 
-        # split_by_bytes() keeps every lease request within one thread's share of the pool,
-        # so a batch larger than that share is read in several rounds instead of failing.
-        for group in split_by_bytes(batch_nbytes, self._lease_bytes):
-            self._read_via_buffer_pool(group, batch_keys, batch_buffer_ptrs, batch_nbytes, batch_buffer_tensors)
+        # Read what the pool can serve; register the rest in one pass after the loop, so
+        # oversized tensors and pool exhaustion keep the pre-pool cost (one register + one
+        # transfer) instead of paying it per group.
+        fallback: list[int] = []
+        for group in split_by_bytes(batch_nbytes, self._pool_share_bytes):
+            fallback += self._read_via_buffer_pool(
+                group, batch_keys, batch_buffer_ptrs, batch_nbytes, batch_buffer_tensors
+            )
+        if fallback:
+            self._read_into_registered_tensors(
+                [batch_keys[i] for i in fallback],
+                [batch_buffer_ptrs[i] for i in fallback],
+                [batch_nbytes[i] for i in fallback],
+            )
 
         return batch_buffer_tensors, indexes
 
-    def _read_into_registered_tensors(
-        self, keys: list[str], ptrs: list[int], nbytes: list[int], region_ptrs: list[int], region_sizes: list[int]
-    ) -> None:
+    def _read_into_registered_tensors(self, keys: list[str], ptrs: list[int], nbytes: list[int]) -> None:
         """Register the receive regions for one transfer, read into them, then unregister."""
+        region_ptrs, region_sizes = merge_contiguous_memory(ptrs, nbytes)
         self._register_all_buffers(region_ptrs, region_sizes)
         try:
             self._batch_get_into_with_retry(keys, ptrs, nbytes)
@@ -507,26 +521,20 @@ class MooncakeStoreClient(StorageKVClient):
         batch_ptrs: list[int],
         batch_nbytes: list[int],
         batch_tensors: list[Tensor],
-    ) -> None:
-        """Read one group of keys into a pooled buffer, then copy into the caller's tensors.
+    ) -> list[int]:
+        """Read one group into a pooled buffer and copy into the caller's tensors.
 
-        The copy is what lets the buffer return to the pool immediately, keeping the
-        returned tensors owned by the caller exactly as the register-per-read path does.
+        Returns the group unread when the pool cannot serve it, so the caller can register
+        those keys in one batch. A group larger than one reader's share is never leased:
+        that headroom belongs to the other readers and to mooncake's own staging.
         """
-        keys = [batch_keys[i] for i in group]
         nbytes = [batch_nbytes[i] for i in group]
         offsets, total = _aligned_offsets(nbytes)
-
-        # split_by_bytes() gives a tensor larger than the share its own group without
-        # shrinking it, so the share is re-checked here rather than letting one reader
-        # lease the headroom the other readers and mooncake's own staging need.
-        lease = self._acquire_buffer(total) if total <= self._lease_bytes else None
+        lease = self._acquire_buffer(total) if total <= self._pool_share_bytes else None
         if lease is None:
-            ptrs = [batch_ptrs[i] for i in group]
-            region_ptrs, region_sizes = merge_contiguous_memory(ptrs, nbytes)
-            self._read_into_registered_tensors(keys, ptrs, nbytes, region_ptrs, region_sizes)
-            return
+            return group
 
+        keys = [batch_keys[i] for i in group]
         try:
             self._batch_get_into_with_retry(keys, [lease.ptr + off for off in offsets], nbytes)
             _copy_buffer_content_into_tensors(lease, [batch_tensors[i] for i in group], offsets)
@@ -537,26 +545,25 @@ class MooncakeStoreClient(StorageKVClient):
             except Exception as release_error:
                 logger.warning(f"Returning the pooled receive buffer failed: {release_error}")
             raise
-        else:
-            lease.release()
+        lease.release()
+        return []
 
     def _acquire_buffer(self, nbytes: int):
         """Lease ``nbytes`` of pre-registered memory, or None when the pool cannot serve it.
 
-        Never block: waiting for a busy pool only delays a read that can register its own
-        receive buffer instead. Exhaustion is reported as an exception by mooncake.
+        Never block: a busy pool means registering a receive buffer beats waiting. mooncake
+        reports both the per-reader cap and an over-capacity request as an exception.
         """
         assert self._buffer_pool is not None
         try:
             return self._buffer_pool.acquire(nbytes, block=False)
         except Exception as e:
-            # warn once and keep the details at debug level.
             logger.debug(f"Leasing {nbytes} B of pre-registered memory failed ({e}); registering own buffer.")
-            if not self._buffer_pool_exhausted_logged:
-                self._buffer_pool_exhausted_logged = True
+            if not self._pool_fallback_warned:
+                self._pool_fallback_warned = True
                 logger.warning(
-                    "Cannot lease pre-registered memory from MooncakeStore, falling back to registering "
-                    "receive buffers per read. Raise local_buffer_size to keep reads on the fast path."
+                    f"Falling back to registering receive buffers per read ({e}). Raise local_buffer_size "
+                    "or lower read concurrency to keep reads on the pre-registered fast path."
                 )
             return None
 
@@ -684,11 +691,7 @@ class MooncakeStoreClient(StorageKVClient):
         buffer is still leased, and the store owns the memory those buffers point into.
         """
         if self._buffer_pool is not None:
-            try:
-                self._buffer_pool.close()
-            except Exception as e:
-                # Keep the store open; its local buffer still backs the leased regions.
-                raise RuntimeError("Cannot close MooncakeStore while receive buffers are leased") from e
+            self._buffer_pool.close()
             self._buffer_pool = None
         if self._gdr_staging is not None:
             self._gdr_staging.close(self._store)

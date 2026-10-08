@@ -199,6 +199,8 @@ def make_client(local_buffer_size=1 << 30, **extra):
         "metadata_server": "127.0.0.1:8080",
         "master_server_address": "127.0.0.1:8081",
         "local_buffer_size": local_buffer_size,
+        # The pool only runs on RDMA; default to it so the pooled-path tests exercise it.
+        "protocol": "rdma",
     }
     config.update(extra)
     return mcc.MooncakeStoreClient(config)
@@ -255,7 +257,19 @@ def test_pool_budget_is_capped_by_the_registered_local_buffer(store, monkeypatch
     # buffer is full, which is exactly the cost this path removes.
     assert factory.kwargs == {"max_bytes": 1 << 20, "max_regions": mcc.MAX_BATCH_WORKER_THREADS}
     # Half of an equal per-thread share, leaving the store room for its own staging.
-    assert client._lease_bytes == (1 << 20) // (2 * mcc.MAX_BATCH_WORKER_THREADS)
+    assert client._pool_share_bytes == (1 << 20) // (2 * mcc.MAX_BATCH_WORKER_THREADS)
+
+
+def test_pool_is_disabled_on_tcp(store, monkeypatch):
+    # TCP has no registration cost to save, so the pool would only add the copy-out.
+    install_pool(monkeypatch)
+    client = make_client(protocol="tcp")
+
+    assert client._buffer_pool is None
+    tensors = read_all(client)
+
+    assert_payloads(tensors)
+    assert store.registered and len(store.unregistered) == len(store.registered)
 
 
 def test_batch_larger_than_share_is_read_in_rounds(store, monkeypatch):
@@ -266,7 +280,7 @@ def test_batch_larger_than_share_is_read_in_rounds(store, monkeypatch):
 
     assert_payloads(tensors)
     assert len(pool.acquired) > 1
-    assert all(nbytes <= client._lease_bytes for nbytes in pool.acquired)
+    assert all(nbytes <= client._pool_share_bytes for nbytes in pool.acquired)
     assert pool.returned == len(pool.acquired)
     assert store.registered == []
 
@@ -283,9 +297,28 @@ def test_tensor_larger_than_share_registers_its_own_buffer(store, monkeypatch):
         assert torch.equal(got, want)
     # The oversized tensor must not lease the headroom the other readers need; the
     # small one still takes the pooled path.
-    assert pool.acquired and all(nbytes <= client._lease_bytes for nbytes in pool.acquired)
+    assert pool.acquired and all(nbytes <= client._pool_share_bytes for nbytes in pool.acquired)
     assert store.registered and len(store.unregistered) == len(store.registered)
     assert pool.active == {}
+
+
+def test_fallback_registers_everything_in_one_pass(store, monkeypatch):
+    # Pool exhausted up front: every group falls back, but a single same-dtype batch must
+    # register one merged region, not one per group (the pre-pool cost, not N times it).
+    client, pool = make_client_and_pool(monkeypatch, local_buffer_size=4096)
+    held = pool.acquire(pool.capacity)
+
+    n = 8
+    keys = [f"f{i}" for i in range(n)]
+    payloads = [torch.arange(i, i + 32, dtype=torch.float32) for i in range(n)]
+    store.objects = {k: bytes(t.numpy().tobytes()) for k, t in zip(keys, payloads, strict=True)}
+
+    tensors = read(client, keys, [(32,)] * n, [torch.float32] * n)
+
+    for got, want in zip(tensors, payloads, strict=True):
+        assert torch.equal(got, want)
+    assert len(store.registered) == 1 and len(store.unregistered) == 1
+    held.release()
 
 
 def test_falls_back_to_own_buffers_when_pool_is_exhausted(store, monkeypatch):
@@ -310,7 +343,7 @@ def test_exhaustion_warns_once(store, monkeypatch, caplog):
         read_all(client)
 
     # Every group of every read falls back here; the hot path must not flood the log.
-    fallbacks = [r for r in caplog.records if "falling back to registering" in r.message]
+    fallbacks = [r for r in caplog.records if "Falling back to registering" in r.message]
     assert len(fallbacks) == 1
     held.release()
 
@@ -448,11 +481,29 @@ def test_close_keeps_the_store_open_while_a_buffer_is_out(store, monkeypatch):
     client, pool = make_client_and_pool(monkeypatch)
     held = pool.acquire(1024)
 
-    # The store owns the memory the buffer points into, so it must outlive the pool.
-    with pytest.raises(RuntimeError, match="while receive buffers are leased"):
+    # The store owns the memory the buffer points into, so a refused pool close must not
+    # tear it down underneath an active lease.
+    with pytest.raises(RuntimeError, match="cannot close buffer pool with active leases"):
         client.close()
 
     assert not store.closed and client._buffer_pool is pool
     held.release()
     client.close()
     assert pool.closed and store.closed
+
+
+def test_empty_tensor_reads_like_the_register_path(store, monkeypatch):
+    # mooncake rejects a 0-byte put, so this is unreachable in practice; the guard only keeps
+    # the pooled path from raising where the register path returns, should it ever be hit.
+    keys, shapes, dtypes = ["empty", "normal"], [(0,), (4,)], [torch.float32, torch.float32]
+    payloads = [torch.empty(0), torch.arange(4, dtype=torch.float32)]
+    store.objects = {k: bytes(t.numpy().tobytes()) for k, t in zip(keys, payloads, strict=True)}
+
+    monkeypatch.setattr(mcc, "MOONCAKE_BUFFER_POOL_IMPORTED", False)
+    registered = read(make_client(), keys, shapes, dtypes)
+    client, pool = make_client_and_pool(monkeypatch)
+    pooled = read(client, keys, shapes, dtypes)
+
+    for got, want in zip(pooled, registered, strict=True):
+        assert got.shape == want.shape and torch.equal(got, want)
+    assert pool.returned == len(pool.acquired)
