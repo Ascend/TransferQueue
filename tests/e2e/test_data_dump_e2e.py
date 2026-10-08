@@ -316,19 +316,28 @@ class TestDumpLoadRoundtrip:
         retrieved = tq.kv_batch_get(keys=keys, partition_id=partition_id, select_fields=["input_ids"])
         _assert_rows_equal(retrieved["input_ids"], [_row_input_ids(row) for row in range(len(keys))])
 
-    def test_dump_replaces_preexisting_directory(self, tq_system, dump_dir):
-        # Define test data
-        partition_id = "d_replace"
-        _put_rows(partition_id, ["s0", "s1"])
-        dump_dir.mkdir(parents=True)
-        (dump_dir / "stale.pkl").write_bytes(b"stale")
-
-        # Dump
+    def test_dump_refuses_an_existing_directory(self, tq_system, dump_dir):
+        partition_id = "d_existing"
+        _put_rows(partition_id, ["s0"])
         tq.dump_data_by_key(dump_dir, ["s0"], partition_id)
+        with pytest.raises(FileExistsError):
+            tq.dump_data_by_key(dump_dir, ["s0"], partition_id)
+        assert sorted(path.name for path in dump_dir.parent.iterdir()) == [dump_dir.name]
+        assert tq.read_row_index(dump_dir)["partition_id"] == partition_id
 
-        # Check saved state
-        assert not (dump_dir / "stale.pkl").exists()
-        assert (dump_dir / "dump_info.json").exists()
+    def test_published_dump_loads_from_a_read_only_directory(self, tq_system, dump_dir):
+        partition_id = "d_read_only"
+        _put_rows(partition_id, ["s0"])
+        tq.dump_data_by_key(dump_dir, ["s0"], partition_id)
+        tq.kv_clear(["s0"], partition_id)
+        dump_dir.parent.chmod(0o555)
+        try:
+            assert sorted(tq.read_row_index(dump_dir)["rows"]) == ["s0"]
+            tq.load_data_by_key(dump_dir)
+            assert sorted(path.name for path in dump_dir.parent.iterdir()) == [dump_dir.name]
+        finally:
+            dump_dir.parent.chmod(0o755)
+        _assert_rows_equal(tq.kv_batch_get(["s0"], partition_id, ["input_ids"])["input_ids"], [_row_input_ids(0)])
 
 
 # ---------------------------------------------------------------------------
@@ -375,8 +384,7 @@ class TestDumpErrors:
             tq.dump_data_by_key(dump_dir, ["e0", "nope"], partition_id)
 
         # Check saved state: no partial directory left behind
-        assert not dump_dir.exists()
-        assert not dump_dir.with_name(dump_dir.name + ".tmp").exists()
+        assert not list(dump_dir.parent.iterdir())
 
     def test_unknown_partition_raises(self, tq_system, dump_dir):
         _put_rows("d_err_part", ["e0"])

@@ -93,63 +93,32 @@ def empty_dump_client(monkeypatch):
     )
 
 
-def test_failed_publication_preserves_previous_dump(empty_dump_client, monkeypatch, tmp_path):
+def test_failed_dump_leaves_no_staging_directory(empty_dump_client, monkeypatch, tmp_path):
+    def fail(path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(data_dump, "_fsync_directory", fail)
+    with pytest.raises(OSError, match="disk full"):
+        data_dump.dump_data_by_key(tmp_path / "dump", [], "p")
+    assert not list(tmp_path.iterdir())
+
+
+def test_racing_dumps_to_one_path_publish_only_the_first(empty_dump_client, monkeypatch, tmp_path):
     dump = tmp_path / "dump"
-    data_dump.dump_data_by_key(dump, [], "old")
-    rename = type(dump).rename
+    fsync = data_dump._fsync_directory
+    raced = []
 
-    def fail_publish(path, target):
-        if path == tmp_path / "dump.tmp":
-            raise OSError("publication failed")
-        return rename(path, target)
+    def publish_another_dump_first(path):
+        if path.name.startswith("dump.tmp-") and not raced:
+            raced.append(path)
+            data_dump.dump_data_by_key(dump, [], "first")
+        fsync(path)
 
-    monkeypatch.setattr(type(dump), "rename", fail_publish)
-    with pytest.raises(OSError, match="publication failed"):
-        data_dump.dump_data_by_key(dump, [], "new")
-    assert data_dump.read_row_index(dump)["partition_id"] == "old"
-    assert not (tmp_path / "dump.tmp").exists()
-
-
-@pytest.mark.parametrize("next_operation", ["read", "load", "dump"])
-def test_interrupted_publication_recovers_on_next_access(empty_dump_client, monkeypatch, tmp_path, next_operation):
-    dump = tmp_path / "dump"
-    data_dump.dump_data_by_key(dump, [], "old")
-    rename = type(dump).rename
-
-    def interrupt_publish(path, target):
-        if path == tmp_path / "dump.tmp":
-            raise KeyboardInterrupt
-        return rename(path, target)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(type(dump), "rename", interrupt_publish)
-        with pytest.raises(KeyboardInterrupt):
-            data_dump.dump_data_by_key(dump, [], "new")
-    assert not dump.exists()
-    assert (tmp_path / "dump.old").exists()
-    if next_operation == "read":
-        assert data_dump.read_row_index(dump)["partition_id"] == "old"
-    elif next_operation == "load":
-        assert data_dump.load_data_by_key(dump)["keys"] == 0
-        assert data_dump.read_row_index(dump)["partition_id"] == "old"
-    else:
-        data_dump.dump_data_by_key(dump, [], "replacement")
-        assert data_dump.read_row_index(dump)["partition_id"] == "replacement"
-
-
-def test_backup_cleanup_failure_does_not_fail_published_dump(empty_dump_client, monkeypatch, tmp_path):
-    dump = tmp_path / "dump"
-    data_dump.dump_data_by_key(dump, [], "old")
-    rmtree = data_dump.shutil.rmtree
-
-    def fail_cleanup(path):
-        if path == tmp_path / "dump.old":
-            raise OSError("cleanup failed")
-        return rmtree(path)
-
-    monkeypatch.setattr(data_dump.shutil, "rmtree", fail_cleanup)
-    data_dump.dump_data_by_key(dump, [], "new")
-    assert data_dump.read_row_index(dump)["partition_id"] == "new"
+    monkeypatch.setattr(data_dump, "_fsync_directory", publish_another_dump_first)
+    with pytest.raises(OSError):
+        data_dump.dump_data_by_key(dump, [], "second")
+    assert data_dump.read_row_index(dump)["partition_id"] == "first"
+    assert [path.name for path in tmp_path.iterdir()] == ["dump"]
 
 
 def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch):

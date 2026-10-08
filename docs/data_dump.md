@@ -15,9 +15,9 @@ tq.load_data_by_key("/shared/dumps/selected")
 ```
 
 Pause writes and clears for these keys during both operations. A dump is not an
-atomic snapshot of concurrent writers. Calls on the same dump path are serialized
-by an exclusive lock in a stable sibling `.lock` file. Different dump paths remain
-independent, and storage units within a load still read in parallel.
+atomic snapshot of concurrent writers. Each dump goes to a new directory: an existing
+target is refused, so a published dump never changes and can be loaded from a
+read-only location.
 
 ## Distributed I/O
 
@@ -102,15 +102,11 @@ SimpleStorage.
 
 ## Failure behavior
 
-Publication writes and syncs `.tmp`, moves the old directory to `.old`, publishes
-the new directory, and syncs its parent before deleting the backup. If publication
-is interrupted while the main directory is absent, the next dump, load or row-index
-read recovers `.old`. Readers perform recovery only while holding the same lock as
-publishers, so a healthy rename window is never mistaken for a crashed writer.
-The load keeps the lock through all remote reads. Do not delete the sibling
-lock file: unlinking it can create two independent locks for the same dump.
-The shared filesystem must provide cross-node advisory locking (not local-only
-locks). A backup-cleanup error does not invalidate a published dump.
+A dump is staged in a uniquely named sibling `<dump>.tmp-<id>` directory, with
+`dump_info.json` written last, and renamed into place once everything is synced.
+A failed dump removes its staging directory; a crash can leave one behind, which is
+never read and can be deleted. If two dumps race to one path, only the first rename
+succeeds. Readers need no lock and no write access.
 
 Restore has the failure semantics of `kv_batch_put`: it is not transactional, and
 payload writes before a failure remain. Metadata is published only after every unit

@@ -29,15 +29,14 @@ Layout::
             shard_<N>_<su_id>.pkl      # independent {global_index, fields} records
 """
 
-import fcntl
 import json
 import os
 import pickle
 import shutil
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import torch
 from tensordict import TensorDict
@@ -77,36 +76,15 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
-@contextmanager
-def _dump_lock(dump_dir: str | Path):
-    """Serialize publication and recovery using a stable sibling inode shared by all callers."""
-    directory = Path(dump_dir).resolve()
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = directory.with_name(directory.name + ".lock")
-    with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        try:
-            yield directory
-        finally:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-
-def _recover_dump(dump_dir: Path) -> None:
-    old_dir = dump_dir.with_name(dump_dir.name + ".old")
-    if not dump_dir.exists() and old_dir.exists():
-        old_dir.rename(dump_dir)
-        _fsync_directory(dump_dir.parent)
-
-
 def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -> dict[str, int]:
     """Dump the rows addressed by ``keys`` into ``dump_dir``.
 
     Each storage unit pickles the rows it owns in its own process, so the payload never
     passes through the caller. The caller writes only a small row index.
 
-    The directory is replaced wholesale. The previous dump is retained as ``.old``
-    until publication is durable, and recovered on the next access after interruption.
-    Access to the same directory is serialized with a sibling file lock.
+    The dump is staged in a uniquely named sibling directory and renamed into place
+    once durable. An existing ``dump_dir`` is refused, so a published dump is never
+    replaced: loads need no lock and readers no write access.
 
     .. note::
         **Multi-node limitation**: dump_dir must reside on a shared network filesystem
@@ -125,11 +103,11 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         ``{"keys", "rows_with_data", "shards", "bytes"}``.
 
     Raises:
+        FileExistsError: ``dump_dir`` already exists.
         RuntimeError: TransferQueue is not initialized, the partition or a key does not
             exist, or a storage unit holds no data for a row it was asked to dump.
     """
-    with _dump_lock(dump_dir) as directory:
-        return _dump_data_by_key(directory, keys, partition_id)
+    return _dump_data_by_key(Path(dump_dir).resolve(), keys, partition_id)
 
 
 def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dict[str, int]:
@@ -138,14 +116,12 @@ def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dic
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
+    if dump_dir.exists():
+        raise FileExistsError(f"{dump_dir} already exists; write each dump to a new directory")
     unique_keys = list(dict.fromkeys(keys))
-    dump_dir = Path(dump_dir).resolve()
     client = _maybe_create_tq_client()
-    _recover_dump(dump_dir)
-    tmp_dir = dump_dir.parent / (dump_dir.name + ".tmp")
-    old_dir = dump_dir.with_name(dump_dir.name + ".old")
-    if tmp_dir.exists():
-        shutil.rmtree(tmp_dir)
+    # A unique staging name keeps concurrent dumps to the same path from sharing files.
+    tmp_dir = dump_dir.with_name(f"{dump_dir.name}.tmp-{uuid4().hex}")
     tmp_dir.mkdir(parents=True)
 
     try:
@@ -220,26 +196,13 @@ def _dump_data_by_key(dump_dir: Path, keys: list[str], partition_id: str) -> dic
         # published. Syncing the parent makes the rename itself survive a crash.
         _fsync_directory(tmp_dir)
 
-        if dump_dir.exists():
-            if old_dir.exists():
-                shutil.rmtree(old_dir)
-            dump_dir.rename(old_dir)
-            _fsync_directory(dump_dir.parent)
+        # rename() refuses a non-empty target, so of two dumps racing to one path only
+        # the first is published.
         tmp_dir.rename(dump_dir)
         _fsync_directory(dump_dir.parent)
-    except Exception:
-        _recover_dump(dump_dir)
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
-
-    # Publication already succeeded; cleanup must not invalidate the new dump.
-    if old_dir.exists():
-        try:
-            shutil.rmtree(old_dir)
-            _fsync_directory(dump_dir.parent)
-        except OSError:
-            logger.warning("Could not remove previous dump at %s", old_dir, exc_info=True)
 
     total_bytes = sum(path.stat().st_size for path in dump_dir.rglob("*") if path.is_file())
     logger.info(f"Dumped {len(unique_keys)} keys of partition {partition_id} to {dump_dir}")
@@ -300,13 +263,10 @@ def read_row_index(dump_dir: str | Path) -> dict[str, Any]:
     Raises:
         FileNotFoundError: The row index is missing.
     """
-    with _dump_lock(dump_dir) as directory:
-        return _read_row_index(directory)
+    return _read_row_index(Path(dump_dir))
 
 
 def _read_row_index(dump_dir: Path) -> dict[str, Any]:
-    dump_dir = Path(dump_dir)
-    _recover_dump(dump_dir)
     row_index_path = dump_dir / _ROW_INDEX_FILE
     if not row_index_path.exists():
         raise FileNotFoundError(f"{_ROW_INDEX_FILE} not found in {dump_dir}")
@@ -334,8 +294,7 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, int]:
         FileNotFoundError: The dump is incomplete.
         ValueError: The manifest or a row disagrees with the row index.
     """
-    with _dump_lock(dump_dir) as directory:
-        return _load_data_by_key(directory)
+    return _load_data_by_key(Path(dump_dir).resolve())
 
 
 def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
@@ -344,8 +303,6 @@ def _load_data_by_key(dump_dir: Path) -> dict[str, int]:
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
-    dump_dir = Path(dump_dir).resolve()
-    _recover_dump(dump_dir)
     info_path = dump_dir / _DUMP_INFO_FILE
     if not info_path.exists():
         raise FileNotFoundError(f"{_DUMP_INFO_FILE} not found in {dump_dir}")
