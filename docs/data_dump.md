@@ -35,10 +35,8 @@ On version-3 SimpleStorage restore:
 4. Each target unit reads only its assigned byte ranges and merges those values
    into local storage. Records are processed in batches of at most 128 rows per
    shard; the caller never reads or forwards their payloads.
-5. Each unit claims permission from the controller before writing, then reports
-   completion directly. The client commits the saved schemas and tags only after
-   every unit has completed. The controller reserves the destination partition
-   until commit or confirmed cancellation.
+5. After every unit has succeeded, the storage manager publishes the saved schemas
+   to the controller, as an ordinary put does, and the client then writes the tags.
 
 The number of source units can differ from the number of destination units.
 Even a dump with one source shard can restore across several target units because
@@ -109,71 +107,20 @@ the new directory, and syncs its parent before deleting the backup. If publicati
 is interrupted while the main directory is absent, the next dump, load or row-index
 read recovers `.old`. Readers perform recovery only while holding the same lock as
 publishers, so a healthy rename window is never mistaken for a crashed writer.
-The load keeps the lock through all remote reads; a pending load marker continues
-to prevent replacement after a timeout or client exit. Do not delete the sibling
+The load keeps the lock through all remote reads. Do not delete the sibling
 lock file: unlinking it can create two independent locks for the same dump.
 The shared filesystem must provide cross-node advisory locking (not local-only
 locks). A backup-cleanup error does not invalidate a published dump.
 
-Restore is not transactional: payload writes before a failure remain. Every load
-has a unique ID. The controller blocks clearing/reusing its destination indexes
-and conflicting KV puts while an operation is unresolved. Units must claim that ID
-before writing; cancellation rejects requests that have not yet claimed permission.
-A receive timeout never releases a writer that has already claimed permission.
-Timeouts leave the operation pending, even if every unit later succeeds. They do
-not cancel it or require changing the timeout used by ordinary puts and gets.
+Restore has the failure semantics of `kv_batch_put`: it is not transactional, and
+payload writes before a failure remain. Metadata is published only after every unit
+has succeeded, so a failed load leaves those writes invisible. Existing keys keep
+their indexes, so retrying the same load is idempotent; clearing the keys abandons it.
+Like an ordinary put, a load does not fence late writes against indexes that are
+cleared and reused while it runs, so keep writers and clears for these keys paused.
 
-`RestorePendingError` means remote work is still running or its outcome is unknown.
-The dump also retains a sibling `.restore` marker so an interrupted client cannot
-silently allow its files to be replaced. After an interruption, call:
-
-```python
-committed = tq.recover_data_load("/shared/dumps/selected")
-```
-
-Recovery asks units to resend terminal results and commits schemas and tags only
-when all units succeeded. It returns `True` for committed loads (or no pending
-load), and `False` for a failed or cancelled load after all claimed workers stopped.
-Unresolved work raises `RestorePendingError`, which includes `reason`, `unit_states`
-and `report_errors`. Reports that fail retain the unit ID and original error message.
-The controller remembers terminal outcomes so a lost commit reply can be confirmed
-safely by retrying recovery; a redundant report failure cannot reverse that outcome.
-
-- `running` units have claimed permission but have not reported completion. Retry
-  recovery later; a reporting timeout does not prove that a worker has stopped.
-- `pending` units have not claimed permission. A request may still be queued, so
-  recovery does not automatically cancel it. If the initiating client exited before
-  sending all requests, use `recover_data_load(dump_dir, cancel=True)` to abandon the
-  operation; simply repeating recovery cannot dispatch the missing requests.
-- `reason="unknown_restore"` means the controller has no record of the ID in the
-  `.restore` marker. If the initiating client has stopped, use explicit cancellation.
-  After a whole-system restart, first ensure all old actors have stopped, then cancel
-  the stale operation. This marker blocks its dump path, not the new controller's
-  unrelated partitions or checkpoints.
-
-A unit whose claim timed out caches a failure confirming that it did not write.
-Recovery accepts this failure even when the claim never reached the controller,
-cancels unclaimed work and waits for any other claimed workers to finish.
-
-To abandon the load explicitly, use `recover_data_load(dump_dir, cancel=True)`.
-This denies unclaimed work and retains the reservation until claimed workers stop.
-Cancellation cannot undo a load that has already committed. A failed unit also
-cancels remaining unclaimed work; partial payload writes are never rolled back.
-After cancellation settles, retry the load or clear its keys. A lost unit requires
-stopping the old TQ actors and restarting the whole TQ system; restarting only the
-controller while old storage actors run is unsupported.
-After restarting, cancel the old marker before loading the dump again:
-
-```python
-# Run only after all old TQ actors have stopped and the new system is initialized.
-tq.recover_data_load(dump_dir, cancel=True)
-tq.load_data_by_key(dump_dir)
-```
-
-Writers that already hold low-level metadata must remain paused throughout recovery.
-The controller reservation covers only the destination partition. Each storage unit
-still serves requests on one worker thread: other partitions using that unit can
-wait behind a load. The 128-row batches bound memory, not request latency.
+Each storage unit serves requests on one worker thread: other partitions using that
+unit can wait behind a load. The 128-row batches bound memory, not request latency.
 
 ## Tests
 

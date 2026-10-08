@@ -583,7 +583,6 @@ def test_legacy_chunks_with_missing_nested_shapes_roundtrip(
         if legacy_metadata and last_kind != "tensor" and target == dump_dir:
             with pytest.raises(RuntimeError, match="tensor/non-tensor type mismatch"):
                 tq.load_data_by_key(target)
-            assert not target.with_name(target.name + ".restore").exists()
         tq.kv_clear(keys, partition)
         tq.load_data_by_key(target)
         for start in range(0, row_count, 128):
@@ -638,69 +637,28 @@ def test_regular_put_keeps_legacy_tensor_nontensor_acceptance(tq_system, control
     assert snapshot.field_metadata["x"].global_indexes == set(metadata.global_indexes)
 
 
-@pytest.mark.parametrize("lost_reply", ["load", "commit"])
-def test_recovery_commits_after_lost_reply(tq_system, dump_dir, monkeypatch, lost_reply):
-    import zmq
-
-    from transfer_queue.utils.zmq_utils import ZMQRequestType
-
-    _put_rows("lost_reply", ["key"])
-    tq.dump_data_by_key(dump_dir, ["key"], "lost_reply")
+def test_failed_load_publishes_no_metadata_and_retry_is_idempotent(tq_system, dump_dir, controller, monkeypatch):
+    _put_rows("retry", ["key"])
+    tq.dump_data_by_key(dump_dir, ["key"], "retry")
     client = tq.get_client()
-    client.clear_partition("lost_reply")
+    client.clear_partition("retry")
     manager = client.storage_manager
     original_load = manager._load_selected_rows
-    original_rpc = client._restore_rpc
-    loads = []
 
-    async def load(*args, **kwargs):
-        loads.append(kwargs["target_storage_unit"])
-        result = await original_load(*args, **kwargs)
-        if lost_reply == "load":
-            raise zmq.error.Again()
-        return result
-
-    async def rpc(action, body):
-        result = await original_rpc(action, body)
-        if lost_reply == "commit" and action == ZMQRequestType.FINISH_RESTORE and body["commit"]:
-            raise zmq.error.Again()
-        return result
+    async def lose_reply(*args, **kwargs):
+        await original_load(*args, **kwargs)
+        raise RuntimeError("lost reply")
 
     with monkeypatch.context() as patcher:
-        patcher.setattr(manager, "_load_selected_rows", load)
-        patcher.setattr(client, "_restore_rpc", rpc)
-        with pytest.raises(tq.RestorePendingError):
+        patcher.setattr(manager, "_load_selected_rows", lose_reply)
+        with pytest.raises(RuntimeError, match="lost reply"):
             tq.load_data_by_key(dump_dir)
-    assert dump_dir.with_name(dump_dir.name + ".restore").exists()
-    assert tq.recover_data_load(dump_dir) is True
-    assert not dump_dir.with_name(dump_dir.name + ".restore").exists()
-    assert len(loads) == 1
-    _assert_rows_equal(tq.kv_batch_get(["key"], "lost_reply", ["input_ids"])["input_ids"], [_row_input_ids(0)])
+    snapshot = ray.get(controller.get_partition_snapshot.remote("retry"))
+    index = snapshot.keys_mapping["key"]
+    assert not snapshot.field_metadata
 
-
-def test_running_restore_blocks_clear_and_dump_until_recovery(tq_system, dump_dir, controller):
-    _put_rows("reserved", ["key"])
-    tq.dump_data_by_key(dump_dir, ["key"], "reserved")
-    client = tq.get_client()
-    manager = client.storage_manager
-    rows = tq.read_row_index(dump_dir)["rows"]
-    tq.save_checkpoint(dump_dir.parent / "checkpoint")
-    units = list(manager.storage_unit_infos)
-    metadata = ray.get(
-        controller.begin_restore.remote("running-test", str(dump_dir.resolve()), "reserved", rows, units, {})
-    )
-    owner = units[metadata.global_indexes[0] % len(units)]
-    ray.get(controller.restore_unit.remote("running-test", owner, "claim"))
-    with pytest.raises(RuntimeError, match="unresolved"):
-        client.clear_partition("reserved")
-    with pytest.raises(tq.RestorePendingError):
-        tq.dump_data_by_key(dump_dir, ["key"], "reserved")
-    with pytest.raises(tq.RestorePendingError):
-        tq.load_checkpoint(dump_dir.parent / "checkpoint")
-    with pytest.raises(tq.RestorePendingError):
-        tq.recover_data_load(dump_dir)
-    ray.get(controller.restore_unit.remote("running-test", owner, "complete", {"success": False}))
-    tq.recover_data_load(dump_dir)
-    client.clear_partition("reserved")
     tq.load_data_by_key(dump_dir)
-    assert tq.kv_batch_get(["key"], "reserved", ["input_ids"]).batch_size[0] == 1
+    snapshot = ray.get(controller.get_partition_snapshot.remote("retry"))
+    assert snapshot.keys_mapping["key"] == index
+    _assert_rows_equal(tq.kv_batch_get(["key"], "retry", ["input_ids"])["input_ids"], [_row_input_ids(0)])
+    assert tq.kv_list("retry")["retry"] == {"key": {"idx": 0}}

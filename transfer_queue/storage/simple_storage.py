@@ -798,7 +798,6 @@ class SimpleStorageUnit:
         self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
 
-        self._restore_results: dict[str, dict] = {}
         self._metrics: TQMetricsExporter | None = None
 
         self._init_zmq_socket()
@@ -1016,8 +1015,6 @@ class SimpleStorageUnit:
             elif operation == ZMQRequestType.LOAD_ROWS:  # type: ignore[arg-type]
                 with monitor.measure(op_type="LOAD_ROWS"):
                     response_msg = self._handle_load_rows(request_msg)
-            elif operation == ZMQRequestType.REPORT_RESTORE:
-                response_msg = self._handle_report_restore(request_msg)
             elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                 response_msg = self._handle_load_checkpoint(request_msg)
             else:
@@ -1364,88 +1361,7 @@ class SimpleStorageUnit:
                 body={"success": False, "message": str(e)},
             )
 
-    def _restore_controller_request(self, context: dict, action: str, result: dict | None = None) -> None:
-        socket = create_zmq_socket(self.zmq_context, zmq.DEALER, context["controller_ip"])
-        try:
-            socket.setsockopt(zmq.RCVTIMEO, 10000)
-            socket.setsockopt(zmq.SNDTIMEO, 10000)
-            socket.connect(context["controller_address"])
-            request = ZMQMessage.create(
-                request_type=ZMQRequestType.RESTORE_UNIT,
-                sender_id=self.storage_unit_id,
-                body={
-                    "restore_id": context["restore_id"],
-                    "unit_id": self.storage_unit_id,
-                    "action": action,
-                    "result": result,
-                },
-            )
-            socket.send_multipart(request.serialize())
-            response = ZMQMessage.deserialize(socket.recv_multipart())
-            if response.request_type != ZMQRequestType.RESTORE_UNIT_RESPONSE:
-                raise RuntimeError(response.body.get("message", "Restore permission rejected"))
-        finally:
-            socket.close(linger=0)
-
-    def _handle_report_restore(self, request: ZMQMessage) -> ZMQMessage:
-        context = request.body
-        result = self._restore_results.get(context["restore_id"])
-        try:
-            if result is not None:
-                self._restore_controller_request(context, "complete", result)
-                self._restore_results.pop(context["restore_id"], None)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.REPORT_RESTORE_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": True},
-            )
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.REPORT_RESTORE_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
     def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Claim permission before touching storage; report completion independently of the caller."""
-        context = request.body.get("restore")
-        if context is None:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": "Missing restore reservation"},
-            )
-        try:
-            self._restore_controller_request(context, "claim")
-        except zmq.error.Again as e:
-            # A lost claim ACK may leave the controller in running state even though
-            # this worker will not write; retain a terminal result for recovery.
-            self._restore_results[context["restore_id"]] = {
-                "success": False,
-                "claim_failed": True,
-                "message": f"Restore claim was not acknowledged; payload was not written: {e}",
-            }
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": "Restore claim outcome unknown"},
-            )
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-        response = self._load_rows(request)
-        self._restore_results[context["restore_id"]] = response.body
-        try:
-            self._restore_controller_request(context, "complete", response.body)
-            self._restore_results.pop(context["restore_id"], None)
-        except Exception as e:
-            logger.warning("[%s]: restore result retained for recovery: %s", self.storage_unit_id, e)
-        return response
-
-    def _load_rows(self, request: ZMQMessage) -> ZMQMessage:
         """Seek to assigned records and merge them into local storage at current indexes."""
         updates = []
         bytes_read = 0

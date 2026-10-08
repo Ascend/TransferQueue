@@ -18,7 +18,6 @@ import os
 import threading
 import weakref
 from typing import Any, Callable
-from uuid import uuid4
 
 import torch
 import zmq
@@ -27,7 +26,6 @@ from tensordict import TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
-from transfer_queue.storage.dump_io import RestorePendingError
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -1196,110 +1194,31 @@ class AsyncTransferQueueClient:
             shard_dir, global_indexes, fields_by_index, **({"missing_shapes": missing_shapes} if missing_shapes else {})
         )
 
-    def _restore_context(self, restore_id: str) -> dict:
-        return {
-            "restore_id": restore_id,
-            "controller_ip": self._controller.ip,
-            "controller_address": self._controller.to_addr("request_handle_socket"),
-        }
-
-    @with_controller_socket
-    async def _restore_rpc(self, request_type: ZMQRequestType, body: dict, socket=None) -> dict:
-        response_type = ZMQRequestType(request_type.value + "_RESPONSE")
-        response = await self._request_controller(socket, request_type, response_type, body)
-        return response.body
-
-    async def _finish_data_load(
-        self, restore_id: str, *, commit: bool, report_errors: dict[str, str] | None = None
-    ) -> bool:
-        """Keep the reservation when completion is pending or its reply is lost."""
-        try:
-            result = await self._restore_rpc(
-                ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": commit}
-            )
-        except (zmq.error.Again, TimeoutError) as error:
-            raise RestorePendingError(restore_id, report_errors=report_errors) from error
-        if not result["finished"]:
-            raise RestorePendingError(
-                restore_id,
-                reason=result.get("reason", "unknown_outcome"),
-                unit_states=result.get("unit_states"),
-                report_errors=report_errors,
-            )
-        return result["committed"]
-
     async def async_load_rows_by_key(
         self,
         partition_id: str,
         rows: dict[str, dict[str, Any]],
         shards: list[dict[str, Any]],
-        dump_dir: str = "",
-        restore_id: str | None = None,
-    ) -> None:
-        """Reserve indexes until every unit has explicitly completed or been denied permission."""
+    ) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read.
+
+        Failure semantics match ``kv_batch_put``: new keys stay registered and payload
+        writes may be partial, and retrying is idempotent because keys keep their indexes.
+        """
         manager = getattr(self, "storage_manager", None)
         if manager is None or not hasattr(manager, "load_rows_by_index"):
             raise NotImplementedError("Storage backend does not support direct selective load")
         if not rows:
-            return
-        restore_id = restore_id or uuid4().hex
-        try:
-            response = await self._restore_rpc(
-                ZMQRequestType.BEGIN_RESTORE,
-                {
-                    "restore_id": restore_id,
-                    "dump_dir": dump_dir,
-                    "partition_id": partition_id,
-                    "rows": rows,
-                    "units": list(manager.storage_unit_infos),
-                    "schema": shards[0].get("field_schema", {}) if shards else {},
-                },
-            )
-            metadata = response["metadata"]
-            target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
-            for shard in shards:
-                for record in shard["records"]:
-                    record["target_index"] = target_indexes[record["key"]]
-            await manager.load_rows_by_index(shards, self._restore_context(restore_id))
-            if not await self._finish_data_load(restore_id, commit=True):
-                raise RuntimeError("Restore failed or was cancelled")
-        except RestorePendingError:
-            raise
-        except (zmq.error.Again, TimeoutError) as error:
-            raise RestorePendingError(restore_id) from error
-        except BaseException as error:
-            try:
-                await asyncio.shield(self._finish_data_load(restore_id, commit=False))
-            except BaseException:
-                raise RestorePendingError(restore_id) from error
-            raise
-
-    async def async_recover_data_load(
-        self, dump_dir: str, restore_ids: list[str] | None = None, *, cancel: bool = False
-    ) -> bool:
-        """Finish successful loads, or explicitly cancel; return whether all loads committed."""
-        response = await self._restore_rpc(ZMQRequestType.LIST_RESTORES, {"dump_dir": dump_dir})
-        committed = True
-        for restore_id in set(response["restore_ids"]) | set(restore_ids or []):
-            if not hasattr(self.storage_manager, "report_restore"):
-                raise NotImplementedError(
-                    f"{type(self.storage_manager).__name__} does not support selective load recovery"
-                )
-            if cancel:
-                try:
-                    await self._restore_rpc(ZMQRequestType.FINISH_RESTORE, {"restore_id": restore_id, "commit": False})
-                except (zmq.error.Again, TimeoutError) as error:
-                    raise RestorePendingError(restore_id) from error
-            report_errors = await self.storage_manager.report_restore(self._restore_context(restore_id))
-            outcome = await self._finish_data_load(restore_id, commit=not cancel, report_errors=report_errors)
-            committed = committed and outcome
-        return committed
-
-    async def async_check_data_loads(self, dump_dir: str | None = None) -> None:
-        """Reject replacing a dump whose files may still be read by a storage unit."""
-        response = await self._restore_rpc(ZMQRequestType.LIST_RESTORES, {"dump_dir": dump_dir})
-        if response["restore_ids"]:
-            raise RestorePendingError(response["restore_ids"][0])
+            return 0
+        metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
+        target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
+        for shard in shards:
+            for record in shard["records"]:
+                record["target_index"] = target_indexes[record["key"]]
+        bytes_read = await manager.load_rows_by_index(partition_id, shards)
+        metadata.update_custom_meta([row["tag"] for row in rows.values()])
+        await self.async_set_custom_meta(metadata)
+        return bytes_read
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
@@ -1490,8 +1409,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
-        self._recover_data_load = _make_sync(self.async_recover_data_load)
-        self._check_data_loads = _make_sync(self.async_check_data_loads)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1977,19 +1894,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index, missing_shapes=missing_shapes)
 
-    def load_rows_by_key(
-        self, partition_id: str, rows: dict, shards: list[dict], dump_dir: str = "", restore_id: str | None = None
-    ) -> None:
-        """Restore selected payloads while the controller reserves destination indexes."""
-        return self._load_rows_by_key(partition_id, rows, shards, dump_dir, restore_id)
-
-    def recover_data_load(self, dump_dir: str, restore_ids: list[str] | None = None, *, cancel: bool = False) -> bool:
-        """Finish or cancel interrupted loads; return whether every load committed."""
-        return self._recover_data_load(dump_dir, restore_ids, cancel=cancel)
-
-    def check_data_loads(self, dump_dir: str | None = None) -> None:
-        """Reject replacing a dump while a remote restore may still read it."""
-        return self._check_data_loads(dump_dir)
+    def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""
+        return self._load_rows_by_key(partition_id, rows, shards)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:

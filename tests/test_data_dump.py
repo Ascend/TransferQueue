@@ -192,7 +192,7 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
         records.append(
             {"source_index": source, "target_index": target, "fields": ["x"], "offset": offset, "length": length}
         )
-    loaded = unit._load_rows(
+    loaded = unit._handle_load_rows(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -232,7 +232,7 @@ async def test_manager_loads_current_owners_concurrently():
 
     manager._load_selected_rows = load
     records = [{"source_index": i, "target_index": 31 - i} for i in range(16)]
-    assert await manager.load_rows_by_index([{"path": "shard.pkl", "records": records}]) == []
+    assert await manager.load_rows_by_index("p", [{"path": "shard.pkl", "records": records}]) == 0
     assert sorted(seen) == list(range(16))
 
 
@@ -247,7 +247,7 @@ def test_unit_rejects_invalid_records(unit, tmp_path, problem):
         record["length"] += 1
     else:
         record["fields"] = ["missing"]
-    reply = unit._load_rows(
+    reply = unit._handle_load_rows(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -329,12 +329,20 @@ async def test_load_waits_for_other_units_before_raising():
         await failed.wait()
         await asyncio.sleep(0)
         finished.append(target_storage_unit)
-        return {"bytes_read": 0, "updates": []}
+        return {"bytes_read": 0, "updates": [{"global_indexes": [1], "field_schema": {}}]}
 
+    async def notify(*args):
+        notified.append(args)
+
+    notified = []
     manager._load_selected_rows = load
+    manager.notify_data_update = notify
     with pytest.raises(RuntimeError, match="unit failed"):
-        await manager.load_rows_by_index([{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}])
+        await manager.load_rows_by_index(
+            "p", [{"path": "shard", "records": [{"target_index": 0}, {"target_index": 1}]}]
+        )
     assert finished == ["u1"]
+    assert not notified
 
 
 @pytest.mark.asyncio

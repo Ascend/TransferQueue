@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 import zmq
@@ -37,7 +37,6 @@ from transfer_queue.storage.simple_storage import (
 )
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.storage_routing import RoutingGroup, group_by_storage_unit
 from transfer_queue.utils.tensor_utils import pack_field_values
 from transfer_queue.utils.zmq_utils import (
     TQ_SOCKET_POOL_SIZE,
@@ -105,6 +104,13 @@ with_storage_unit_probe_socket = with_zmq_socket(
     get_pool=lambda self: self.storage_probe_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
+
+
+class RoutingGroup(NamedTuple):
+    """Routing result for a single storage unit."""
+
+    global_indexes: list[int]  # global indexes routed to this SU
+    batch_positions: list[int]  # corresponding positions in the original batch
 
 
 @StorageManagerFactory.register("SimpleStorage")
@@ -212,7 +218,15 @@ class AsyncSimpleStorageManager(StorageManager):
 
         NOTE: Dynamic SU scaling requires a data migration mechanism (not yet supported).
         """
-        return group_by_storage_unit(global_indexes, list(self.storage_unit_infos))
+        storage_unit_keys = list(self.storage_unit_infos.keys())
+        num_units = len(storage_unit_keys)
+        gi_lists: dict[str, list[int]] = defaultdict(list)
+        pos_lists: dict[str, list[int]] = defaultdict(list)
+        for pos, global_idx in enumerate(global_indexes):
+            key = storage_unit_keys[global_idx % num_units]
+            gi_lists[key].append(global_idx)
+            pos_lists[key].append(pos)
+        return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
 
     def _describe_storage_unit(self, storage_unit_id: str) -> str:
         """Return ``ip:port`` for a storage unit, for use in diagnostics.
@@ -865,10 +879,15 @@ class AsyncSimpleStorageManager(StorageManager):
         )
         return shards
 
-    async def load_rows_by_index(
-        self, shards: list[dict[str, Any]], restore: dict | None = None
-    ) -> list[dict[str, Any]]:
-        """Have current owner units read assigned byte ranges concurrently."""
+    async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
+        """Have current owner units read assigned byte ranges concurrently, then publish metadata.
+
+        Metadata is published only after every unit succeeded, so a failed load leaves its
+        payload writes invisible; retrying rewrites the same target indexes.
+
+        Returns:
+            Payload bytes read by the units.
+        """
         assignments = defaultdict(list)
         for shard in shards:
             rows = shard["records"]
@@ -880,43 +899,36 @@ class AsyncSimpleStorageManager(StorageManager):
                     }
                 )
         results = await asyncio.gather(
-            *(
-                self._load_selected_rows(
-                    shards, target_storage_unit=unit_id, **({"restore": restore} if restore else {})
-                )
-                for unit_id, shards in assignments.items()
-            ),
+            *(self._load_selected_rows(shards, target_storage_unit=unit_id) for unit_id, shards in assignments.items()),
             return_exceptions=True,
         )
-        # Local RPC completion is not remote completion; the controller retains reservations on timeout.
-        updates = []
-        bytes_read = 0
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-            bytes_read += result["bytes_read"]
-            updates.extend(result["updates"])
+        for result in results:
+            for update in result["updates"]:
+                await self.notify_data_update(partition_id, update["global_indexes"], update["field_schema"])
+        bytes_read = sum(result["bytes_read"] for result in results)
         logger.info(
             "[%s]: loaded %s bytes across %s units",
             self.storage_manager_id,
             bytes_read,
             len(assignments),
         )
-        return updates
+        return bytes_read
 
     @with_storage_unit_socket
     async def _load_selected_rows(
         self,
         shards: list[dict[str, Any]],
         target_storage_unit: str,
-        restore: dict | None = None,
         socket: zmq.Socket = None,
     ) -> dict[str, Any]:
         request = ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"shards": shards, "restore": restore},
+            body={"shards": shards},
         )
         await socket.send_multipart(request.serialize(), copy=False)
         response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
@@ -925,37 +937,6 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
             )
         return response.body
-
-    async def report_restore(self, restore: dict) -> dict[str, str]:
-        """Wait for all unit reports and return failures without discarding successful reports."""
-        units = list(self.storage_unit_infos)
-        results = await asyncio.gather(
-            *(self._report_restore_unit(restore, target_storage_unit=unit) for unit in units),
-            return_exceptions=True,
-        )
-        errors = {}
-        for unit, result in zip(units, results, strict=True):
-            if isinstance(result, Exception):
-                errors[unit] = f"{type(result).__name__}: {result}"
-                logger.warning(
-                    "Restore %s: unit %s could not report completion: %s", restore["restore_id"], unit, errors[unit]
-                )
-            elif isinstance(result, BaseException):
-                raise result
-        return errors
-
-    @with_storage_unit_socket
-    async def _report_restore_unit(self, restore: dict, target_storage_unit: str, socket: zmq.Socket = None) -> None:
-        request = ZMQMessage.create(
-            request_type=ZMQRequestType.REPORT_RESTORE, sender_id=self.storage_manager_id, body=restore
-        )
-        await socket.send_multipart(request.serialize())
-        response = ZMQMessage.deserialize(await socket.recv_multipart())
-        if response.request_type != ZMQRequestType.REPORT_RESTORE_RESPONSE or not response.body.get("success"):
-            message = response.body.get("message", f"Unexpected response: {response.request_type}")
-            raise RuntimeError(
-                f"Restore {restore['restore_id']}: storage unit {target_storage_unit} report failed: {message}"
-            )
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.

@@ -1130,7 +1130,6 @@ def load_checkpoint(
         meta = json.load(f)
 
     client = _maybe_create_tq_client()
-    client.check_data_loads()
 
     controller_path = checkpoint_dir / _CONTROLLER_FILE
     if not controller_path.exists():
