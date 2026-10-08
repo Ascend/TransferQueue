@@ -29,7 +29,7 @@ from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
-from transfer_queue.utils.zmq_utils import ZMQServerInfo
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
 def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
@@ -57,6 +57,37 @@ def _single_sample_batch() -> tuple[TensorDict, BatchMeta]:
     return TensorDict({"input_ids": torch.zeros(1, 2, dtype=torch.int64)}, batch_size=1), metadata
 
 
+class _SocketLease:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def __aenter__(self):
+        return self.socket
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_controller_notification_returns_ack_status(accepted):
+    manager = _manager()
+    manager.controller_info = MagicMock(id="controller")
+    socket = MagicMock()
+    socket.send_multipart = AsyncMock()
+    socket.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+            sender_id="controller",
+            body={"success": accepted},
+        ).serialize()
+    )
+    manager.notify_pool = MagicMock()
+    manager.notify_pool.alease.return_value = _SocketLease(socket)
+
+    assert await manager._notify_and_wait([b"request"]) is accepted
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data: data, 1)])
 async def test_put_retries_only_without_a_parser(data_parser, expected_attempts):
@@ -73,6 +104,36 @@ async def test_put_retries_only_without_a_parser(data_parser, expected_attempts)
         await manager.put_data(data, metadata, data_parser=data_parser)
 
     assert manager._put_to_single_storage_unit.await_count == expected_attempts
+    manager.notify_data_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_update_reports_controller_rejection_after_storage_commit():
+    manager = _manager()
+    manager._update_to_single_storage_unit = AsyncMock(
+        return_value={"input_ids": {"dtype": torch.int64, "shapes": [(3,)]}}
+    )
+    manager.notify_data_update = AsyncMock(return_value=False)
+    values, metadata = _single_sample_batch()
+
+    with pytest.raises(RuntimeError, match="Storage update committed.*do not retry"):
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]))
+
+    manager._update_to_single_storage_unit.assert_awaited_once()
+    manager.notify_data_update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_update_timeout_is_not_retried_or_published():
+    manager = _manager()
+    manager._update_to_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("outcome unknown"))
+    manager.notify_data_update = AsyncMock()
+    values, metadata = _single_sample_batch()
+
+    with patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"), pytest.raises(StorageUnitTimeout):
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]))
+
+    manager._update_to_single_storage_unit.assert_awaited_once()
     manager.notify_data_update.assert_not_awaited()
 
 

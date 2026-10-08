@@ -1111,115 +1111,139 @@ class TestKVE2ECornerCases:
 
 
 class TestKVUpdateE2E:
-    """kv_update: SimpleStorage runs parsers on the unit; KV backends reject."""
+    """SimpleStorage merge and empty behavior through sync and async public APIs."""
 
-    def test_concat_then_empty(self, controller, tq_api, backend_name):
+    def test_update_then_empty_preserves_partition_field_metadata(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":
-            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
 
         partition_id = "test_partition"
-        key = "sample_update"
-
-        tq_api.kv_put(key=key, partition_id=partition_id, fields={"tokens": torch.tensor([1, 2, 3])}, tag={"step": 1})
+        keys = ["empty_0", "empty_1", "empty_2"]
+        tq_api.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"tokens": torch.arange(12).reshape(3, 4)}, batch_size=3),
+        )
 
         def concat(old, new):
             return torch.cat([old, new])
 
         meta = tq_api.kv_update(
-            key=key, partition_id=partition_id, fields="tokens", values=torch.tensor([4, 5]), parser=concat
+            key=keys[1],
+            partition_id=partition_id,
+            fields={"tokens": torch.tensor([12, 13])},
+            merge_fn=concat,
         )
         assert "tokens" in meta.fields
-
-        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
-        assert_tensor_equal(retrieved["tokens"][0], torch.tensor([1, 2, 3, 4, 5]))
-
-        tq_api.kv_empty(key=key, partition_id=partition_id, fields="tokens")
-        emptied = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
+        tq_api.kv_empty(keys=keys[0], partition_id=partition_id, fields="tokens")
+        emptied = tq_api.kv_batch_get(keys=keys[0], partition_id=partition_id, select_fields="tokens")
         assert emptied["tokens"][0] is None
 
         partition = get_controller_partition(controller, partition_id)
         col = partition.field_name_mapping["tokens"]
-        global_idx = partition.keys_mapping[key]
+        global_idx = partition.keys_mapping[keys[0]]
         assert partition.production_status[global_idx, col] == 1
-        # The column now holds None, so the controller must not still describe it as a tensor.
-        assert partition.field_metadata["tokens"].is_non_tensor is True
+        assert partition.field_metadata["tokens"].is_non_tensor is False
+        assert partition.field_metadata["tokens"].dtype == torch.int64
 
-        tq_api.kv_clear(keys=key, partition_id=partition_id)
+        tq_api.kv_batch_put(
+            keys=["nested_0", "nested_1"],
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "tokens": torch.nested.as_nested_tensor(
+                        [torch.tensor([20, 21]), torch.tensor([30, 31, 32])],
+                        layout=torch.jagged,
+                    )
+                },
+                batch_size=2,
+            ),
+        )
+        partition = get_controller_partition(controller, partition_id)
+        assert partition.field_metadata["tokens"].is_nested is True
 
-    def test_concat_prompt_and_response_keeps_field_name(self, tq_api, backend_name):
-        """prompt_ids already stored; update appends response_ids; field stays sequence_ids."""
+    def test_batch_update_multiple_fields_across_storage_units(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":
-            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
 
         partition_id = "test_partition"
-        key = "sample_seq"
-        prompt_ids = torch.tensor([10, 11, 12])
-        response_ids = torch.tensor([20, 21])
-
-        tq_api.kv_put(key=key, partition_id=partition_id, fields={"sequence_ids": prompt_ids})
-        tq_api.kv_update(
-            key=key,
+        keys = [f"batch_update_{i}" for i in range(8)]
+        lengths = [i + 1 for i in range(len(keys))]
+        tq_api.kv_batch_put(
+            keys=keys,
             partition_id=partition_id,
-            fields="sequence_ids",
-            values=response_ids,
-            parser=lambda old, new: torch.cat([old, new]),
+            fields=TensorDict(
+                {
+                    "tokens": torch.nested.as_nested_tensor(
+                        [torch.arange(length) for length in lengths],
+                        layout=torch.jagged,
+                    ),
+                    "score": torch.arange(8).reshape(8, 1),
+                },
+                batch_size=8,
+            ),
+        )
+        tq_api.kv_batch_update(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict(
+                {
+                    "tokens": torch.arange(100, 108).reshape(8, 1),
+                    "score": torch.arange(200, 208).reshape(8, 1),
+                },
+                batch_size=8,
+            ),
+            merge_fn=lambda old, new: torch.cat([old, new]),
         )
 
-        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
-        assert "sequence_ids" in retrieved
-        assert "prompt_ids" not in retrieved
-        assert "response_ids" not in retrieved
-        assert_tensor_equal(retrieved["sequence_ids"][0], torch.tensor([10, 11, 12, 20, 21]))
-
-        tq_api.kv_clear(keys=key, partition_id=partition_id)
-
-    def test_update_multiple_fields_at_once(self, tq_api, backend_name):
-        if backend_name != "SimpleStorage":
-            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
-
-        partition_id = "test_partition"
-        key = "sample_multi"
-
-        tq_api.kv_put(
-            key=key,
-            partition_id=partition_id,
-            fields={"a": torch.tensor([1, 2]), "b": torch.tensor([10])},
-        )
-        tq_api.kv_update(
-            key=key,
-            partition_id=partition_id,
-            fields=["a", "b"],
-            values={"a": torch.tensor([3]), "b": torch.tensor([20, 30])},
-            parser=lambda old, new: torch.cat([old, new]),
-        )
-
-        retrieved = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
-        assert_tensor_equal(retrieved["a"][0], torch.tensor([1, 2, 3]))
-        assert_tensor_equal(retrieved["b"][0], torch.tensor([10, 20, 30]))
-
-        tq_api.kv_empty(key=key, partition_id=partition_id, fields=["a", "b"])
-        emptied = tq_api.kv_batch_get(keys=key, partition_id=partition_id)
-        assert emptied["a"][0] is None
-        assert emptied["b"][0] is None
-
-        tq_api.kv_clear(keys=key, partition_id=partition_id)
-
-    def test_missing_key_and_empty_with_values(self, tq_api, backend_name):
-        if backend_name != "SimpleStorage":
-            pytest.skip("parser-backed kv_update is implemented only for SimpleStorage")
-
-        with pytest.raises(ValueError, match="must not specify values"):
-            tq_api.kv_update(
-                key="no_such", partition_id="test_partition", fields="tokens", values=torch.tensor([1]), empty=True
+        retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
+        for i, length in enumerate(lengths):
+            assert_tensor_equal(
+                retrieved["tokens"][i],
+                torch.cat([torch.arange(length), torch.tensor([100 + i])]),
             )
+            assert_tensor_equal(retrieved["score"][i], torch.tensor([i, 200 + i]))
+
+        partition = get_controller_partition(controller, partition_id)
+        tokens = partition.field_metadata["tokens"]
+        assert tokens.is_nested is True
+        for key, length in zip(keys, lengths, strict=True):
+            global_idx = partition.keys_mapping[key]
+            assert tuple(tokens.per_sample_shapes[global_idx]) == (length + 1,)
+
+        tq_api.kv_empty(keys=keys, partition_id=partition_id, fields=["tokens", "score"])
+        emptied = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
+        assert all(value is None for value in emptied["tokens"])
+        assert all(value is None for value in emptied["score"])
+
+    def test_rejects_missing_key_unproduced_field_and_incompatible_result(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
+
         with pytest.raises(ValueError, match="not found"):
             tq_api.kv_update(
                 key="no_such",
                 partition_id="test_partition",
-                fields="tokens",
-                values=torch.tensor([1]),
-                parser=lambda old, new: new,
+                fields={"tokens": torch.tensor([1])},
+                merge_fn=lambda _old, new: new,
             )
+        tq_api.kv_put(key="sample", partition_id="test_partition", fields={"tokens": torch.tensor([1, 2])})
+        with pytest.raises(ValueError, match="not produced"):
+            tq_api.kv_update(
+                key="sample",
+                partition_id="test_partition",
+                fields={"fresh": torch.tensor([1])},
+                merge_fn=lambda _old, new: new,
+            )
+        with pytest.raises(RuntimeError, match="keep dtype"):
+            tq_api.kv_update(
+                key="sample",
+                partition_id="test_partition",
+                fields={"tokens": torch.tensor([3])},
+                merge_fn=lambda old, new: torch.cat([old, new]).to(torch.float32),
+            )
+        unchanged = tq_api.kv_batch_get(keys="sample", partition_id="test_partition", select_fields="tokens")
+        assert_tensor_equal(unchanged["tokens"][0], torch.tensor([1, 2]))
 
     def test_kv_backend_rejects(self, tq_api, backend_name):
         if backend_name == "SimpleStorage":
@@ -1230,9 +1254,8 @@ class TestKVUpdateE2E:
             tq_api.kv_update(
                 key="k",
                 partition_id="test_partition",
-                fields="tokens",
-                values=torch.tensor([2]),
-                parser=lambda old, new: new,
+                fields={"tokens": torch.tensor([2])},
+                merge_fn=lambda _old, new: new,
             )
         tq_api.kv_clear(keys="k", partition_id="test_partition")
 
