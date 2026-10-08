@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 from contextlib import contextmanager
@@ -183,6 +198,30 @@ class TQMetricsExporter:
         )
         self.storage_memory_rss = Gauge(
             "tq_storage_memory_rss_bytes", "Storage unit process RSS memory", ["storage_unit_id"], registry=r
+        )
+        self.storage_ssd_offload_enabled = Gauge(
+            "tq_storage_ssd_offload_enabled",
+            "Whether SSD offload is enabled for the storage unit",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_active_values = Gauge(
+            "tq_storage_ssd_active_values",
+            "Active field values stored on SSD",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_active_bytes = Gauge(
+            "tq_storage_ssd_active_bytes",
+            "Logical bytes held by active SSD-backed values",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_fallback_values = Gauge(
+            "tq_storage_ssd_fallback_values_total",
+            "Values retained in memory because SSD encoding was unavailable",
+            ["storage_unit_id"],
+            registry=r,
         )
 
         # ---- Storage-unit request-loss diagnostics ----
@@ -417,6 +456,14 @@ class TQMetricsExporter:
                             pass
                 self.storage_active_keys.labels(storage_unit_id=label).set(active)
                 self.storage_memory_rss.labels(storage_unit_id=label).set(metrics.get("process_rss_bytes", 0))
+                self.storage_ssd_offload_enabled.labels(storage_unit_id=label).set(
+                    metrics.get("ssd_offload_enabled", 0)
+                )
+                self.storage_ssd_active_values.labels(storage_unit_id=label).set(metrics.get("ssd_active_values", 0))
+                self.storage_ssd_active_bytes.labels(storage_unit_id=label).set(metrics.get("ssd_active_bytes", 0))
+                self.storage_ssd_fallback_values.labels(storage_unit_id=label).set(
+                    metrics.get("ssd_fallback_values_total", 0)
+                )
 
                 self.storage_requests_arrived.labels(storage_unit_id=label).set(metrics.get("requests_arrived", 0))
                 for op_type, arrived in (metrics.get("arrivals_by_op") or {}).items():

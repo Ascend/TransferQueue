@@ -35,6 +35,18 @@ backend:
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
+    # SSD offload stores large field values on local SSD to reduce long-lived host-memory use.
+    # See docs/ssd_offload.md for configuration and cleanup details.
+    ssd_offload:
+      # Master switch. Set to true to enable SSD offload.
+      enabled: false
+      # SSD offload target directory; created automatically if it does not exist.
+      path: null
+      # Samples at or above this encoded-size threshold (in bytes) are stored on SSD.
+      threshold_bytes: 1048576
+      # glibc-only allocator threshold for reclaiming large transient allocations.
+      glibc_mmap_threshold_bytes: 1048576
+
   # MooncakeStore: high-performance KV-based hierarchical storage
   # that supports RDMA transport between GPU and DRAM.
   MooncakeStore:

@@ -13,6 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
@@ -98,6 +113,10 @@ class TestMetricDefinitions:
             "tq_storage_active_keys_total",
             "tq_storage_utilization_ratio",
             "tq_storage_memory_rss_bytes",
+            "tq_storage_ssd_offload_enabled",
+            "tq_storage_ssd_active_values",
+            "tq_storage_ssd_active_bytes",
+            "tq_storage_ssd_fallback_values_total",
             "tq_storage_requests_arrived",
             "tq_storage_arrivals_by_op",
             "tq_storage_accept_queue_backlog",
@@ -313,6 +332,10 @@ class TestStorageMetricsCollection:
                 "capacity": 1000,
                 "active_keys": 250,
                 "process_rss_bytes": 512 * 1024 * 1024,
+                "ssd_offload_enabled": 1,
+                "ssd_active_values": 120,
+                "ssd_active_bytes": 4 * 1024 * 1024 * 1024,
+                "ssd_fallback_values_total": 7,
             }
         )
 
@@ -322,6 +345,14 @@ class TestStorageMetricsCollection:
         assert exporter.storage_active_keys.labels(storage_unit_id="SU_001")._value.get() == 250
         assert exporter.storage_utilization.labels(storage_unit_id="SU_001")._value.get() == 0.25
         assert exporter.storage_memory_rss.labels(storage_unit_id="SU_001")._value.get() == 512 * 1024 * 1024
+        assert exporter.storage_ssd_offload_enabled.labels(storage_unit_id="SU_001")._value.get() == 1
+        assert exporter.storage_ssd_active_values.labels(storage_unit_id="SU_001")._value.get() == 120
+        assert exporter.storage_ssd_active_bytes.labels(storage_unit_id="SU_001")._value.get() == 4 * 1024 * 1024 * 1024
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 7
+
+        exporter._query_storage_unit.return_value["ssd_fallback_values_total"] = 9
+        exporter.collect_storage_metrics()
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 9
 
     def test_arrival_counters_are_exported(self):
         """Arrival counts reach Prometheus, so a dashboard can compare them with completions."""
@@ -456,6 +487,10 @@ class TestStorageMetricsCollection:
         # active_keys and memory_rss are still reported
         assert exporter.storage_active_keys.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 42
         assert exporter.storage_memory_rss.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 128 * 1024 * 1024
+        assert exporter.storage_ssd_offload_enabled.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_active_values.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_active_bytes.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
 
     def test_storage_metrics_prunes_stale_capacity_on_switch_to_unlimited(self):
         """If a storage unit transitions from a numeric capacity to unlimited,

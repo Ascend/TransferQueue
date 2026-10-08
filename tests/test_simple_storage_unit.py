@@ -13,16 +13,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import pickle
 import time
+from pathlib import Path
 from uuid import uuid4
 
+import numpy as np
 import pytest
 import ray
 import tensordict
 import torch
 import zmq
 
-from transfer_queue.storage.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import (
+    HybridStorageUnitData,
+    SimpleStorageUnit,
+    SSDFileStore,
+    StorageKeyNotFoundError,
+    _SSDValueRef,
+)
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -112,7 +136,9 @@ def storage_setup(ray_setup):
     tensordict.set_list_to_stack(True).set()
 
     # Start Ray actor for SimpleStorageUnit
-    storage_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(storage_unit_size=storage_size)
+    storage_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(
+        config={"total_storage_size": storage_size, "num_data_storage_units": 1}
+    )
 
     # Get ZMQ server info from storage unit
     zmq_info = ray.get(storage_actor.get_zmq_server_info.remote())
@@ -467,6 +493,307 @@ def test_storage_unit_data_capacity_uses_active_keys():
     assert storage._active_keys == {0, 1, 3}
 
 
+def test_hybrid_storage_routes_each_sample_by_payload_size_and_clears(tmp_path):
+    """Large samples use SSD while small samples preserve the in-memory contract."""
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    large_sparse = torch.sparse_coo_tensor(
+        torch.stack((torch.arange(16), torch.arange(16))),
+        torch.ones(16),
+        size=(16, 16),
+    )
+    try:
+        storage.put_data(
+            {
+                "mixed": [b"x" * 100, b"y" * 10],
+                "small": [1, 2],
+                "unsupported": [large_sparse, b"small"],
+            },
+            [1, 2],
+        )
+
+        assert storage.get_data(["mixed", "small"], [1, 2]) == {
+            "small": [1, 2],
+            "mixed": [b"x" * 100, b"y" * 10],
+        }
+        assert len(list(tmp_path.rglob("*.bin"))) == 1
+        assert storage.ssd_active_values == 1
+        assert storage.ssd_active_bytes == 100
+        assert storage.ssd_fallback_values_total == 1
+
+        storage.clear([1])
+        assert storage.active_key_count == 1
+        assert storage.ssd_active_values == 0
+        assert storage.ssd_active_bytes == 0
+        assert storage.ssd_fallback_values_total == 1
+        assert not list(tmp_path.rglob("*.bin"))
+        with pytest.raises(StorageKeyNotFoundError):
+            storage.get_data(["mixed"], [1])
+
+        storage.clear([2])
+        with pytest.raises(StorageKeyNotFoundError):
+            storage.get_data(["mixed"], [2])
+    finally:
+        storage.close()
+
+    assert not (tmp_path / "transfer_queue_ssd_offload" / "test-run").exists()
+
+
+def test_hybrid_storage_cleans_completed_ssd_writes_after_batch_failure(tmp_path, monkeypatch):
+    """A failed SSD batch removes files written by its successful tasks."""
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+
+    write_value_file = storage._ssd_store._write_value_file
+
+    def fail_one_write(encoded_value):
+        if encoded_value.payload[0] == ord("y"):
+            raise OSError("injected SSD failure")
+        return write_value_file(encoded_value)
+
+    monkeypatch.setattr(storage._ssd_store, "_write_value_file", fail_one_write)
+    try:
+        with pytest.raises(OSError, match="injected SSD failure"):
+            storage.put_data(
+                {"small": [1, 2], "large": [b"x" * 100, b"y" * 100]},
+                [1, 2],
+            )
+
+        assert not list(tmp_path.rglob("*.bin"))
+    finally:
+        storage.close()
+
+
+def test_failed_ssd_overwrite_preserves_old_value(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    old_value = b"o" * 100
+    try:
+        storage.put_data({"value": [old_value]}, [1])
+        old_path = next(tmp_path.rglob("*.bin"))
+
+        def fail_write(_fd, _data):
+            raise OSError("injected overwrite failure")
+
+        monkeypatch.setattr(storage._ssd_store, "_write_all_bytes", fail_write)
+        with pytest.raises(OSError, match="injected overwrite failure"):
+            storage.put_data({"value": [b"n" * 100]}, [1])
+
+        assert storage.get_data(["value"], [1])["value"] == [old_value]
+        assert storage._ssd_active_values == 1
+        assert storage._ssd_active_bytes == len(old_value)
+        assert old_path.exists()
+        assert list(tmp_path.rglob("*.bin")) == [old_path]
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("threshold_bytes", [0, -1])
+def test_hybrid_storage_requires_positive_threshold(tmp_path, threshold_bytes):
+    with pytest.raises(ValueError, match="threshold must be greater than zero"):
+        HybridStorageUnitData(
+            storage_size=10,
+            threshold_bytes=threshold_bytes,
+            ssd_path=str(tmp_path),
+            run_id="test-run",
+            unit_id="test-unit",
+        )
+
+
+def test_hybrid_checkpoint_copies_ssd_values_without_materializing(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "ssd"),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    checkpoint_path = tmp_path / "storage_unit.pkl"
+    try:
+        storage.put_data({"value": [b"small", b"x" * 100]}, [1, 2])
+
+        def fail_materialization(*_args):
+            raise AssertionError("checkpoint must not materialize or re-encode SSD values")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(storage._ssd_store, "read_values", fail_materialization)
+            storage.save_checkpoint(checkpoint_path, "test-unit")
+
+        with open(checkpoint_path, "rb") as f:
+            manifest = pickle.load(f)
+        assert manifest["field_data"] == {"value": {1: b"small"}}
+        checkpoint_ref = manifest["ssd_index"]["value"][2]
+        blob_path = Path(f"{checkpoint_path}.blobs") / checkpoint_ref["filename"]
+        assert blob_path.read_bytes() == b"x" * 100
+
+        storage.clear([1, 2])
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                HybridStorageUnitData,
+                "_sample_from_value",
+                staticmethod(fail_materialization),
+            )
+            storage.load_checkpoint(checkpoint_path)
+
+        assert storage.get_data(["value"], [1, 2]) == {"value": [b"small", b"x" * 100]}
+        assert storage._ssd_active_values == 1
+        assert storage._ssd_active_bytes == 100
+    finally:
+        storage.close()
+
+
+def test_hybrid_checkpoint_load_failure_preserves_existing_state(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "target-ssd"),
+        run_id="target-run",
+        unit_id="target-unit",
+    )
+    checkpoint_storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "checkpoint-ssd"),
+        run_id="checkpoint-run",
+        unit_id="checkpoint-unit",
+    )
+    checkpoint_path = tmp_path / "storage_unit.pkl"
+    try:
+        storage.put_data({"value": [b"original" * 16]}, [1])
+        original_files = set((tmp_path / "target-ssd").rglob("*.bin"))
+
+        checkpoint_storage.put_data({"value": [b"x" * 100, b"y" * 100]}, [2, 3])
+        checkpoint_storage.save_checkpoint(checkpoint_path, "checkpoint-unit")
+
+        import_file = storage._ssd_store.import_file
+        import_count = 0
+
+        def fail_on_second_import(source, metadata):
+            nonlocal import_count
+            import_count += 1
+            if import_count == 2:
+                raise OSError("injected checkpoint import failure")
+            return import_file(source, metadata)
+
+        monkeypatch.setattr(storage._ssd_store, "import_file", fail_on_second_import)
+
+        with pytest.raises(OSError, match="injected checkpoint import failure"):
+            storage.load_checkpoint(checkpoint_path)
+
+        assert storage.get_data(["value"], [1]) == {"value": [b"original" * 16]}
+        assert storage.active_key_count == 1
+        assert set((tmp_path / "target-ssd").rglob("*.bin")) == original_files
+    finally:
+        storage.close()
+        checkpoint_storage.close()
+
+
+def test_hybrid_storage_loads_legacy_logical_checkpoint(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=1,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path / "ssd"),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    checkpoint_path = tmp_path / "legacy.pkl"
+    with open(checkpoint_path, "wb") as f:
+        pickle.dump(
+            {
+                "storage_unit_id": "old-unit",
+                "storage_unit_size": 10,
+                "field_data": {"value": {1: b"x" * 100, 2: b"y" * 100}},
+                "active_keys": {1, 2},
+            },
+            f,
+        )
+
+    try:
+        storage.load_checkpoint(checkpoint_path)
+        assert all(isinstance(value, _SSDValueRef) for value in storage.field_data["value"].values())
+        assert storage._ssd_active_values == 2
+        assert storage._ssd_active_bytes == 200
+        assert storage.get_data(["value"], [1, 2]) == {"value": [b"x" * 100, b"y" * 100]}
+    finally:
+        storage.close()
+
+
+def test_hybrid_storage_round_trips_supported_codecs(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    values = torch.arange(64, dtype=torch.float32).view(2, 32)
+    variable = [
+        torch.arange(20, dtype=torch.float32),
+        torch.arange(40, dtype=torch.float32),
+    ]
+    arrays = np.arange(64, dtype=np.float32).reshape(2, 32)
+    structured = np.zeros((2, 8), dtype=[("index", "<i4"), ("score", "<f8")])
+    structured["index"] = np.arange(16).reshape(2, 8)
+    structured["score"] = np.arange(16, dtype=np.float64).reshape(2, 8) / 2
+    objects = [{"payload": "a" * 100}, {"payload": "b" * 100}]
+    try:
+        fields = {
+            "tensor": values,
+            "variable": variable,
+            "array": arrays,
+            "structured": structured,
+            "object": objects,
+        }
+        storage.put_data(fields, [1, 2])
+        assert all(
+            isinstance(value, _SSDValueRef)
+            for stored_values in storage.field_data.values()
+            for value in stored_values.values()
+        )
+        assert {entry.codec for entry in storage.field_data["tensor"].values()} == {"tensor"}
+        assert {entry.codec for entry in storage.field_data["array"].values()} == {"numpy"}
+        assert {entry.codec for entry in storage.field_data["structured"].values()} == {"numpy"}
+        assert {entry.codec for entry in storage.field_data["object"].values()} == {"pickle"}
+
+        result = storage.get_data(list(fields), [1, 2])
+        torch.testing.assert_close(result["tensor"][0], values[0])
+        torch.testing.assert_close(result["tensor"][1], values[1])
+        torch.testing.assert_close(result["variable"][0], variable[0])
+        torch.testing.assert_close(result["variable"][1], variable[1])
+        np.testing.assert_array_equal(result["array"][0], arrays[0])
+        np.testing.assert_array_equal(result["array"][1], arrays[1])
+        np.testing.assert_array_equal(result["structured"][0], structured[0])
+        np.testing.assert_array_equal(result["structured"][1], structured[1])
+        assert result["structured"][0].dtype == structured.dtype
+        assert result["object"] == objects
+    finally:
+        storage.close()
+
+
+def test_ssd_file_store_creates_missing_parent_directories(tmp_path):
+    ssd_path = tmp_path / "missing" / "nested"
+    store = SSDFileStore(str(ssd_path), "test-run", "test-unit")
+    try:
+        assert (ssd_path / "transfer_queue_ssd_offload").is_dir()
+    finally:
+        store.close()
+
+
 def test_storage_unit_data_parser(storage_setup):
     """Test data_parser functionality in SimpleStorageUnit.
 
@@ -663,7 +990,9 @@ def test_storage_unit_checkpoint_round_trip(storage_setup, tmp_path):
     assert (tmp_path / "storage_unit.pkl").exists()
 
     # 3. Create a fresh storage unit and load the checkpoint into it
-    fresh_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(storage_unit_size=10000)
+    fresh_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(
+        config={"total_storage_size": 10000, "num_data_storage_units": 1}
+    )
     fresh_zmq_info = ray.get(fresh_actor.get_zmq_server_info.remote())
     import time as _time
 
@@ -701,7 +1030,9 @@ def test_storage_unit_checkpoint_overwrites_existing_data(storage_setup, tmp_pat
     assert response.body["success"] is True
 
     # 2. Create a second unit, pre-populate it with different data, then load the checkpoint
-    second_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(storage_unit_size=10000)
+    second_actor = SimpleStorageUnit.options(max_concurrency=50, num_cpus=1).remote(
+        config={"total_storage_size": 10000, "num_data_storage_units": 1}
+    )
     second_zmq_info = ray.get(second_actor.get_zmq_server_info.remote())
     import time as _time
 

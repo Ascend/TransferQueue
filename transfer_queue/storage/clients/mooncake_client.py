@@ -33,6 +33,34 @@ from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes
 
 logger = get_logger(__name__)
 
+try:
+    import torch_npu  # noqa: F401
+
+    NPU_IMPORTED: bool = True
+except Exception:  # pragma: no cover - accelerator optional
+    NPU_IMPORTED = False
+
+
+def _resolve_npu_device() -> int | None:
+    """Return the NPU device this process is bound to, or ``None`` if it uses no NPU.
+
+    Ascend ACL contexts are thread-local, so this must run on the thread that owns
+    the device (``__init__``). Resolving it on a context-less pool worker would
+    always report device 0. Gating on ``is_initialized()`` (rather than
+    ``is_available()``) keeps a process that never touches the NPU from allocating
+    device memory and contending for device 0.
+    """
+    if not NPU_IMPORTED:
+        return None
+    try:
+        if not torch.npu.is_initialized():
+            return None
+        return int(torch.npu.current_device())
+    except Exception:
+        logger.warning("Failed to resolve the current NPU device.", exc_info=True)
+        return None
+
+
 MOONCAKE_STORE_IMPORTED: bool = True
 try:
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -179,6 +207,9 @@ class MooncakeStoreClient(StorageKVClient):
             hard_pin = not offload_enabled
         self.replica_config.with_hard_pin = bool(hard_pin)
 
+        # Capture on the owning thread; pool workers reuse it via _bind_npu_device.
+        self._npu_device = _resolve_npu_device()
+
         self._store = MooncakeDistributedStore()
         ret = self._store.setup(
             self.local_hostname,
@@ -211,6 +242,19 @@ class MooncakeStoreClient(StorageKVClient):
         # Claim at most half the registered buffer: mooncake stages its own reads from the
         # same region, so splitting all of it across the reader threads would starve those reads.
         self._pool_share_bytes = self.local_buffer_size // (2 * MAX_BATCH_WORKER_THREADS)
+
+    def _bind_npu_device(self) -> None:
+        """``ThreadPoolExecutor`` initializer: bind a worker to ``self._npu_device``."""
+        if self._npu_device is None:
+            return
+        try:
+            torch.npu.set_device(self._npu_device)
+        except Exception:
+            logger.warning(
+                f"Failed to bind NPU device {self._npu_device} on a worker thread; "
+                "Mooncake buffer register/unregister may fail.",
+                exc_info=True,
+            )
 
     def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
@@ -251,7 +295,10 @@ class MooncakeStoreClient(StorageKVClient):
 
         tensor_futures: list[Future[None]] = []
         bytes_futures: list[Future[list[int]]] = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=self._bind_npu_device,
+        ) as executor:
             if not use_gdr_path:
                 for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
                     batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
@@ -451,7 +498,10 @@ class MooncakeStoreClient(StorageKVClient):
                 results[idx] = val
 
         futures = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=self._bind_npu_device,
+        ) as executor:
             for i in range(0, len(cpu_tensor_indices), BATCH_SIZE_LIMIT):
                 batch_keys = cpu_tensor_keys[i : i + BATCH_SIZE_LIMIT]
                 batch_shapes = cpu_tensor_shapes[i : i + BATCH_SIZE_LIMIT]
