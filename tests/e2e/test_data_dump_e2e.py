@@ -662,3 +662,14 @@ def test_failed_load_publishes_no_metadata_and_retry_is_idempotent(tq_system, du
     assert snapshot.keys_mapping["key"] == index
     _assert_rows_equal(tq.kv_batch_get(["key"], "retry", ["input_ids"])["input_ids"], [_row_input_ids(0)])
     assert tq.kv_list("retry")["retry"] == {"key": {"idx": 0}}
+
+
+def test_dump_and_load_do_not_use_the_put_get_timeout_pool(tq_system, dump_dir, monkeypatch):
+    _put_rows("own_pool", ["key"])
+    manager = tq.get_client().storage_manager
+    # Any lease from the ordinary put/get pool now fails, so only the dump pool can serve these.
+    monkeypatch.setattr(manager, "storage_rpc_pool", None)
+    tq.dump_data_by_key(dump_dir, ["key"], "own_pool")
+    tq.load_data_by_key(dump_dir)
+    monkeypatch.undo()
+    _assert_rows_equal(tq.kv_batch_get(["key"], "own_pool", ["input_ids"])["input_ids"], [_row_input_ids(0)])

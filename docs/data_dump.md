@@ -121,6 +121,9 @@ cleared and reused while it runs, so keep writers and clears for these keys paus
 
 Each storage unit serves requests on one worker thread: other partitions using that
 unit can wait behind a load. The 128-row batches bound memory, not request latency.
+Dump and load requests use their own connection pool, whose timeout is
+`TQ_SIMPLE_STORAGE_DUMP_TIMEOUT` (3600 seconds by default) rather than the put/get
+timeout, because each unit receives a single request covering all of its rows.
 
 ## Tests
 

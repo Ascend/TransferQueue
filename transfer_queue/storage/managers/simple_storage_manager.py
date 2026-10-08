@@ -59,6 +59,10 @@ TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEM
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
 TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TIMEOUT", 10))
 
+# A selective dump or load sends one request per unit covering all of its rows, so its duration
+# grows with the selection and shared-filesystem speed rather than with a batch.
+TQ_SIMPLE_STORAGE_DUMP_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_DUMP_TIMEOUT", 3600))
+
 
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
@@ -105,6 +109,12 @@ with_storage_unit_probe_socket = with_zmq_socket(
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
 
+with_storage_unit_dump_socket = with_zmq_socket(
+    get_peer=lambda self, target: self.storage_unit_infos[target],
+    get_pool=lambda self: self.storage_dump_pool,
+    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
+)
+
 
 class RoutingGroup(NamedTuple):
     """Routing result for a single storage unit."""
@@ -141,6 +151,12 @@ class AsyncSimpleStorageManager(StorageManager):
             "put_get_socket",
             timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
             maxsize=1,
+        )
+        self.storage_dump_pool = ZMQSocketPool(
+            self.zmq_context,
+            f"{self.storage_manager_id}_dump",
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_DUMP_TIMEOUT,
         )
 
         self.config = config
@@ -766,7 +782,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
 
-    @with_storage_unit_socket
+    @with_storage_unit_dump_socket
     async def _dump_single_shard(
         self,
         path: str,
@@ -917,7 +933,7 @@ class AsyncSimpleStorageManager(StorageManager):
         )
         return bytes_read
 
-    @with_storage_unit_socket
+    @with_storage_unit_dump_socket
     async def _load_selected_rows(
         self,
         shards: list[dict[str, Any]],
@@ -1003,4 +1019,7 @@ class AsyncSimpleStorageManager(StorageManager):
         probe_pool = getattr(self, "storage_probe_pool", None)
         if probe_pool is not None:
             probe_pool.close()
+        dump_pool = getattr(self, "storage_dump_pool", None)
+        if dump_pool is not None:
+            dump_pool.close()
         super().close()
