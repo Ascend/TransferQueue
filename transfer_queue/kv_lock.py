@@ -236,12 +236,11 @@ class LockLostError(RuntimeError):
 
 
 class GlobalLease:
-    """Yielded by ``kv_global_lock``. ``fence`` maps each key to a fencing token that grows with every grant."""
+    """Yielded by ``kv_global_lock``; ``check()`` raises ``LockLostError`` once the lease is lost."""
 
     def __init__(self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], lease_s: float):
         self.names, self.shards, self.lease_s = names, shards, lease_s
         self.token = f"{os.getpid()}:{uuid.uuid4().hex}"
-        self.fence: dict[str, int] = {}
         self.deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
         self.lost = False
         self.pending: list[int] = []  # shards that may hold or await this token, so exit must release them
@@ -297,12 +296,10 @@ def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
     return manager.acquire.remote(lease.shards[shard], lease.token, _remaining(deadline), lease.lease_s, holder)
 
 
-def _take_grant(lease: GlobalLease, shard: int, reply, sent: float) -> None:
-    if reply is None:
+def _take_grant(lease: GlobalLease, shard: int, waited: float | None, sent: float) -> None:
+    if waited is None:
         lease.pending.remove(shard)
         raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
-    fences, waited = reply
-    lease.fence.update(fences)
     # The grant happened at least `waited` after `sent`, so this never outlives the shard's lease.
     lease.deadline = min(lease.deadline, sent + waited + lease.lease_s)
 
@@ -399,10 +396,10 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
         for shard in lease.shards:
             sent = time.monotonic()
             try:
-                reply = ray.get(_send_acquire(lease, shard, deadline))
+                waited = ray.get(_send_acquire(lease, shard, deadline))
             except RayActorError as e:
                 raise RuntimeError(_MANAGER_GONE) from e
-            _take_grant(lease, shard, reply, sent)
+            _take_grant(lease, shard, waited, sent)
         _start_lease(lease)
         yield lease
         lease.check()
@@ -423,10 +420,10 @@ async def async_kv_global_lock(
         for shard in lease.shards:
             sent = time.monotonic()
             try:
-                reply = await _send_acquire(lease, shard, deadline)
+                waited = await _send_acquire(lease, shard, deadline)
             except RayActorError as e:
                 raise RuntimeError(_MANAGER_GONE) from e
-            _take_grant(lease, shard, reply, sent)
+            _take_grant(lease, shard, waited, sent)
         _start_lease(lease)
         yield lease
         lease.check()

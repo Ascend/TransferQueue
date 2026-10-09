@@ -44,7 +44,6 @@ class TransferQueueLockManager:
         # waiter sleeps until it is granted.
         self._timer: asyncio.TimerHandle | None = None
         self._timer_at = float("inf")
-        self._fences: dict[tuple[str, str], int] = {}  # never reset, so a key's fence only grows
         # Waiting tokens per key in arrival order. A request is granted only when all its keys are
         # free and it heads every one of their queues: no newcomer can barge, and single-key
         # requests cannot starve an older multi-key one. All queues share one arrival order, so the
@@ -57,7 +56,6 @@ class TransferQueueLockManager:
         now = time.monotonic()
         for name in names:
             self._holder[name] = token
-            self._fences[name] = self._fences.get(name, 0) + 1
         self._leases[token] = dict(names=names, lease_s=lease_s, expires_at=now + lease_s, granted_at=now, info=info)
         heapq.heappush(self._expiries, (now + lease_s, token))
         if now + lease_s < self._timer_at:
@@ -109,7 +107,7 @@ class TransferQueueLockManager:
             self._timer = asyncio.get_running_loop().call_later(max(0.0, self._timer_at - now), self._expire)
 
     async def acquire(self, names, token, timeout, lease_s, holder_info):
-        """Grant all ``names`` at once; return ``({key: fence}, waited_s)``, or None on timeout or withdrawal."""
+        """Grant all ``names`` at once; return the seconds waited, or None on timeout or withdrawal."""
         start = time.monotonic()
         if self._withdrawn.pop(token, None) is not None:
             return None
@@ -129,7 +127,7 @@ class TransferQueueLockManager:
                     self._hand_off(self._leave_queues(token)["names"])
             if token not in self._leases:  # withdrawn, or already released by a caller that left
                 return None
-        return {key: self._fences[(pid, key)] for pid, key in names}, self._leases[token]["granted_at"] - start
+        return self._leases[token]["granted_at"] - start
 
     def num_shards(self) -> int:
         """Return the global shard count recorded by this manager."""

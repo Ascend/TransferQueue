@@ -56,7 +56,7 @@ class Worker:
 
     def hold(self, key, lease_s=30):
         self.held = tq.kv_global_lock(key, P, timeout=TIMEOUT_S, lease_s=lease_s)
-        return self.held.__enter__().fence[key]
+        self.held.__enter__()
 
     def release(self):
         self.held.__exit__(None, None, None)
@@ -176,7 +176,7 @@ def test_timeout_leaves_no_holder_or_waiter():
 
 def test_cancelled_waiter_is_withdrawn_and_never_granted():
     worker = Worker.remote()
-    fence = ray.get(worker.hold.remote("c"), timeout=TIMEOUT_S)
+    ray.get(worker.hold.remote("c"), timeout=TIMEOUT_S)
 
     async def wait_for_lock():
         async with tq.async_kv_global_lock("c", P):
@@ -196,8 +196,8 @@ def test_cancelled_waiter_is_withdrawn_and_never_granted():
     wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0)
     ray.get(worker.release.remote(), timeout=TIMEOUT_S)
     # A ghost grant to the cancelled waiter would hold "c" for its whole 30 s lease.
-    with tq.kv_global_lock("c", P, timeout=5) as lease:
-        assert lease.fence["c"] == fence + 1
+    with tq.kv_global_lock("c", P, timeout=5):
+        pass
 
 
 def test_release_before_acquire_withdraws_it():
@@ -284,17 +284,6 @@ def test_lease_renews_and_lost_lease_raises():
             wait_until(lambda: lease.lost)
             raise ValueError("body")
     wait_until(lambda: holders() == set())
-
-
-def test_fences_grow_across_holders():
-    with tq.kv_global_lock(["f", "g"], P) as first:
-        pass
-    worker = Worker.remote()
-    fence = ray.get(worker.hold.remote("f"), timeout=TIMEOUT_S)
-    ray.get(worker.release.remote(), timeout=TIMEOUT_S)
-    with tq.kv_global_lock("f", P) as last:
-        pass
-    assert first.fence["f"] < fence < last.fence["f"] and set(first.fence) == {"f", "g"}
 
 
 def test_nesting_and_ordering_rules():
