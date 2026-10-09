@@ -25,6 +25,7 @@ import torch
 from omegaconf import OmegaConf
 
 import transfer_queue as tq
+from transfer_queue.lock_manager import TransferQueueLockManager
 
 kvl = importlib.import_module("transfer_queue.kv_lock")
 P = "global_lock_e2e"
@@ -204,6 +205,56 @@ def test_release_before_acquire_withdraws_it():
     ray.get(lock_manager.release.remote("early"), timeout=TIMEOUT_S)
     assert ray.get(lock_manager.acquire.remote([(P, "w")], "early", None, 5, {}), timeout=TIMEOUT_S) is None
     assert holders() == set()
+
+
+@pytest.fixture
+def own_manager():
+    """A lock actor of its own, so these tests control every request it sees."""
+    lock_manager = TransferQueueLockManager.remote(1)
+    yield lock_manager
+    ray.kill(lock_manager)
+
+
+def acquire(lock_manager, keys, token, timeout=None, lease_s=30):
+    return lock_manager.acquire.remote([(P, key) for key in keys], token, timeout, lease_s, {})
+
+
+def n_waiters(lock_manager):
+    return ray.get(lock_manager.list_locks.remote(P), timeout=TIMEOUT_S)["waiters"]
+
+
+def test_waiters_are_granted_in_arrival_order(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    both = acquire(own_manager, ["a", "b"], "both")
+    wait_until(lambda: n_waiters(own_manager) == 1)
+    # b is free, but granting it past the older [a, b] request would let single-key traffic starve it.
+    assert ray.get(acquire(own_manager, ["b"], "newcomer", timeout=0), timeout=TIMEOUT_S) is None
+    only_b = acquire(own_manager, ["b"], "only_b")
+    wait_until(lambda: n_waiters(own_manager) == 2)
+    ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
+    assert ray.get(both, timeout=TIMEOUT_S) is not None
+    assert n_waiters(own_manager) == 1
+    ray.get(own_manager.release.remote("both"), timeout=TIMEOUT_S)
+    assert ray.get(only_b, timeout=TIMEOUT_S) is not None
+
+
+def test_a_waiter_that_gives_up_lets_the_next_one_through(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    both = acquire(own_manager, ["a", "b"], "both", timeout=0.5)
+    wait_until(lambda: n_waiters(own_manager) == 1)
+    only_b = acquire(own_manager, ["b"], "only_b")
+    assert ray.get(both, timeout=TIMEOUT_S) is None
+    assert ray.get(only_b, timeout=TIMEOUT_S) is not None
+
+
+def test_expired_leases_pass_the_key_down_the_queue(own_manager):
+    # Nobody releases: each grant has to come from the actor expiring the lease ahead of it.
+    ray.get(acquire(own_manager, ["a"], "dead", lease_s=0.5), timeout=TIMEOUT_S)
+    first = acquire(own_manager, ["a"], "first", lease_s=0.5)
+    wait_until(lambda: n_waiters(own_manager) == 1)
+    second = acquire(own_manager, ["a"], "second")
+    assert ray.get(second, timeout=TIMEOUT_S) is not None
+    assert ray.get(first, timeout=TIMEOUT_S) is not None
 
 
 def test_killed_holder_frees_the_key_after_its_lease():

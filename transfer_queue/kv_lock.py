@@ -379,8 +379,10 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
 
     The locks live in the ``controller.num_lock_shards`` actors that ``tq.init()`` creates,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
-    background thread renews. Keys on several actors are taken one actor at a time, each
-    all at once, so keys already granted stay held while a later actor's keys are awaited.
+    background thread renews. Each actor grants in arrival order: a request waits behind
+    every earlier one that shares a key with it. Keys on several actors are taken one actor
+    at a time, each all at once, so keys already granted stay held while a later actor's
+    keys are awaited.
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever), and ``RuntimeError`` when nested, taken while holding a
     ``kv_local_lock``, or called with a running event loop. Exit always releases the lock,
