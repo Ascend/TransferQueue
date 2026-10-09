@@ -77,11 +77,11 @@ def dump_field_schema(declared: dict, row_schema: dict[int, dict]) -> dict:
     unchanged, so dtypes and shapes come from the stored rows: a field is saved as
     non-tensor unless every row is a tensor of one dtype, and nested if shapes differ.
     """
-    rows_by_field = defaultdict(dict)
+    rows_by_field: defaultdict[str, dict[int, Any]] = defaultdict(dict)
     for index, fields in row_schema.items():
         for name, meta in fields.items():
             rows_by_field[name][index] = meta
-    schema = {}
+    schema: dict[str, dict[str, Any]] = {}
     for name, rows in rows_by_field.items():
         metas = list(rows.values())
         if declared[name]["is_non_tensor"] or None in metas or len({dtype for dtype, _ in metas}) > 1:

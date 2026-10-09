@@ -1765,7 +1765,7 @@ class TransferQueueController:
         if missing_keys:
             raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
 
-        rows = {
+        rows: dict[str, dict[str, Any]] = {
             key: {
                 "global_index": global_index,
                 "fields": sorted(
