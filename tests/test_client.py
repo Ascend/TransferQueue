@@ -434,7 +434,7 @@ def client_setup(mock_controller, mock_storage):
         async def mock_put_data(data, metadata, data_parser=None):
             pass  # Just pretend to store the data
 
-        async def mock_get_data(metadata):
+        async def mock_get_data(metadata, **kwargs):
             # Return the test data when requested
             return TEST_DATA
 
@@ -527,7 +527,7 @@ def test_single_controller_multiple_storages():
             async def mock_put_data(data, metadata, data_parser=None):
                 pass  # Just pretend to store the data
 
-            async def mock_get_data(metadata):
+            async def mock_get_data(metadata, **kwargs):
                 # Return some test data when requested
                 return TensorDict({"tokens": torch.randint(0, 100, (5, 128))}, batch_size=5)
 

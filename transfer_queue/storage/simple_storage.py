@@ -51,6 +51,7 @@ import zmq
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.get_parser import apply_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
@@ -1289,18 +1290,25 @@ class SimpleStorageUnit:
         try:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
+            parser = data_parts.body.get("parser")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
                 result_data = self.storage_data.get_data(fields, global_indexes)
+                if parser is not None:
+                    result_data = apply_get_parser(
+                        result_data, parser, data_parts.body.get("parser_args"), global_indexes
+                    )
 
+            response_body: dict[str, Any] = {"data": result_data}
+            if parser is not None:
+                # NOTE(neowywang): lets the manager tell a parsed reply from an older unit that ignored the parser.
+                response_body["parsed"] = True
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
-                body={
-                    "data": result_data,
-                },
+                body=response_body,
             )
         except Exception as e:
             key_not_found = isinstance(e, StorageKeyNotFoundError)

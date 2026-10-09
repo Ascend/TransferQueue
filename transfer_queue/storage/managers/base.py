@@ -21,6 +21,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 from uuid import uuid4
@@ -35,6 +36,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
+from transfer_queue.utils.get_parser import GetParser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -334,12 +336,19 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement put_data")
 
     @abstractmethod
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        parser: GetParser | None = None,
+        parser_args: Sequence[Any] | None = None,
+    ) -> TensorDict:
         """
         Get data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be retrieved from the storage.
+            parser: Optional get parser applied to every requested value where it is stored, before sending.
+            parser_args: Optional per-sample parser arguments, aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing the data retrieved from the storage.
@@ -823,13 +832,24 @@ class KVStorageManager(StorageManager):
             per_field_custom_backend_meta,
         )
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        parser: GetParser | None = None,
+        parser_args: Sequence[Any] | None = None,
+    ) -> TensorDict:
         """
         Retrieve tensor data from the backend storage.
 
         Fetches tensors using the provided metadata, reconstructs them with the
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
+        if parser is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support kv_batch_get parsers: KV backends return whole (key, field) "
+                "values and cannot run a parser where the data is stored. Use the SimpleStorage backend, or fetch "
+                "without parser= and select the needed part on the caller side"
+            )
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))

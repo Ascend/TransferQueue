@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Sequence
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -53,6 +54,7 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils.get_parser import GetParser, validate_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
@@ -523,7 +525,13 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | Non
     return tq_client._run_coroutine(async_kv_batch_get_by_meta(meta=meta, select_fields=select_fields))
 
 
-def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None) -> TensorDict:
+def kv_batch_get(
+    keys: list[str] | str,
+    partition_id: str,
+    select_fields: list[str] | str | None = None,
+    parser: GetParser | None = None,
+    parser_args: Sequence[Any] | None = None,
+) -> TensorDict:
     """Get data from TransferQueue using user-specified keys.
 
     This is a convenience method for retrieving data using keys instead of indexes.
@@ -532,6 +540,10 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        parser: Optional ``parser(value, parser_arg)`` each SimpleStorage unit applies to every selected (key, field)
+            before serializing its reply, e.g. ``transfer_queue.select_list_items``. Sent by cloudpickle, so a
+            module-level parser must be importable on the storage units. KV backends raise NotImplementedError.
+        parser_args: Optional per-key ``parser_arg`` values aligned with ``keys``; None passes None for every key.
 
     Returns:
         TensorDict with the requested data
@@ -539,6 +551,8 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a parser is given and some keys are missing
+        RuntimeError: If the parser fails on a storage unit; the message names the field, global index and parser_arg
 
     Example:
         >>> import transfer_queue as tq
@@ -551,11 +565,36 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
         ...     partition_id="train",
         ...     select_fields="input_ids"
         ... )
+        >>> # Get the images at per-key indices out of a list-valued field
+        >>> data = tq.kv_batch_get(
+        ...     keys=["sample_1", "sample_2"],
+        ...     partition_id="train",
+        ...     select_fields="images",
+        ...     parser=tq.select_list_items,
+        ...     parser_args=[[0, 2], [1]],
+        ... )
     """
+    keys = [keys] if isinstance(keys, str) else keys
+    validate_get_parser(parser, parser_args, len(keys))
     tq_client = _maybe_create_tq_client()
     return tq_client._run_coroutine(
-        async_kv_batch_get(keys=keys, partition_id=partition_id, select_fields=select_fields)
+        async_kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields=select_fields,
+            parser=parser,
+            parser_args=parser_args,
+        )
     )
+
+
+def _check_all_keys_found(num_found: int, keys: list[str], partition_id: str, parser: GetParser | None) -> None:
+    # NOTE(neowywang): a missing key is dropped from the meta, which would shift parser_args onto other keys.
+    if parser is not None and num_found != len(keys):
+        raise ValueError(
+            f"only {num_found} of {len(keys)} keys were found in partition {partition_id!r}; a kv_batch_get "
+            "with a parser needs every key, since parser_args are aligned with keys"
+        )
 
 
 def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
@@ -938,7 +977,11 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str]
 
 
 async def async_kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None
+    keys: list[str] | str,
+    partition_id: str,
+    select_fields: list[str] | str | None = None,
+    parser: GetParser | None = None,
+    parser_args: Sequence[Any] | None = None,
 ) -> TensorDict:
     """Asynchronously get data from TransferQueue using user-specified keys.
 
@@ -948,6 +991,8 @@ async def async_kv_batch_get(
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        parser: Optional get parser each SimpleStorage unit applies before replying; see ``kv_batch_get``.
+        parser_args: Optional per-key ``parser_arg`` values aligned with ``keys``; None passes None for every key.
 
     Returns:
         TensorDict with the requested data
@@ -955,6 +1000,8 @@ async def async_kv_batch_get(
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a parser is given and some keys are missing
+        RuntimeError: If the parser fails on a storage unit; the message names the field, global index and parser_arg
 
     Example:
         >>> import transfer_queue as tq
@@ -968,12 +1015,15 @@ async def async_kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
+    keys = [keys] if isinstance(keys, str) else keys
+    validate_get_parser(parser, parser_args, len(keys))
     tq_client = _maybe_create_tq_client()
 
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
+    _check_all_keys_found(batch_meta.size, keys, partition_id, parser)
 
     if select_fields is not None:
         if isinstance(select_fields, str):
@@ -985,7 +1035,7 @@ async def async_kv_batch_get(
     if not batch_meta.is_ready:
         raise ValueError("Some fields are not ready in all the requested keys!")
 
-    data = await tq_client.async_get_data(batch_meta)
+    data = await tq_client.async_get_data(batch_meta, parser=parser, parser_args=parser_args)
     return data
 
 

@@ -18,7 +18,7 @@ import os
 import time
 import warnings
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
@@ -36,6 +36,7 @@ from transfer_queue.storage.simple_storage import (
     StorageKeyNotFoundError,
 )
 from transfer_queue.utils.common import log_heavy_operation
+from transfer_queue.utils.get_parser import GetParser, validate_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     TQ_SOCKET_POOL_SIZE,
@@ -779,7 +780,12 @@ class AsyncSimpleStorageManager(StorageManager):
             # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
         return NonTensorStack(*values)
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        parser: GetParser | None = None,
+        parser_args: Sequence[Any] | None = None,
+    ) -> TensorDict:
         """
         Retrieve data from remote StorageUnit based on metadata.
 
@@ -787,6 +793,8 @@ class AsyncSimpleStorageManager(StorageManager):
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
+            parser: Optional ``parser(value, parser_arg)`` each SU applies to every requested value before replying.
+            parser_args: Optional per-sample parser arguments, aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing the retrieved data.
@@ -796,6 +804,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
+        validate_get_parser(parser, parser_args, metadata.size)
 
         routing = self._group_by_hash(metadata.global_indexes)
 
@@ -809,6 +818,8 @@ class AsyncSimpleStorageManager(StorageManager):
                     group.global_indexes,
                     metadata.field_names,
                     target_storage_unit=su_id,
+                    parser=parser,
+                    parser_args=None if parser_args is None else [parser_args[pos] for pos in group.batch_positions],
                 ),
             )
             for su_id, group in routing.items()
@@ -847,14 +858,19 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
+        parser: GetParser | None = None,
+        parser_args: list[Any] | None = None,
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
+        body = {"global_indexes": global_indexes, "fields": fields}
+        if parser is not None:
+            body.update(parser=parser, parser_args=parser_args)
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "fields": fields},
+            body=body,
         )
         try:
             await socket.send_multipart(request_msg.serialize())
@@ -862,6 +878,11 @@ class AsyncSimpleStorageManager(StorageManager):
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
+                if parser is not None and not response_msg.body.get("parsed", False):
+                    raise RuntimeError(
+                        f"storage unit {target_storage_unit} replied without applying the kv_batch_get parser; it "
+                        "runs a TransferQueue older than get parsers, so restart the storage units on this version"
+                    )
                 storage_unit_data = response_msg.body["data"]
                 return fields, storage_unit_data
             else:
