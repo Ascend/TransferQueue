@@ -46,7 +46,7 @@ def test_dump_excludes_unselected_tensor_storage(unit, tmp_path, row_count):
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
-            body={"path": str(path), "global_indexes": indexes},
+            body={"path": str(path), "fields_by_index": {index: ["x"] for index in indexes}},
         )
     )
     assert reply.body["success"]
@@ -125,11 +125,7 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
-            body={
-                "path": str(path),
-                "global_indexes": list(range(8)),
-                "fields_by_index": {index: ["x"] for index in range(8)},
-            },
+            body={"path": str(path), "fields_by_index": {index: ["x"] for index in range(8)}},
         )
     )
     assert reply.body["success"]
@@ -223,7 +219,7 @@ def test_dump_reports_every_rows_stored_types(unit, tmp_path):
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
-            body={"path": str(tmp_path / "shard.pkl"), "global_indexes": [9, 10]},
+            body={"path": str(tmp_path / "shard.pkl"), "fields_by_index": {9: ["x", "y"], 10: ["x", "y"]}},
         )
     )
     assert response.body["success"]

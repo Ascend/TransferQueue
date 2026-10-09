@@ -705,7 +705,7 @@ def test_dump_waits_for_writers_before_cleanup_can_start(tq_system, dump_dir, mo
     async def dump_with_one_failure():
         failed = asyncio.Event()
 
-        async def dump(path, target_storage_unit, global_indexes, fields_by_index):
+        async def dump(path, target_storage_unit, fields_by_index):
             if target_storage_unit == units[0]:
                 failed.set()
                 raise OSError("write failed")
@@ -715,7 +715,7 @@ def test_dump_waits_for_writers_before_cleanup_can_start(tq_system, dump_dir, mo
             return {"row_offsets": {1: [0, 1]}, "row_schema": {}}
 
         monkeypatch.setattr(manager, "_dump_single_shard", dump)
-        await manager.dump_rows_by_index(str(dump_dir), [0, 1])
+        await manager.dump_rows_by_index(str(dump_dir), {0: ["x"], 1: ["x"]})
 
     with pytest.raises(OSError, match="write failed"):
         asyncio.run(dump_with_one_failure())

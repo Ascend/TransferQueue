@@ -1156,18 +1156,12 @@ class AsyncTransferQueueClient:
             body={"partition_id": partition_id, "field_schema": field_schema},
         )
 
-    async def async_dump_rows_by_index(
-        self,
-        shard_dir: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
-    ) -> dict[str, Any]:
+    async def async_dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
         """Asynchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
-            global_indexes: Global indexes to dump.
-            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            fields_by_index: Global index of each row to dump -> its produced fields.
 
         Returns:
             ``{"shards", "row_schema"}``: one entry per written shard, and each row's
@@ -1183,7 +1177,7 @@ class AsyncTransferQueueClient:
                 f"[{self.client_id}]: Storage manager not initialized. "
                 "Call initialize_storage_manager() before dump operations."
             )
-        return await self.storage_manager.dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+        return await self.storage_manager.dump_rows_by_index(shard_dir, fields_by_index)
 
     async def async_load_rows_by_key(
         self,
@@ -1850,18 +1844,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """Reject incompatible destination fields before restoring payloads."""
         return self._validate_dump_schema(partition_id, field_schema)
 
-    def dump_rows_by_index(
-        self,
-        shard_dir: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
-    ) -> dict[str, Any]:
+    def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
         """Synchronously dump the given rows into per-storage-unit shards.
 
         Args:
             shard_dir: Directory to write shard files into.
-            global_indexes: Global indexes to dump.
-            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            fields_by_index: Global index of each row to dump -> its produced fields.
 
         Returns:
             ``{"shards", "row_schema"}``: one entry per written shard, and each row's
@@ -1872,7 +1860,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 no data for a row it was asked to dump.
             NotImplementedError: If the storage backend does not support dumping.
         """
-        return self._dump_rows_by_index(shard_dir, global_indexes, fields_by_index)
+        return self._dump_rows_by_index(shard_dir, fields_by_index)
 
     def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
         """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""

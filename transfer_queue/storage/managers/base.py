@@ -373,12 +373,7 @@ class StorageManager(ABC):
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support checkpoint")
 
-    async def dump_rows_by_index(
-        self,
-        shard_dir: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
-    ) -> dict[str, Any]:
+    async def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
         """Have the owner units write the given rows into shards under shard_dir.
 
         Raises:

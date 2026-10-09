@@ -1204,9 +1204,7 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
         shard_records = []
         if fields_by_index:
-            dumped = client.dump_rows_by_index(
-                str(tmp_dir / data_dump.SHARD_SUBDIR), sorted(fields_by_index), fields_by_index
-            )
+            dumped = client.dump_rows_by_index(str(tmp_dir / data_dump.SHARD_SUBDIR), fields_by_index)
             shard_records = dumped["shards"]
             row_index["field_schema"] = data_dump.dump_field_schema(row_index["field_schema"], dumped["row_schema"])
         data_dump.publish_dump(tmp_dir, dump_dir, row_index, shard_records)

@@ -834,8 +834,7 @@ class AsyncSimpleStorageManager(StorageManager):
         self,
         path: str,
         target_storage_unit: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
+        fields_by_index: dict[int, list[str]],
         socket: zmq.Socket = None,
     ) -> dict[str, Any]:
         """Ask one storage unit to write the rows it owns into a shard file."""
@@ -844,11 +843,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={
-                    "path": path,
-                    "global_indexes": global_indexes,
-                    "fields_by_index": fields_by_index,
-                },
+                body={"path": path, "fields_by_index": fields_by_index},
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -874,8 +869,7 @@ class AsyncSimpleStorageManager(StorageManager):
     async def dump_rows_by_index(
         self,
         shard_dir: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
+        fields_by_index: dict[int, list[str]],
     ) -> dict[str, Any]:
         """Dump the given rows into one shard per storage unit, in parallel.
 
@@ -885,8 +879,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
         Args:
             shard_dir: Directory to write shard files into.
-            global_indexes: Global indexes to dump.
-            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
+            fields_by_index: Global index of each row to dump -> its produced fields.
 
         Returns:
             ``{"shards", "row_schema"}``: one ``{"position", "storage_unit_id", "rows",
@@ -899,7 +892,7 @@ class AsyncSimpleStorageManager(StorageManager):
         shard_dir_path = Path(shard_dir)
         shard_dir_path.mkdir(parents=True, exist_ok=True)
 
-        routing = self._group_by_hash(global_indexes)
+        routing = self._group_by_hash(sorted(fields_by_index))
         targets = [(su_id, group.global_indexes) for su_id, group in routing.items()]
         paths = [str(shard_dir_path / f"shard_{pos}_{su_id}.pkl") for pos, (su_id, _) in enumerate(targets)]
 
@@ -908,8 +901,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 self._dump_single_shard(
                     path,
                     target_storage_unit=su_id,
-                    global_indexes=indexes,
-                    fields_by_index={index: fields_by_index[index] for index in indexes} if fields_by_index else None,
+                    fields_by_index={index: fields_by_index[index] for index in indexes},
                 )
                 for path, (su_id, indexes) in zip(paths, targets, strict=True)
             ),

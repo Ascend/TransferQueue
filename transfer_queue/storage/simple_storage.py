@@ -1305,25 +1305,17 @@ class SimpleStorageUnit:
     def _handle_dump_rows(self, request: ZMQMessage) -> ZMQMessage:
         """Write independent row records and return their offsets, never their payloads."""
         path = request.body["path"]
-        indexes = set(request.body["global_indexes"])
+        fields_by_index = request.body["fields_by_index"]
         try:
-            missing = indexes - self.storage_data._active_keys
+            missing = fields_by_index.keys() - self.storage_data._active_keys
             if missing:
                 raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
             row_offsets = {}
             row_schema = {}
             with open(path, "wb") as f:
-                for index in sorted(indexes):
-                    described_fields = request.body.get("fields_by_index")
-                    if described_fields is None:
-                        fields = {
-                            name: values[index]
-                            for name, values in self.storage_data.field_data.items()
-                            if index in values
-                        }
-                    else:
-                        # Reused global indexes can retain fields no longer present in metadata.
-                        fields = {name: self.storage_data.field_data[name][index] for name in described_fields[index]}
+                for index in sorted(fields_by_index):
+                    # Reused global indexes can retain fields no longer present in metadata.
+                    fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
                     # Controller metadata can trail the stored values, so report what each
                     # row actually holds; only type metadata leaves the unit.
                     row_schema[index] = {
@@ -1335,13 +1327,13 @@ class SimpleStorageUnit:
                     row_offsets[index] = [offset, f.tell() - offset]
                 f.flush()
                 os.fsync(f.fileno())
-            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(indexes), path)
+            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
             return ZMQMessage.create(
                 request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,
                 body={
                     "success": True,
-                    "dumped_rows": len(indexes),
+                    "dumped_rows": len(fields_by_index),
                     "missing_rows": [],
                     "row_offsets": row_offsets,
                     "row_schema": row_schema,
