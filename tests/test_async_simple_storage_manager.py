@@ -25,6 +25,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.get_parser import select_list_items
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
@@ -576,3 +577,70 @@ class TestPackFieldValues:
 
         assert isinstance(result, NonTensorStack)
         assert result.tolist() == [None, None]
+
+
+def _two_unit_manager(storage_manager_id: str) -> AsyncSimpleStorageManager:
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = storage_manager_id
+    manager.storage_unit_infos = {
+        unit_id: ZMQServerInfo(role=Role.STORAGE, id=unit_id, ip="127.0.0.1", ports={"put_get_socket": port})
+        for unit_id, port in (("storage_0", 19050), ("storage_1", 19051))
+    }
+    return manager
+
+
+@pytest.mark.asyncio
+async def test_get_data_slices_parser_args_per_storage_unit_by_batch_position():
+    manager = _two_unit_manager("test_parser_routing")
+    # global_index % 2 routes 2 and 0 to storage_0, 3 and 1 to storage_1.
+    batch_meta = BatchMeta(
+        global_indexes=[3, 0, 2, 1],
+        partition_ids=["p0"] * 4,
+        field_schema={"images": {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}},
+        production_status=np.ones(4, dtype=np.int8),
+    )
+    parser_args = [["arg_3"], ["arg_0"], ["arg_2"], ["arg_1"]]
+    requests: dict[str, dict] = {}
+
+    async def fake_get(global_indexes, fields, target_storage_unit=None, parser=None, parser_args=None):
+        requests[target_storage_unit] = {"global_indexes": global_indexes, "parser": parser, "args": parser_args}
+        values = [f"value_{gi}_{args[0]}" for gi, args in zip(global_indexes, parser_args, strict=True)]
+        return fields, {"images": values}
+
+    manager._get_from_single_storage_unit = fake_get
+
+    data = await manager.get_data(batch_meta, parser=select_list_items, parser_args=parser_args)
+
+    assert requests == {
+        "storage_0": {"global_indexes": [0, 2], "parser": select_list_items, "args": [["arg_0"], ["arg_2"]]},
+        "storage_1": {"global_indexes": [3, 1], "parser": select_list_items, "args": [["arg_3"], ["arg_1"]]},
+    }
+    assert list(data["images"]) == ["value_3_arg_3", "value_0_arg_0", "value_2_arg_2", "value_1_arg_1"]
+
+
+@pytest.mark.asyncio
+async def test_get_with_parser_rejects_reply_without_parsed_flag():
+    manager = _two_unit_manager("test_parser_old_unit")
+    old_unit_reply = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
+        sender_id="storage_0",
+        body={"data": {"images": [["whole_row"]]}},
+    )
+    socket = Mock()
+    socket.send_multipart = AsyncMock()
+    socket.recv_multipart = AsyncMock(return_value=old_unit_reply.serialize())
+    get_from_unit = AsyncSimpleStorageManager._get_from_single_storage_unit.__wrapped__
+
+    with pytest.raises(RuntimeError, match="storage unit storage_0 replied without applying the kv_batch_get parser"):
+        await get_from_unit(
+            manager,
+            [0],
+            ["images"],
+            target_storage_unit="storage_0",
+            parser=select_list_items,
+            parser_args=[[0]],
+            socket=socket,
+        )
+
+    sent_body = ZMQMessage.deserialize(socket.send_multipart.await_args.args[0]).body
+    assert sent_body["parser"] is select_list_items and sent_body["parser_args"] == [[0]]

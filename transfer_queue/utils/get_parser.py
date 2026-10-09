@@ -60,7 +60,7 @@ def apply_get_parser(
 ) -> dict[str, list[Any]]:
     """Replace every stored value by ``parser(value, parser_arg)`` of its key; values arrive unwrapped from NonTensor*.
 
-    A parser error is re-raised as ``ValueError`` naming the field, global index and parser_arg it failed on."""
+    Parser errors raise ``ValueError`` (field, global index, arg); kv_batch_get callers get ``RuntimeError``."""
     if parser_args is None:
         parser_args = [None] * len(global_indexes)
     elif len(parser_args) != len(global_indexes):

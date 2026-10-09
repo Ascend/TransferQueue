@@ -541,8 +541,9 @@ def kv_batch_get(
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
         parser: Optional ``parser(value, parser_arg)`` each SimpleStorage unit applies to every selected (key, field)
-            before serializing its reply, e.g. ``transfer_queue.select_list_items``. Sent by cloudpickle, so a
-            module-level parser must be importable on the storage units. KV backends raise NotImplementedError.
+            before replying, e.g. ``transfer_queue.select_list_items``; pair it with ``select_fields``. It runs
+            synchronously on the storage unit worker, so keep it light and side-effect free. Sent by cloudpickle, so
+            a module-level parser must be importable on the storage units. KV backends raise NotImplementedError.
         parser_args: Optional per-key ``parser_arg`` values aligned with ``keys``; None passes None for every key.
 
     Returns:
@@ -565,7 +566,8 @@ def kv_batch_get(
         ...     partition_id="train",
         ...     select_fields="input_ids"
         ... )
-        >>> # Get the images at per-key indices out of a list-valued field
+        >>> # Get the images at per-key indices out of a list-valued field; select_fields keeps the parser off
+        >>> # fields such as input_ids, which select_list_items would reject
         >>> data = tq.kv_batch_get(
         ...     keys=["sample_1", "sample_2"],
         ...     partition_id="train",
@@ -991,7 +993,8 @@ async def async_kv_batch_get(
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
         select_fields: Optional field(s) to retrieve. If None, retrieves all fields
-        parser: Optional get parser each SimpleStorage unit applies before replying; see ``kv_batch_get``.
+        parser: Optional get parser each SimpleStorage unit applies to every selected (key, field) before replying;
+            pair it with ``select_fields`` and keep it light and side-effect free. See ``kv_batch_get``.
         parser_args: Optional per-key ``parser_arg`` values aligned with ``keys``; None passes None for every key.
 
     Returns:
