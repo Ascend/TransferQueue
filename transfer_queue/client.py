@@ -1067,6 +1067,30 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
+    @with_controller_socket
+    async def async_kv_describe(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, Any]:
+        """Asynchronously describe each key's row and its fields' declared types, without payloads.
+
+        Unlike ``kv_retrieve_meta``, every row keeps its own produced fields, and a missing
+        key raises instead of being dropped.
+
+        Returns:
+            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
+            {"is_nested", "is_non_tensor"}}}``.
+        """
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_DESCRIBE,
+            response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1123,6 +1147,77 @@ class AsyncTransferQueueClient:
                 if not can_destroy():
                     return False
         return True
+
+    # ==================== Selective Data Dump API ====================
+    @with_controller_socket
+    async def async_validate_dump_schema(
+        self,
+        partition_id: str,
+        field_schema: dict,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
+            response_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE,
+            body={"partition_id": partition_id, "field_schema": field_schema},
+        )
+
+    async def async_dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Asynchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before dump operations."
+            )
+        return await self.storage_manager.dump_rows_by_index(shard_dir, fields_by_index)
+
+    async def async_load_rows_by_key(
+        self,
+        partition_id: str,
+        rows: dict[str, dict[str, Any]],
+        shards: list[dict[str, Any]],
+    ) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read.
+
+        Failure semantics match ``kv_batch_put``: new keys stay registered and payload
+        writes may be partial, and retrying is idempotent because keys keep their indexes.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit fails.
+            NotImplementedError: If the storage backend does not support selective loads.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before load operations."
+            )
+        if not rows:
+            return 0
+        metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
+        target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
+        for shard in shards:
+            for record in shard["records"]:
+                record["target_index"] = target_indexes[record["key"]]
+        bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
+        metadata.update_custom_meta([row["tag"] for row in rows.values()])
+        await self.async_set_custom_meta(metadata)
+        return bytes_read
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
@@ -1308,6 +1403,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
+        self._kv_describe = _make_sync(self.async_kv_describe)
+        self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
+        self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
+        self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
@@ -1743,6 +1842,41 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._kv_list(partition_id=partition_id)
+
+    def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
+        """Synchronously describe each key's row and its fields' declared types, without payloads.
+
+        See ``async_kv_describe``.
+        """
+        return self._kv_describe(keys, partition_id)
+
+    # ==================== Selective Data Dump API ====================
+
+    def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:
+        """Reject incompatible destination fields before restoring payloads."""
+        return self._validate_dump_schema(partition_id, field_schema)
+
+    def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Synchronously dump the given rows into per-storage-unit shards.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
+            stored field types.
+
+        Raises:
+            RuntimeError: If the storage manager is not initialized, or a unit holds
+                no data for a row it was asked to dump.
+            NotImplementedError: If the storage backend does not support dumping.
+        """
+        return self._dump_rows_by_index(shard_dir, fields_by_index)
+
+    def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
+        """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""
+        return self._load_rows_by_key(partition_id, rows, shards)
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:

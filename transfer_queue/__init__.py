@@ -25,6 +25,7 @@ from .interface import (
     async_kv_list,
     async_kv_put,
     close,
+    dump_data_by_key,
     get_client,
     get_metrics_endpoint,
     init,
@@ -35,6 +36,7 @@ from .interface import (
     kv_list,
     kv_put,
     load_checkpoint,
+    load_data_by_key,
     save_checkpoint,
 )
 from .metadata import BatchMeta, KVBatchMeta
@@ -69,6 +71,11 @@ __all__ = (
         # Checkpoint Interface
         "save_checkpoint",
         "load_checkpoint",
+    ]
+    + [
+        # Selective Data Dump Interface
+        "dump_data_by_key",
+        "load_data_by_key",
     ]
     + [
         # High-Level StreamingDataLoader Interface

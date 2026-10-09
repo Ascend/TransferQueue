@@ -101,6 +101,9 @@ checkpoint_dir/
 ]
 ```
 
+Loading unpickles the controller state and every storage unit file, which can run
+arbitrary code. Load only checkpoints from directories that you trust.
+
 ## Atomic Checkpoint Replacement
 
 `save_checkpoint` writes to `<checkpoint_dir>.tmp`, renames the existing `checkpoint_dir` to `<checkpoint_dir>.old`, renames `.tmp` into `checkpoint_dir`, then deletes `.old`. This keeps the old checkpoint recoverable until the new one is fully in place; a failure partway through restores `.old` automatically, and the directory stays a plain folder (no symlink).
@@ -168,3 +171,10 @@ client.load_controller_checkpoint(...)    # (2) controller restored second
 If step (1) partially succeeds and step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
 
 **Workaround**: If `load_checkpoint` raises, call `tq.init()` again to reset the system to a clean state before retrying.
+
+## Exporting selected keys
+
+Use [selective data dumps](data_dump.md) when restoring selected keys into an
+existing system or a different number of storage units. SimpleStorage restores read
+assigned row ranges directly on the current storage owners and merge values instead
+of replacing entire unit and controller state.

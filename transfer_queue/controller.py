@@ -557,6 +557,18 @@ class DataPartitionStatus:
             logger.error(f"Error updating production status for partition {self.partition_id}: {e}")
             return False
 
+    def validate_field_schema(self, field_schema: dict[str, dict[str, Any]]) -> None:
+        """Reject incompatible field types without changing metadata or readiness."""
+        for name, incoming in field_schema.items():
+            existing = self.field_metadata.get(name)
+            if existing is None:
+                continue
+            if bool(existing.is_non_tensor) != bool(incoming.get("is_non_tensor", False)):
+                raise ValueError(f"Field {name!r} tensor/non-tensor type mismatch")
+            dtype = incoming.get("dtype")
+            if dtype is not None and existing.dtype is not None and dtype != existing.dtype:
+                raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
+
     def _update_field_metadata(
         self,
         global_indexes: list[int],
@@ -1725,6 +1737,54 @@ class TransferQueueController:
 
         return keys
 
+    def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
+        """Describe each key's row and the declared types of its fields, without payloads.
+
+        Unlike ``kv_retrieve_meta``, which keeps only the fields every row has produced and
+        drops missing keys, this reports each row's own field set and fails on a missing
+        key. Avoids ``to_snapshot``: a handful of lookups per key, not a partition copy.
+
+        Args:
+            keys: Keys to describe, already deduplicated by the caller.
+            partition_id: Partition that owns ``keys``.
+
+        Returns:
+            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
+            {"is_nested", "is_non_tensor"}}}``. ``fields`` is empty for a row with no
+            produced field yet; ``field_schema`` covers the fields of the described rows.
+
+        Raises:
+            KeyError: The partition or any key does not exist.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            raise KeyError(f"partition {partition_id!r} does not exist; existing partitions: {sorted(self.partitions)}")
+
+        global_indexes = partition.kv_retrieve_indexes(keys)
+        missing_keys = [key for key, index in zip(keys, global_indexes, strict=True) if index is None]
+        if missing_keys:
+            raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
+
+        rows: dict[str, dict[str, Any]] = {
+            key: {
+                "global_index": global_index,
+                "fields": sorted(
+                    field_name
+                    for field_name, field_meta in partition.field_metadata.items()
+                    if global_index in field_meta.global_indexes
+                ),
+                "tag": partition.custom_meta.get(global_index, {}),
+            }
+            for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True)
+        }
+        # Only the declared types: row dtypes and shapes live with the storage units.
+        field_schema = {
+            name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
+            for name, meta in partition.field_metadata.items()
+            if any(name in row["fields"] for row in rows.values())
+        }
+        return {"rows": rows, "field_schema": field_schema}
+
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
@@ -1948,6 +2008,8 @@ class TransferQueueController:
             ZMQRequestType.KV_RETRIEVE_META: self._handle_kv_retrieve_meta_request,
             ZMQRequestType.KV_RETRIEVE_KEYS: self._handle_kv_retrieve_keys_request,
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
+            ZMQRequestType.KV_DESCRIBE: self._handle_kv_describe_request,
+            ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2145,6 +2207,11 @@ class TransferQueueController:
         )
         return self._make_response(request_msg, ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE, {"keys": keys})
 
+    def _handle_kv_describe_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        description = self.kv_describe(params["keys"], params["partition_id"])
+        return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
+
     def _handle_kv_list_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         requested_partition_id = request_msg.body["partition_id"]
         partition_ids = list(self.partitions.keys()) if requested_partition_id is None else [requested_partition_id]
@@ -2180,6 +2247,13 @@ class TransferQueueController:
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
             {"success": True},
         )
+
+    def _handle_validate_dump_schema_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        partition = self._get_partition(params["partition_id"])
+        if partition is not None:
+            partition.validate_field_schema(params["field_schema"])
+        return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""

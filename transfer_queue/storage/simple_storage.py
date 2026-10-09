@@ -34,6 +34,7 @@ import pickle
 import shutil
 import time
 import weakref
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,6 +48,7 @@ import ray
 import torch
 import zmq
 
+from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -719,6 +721,53 @@ class HybridStorageUnitData(StorageUnitData):
         self._ssd_store.close()
 
 
+# Readers for the selective dump records that SimpleStorageUnit._handle_dump_rows writes.
+def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
+    """Read and validate exactly one record against its expected index and fields."""
+    file.seek(offset)
+    payload = file.read(length)
+    if len(payload) != length:
+        raise ValueError(f"Truncated dump row {global_index} in {file.name}")
+    row = pickle.loads(payload)
+    if row["global_index"] != global_index or set(row["fields"]) != set(fields):
+        raise ValueError(f"Dump row {global_index} disagrees with the row index in {file.name}")
+    return row["fields"]
+
+
+def validate_dump_values(values: dict, schema: dict, source_index: int) -> None:
+    """Validate persisted tensor values without changing their type or dtype."""
+    for name, value in values.items():
+        field = schema[name]
+        if field["is_non_tensor"]:
+            continue
+        shape = field.get("per_sample_shapes", {}).get(source_index) if field["is_nested"] else field["shape"]
+        if shape is None:
+            raise ValueError(f"Dump field {name!r} has no saved shape at row {source_index}")
+        actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+        # Existing dense scalar fields use a one-element metadata shape.
+        scalar = actual_shape == () and tuple(shape) == (1,) and not field["is_nested"]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype != field["dtype"]
+            or (actual_shape != tuple(shape) and not scalar)
+        ):
+            raise ValueError(f"Dump field {name!r} disagrees with its saved schema at row {source_index}")
+
+
+def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: list[int], names: tuple) -> dict:
+    """Remap only the selected nested shapes to the current destination indexes."""
+    selected = {}
+    for name in names:
+        field = dict(schema[name])
+        if field["is_nested"]:
+            field["per_sample_shapes"] = {
+                target: field["per_sample_shapes"][source]
+                for source, target in zip(source_indexes, target_indexes, strict=True)
+            }
+        selected[name] = field
+    return selected
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -1003,6 +1052,12 @@ class SimpleStorageUnit:
                 response_msg = self._handle_get_metrics()
             elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                 response_msg = self._handle_save_checkpoint(request_msg)
+            elif operation == ZMQRequestType.DUMP_ROWS:  # type: ignore[arg-type]
+                with monitor.measure(op_type="DUMP_ROWS"):
+                    response_msg = self._handle_dump_rows(request_msg)
+            elif operation == ZMQRequestType.LOAD_ROWS:  # type: ignore[arg-type]
+                with monitor.measure(op_type="LOAD_ROWS"):
+                    response_msg = self._handle_load_rows(request_msg)
             elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                 response_msg = self._handle_load_checkpoint(request_msg)
             else:
@@ -1238,7 +1293,7 @@ class SimpleStorageUnit:
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
             op_stats = {}
-            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
+            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
@@ -1289,6 +1344,100 @@ class SimpleStorageUnit:
             logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
+
+    def _handle_dump_rows(self, request: ZMQMessage) -> ZMQMessage:
+        """Write independent row records and return their offsets, never their payloads."""
+        path = request.body["path"]
+        fields_by_index = request.body["fields_by_index"]
+        try:
+            missing = fields_by_index.keys() - self.storage_data._active_keys
+            if missing:
+                raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
+            row_offsets = {}
+            row_schema = {}
+            with open(path, "wb") as f:
+                for index in sorted(fields_by_index):
+                    # Reused global indexes can retain fields no longer present in metadata.
+                    fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
+                    # Controller metadata can trail the stored values, so report what each
+                    # row actually holds; only type metadata leaves the unit.
+                    row_schema[index] = {
+                        name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+                        for name, value in fields.items()
+                    }
+                    offset = f.tell()
+                    compact_pickle.dump({"global_index": index, "fields": fields}, f)
+                    row_offsets[index] = [offset, f.tell() - offset]
+                f.flush()
+                os.fsync(f.fileno())
+            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={
+                    "success": True,
+                    "dumped_rows": len(fields_by_index),
+                    "missing_rows": [],
+                    "row_offsets": row_offsets,
+                    "row_schema": row_schema,
+                },
+            )
+        except Exception as e:
+            logger.error("[%s]: dump rows failed: %s", self.storage_unit_id, e)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"success": False, "message": str(e)},
+            )
+
+    def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
+        """Seek to assigned records and merge them into local storage at current indexes."""
+        updates = []
+        bytes_read = 0
+        try:
+            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS):
+                for shard in request.body["shards"]:
+                    records = sorted(shard["records"], key=lambda row: row["offset"])
+                    with open(shard["path"], "rb", buffering=0) as f:
+                        # Bound temporary payload memory while retaining batched schema updates.
+                        for start in range(0, len(records), 128):
+                            groups = defaultdict(list)
+                            for row in records[start : start + 128]:
+                                fields = read_dump_row(
+                                    f, row["offset"], row["length"], row["source_index"], row["fields"]
+                                )
+                                validate_dump_values(fields, shard["field_schema"], row["source_index"])
+                                groups[tuple(row["fields"])].append((row, fields))
+                                bytes_read += row["length"]
+                            for signature, rows in groups.items():
+                                indexes = [row["target_index"] for row, _ in rows]
+                                values = {name: [fields[name] for _, fields in rows] for name in signature}
+                                schema = select_dump_schema(
+                                    shard["field_schema"],
+                                    [row["source_index"] for row, _ in rows],
+                                    indexes,
+                                    signature,
+                                )
+                                self.storage_data.put_data(values, indexes)
+                                updates.append({"global_indexes": indexes, "field_schema": schema})
+            logger.info(
+                "[%s]: loaded %s rows (%s bytes)",
+                self.storage_unit_id,
+                sum(len(update["global_indexes"]) for update in updates),
+                bytes_read,
+            )
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
+                sender_id=self.storage_unit_id,
+                body={"success": True, "updates": updates, "bytes_read": bytes_read},
+            )
+        except Exception as e:
+            logger.error("[%s]: load rows failed: %s", self.storage_unit_id, e)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,
                 body={"success": False, "message": str(e)},
             )

@@ -58,6 +58,10 @@ TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEM
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
 TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TIMEOUT", 10))
 
+# A selective dump or load sends one request per unit covering all of its rows, so its duration
+# grows with the selection and shared-filesystem speed rather than with a batch.
+TQ_SIMPLE_STORAGE_DUMP_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_DUMP_TIMEOUT", 3600))
+
 
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
@@ -104,6 +108,12 @@ with_storage_unit_probe_socket = with_zmq_socket(
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
 
+with_storage_unit_dump_socket = with_zmq_socket(
+    get_peer=lambda self, target: self.storage_unit_infos[target],
+    get_pool=lambda self: self.storage_dump_pool,
+    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
+)
+
 
 class RoutingGroup(NamedTuple):
     """Routing result for a single storage unit."""
@@ -140,6 +150,12 @@ class AsyncSimpleStorageManager(StorageManager):
             "put_get_socket",
             timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
             maxsize=1,
+        )
+        self.storage_dump_pool = ZMQSocketPool(
+            self.zmq_context,
+            f"{self.storage_manager_id}_dump",
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_DUMP_TIMEOUT,
         )
 
         self.config = config
@@ -813,6 +829,175 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
 
+    @with_storage_unit_dump_socket
+    async def _dump_single_shard(
+        self,
+        path: str,
+        target_storage_unit: str,
+        fields_by_index: dict[int, list[str]],
+        socket: zmq.Socket = None,
+    ) -> dict[str, Any]:
+        """Ask one storage unit to write the rows it owns into a shard file."""
+        try:
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
+                sender_id=self.storage_manager_id,
+                receiver_id=target_storage_unit,
+                body={"path": path, "fields_by_index": fields_by_index},
+            )
+            await socket.send_multipart(request_msg.serialize(), copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+            if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get("success"):
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
+                    f"{response_msg.body.get('message', 'unknown error')}"
+                )
+            missing_rows = response_msg.body["missing_rows"]
+            if missing_rows:
+                # The controller reported these rows as produced, so a unit that has no
+                # data for them means the two disagree. Never write a half table.
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
+                )
+            return response_msg.body
+        except Exception as e:
+            raise RuntimeError(
+                f"[{self.storage_manager_id}]: Error dumping shard from storage unit {target_storage_unit}: {str(e)}"
+            ) from e
+
+    async def dump_rows_by_index(
+        self,
+        shard_dir: str,
+        fields_by_index: dict[int, list[str]],
+    ) -> dict[str, Any]:
+        """Dump the given rows into one shard per storage unit, in parallel.
+
+        Each unit pickles its own rows in its own process, so the payload never passes
+        through the caller. A unit that owns none of the rows is skipped rather than
+        writing an empty shard.
+
+        Args:
+            shard_dir: Directory to write shard files into.
+            fields_by_index: Global index of each row to dump -> its produced fields.
+
+        Returns:
+            ``{"shards", "row_schema"}``: one ``{"file", "storage_unit_id", "rows",
+            "row_offsets"}`` entry per written shard, and each dumped row's
+            ``{field: (dtype, shape) or None}`` as the owner unit holds it.
+
+        Raises:
+            RuntimeError: A unit holds no data for a row it was asked to dump.
+        """
+        shard_dir_path = Path(shard_dir)
+        shard_dir_path.mkdir(parents=True, exist_ok=True)
+
+        routing = self._group_by_hash(sorted(fields_by_index))
+        targets = [(su_id, group.global_indexes) for su_id, group in routing.items()]
+        paths = [str(shard_dir_path / f"shard_{pos}_{su_id}.pkl") for pos, (su_id, _) in enumerate(targets)]
+
+        results = await asyncio.gather(
+            *(
+                self._dump_single_shard(
+                    path,
+                    target_storage_unit=su_id,
+                    fields_by_index={index: fields_by_index[index] for index in indexes},
+                )
+                for path, (su_id, indexes) in zip(paths, targets, strict=True)
+            ),
+            return_exceptions=True,
+        )
+        shards = []
+        row_schema = {}
+        total_rows = 0
+        for path, (su_id, _), result in zip(paths, targets, results, strict=True):
+            if isinstance(result, BaseException):
+                raise result
+            offsets = result["row_offsets"]
+            total_rows += len(offsets)
+            row_schema.update(result["row_schema"])
+            shards.append(
+                {
+                    "file": Path(path).name,
+                    "storage_unit_id": su_id,
+                    "rows": len(offsets),
+                    "row_offsets": offsets,
+                }
+            )
+
+        logger.info(
+            f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"
+        )
+        return {"shards": shards, "row_schema": row_schema}
+
+    async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
+        """Have current owner units read assigned byte ranges concurrently, then publish metadata.
+
+        Metadata is published only after every unit succeeded, so writes to new keys stay
+        invisible after a failure, while fields existing keys already produced are
+        overwritten in place. Retrying rewrites the same target indexes.
+
+        Returns:
+            Payload bytes read by the units.
+        """
+        assignments = defaultdict(list)
+        for shard in shards:
+            rows = shard["records"]
+            for unit_id, group in self._group_by_hash([row["target_index"] for row in rows]).items():
+                assignments[unit_id].append(
+                    {
+                        **shard,
+                        "records": [rows[pos] for pos in group.batch_positions],
+                    }
+                )
+        results = await asyncio.gather(
+            *(self._load_selected_rows(shards, target_storage_unit=unit_id) for unit_id, shards in assignments.items()),
+            return_exceptions=True,
+        )
+        loaded = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            loaded.append(result)
+        # One update per (shard, unit, batch, field set): sequential round trips would
+        # dominate a wide cross-topology load. The notify pool bounds the concurrency.
+        await asyncio.gather(
+            *(
+                self.notify_data_update(partition_id, update["global_indexes"], update["field_schema"])
+                for result in loaded
+                for update in result["updates"]
+            )
+        )
+        bytes_read = sum(result["bytes_read"] for result in loaded)
+        logger.info(
+            "[%s]: loaded %s bytes across %s units",
+            self.storage_manager_id,
+            bytes_read,
+            len(assignments),
+        )
+        return bytes_read
+
+    @with_storage_unit_dump_socket
+    async def _load_selected_rows(
+        self,
+        shards: list[dict[str, Any]],
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ) -> dict[str, Any]:
+        request = ZMQMessage.create(
+            request_type=ZMQRequestType.LOAD_ROWS,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={"shards": shards},
+        )
+        await socket.send_multipart(request.serialize(), copy=False)
+        response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+        if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
+            raise RuntimeError(
+                f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
+            )
+        return response.body
+
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
 
@@ -878,4 +1063,7 @@ class AsyncSimpleStorageManager(StorageManager):
         probe_pool = getattr(self, "storage_probe_pool", None)
         if probe_pool is not None:
             probe_pool.close()
+        dump_pool = getattr(self, "storage_dump_pool", None)
+        if dump_pool is not None:
+            dump_pool.close()
         super().close()
