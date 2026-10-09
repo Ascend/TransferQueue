@@ -882,7 +882,7 @@ class AsyncSimpleStorageManager(StorageManager):
             fields_by_index: Global index of each row to dump -> its produced fields.
 
         Returns:
-            ``{"shards", "row_schema"}``: one ``{"position", "storage_unit_id", "rows",
+            ``{"shards", "row_schema"}``: one ``{"file", "storage_unit_id", "rows",
             "row_offsets"}`` entry per written shard, and each dumped row's
             ``{field: (dtype, shape) or None}`` as the owner unit holds it.
 
@@ -910,7 +910,7 @@ class AsyncSimpleStorageManager(StorageManager):
         shards = []
         row_schema = {}
         total_rows = 0
-        for pos, ((su_id, _), result) in enumerate(zip(targets, results, strict=True)):
+        for path, (su_id, _), result in zip(paths, targets, results, strict=True):
             if isinstance(result, BaseException):
                 raise result
             offsets = result["row_offsets"]
@@ -918,7 +918,7 @@ class AsyncSimpleStorageManager(StorageManager):
             row_schema.update(result["row_schema"])
             shards.append(
                 {
-                    "position": pos,
+                    "file": Path(path).name,
                     "storage_unit_id": su_id,
                     "rows": len(offsets),
                     "row_offsets": offsets,

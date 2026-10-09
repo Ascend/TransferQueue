@@ -67,8 +67,8 @@ shards/
 ```
 
 Each shard is a sequence of independent pickle records containing a source global
-index and a field/value mapping. `shard_info.json` records each source index's
-`[offset, length]`. Source indexes only locate records; they are never reused as
+index and a field/value mapping. `shard_info.json` records each shard's file name
+and each source index's `[offset, length]`. Source indexes only locate records; they are never reused as
 current indexes without controller resolution.
 
 Loading unpickles `row_index.pt` and every shard record, which can run arbitrary

@@ -25,7 +25,7 @@ Layout::
         dump_info.json                # version, partition, counts
         row_index.pt                  # key -> {global_index, fields, tag}
         shards/
-            shard_info.json           # unit, row count, source index -> [offset, length]
+            shard_info.json           # file, unit, row count, source index -> [offset, length]
             shard_<N>_<su_id>.pkl      # independent {global_index, fields} records
 """
 
@@ -195,7 +195,7 @@ def read_dump(dump_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     shards = []
     seen = set()
     for record in shard_records:
-        path = shard_dir / f"shard_{record['position']}_{record['storage_unit_id']}.pkl"
+        path = shard_dir / record["file"]
         if not path.is_file():
             raise FileNotFoundError(f"Missing dump shard: {path}")
         records = []
