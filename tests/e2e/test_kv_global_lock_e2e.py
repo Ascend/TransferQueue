@@ -85,7 +85,7 @@ def wait_until(predicate):
 
 
 def holders():
-    # Exit sends its release without waiting for it, so wait for holders to drain, not assert.
+    # Exit sends its release without waiting for it, so wait for holders and waiters to drain.
     return {h["key"] for h in tq.kv_lock_list(P)["holders"]}
 
 
@@ -134,7 +134,7 @@ def test_multi_shard_timeout_releases_the_earlier_shard():
         with tq.kv_global_lock([early, late], P, timeout=0.5):
             pass
     wait_until(lambda: holders() == {late})
-    assert tq.kv_lock_list(P)["waiters"] == 0
+    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0)
     with tq.kv_global_lock(early, P, timeout=5):  # a leaked grant would hold it for its 30 s lease
         pass
     ray.get(worker.release.remote(), timeout=TIMEOUT_S)
@@ -171,7 +171,7 @@ def test_timeout_leaves_no_holder_or_waiter():
     with pytest.raises(TimeoutError):
         with tq.kv_global_lock("t", P, timeout=0.3):
             pass
-    assert tq.kv_lock_list(P)["waiters"] == 0
+    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0)
     ray.get(worker.release.remote(), timeout=TIMEOUT_S)
     wait_until(lambda: tq.kv_lock_list(P) == {"holders": [], "waiters": 0})
 
@@ -259,6 +259,7 @@ def test_waiters_are_granted_in_arrival_order(own_manager):
     wait_until(lambda: n_waiters(own_manager) == 1)
     # b is free, but granting it past the older [a, b] request would let single-key traffic starve it.
     assert ray.get(acquire(own_manager, ["b"], "newcomer", timeout=0), timeout=TIMEOUT_S) is None
+    ray.get(own_manager.release.remote("newcomer"), timeout=TIMEOUT_S)  # as kv_global_lock does on timeout
     only_b = acquire(own_manager, ["b"], "only_b")
     wait_until(lambda: n_waiters(own_manager) == 2)
     ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
@@ -268,12 +269,24 @@ def test_waiters_are_granted_in_arrival_order(own_manager):
     assert ray.get(only_b, timeout=TIMEOUT_S) is not None
 
 
-def test_a_waiter_that_gives_up_lets_the_next_one_through(own_manager):
+def test_a_timed_out_call_keeps_its_place_until_withdrawn(own_manager):
     ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
-    both = acquire(own_manager, ["a", "b"], "both", timeout=0.5)
-    wait_until(lambda: n_waiters(own_manager) == 1)
+    assert ray.get(acquire(own_manager, ["a"], "first", timeout=0.1), timeout=TIMEOUT_S) is None
+    second = acquire(own_manager, ["a"], "second")
+    wait_until(lambda: n_waiters(own_manager) == 2)
+    ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
+    assert ray.get(own_manager.wait.remote("first", TIMEOUT_S), timeout=TIMEOUT_S) > 0
+    assert n_waiters(own_manager) == 1
+    ray.get(own_manager.release.remote("first"), timeout=TIMEOUT_S)
+    assert ray.get(second, timeout=TIMEOUT_S) is not None
+
+
+def test_a_waiter_that_withdraws_lets_the_next_one_through(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    assert ray.get(acquire(own_manager, ["a", "b"], "both", timeout=0.1), timeout=TIMEOUT_S) is None
     only_b = acquire(own_manager, ["b"], "only_b")
-    assert ray.get(both, timeout=TIMEOUT_S) is None
+    wait_until(lambda: n_waiters(own_manager) == 2)
+    ray.get(own_manager.release.remote("both"), timeout=TIMEOUT_S)
     assert ray.get(only_b, timeout=TIMEOUT_S) is not None
 
 

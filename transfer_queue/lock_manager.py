@@ -26,8 +26,8 @@ import ray
 _WITHDRAWN_TTL_S = 300
 
 
-# Every waiting acquire occupies a concurrency slot, so the limit sits far above Ray's async
-# default of 1000 to keep renew and release from queueing behind waiters.
+# A waiting acquire or wait call holds a concurrency slot for at most the caller's poll
+# window, so even if waiters take every slot, renew and release get one within that window.
 @ray.remote(num_cpus=0, max_concurrency=10_000)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
@@ -107,7 +107,7 @@ class TransferQueueLockManager:
             self._timer = asyncio.get_running_loop().call_later(max(0.0, self._timer_at - now), self._expire)
 
     async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards):
-        """Grant all ``names`` at once; return the seconds waited, or None on timeout or withdrawal."""
+        """Queue ``token`` for all ``names`` at once, then wait for the grant as ``wait`` does."""
         # A caller that hashed over another shard count may send a key to the wrong shard,
         # where nothing excludes the callers that sent it to the right one.
         if num_shards != self._num_shards:
@@ -115,26 +115,29 @@ class TransferQueueLockManager:
                 f"kv_global_lock hashed keys over {num_shards} lock shards, but lock.num_shards is "
                 f"{self._num_shards}; TransferQueue restarted, so call tq.close() and tq.init() again"
             )
-        start = time.monotonic()
         if self._withdrawn.pop(token, None) is not None:
             return None
         if not any(name in self._holder or name in self._queues for name in names):
             self._grant(token, names, lease_s, holder_info)
         else:
-            done = asyncio.Event()
-            self._waiting[token] = dict(names=names, lease_s=lease_s, info=holder_info, done=done)
+            self._waiting[token] = dict(names=names, lease_s=lease_s, info=holder_info, done=asyncio.Event())
             for name in names:
                 self._queues.setdefault(name, deque()).append(token)
+        return await self.wait(token, timeout)
+
+    async def wait(self, token: str, timeout: float) -> float | None:
+        """Return the seconds left on ``token``'s lease once granted, else None after ``timeout``.
+
+        A waiter that times out keeps its place in the queues; only ``release`` withdraws it.
+        """
+        waiter = self._waiting.get(token)
+        if waiter is not None:
             try:
-                await asyncio.wait_for(done.wait(), timeout)
+                await asyncio.wait_for(waiter["done"].wait(), timeout)
             except asyncio.TimeoutError:
                 pass
-            finally:
-                if token in self._waiting:  # timed out or cancelled before a grant
-                    self._hand_off(self._leave_queues(token)["names"])
-            if token not in self._leases:  # withdrawn, or already released by a caller that left
-                return None
-        return self._leases[token]["granted_at"] - start
+        lease = self._leases.get(token)
+        return None if lease is None else lease["expires_at"] - time.monotonic()
 
     def num_shards(self) -> int:
         """Return the global shard count recorded by this manager."""
@@ -159,7 +162,7 @@ class TransferQueueLockManager:
         if token in self._waiting:
             waiter = self._leave_queues(token)
             self._hand_off(waiter["names"])
-            waiter["done"].set()  # its acquire finds no lease and returns None
+            waiter["done"].set()  # its pending call finds no lease and returns None
         else:
             now = time.monotonic()
             self._withdrawn = {t: until for t, until in self._withdrawn.items() if until > now}

@@ -38,7 +38,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 
 import ray
-from ray.exceptions import RayActorError
+from ray.exceptions import GetTimeoutError, RayActorError
 
 from transfer_queue.lock_manager import TransferQueueLockManager
 
@@ -203,6 +203,9 @@ _renewer_running = False
 _num_shards: int | None = None  # lock.num_shards, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
+# Longest one call waits inside a lock actor; waiting longer takes another call that keeps
+# the queue position. Bounding each call keeps waiters from pinning the actor's concurrency slots.
+_POLL_S = 1.0
 _NOT_INITIALIZED = (
     "TransferQueueLockManager not found; kv_global_lock needs `lock.enabled: true` "
     "in the config of the tq.init() that starts TransferQueue"
@@ -273,22 +276,31 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
     return GlobalLease(names, dict(sorted(shards.items())), lease_s)
 
 
-def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
+def _poll_window(deadline: float | None) -> float:
+    remaining = _remaining(deadline)
+    return _POLL_S if remaining is None else min(_POLL_S, remaining)
+
+
+def _send_acquire(lease: GlobalLease, shard: int, window: float):
+    """Queue for ``shard`` on the first call, then keep waiting there; reply as the actor's ``wait``."""
     manager = _lock_manager(shard)
+    if shard in lease.pending:
+        return manager.wait.remote(lease.token, window)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
     lease.pending.append(shard)
-    return manager.acquire.remote(
-        lease.shards[shard], lease.token, _remaining(deadline), lease.lease_s, holder, _shard_count()
-    )
+    return manager.acquire.remote(lease.shards[shard], lease.token, window, lease.lease_s, holder, _shard_count())
 
 
-def _take_grant(lease: GlobalLease, shard: int, waited: float | None, sent: float) -> None:
+def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: float, deadline: float | None) -> bool:
+    """Record a reply from ``shard``; return whether it granted, or raise once ``deadline`` passed."""
     global _renewer_running
-    if waited is None:
-        lease.pending.remove(shard)
-        raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
-    # The grant happened at least `waited` after `sent`, so this never outlives the shard's lease.
-    lease.deadline = min(lease.deadline, sent + waited + lease.lease_s)
+    if remaining is None:
+        if deadline is not None and time.monotonic() >= deadline:
+            # Still queued there, so exit's release must withdraw it: the shard stays pending.
+            raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
+        return False
+    # The reply left the actor after `sent`, so this never outlives the shard's lease.
+    lease.deadline = min(lease.deadline, sent + remaining)
     # Renew from the first grant on: waiting on a later shard may outlast an earlier one's lease.
     with _registry:
         lease.granted.append(shard)
@@ -297,6 +309,7 @@ def _take_grant(lease: GlobalLease, shard: int, waited: float | None, sent: floa
         if not _renewer_running:
             _renewer_running = True
             threading.Thread(target=_renew_loop, name="kv_global_lock_renewer", daemon=True).start()
+    return True
 
 
 def _release_lease(lease: GlobalLease) -> None:
@@ -381,12 +394,17 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
         # Every caller visits shards in ascending order, so no two callers can each hold a
         # shard the other awaits: multi-shard requests cannot deadlock.
         for shard in lease.shards:
-            sent = time.monotonic()
-            try:
-                waited = ray.get(_send_acquire(lease, shard, deadline))
-            except RayActorError as e:
-                raise RuntimeError(_MANAGER_GONE) from e
-            _take_grant(lease, shard, waited, sent)
+            granted = False
+            while not granted:
+                window, sent = _poll_window(deadline), time.monotonic()
+                try:
+                    # Bounded, so an unresponsive actor cannot outlast the caller's timeout.
+                    remaining = ray.get(_send_acquire(lease, shard, window), timeout=window + _POLL_S)
+                except GetTimeoutError:
+                    remaining = None
+                except RayActorError as e:
+                    raise RuntimeError(_MANAGER_GONE) from e
+                granted = _take_grant(lease, shard, remaining, sent, deadline)
         lease.check()
         yield lease
         lease.check()
@@ -405,12 +423,16 @@ async def async_kv_global_lock(
     _holding_global.set(True)
     try:
         for shard in lease.shards:
-            sent = time.monotonic()
-            try:
-                waited = await _send_acquire(lease, shard, deadline)
-            except RayActorError as e:
-                raise RuntimeError(_MANAGER_GONE) from e
-            _take_grant(lease, shard, waited, sent)
+            granted = False
+            while not granted:
+                window, sent = _poll_window(deadline), time.monotonic()
+                try:
+                    remaining = await asyncio.wait_for(_send_acquire(lease, shard, window), window + _POLL_S)
+                except asyncio.TimeoutError:
+                    remaining = None
+                except RayActorError as e:
+                    raise RuntimeError(_MANAGER_GONE) from e
+                granted = _take_grant(lease, shard, remaining, sent, deadline)
         lease.check()
         yield lease
         lease.check()
