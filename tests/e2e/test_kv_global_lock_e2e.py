@@ -34,6 +34,7 @@ TIMEOUT_S = 60
 CONF = {
     "controller": {"polling_mode": True},
     "backend": {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 100}},
+    "lock": {"enabled": True},
 }
 
 
@@ -343,13 +344,13 @@ def test_owner_close_kills_the_managers_and_fails_waiters():
         held.__exit__(None, None, None)
 
     wait_until(lambda: actors_named("TransferQueueLockManager_") == [])
-    with pytest.raises(RuntimeError, match="call tq.init"):
+    with pytest.raises(RuntimeError, match="lock.enabled"):
         tq.kv_lock_list()
 
 
 def test_one_lock_shard_still_works():
     wait_until(lambda: actors_named("TransferQueue") == [])
-    tq.init(OmegaConf.create({**CONF, "controller": {"polling_mode": True, "num_lock_shards": 1}}))
+    tq.init(OmegaConf.create({**CONF, "lock": {"enabled": True, "num_shards": 1}}))
     assert actors_named("TransferQueueLockManager_") == ["TransferQueueLockManager_0"]
     with tq.kv_global_lock(["a", "b"], P, timeout=5) as lease:
         assert holders() == {"a", "b"} and list(lease.shards) == [0]

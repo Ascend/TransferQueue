@@ -12,10 +12,15 @@ controller:
   sampler: SequentialSampler
   # Whether return an empty BatchMeta to prevent request blocking when no enough data is available
   polling_mode: False
-  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
-  num_lock_shards: 8
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
+
+# Cluster-wide KV key locks (kv_global_lock). The process-local kv_local_lock needs none of this.
+lock:
+  # Whether tq.init() starts the lock actors; kv_global_lock raises while this is false.
+  enabled: false
+  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
+  num_shards: 8
 
 
 backend:

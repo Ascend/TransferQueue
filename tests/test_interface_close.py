@@ -15,12 +15,15 @@
 
 """Unit tests for `close()` ownership: only the process that created TransferQueue tears it down."""
 
+import importlib
 from unittest.mock import MagicMock
 
 import pytest
 from omegaconf import OmegaConf
 
 import transfer_queue.interface as iface
+
+kvl = importlib.import_module("transfer_queue.kv_lock")
 
 STORED_CONF = OmegaConf.create(
     {"controller": {"zmq_info": None}, "backend": {"storage_backend": "SimpleStorage", "SimpleStorage": {}}}
@@ -32,6 +35,7 @@ def fake(monkeypatch):
     for name in ("_TQ_CLIENT", "_TQ_STORAGE", "_TQ_CONTROLLER"):
         monkeypatch.setattr(iface, name, None)
     monkeypatch.setattr(iface, "_TQ_IS_OWNER", False)
+    monkeypatch.setattr(kvl, "_owned", [])
 
     controller = MagicMock(name="controller")
     ray = MagicMock(name="ray")
@@ -39,35 +43,37 @@ def fake(monkeypatch):
     controller_cls = MagicMock(name="TransferQueueController")
     controller_cls.options.return_value.remote.return_value = controller
     monkeypatch.setattr(iface, "ray", ray)
+    monkeypatch.setattr(kvl, "ray", ray)
     monkeypatch.setattr(iface, "TransferQueueController", controller_cls)
-    monkeypatch.setattr(iface, "TransferQueueLockManager", MagicMock(name="TransferQueueLockManager"))
+    monkeypatch.setattr(kvl, "TransferQueueLockManager", MagicMock(name="TransferQueueLockManager"))
     monkeypatch.setattr(iface, "TransferQueueClient", MagicMock(name="TransferQueueClient"))
     monkeypatch.setattr(iface, "process_zmq_server_info", MagicMock(return_value=None))
     monkeypatch.setattr(iface, "_maybe_create_tq_storage", lambda conf: conf)
     return ray, controller, controller_cls
 
 
-def test_owner_close_kills_controller(fake):
+@pytest.mark.parametrize("lock_enabled", [False, True], ids=["locks_off", "locks_on"])
+def test_owner_close_kills_controller(fake, lock_enabled):
     ray, controller, _ = fake
     ray.get_actor.side_effect = ValueError("no controller yet")
 
-    iface.init(OmegaConf.create({}))
-    client, lock_managers = iface._TQ_CLIENT, iface._TQ_LOCK_MANAGERS
-    assert iface._TQ_IS_OWNER and len(lock_managers) == 8
+    iface.init(OmegaConf.create({"lock": {"enabled": lock_enabled}}))
+    client, lock_managers = iface._TQ_CLIENT, kvl._owned
+    assert iface._TQ_IS_OWNER and len(lock_managers) == (8 if lock_enabled else 0)
 
     iface.close()
     client.close.assert_called_once()
-    assert [c.args for c in ray.kill.call_args_list] == [(controller,)] + [(m,) for m in lock_managers]
+    assert [c.args for c in ray.kill.call_args_list] == [(m,) for m in lock_managers] + [(controller,)]
     assert (iface._TQ_CLIENT, iface._TQ_CONTROLLER, iface._TQ_IS_OWNER) == (None, None, False)
-    assert iface._TQ_LOCK_MANAGERS == []
+    assert kvl._owned == []
 
 
-@pytest.mark.parametrize("num_lock_shards", [0, "8"])
-def test_init_rejects_invalid_num_lock_shards(fake, num_lock_shards):
+@pytest.mark.parametrize("num_shards", [0, "8"])
+def test_init_rejects_invalid_lock_num_shards(fake, num_shards):
     ray, _, controller_cls = fake
     ray.get_actor.side_effect = ValueError("no controller yet")
-    with pytest.raises(ValueError, match="num_lock_shards"):
-        iface.init(OmegaConf.create({"controller": {"num_lock_shards": num_lock_shards}}))
+    with pytest.raises(ValueError, match="lock.num_shards"):
+        iface.init(OmegaConf.create({"lock": {"enabled": True, "num_shards": num_shards}}))
     controller_cls.options.assert_not_called()
 
 

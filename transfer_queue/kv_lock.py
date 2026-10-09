@@ -23,7 +23,8 @@ to a single call.
 
 ``kv_global_lock`` and ``async_kv_global_lock`` do the same across the Ray cluster through
 ``TransferQueueLockManager`` actors that split keys by hash, under a lease that renews
-automatically. Take a global lock before a local one, never inside it.
+automatically. ``tq.init()`` starts those actors only with ``lock.enabled: true``. Take a
+global lock before a local one, never inside it.
 """
 
 import asyncio
@@ -38,6 +39,8 @@ from contextvars import ContextVar
 
 import ray
 from ray.exceptions import RayActorError
+
+from transfer_queue.lock_manager import TransferQueueLockManager
 
 # Not asyncio.Lock: it is bound to one event loop and is not thread-safe, while a process
 # may run several loops plus plain threads. A key is held exactly while it is in _table,
@@ -197,9 +200,13 @@ _holding_global: ContextVar[bool] = ContextVar("_holding_kv_global_lock", defaul
 _registry = threading.Condition()
 _leases: dict[str, "GlobalLease"] = {}
 _renewer_running = False
-_num_shards: int | None = None  # controller.num_lock_shards, asked of shard 0 on first use
+_num_shards: int | None = None  # lock.num_shards, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
-_NOT_INITIALIZED = "TransferQueueLockManager not found; call tq.init() first"
+_owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
+_NOT_INITIALIZED = (
+    "TransferQueueLockManager not found; kv_global_lock needs `lock.enabled: true` "
+    "in the config of the tq.init() that starts TransferQueue"
+)
 _MANAGER_GONE = "The TransferQueueLockManager actor is gone; did the process that ran tq.init() call tq.close()?"
 
 
@@ -239,10 +246,14 @@ def _shard(name: tuple[str, str], num_shards: int) -> int:
     return zlib.crc32(f"{name[0]}\0{name[1]}".encode()) % num_shards
 
 
+def _manager_name(shard: int) -> str:
+    return f"TransferQueueLockManager_{shard}"
+
+
 def _lock_manager(shard: int):
     if shard not in _managers:
         try:
-            _managers[shard] = ray.get_actor(f"TransferQueueLockManager_{shard}", namespace="transfer_queue")
+            _managers[shard] = ray.get_actor(_manager_name(shard), namespace="transfer_queue")
         except ValueError:
             raise RuntimeError(_NOT_INITIALIZED) from None
     return _managers[shard]
@@ -346,7 +357,7 @@ def _renew_loop() -> None:
 def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | None = None, lease_s: float = 30):
     """Hold an exclusive cluster-wide lock on ``keys`` in ``partition_id``; yield a ``GlobalLease``.
 
-    The locks live in the ``controller.num_lock_shards`` actors that ``tq.init()`` creates,
+    The locks live in the ``lock.num_shards`` actors that ``tq.init()`` creates,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
     background thread renews. Each actor grants in arrival order: a request waits behind
     every earlier one that shares a key with it. Keys on several actors are taken one actor
@@ -414,23 +425,47 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
     return {"holders": [h for r in replies for h in r["holders"]], "waiters": sum(r["waiters"] for r in replies)}
 
 
-def _detach_lock_managers(release: bool) -> None:
-    """Called by ``tq.close()``: give up this process's global leases and forget the actor handles."""
-    global _num_shards, _managers
+def _check_lock_conf(lock_conf) -> None:
+    """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
+    if lock_conf.enabled and (not isinstance(lock_conf.num_shards, int) or lock_conf.num_shards < 1):
+        raise ValueError(f"lock.num_shards must be an integer >= 1, got {lock_conf.num_shards!r}")
+
+
+def _start_lock_managers(lock_conf) -> None:
+    """Called by the ``tq.init()`` that created the controller: start the lock actors if enabled."""
+    global _owned
+    if lock_conf.enabled:
+        # Created here rather than on first lock: a non-detached actor dies with its creator.
+        _owned = [
+            TransferQueueLockManager.options(  # type: ignore[attr-defined]
+                name=_manager_name(shard), namespace="transfer_queue", get_if_exists=True
+            ).remote(lock_conf.num_shards)
+            for shard in range(lock_conf.num_shards)
+        ]
+
+
+def _close_lock_managers() -> None:
+    """Called by ``tq.close()``: give up this process's leases, then kill the actors it created."""
+    global _num_shards, _managers, _owned
     with _registry:
         leases = list(_leases.values())
     for lease in leases:
         lease.lost = True
-        if release:
+        if not _owned:  # the owner kills the actors, so releasing would only hand keys to doomed waiters
             _release_lease(lease)
-    _num_shards, _managers = None, {}
+    for actor in _owned:
+        try:
+            ray.kill(actor)
+        except Exception:
+            pass
+    _num_shards, _managers, _owned = None, {}, []
 
 
 def _reset_after_fork() -> None:
     # The child inherits keys, leases and Ray handles that belong to threads and connections it lacks.
-    global _state_lock, _table, _registry, _leases, _renewer_running, _managers
+    global _state_lock, _table, _registry, _leases, _renewer_running, _managers, _owned
     _state_lock, _table = threading.Lock(), {}
-    _registry, _leases, _renewer_running, _managers = threading.Condition(), {}, False, {}
+    _registry, _leases, _renewer_running, _managers, _owned = threading.Condition(), {}, False, {}, []
 
 
 os.register_at_fork(after_in_child=_reset_after_fork)

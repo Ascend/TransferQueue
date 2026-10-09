@@ -399,3 +399,7 @@ def test_kv_local_lock_serializes_simple_storage_read_modify_write(simple_storag
         assert not thread.is_alive()
     assert tq.kv_batch_get("counter", "lock_e2e")["v"][0].item() == 400
     tq.kv_clear("counter", "lock_e2e")
+    # The default config starts no lock actors: the local lock works, the global one says why not.
+    with pytest.raises(RuntimeError, match="lock.enabled"):
+        with tq.kv_global_lock("counter", "lock_e2e"):
+            pass
