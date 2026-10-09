@@ -941,8 +941,9 @@ class AsyncSimpleStorageManager(StorageManager):
     async def load_rows_by_index(self, partition_id: str, shards: list[dict[str, Any]]) -> int:
         """Have current owner units read assigned byte ranges concurrently, then publish metadata.
 
-        Metadata is published only after every unit succeeded, so a failed load leaves its
-        payload writes invisible; retrying rewrites the same target indexes.
+        Metadata is published only after every unit succeeded, so writes to new keys stay
+        invisible after a failure, while fields existing keys already produced are
+        overwritten in place. Retrying rewrites the same target indexes.
 
         Returns:
             Payload bytes read by the units.

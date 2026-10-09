@@ -1230,8 +1230,8 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
     SimpleStorage units read their assigned indexed records directly and in parallel.
     New keys receive current indexes; unrelated rows and fields remain untouched.
     Writers and clears for these keys must be paused during restore. As with
-    ``kv_batch_put``, a failure may leave new keys registered and payload partially
-    written; retrying is idempotent.
+    ``kv_batch_put``, a failure may leave new keys registered and existing keys' fields
+    partially overwritten; retrying is idempotent.
 
     Args:
         dump_dir: Directory previously written by ``dump_data_by_key``. It must be
