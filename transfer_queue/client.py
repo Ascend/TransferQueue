@@ -492,6 +492,36 @@ class AsyncTransferQueueClient:
 
         return metadata
 
+    async def async_update(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+    ) -> BatchMeta:
+        """Merge new values into produced fields on SimpleStorage units.
+
+        Args:
+            metadata: Samples to update. The key must already exist.
+            values: New values aligned with ``metadata``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)``.
+
+        Returns:
+            The same metadata with field_schema and production status updated.
+
+        Raises:
+            NotImplementedError: If the storage backend is not SimpleStorage.
+        """
+        if not hasattr(self, "storage_manager") or self.storage_manager is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                "Call initialize_storage_manager() before performing storage operations."
+            )
+        if not metadata or metadata.size == 0:
+            raise ValueError("metadata cannot be none or empty")
+
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn)
+        return metadata.apply_field_schema(field_schema)
+
     async def async_get_data(self, metadata: BatchMeta) -> TensorDict:
         """Asynchronously fetch data from storage units and organize into TensorDict.
 
@@ -980,6 +1010,29 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}] Failed in async_kv_retrieve_meta: {e}") from e
 
+    async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
+        """Clear fields of existing keys while keeping the keys, tags and consumption status.
+
+        The controller marks the fields as unproduced before storage deletes them, so no
+        reader sees a ready field whose value is gone.
+        """
+        metadata = await self._kv_clear_fields_in_controller(keys, partition_id, fields)
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata, fields=metadata.field_names)
+
+    @with_controller_socket
+    async def _kv_clear_fields_in_controller(
+        self, keys: list[str], partition_id: str, fields: list[str], socket=None
+    ) -> BatchMeta:
+        """Clear fields in the controller and return the cleared cells' metadata."""
+        response_msg = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_CLEAR_FIELDS,
+            response_type=ZMQRequestType.KV_CLEAR_FIELDS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "fields": fields},
+        )
+        return response_msg.body["metadata"]
+
     @with_controller_socket
     async def async_kv_retrieve_keys(
         self,
@@ -1389,6 +1442,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         # Bind internal sync wrappers. Public methods are defined explicitly below
         # to ensure proper type hints and documentation.
         self._put = _make_sync(self.async_put)
+        self._update = _make_sync(self.async_update)
         self._get_meta = _make_sync(self.async_get_meta)
         self._get_data = _make_sync(self.async_get_data)
         self._clear_partition = _make_sync(self.async_clear_partition)
@@ -1578,6 +1632,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> metadata = client.put(data=prompts_repeated_batch, partition_id=current_partition_id)
         """
         return self._put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
+
+    def update(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+    ) -> BatchMeta:
+        """Synchronously merge new values into produced fields on SimpleStorage units.
+
+        See ``async_update``.
+        """
+        return self._update(metadata, values, merge_fn)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.

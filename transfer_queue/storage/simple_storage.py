@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import numpy as np
@@ -110,6 +110,18 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+
+def _describe_stored_values(values: list) -> dict[str, Any]:
+    """Describe per-sample stored values for the manager.
+
+    A unit only holds part of a batch, so it reports one shape per sample and
+    leaves ``shapes=None`` for a column it cannot describe as tensors; only the
+    manager sees the whole batch and can turn this into a field_schema.
+    """
+    if not all(isinstance(v, torch.Tensor) for v in values):
+        return {"dtype": None, "shapes": None}
+    return {"dtype": values[0].dtype, "shapes": [tuple(v.shape) for v in values]}
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -210,6 +222,7 @@ class StorageUnitData:
                     f"StorageUnitData put_data: field '{f}' values length {len(values)} "
                     f"!= global_indexes length {len(global_indexes)}, length mismatch"
                 )
+        for f, values in field_data.items():
             if f not in self.field_data:
                 self.field_data[f] = {}
             field_dict = self.field_data[f]
@@ -217,16 +230,56 @@ class StorageUnitData:
                 field_dict[key] = val
         self._active_keys.update(global_indexes)
 
-    def clear(self, keys: list[int]) -> None:
+    def apply_update(
+        self,
+        global_indexes: list[int],
+        new_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        field_schema: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, Any]]:
+        """Merge produced values, validate their types, then write once.
+
+        All merge calls and type checks finish before one ``put_data`` call, so
+        a merge error or incompatible result leaves storage unchanged.
+
+        Returns:
+            Per-sample description of the stored values, keyed by field name.
+        """
+        computed: dict[str, list] = {}
+        for field, new_values in new_data.items():
+            stored = self.field_data.get(field, {})
+            missing = [idx for idx in global_indexes if idx not in stored]
+            if missing:
+                raise ValueError(f"Cannot update unproduced field {field!r} for indexes {missing[:20]}")
+            old_values = self.get_data([field], global_indexes)[field]
+            computed[field] = [merge_fn(old, new_values[i]) for i, old in enumerate(old_values)]
+
+            expected = field_schema[field]
+            if expected.get("is_non_tensor"):
+                if any(isinstance(value, torch.Tensor) for value in computed[field]):
+                    raise TypeError(f"Merge result for non-tensor field {field!r} must remain non-tensor")
+            else:
+                for value in computed[field]:
+                    if not isinstance(value, torch.Tensor) or value.dtype != expected["dtype"]:
+                        actual = value.dtype if isinstance(value, torch.Tensor) else type(value).__name__
+                        raise TypeError(
+                            f"Merge result for tensor field {field!r} must keep dtype {expected['dtype']}, got {actual}"
+                        )
+        self.put_data(computed, global_indexes)
+        return {field: _describe_stored_values(values) for field, values in computed.items()}
+
+    def clear(self, keys: list[int], fields: list[str] | None = None) -> None:
         """Remove data at given global index keys, immediately freeing memory.
 
         Args:
             keys: Global indexes to remove.
+            fields: If given, remove only these fields and keep the samples.
         """
-        for f in self.field_data:
+        for f in self.field_data if fields is None else set(fields) & self.field_data.keys():
             for key in keys:
                 self.field_data[f].pop(key, None)
-        self._active_keys -= set(keys)
+        if fields is None:
+            self._active_keys -= set(keys)
 
     def save_checkpoint(self, path: str | Path, storage_unit_id: str) -> None:
         """Write in-memory storage state to a checkpoint."""
@@ -551,38 +604,47 @@ class HybridStorageUnitData(StorageUnitData):
         unique_global_indexes = set(global_indexes)
         has_duplicate_indexes = len(unique_global_indexes) != len(global_indexes)
 
-        for field, values in field_data.items():
-            prepared_values, entries, fallback_values = self._prepare_field_values(values)
-
+        old_ssd_values = []
+        for field in field_data:
             stored_field = self.field_data.get(field, {})
-            old_ssd_values = []
             for global_index in unique_global_indexes:
                 old_value = stored_field.get(global_index)
                 if isinstance(old_value, _SSDValueRef):
                     old_ssd_values.append(old_value)
-            try:
-                super().put_data({field: prepared_values}, global_indexes)
-            except Exception:
-                for entry in entries:
-                    self._ssd_store.unlink(entry)
-                raise
 
-            obsolete_ssd_values = old_ssd_values
-            if has_duplicate_indexes:
-                retained_ssd_paths = set()
+        # Write every field's files before replacing any value: kv_update merge functions are not
+        # idempotent, so a failure on a later field must not leave earlier fields committed.
+        prepared_data = {}
+        entries: list[_SSDValueRef] = []
+        fallback_values = 0
+        try:
+            for field, values in field_data.items():
+                prepared_data[field], field_entries, field_fallback_values = self._prepare_field_values(values)
+                entries.extend(field_entries)
+                fallback_values += field_fallback_values
+            super().put_data(prepared_data, global_indexes)
+        except Exception:
+            for entry in entries:
+                self._ssd_store.unlink(entry)
+            raise
+
+        obsolete_ssd_values = old_ssd_values
+        if has_duplicate_indexes:
+            retained_ssd_paths = set()
+            for field in field_data:
                 for global_index in unique_global_indexes:
                     retained_value = self.field_data[field][global_index]
                     if isinstance(retained_value, _SSDValueRef):
                         retained_ssd_paths.add(retained_value.path)
-                obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
+            obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
 
-            self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
-            self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
-                value.size_bytes for value in obsolete_ssd_values
-            )
-            self._ssd_fallback_values_total += fallback_values
-            for obsolete_value in obsolete_ssd_values:
-                self._ssd_store.unlink(obsolete_value)
+        self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
+        self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
+            value.size_bytes for value in obsolete_ssd_values
+        )
+        self._ssd_fallback_values_total += fallback_values
+        for obsolete_value in obsolete_ssd_values:
+            self._ssd_store.unlink(obsolete_value)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Read mixed memory- and SSD-backed samples in request order."""
@@ -594,15 +656,17 @@ class HybridStorageUnitData(StorageUnitData):
                 values[position] = self._decode_sample(raw, entry)
         return result
 
-    def clear(self, keys: list) -> None:
+    def clear(self, keys: list, fields: list[str] | None = None) -> None:
         """Remove values and unlink any files they reference."""
         ssd_values: list[_SSDValueRef] = []
-        for values in self.field_data.values():
+        for field, values in self.field_data.items():
+            if fields is not None and field not in fields:
+                continue
             for key in set(keys):
                 value = values.get(key)
                 if isinstance(value, _SSDValueRef):
                     ssd_values.append(value)
-        super().clear(keys)
+        super().clear(keys, fields)
         self._ssd_active_values -= len(ssd_values)
         self._ssd_active_bytes -= sum(value.size_bytes for value in ssd_values)
         for value in ssd_values:
@@ -1042,6 +1106,9 @@ class SimpleStorageUnit:
             if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="PUT_DATA"):
                     response_msg = self._handle_put(request_msg)
+            elif operation == ZMQRequestType.UPDATE_DATA:  # type: ignore[arg-type]
+                with monitor.measure(op_type="UPDATE_DATA"):
+                    response_msg = self._handle_update(request_msg)
             elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="GET_DATA"):
                     response_msg = self._handle_get(request_msg)
@@ -1175,6 +1242,40 @@ class SimpleStorageUnit:
                 },
             )
 
+    def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Merge existing fields, write once, and describe what was stored."""
+        try:
+            global_indexes = data_parts.body["global_indexes"]
+            merge_fn = data_parts.body.get("merge_fn")
+            new_data = data_parts.body.get("data")
+            field_schema = data_parts.body.get("field_schema")
+
+            with limit_pytorch_auto_parallel_threads(
+                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
+            ):
+                if not callable(merge_fn):
+                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+                if not isinstance(new_data, dict) or not new_data:
+                    raise TypeError("update data must be a non-empty dict")
+                if not isinstance(field_schema, dict) or set(field_schema) != set(new_data):
+                    raise ValueError("field_schema must describe every update field")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, field_schema)
+
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"stored_shapes": stored_shapes},
+            )
+        except Exception as e:
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_ERROR,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={
+                    "message": f"Failed to update data in storage unit id "
+                    f"#{self.storage_unit_id}, detail error message: {str(e)}"
+                },
+            )
+
     def _handle_get(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
         Handle get request, return data from storage unit.
@@ -1224,7 +1325,7 @@ class SimpleStorageUnit:
         Handle clear request, clear data in storage unit according to given global_indexes.
 
         Args:
-            data_parts: ZMQMessage from client, including target global_indexes.
+            data_parts: ZMQMessage from client, including target global_indexes and optional fields.
 
         Returns:
             Clear data success response ZMQMessage.
@@ -1235,7 +1336,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
-                self.storage_data.clear(global_indexes)
+                self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -1293,7 +1394,7 @@ class SimpleStorageUnit:
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
             op_stats = {}
-            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
+            for op_type in ("PUT_DATA", "UPDATE_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)

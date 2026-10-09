@@ -74,7 +74,7 @@ Specifically, we provide a `StorageManager` abstraction class that defines the c
 
 - `async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None`
 - `async def get_data(self, metadata: BatchMeta) -> TensorDict`
-- `async def clear_data(self, metadata: BatchMeta) -> None`
+- `async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None`
 
 This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.
 
@@ -116,8 +116,15 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
 - **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
+- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into already-produced fields with `merge_fn(old, new)`. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
-- **(async_)kv_clear**: Remove key-value pairs from storage.
+- **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
+
+`kv_update` preserves each field's tensor/non-tensor type and tensor dtype. A
+timeout has an unknown outcome because a storage unit may commit after the
+caller stops waiting, so non-idempotent merge operations must not be retried
+blindly. Updates are atomic within one storage-unit request; a batch spanning
+multiple units is not a distributed transaction.
 
 **Key Features**
 

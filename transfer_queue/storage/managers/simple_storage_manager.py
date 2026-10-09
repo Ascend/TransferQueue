@@ -91,6 +91,48 @@ def _describe_unit_state(body: dict[str, Any]) -> str:
     return f"verdict=unit_serving_again ({' '.join(parts)})"
 
 
+def _build_update_field_schema(
+    global_indexes: list[int],
+    per_unit: list[tuple[list[int], dict[str, dict[str, Any]]]],
+) -> dict[str, dict[str, Any]]:
+    """Assemble one batch-level field_schema from each unit's per-sample description.
+
+    A unit only describes its own rows, so shapes are collected per global index and
+    then ordered to match ``global_indexes``: the controller reads per_sample_shapes
+    positionally against the indexes it is notified about.
+    """
+    dtypes: dict[str, Any] = {}
+    shapes: dict[str, dict[int, tuple]] = defaultdict(dict)
+    non_tensor: set[str] = set()
+    for unit_indexes, described in per_unit:
+        for field_name, description in described.items():
+            unit_shapes = description["shapes"]
+            if unit_shapes is None:
+                non_tensor.add(field_name)
+                continue
+            dtypes[field_name] = description["dtype"]
+            # Serialization turns the unit's tuples into lists; shapes are compared and hashed here.
+            shapes[field_name].update(zip(unit_indexes, (tuple(s) for s in unit_shapes), strict=True))
+
+    field_schema: dict[str, dict[str, Any]] = {}
+    for field_name in non_tensor | set(shapes):
+        # A column is only a tensor column when every unit stored tensors for it.
+        if field_name in non_tensor:
+            field_schema[field_name] = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+            continue
+        ordered = [shapes[field_name][gi] for gi in global_indexes]
+        is_nested = len(set(ordered)) > 1
+        field_schema[field_name] = {
+            "dtype": dtypes[field_name],
+            "shape": None if is_nested else ordered[0],
+            "is_nested": is_nested,
+            "is_non_tensor": False,
+        }
+        if is_nested:
+            field_schema[field_name]["per_sample_shapes"] = ordered
+    return field_schema
+
+
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
 
@@ -497,6 +539,78 @@ class AsyncSimpleStorageManager(StorageManager):
             field_schema,
         )
 
+    async def update_data(
+        self,
+        metadata: BatchMeta,
+        values: TensorDict,
+        merge_fn: Callable[[Any, Any], Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Merge values on each owner unit and notify the controller.
+
+        Each unit reports the values it stored; this assembles one batch-level
+        field_schema so production status stays ready.
+        """
+        logger.debug(f"[{self.storage_manager_id}]: receive update_data request, updating {metadata.size} samples.")
+
+        if metadata.size == 0:
+            return {}
+        if values.batch_size[0] != metadata.size:
+            raise ValueError(
+                f"Batch size of values ({values.batch_size[0]}) does not match metadata size ({metadata.size})"
+            )
+        field_names = list(values.keys())
+
+        routing = self._group_by_hash(metadata.global_indexes)
+        tasks = []
+        for su_id, group in routing.items():
+            storage_data = {f: self._select_by_positions(values[f], group.batch_positions) for f in field_names}
+            tasks.append(
+                self._request_with_retry(
+                    "update",
+                    su_id,
+                    f"samples={len(group.global_indexes)} fields={field_names}",
+                    partial(
+                        self._update_to_single_storage_unit,
+                        group.global_indexes,
+                        storage_data,
+                        merge_fn,
+                        {name: metadata.field_schema[name] for name in field_names},
+                        target_storage_unit=su_id,
+                    ),
+                    # A merge reads stored state, so a replay after a lost answer
+                    # could fold the same new value in twice.
+                    max_attempts=1,
+                )
+            )
+
+        try:
+            described = await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: update_data failed. "
+                f"partition_id={metadata.partition_ids[0]}, "
+                f"num_samples={metadata.size}, "
+                f"num_storage_units={len(routing)}, "
+                f"error={type(e).__name__}: {e}"
+            )
+            raise
+
+        field_schema = _build_update_field_schema(
+            metadata.global_indexes, list(zip([g.global_indexes for g in routing.values()], described, strict=True))
+        )
+
+        published = await self.notify_data_update(
+            metadata.partition_ids[0],
+            metadata.global_indexes,
+            field_schema,
+        )
+        if not published:
+            raise RuntimeError(
+                "Storage update committed, but the controller did not accept its metadata; "
+                "do not retry this merge blindly"
+            )
+        return field_schema
+
     @with_storage_unit_socket
     async def _put_to_single_storage_unit(
         self,
@@ -553,6 +667,67 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"{target_storage_unit}: {type(e).__name__}: {e}"
             )
             raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+
+    @with_storage_unit_socket
+    async def _update_to_single_storage_unit(
+        self,
+        global_indexes: list[int],
+        storage_data: dict[str, Any],
+        merge_fn: Callable[[Any, Any], Any],
+        field_schema: dict[str, dict[str, Any]],
+        target_storage_unit: str,
+        socket: zmq.Socket = None,
+    ) -> dict[str, dict[str, Any]]:
+        """Send an update to one storage unit and return what it stored, per field."""
+        body: dict[str, Any] = {
+            "global_indexes": global_indexes,
+            "data": storage_data,
+            "merge_fn": merge_fn,
+            "field_schema": field_schema,
+        }
+
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body=body,
+        )
+
+        serialized_bytes = 0
+        started = time.perf_counter()
+        try:
+            frames = request_msg.serialize()
+            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+            await socket.send_multipart(frames, copy=False)
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+
+            if response_msg.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
+                raise RuntimeError(
+                    f"Failed to update data on storage unit {target_storage_unit}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
+            log_heavy_operation(
+                self.storage_manager_id,
+                "update",
+                time.perf_counter() - started,
+                serialized_bytes,
+                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
+                f"samples={len(global_indexes)} fields={list(storage_data)}",
+            )
+            return response_msg.body.get("stored_shapes", {})
+        except zmq.error.Again as e:
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during update to storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
+                f"serialized_mb={serialized_bytes / 2**20:.1f}"
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: Unexpected error during update to storage unit "
+                f"{target_storage_unit}: {type(e).__name__}: {e}"
+            )
+            raise RuntimeError(f"Error in update to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -710,13 +885,14 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Error getting data from storage unit {target_storage_unit}: {type(e).__name__}: {e}"
             ) from e
 
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
 
         Routes to each SU using global_idx % num_su (hash routing).
 
         Args:
             metadata: BatchMeta that contains metadata for data clearing.
+            fields: If given, delete only these fields and keep the samples.
         """
 
         logger.debug(f"[{self.storage_manager_id}]: receive clear_data request, clearing {metadata.size} samples.")
@@ -727,7 +903,7 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._clear_single_storage_unit(group.global_indexes, target_storage_unit=su_id)
+            self._clear_single_storage_unit(group.global_indexes, fields=fields, target_storage_unit=su_id)
             for su_id, group in routing.items()
         ]
 
@@ -738,13 +914,13 @@ class AsyncSimpleStorageManager(StorageManager):
                 logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
 
     @with_storage_unit_socket
-    async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
+    async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
         try:
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA,
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"global_indexes": global_indexes},
+                body={"global_indexes": global_indexes, "fields": fields},
             )
 
             await socket.send_multipart(request_msg.serialize())

@@ -941,6 +941,22 @@ class DataPartitionStatus:
                 f"Attempted to clear global_indexes: {indexes_to_release}"
             )
 
+    def clear_fields(self, global_indexes: list[int], field_names: list[str]):
+        """Mark fields as never written for these samples; keys, tags, consumption and indexes stay."""
+        for field_name in field_names:
+            col = self.field_name_mapping.get(field_name)
+            if col is not None:
+                self.production_status[global_indexes, col] = 0
+            field_meta = self.field_metadata.get(field_name)
+            if field_meta is not None:
+                field_meta.remove_samples(global_indexes)
+                if not field_meta.global_indexes:
+                    self.field_metadata.pop(field_name)
+        for idx in global_indexes:
+            backend_meta = self.field_custom_backend_meta.get(idx, {})
+            for field_name in field_names:
+                backend_meta.pop(field_name, None)
+
     def kv_retrieve_indexes(self, keys: list[str]) -> list[int | None]:
         """Translate the user-specified keys to global_indexes"""
         global_indexes = [self.keys_mapping.get(k, None) for k in keys]
@@ -1701,6 +1717,24 @@ class TransferQueueController:
 
         return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
+    def kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> BatchMeta:
+        """Clear fields of existing keys and return the cleared cells' metadata for storage deletion.
+
+        Missing keys and fields are ignored. The metadata is captured before clearing so
+        KV backends still receive the custom backend metadata needed to delete the values.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            return BatchMeta.empty()
+        global_indexes = [idx for idx in partition.kv_retrieve_indexes(keys) if idx is not None]
+        fields = [f for f in fields if f in partition.field_metadata]
+        if not global_indexes or not fields:
+            return BatchMeta.empty()
+
+        metadata = self.generate_batch_meta(partition_id, global_indexes, fields, mode="force_fetch")
+        partition.clear_fields(global_indexes, fields)
+        return metadata
+
     def kv_retrieve_keys(
         self,
         global_indexes: list[int],
@@ -2010,6 +2044,7 @@ class TransferQueueController:
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
             ZMQRequestType.KV_DESCRIBE: self._handle_kv_describe_request,
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
+            ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2211,6 +2246,13 @@ class TransferQueueController:
         params = request_msg.body
         description = self.kv_describe(params["keys"], params["partition_id"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
+
+    def _handle_kv_clear_fields_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        metadata = self.kv_clear_fields(
+            keys=params["keys"], partition_id=params["partition_id"], fields=params["fields"]
+        )
+        return self._make_response(request_msg, ZMQRequestType.KV_CLEAR_FIELDS_RESPONSE, {"metadata": metadata})
 
     def _handle_kv_list_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         requested_partition_id = request_msg.body["partition_id"]

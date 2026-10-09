@@ -1310,6 +1310,46 @@ class TestFieldMetaIntegration:
         assert field_meta.global_indexes == {0, 1}
         assert field_meta.per_sample_shapes == {}
 
+    def test_clear_fields_keeps_samples_and_other_columns(self):
+        """Clearing one sample's field leaves the field's schema for other samples intact."""
+        import torch
+
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1, 2], ["pv", "ids"], {"pv": t4, "ids": t4})
+        partition.keys_mapping = {"a": 0, "b": 1, "c": 2}
+        partition.custom_meta = {0: {"tag": "a"}}
+        partition.field_custom_backend_meta = {0: {"pv": "m0", "ids": "i0"}}
+        partition.consumption_status["task"] = torch.ones(3, dtype=torch.int8)
+
+        partition.clear_fields([0], ["pv"])
+
+        pv_col = partition.field_name_mapping["pv"]
+        ids_col = partition.field_name_mapping["ids"]
+        assert partition.production_status[:3, pv_col].tolist() == [0, 1, 1]
+        assert partition.production_status[:3, ids_col].tolist() == [1, 1, 1]
+        assert partition.field_metadata["pv"].to_batch_schema([1, 2])["shape"] == (4,)
+        assert partition.field_metadata["pv"].global_indexes == {1, 2}
+        assert partition.field_custom_backend_meta[0] == {"ids": "i0"}
+        assert partition.global_indexes == {0, 1, 2}
+        assert partition.keys_mapping["a"] == 0
+        assert partition.custom_meta[0] == {"tag": "a"}
+        assert partition.consumption_status["task"].tolist() == [1, 1, 1]
+
+        nested = {"dtype": "torch.float32", "is_nested": True, "per_sample_shapes": {3: (3,), 4: (7,)}}
+        assert partition.update_production_status([3, 4], ["pv"], {"pv": nested})
+        assert partition.field_metadata["pv"].per_sample_shapes == {1: (4,), 2: (4,), 3: (3,), 4: (7,)}
+
+    def test_clear_fields_drops_fieldmeta_when_no_sample_holds_it(self):
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1], ["pv"], {"pv": t4})
+
+        partition.clear_fields([0, 1], ["pv", "missing"])
+
+        assert "pv" not in partition.field_metadata
+        assert partition.global_indexes == {0, 1}
+
     def test_update_production_status_updates_field_metadata(self):
         """Test that update_production_status correctly updates field_metadata via _update_field_metadata."""
         partition = self._make_partition()
