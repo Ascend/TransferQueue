@@ -17,12 +17,10 @@ import asyncio
 import gc
 import importlib
 import os
-import signal
 import subprocess
 import sys
 import threading
 import time
-from types import SimpleNamespace
 
 import pytest
 import ray
@@ -45,6 +43,18 @@ E2E_TIMEOUT = 120.0
 def table_is_empty_afterwards():
     yield
     assert kvl._table == {}
+
+
+@pytest.fixture(scope="module", autouse=True)
+def node_lock_session():
+    """Create the per-node lock actor used by every local-lock test in this module."""
+    if not ray.is_initialized():
+        ray.init(namespace="TestKVLock")
+    backend = {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 200}}
+    tq.init(OmegaConf.create({"controller": {"polling_mode": True}, "backend": backend}))
+    yield
+    tq.close()
+    ray.shutdown()
 
 
 def n_waiters(key):
@@ -220,7 +230,7 @@ def test_grant_racing_a_timeout_counts_as_acquired(monkeypatch):
             holder.join(TIMEOUT)  # the holder hands the key to this waiter...
             return False  # ...but the wait still reports a timeout
 
-    monkeypatch.setattr(kvl, "threading", SimpleNamespace(Event=GrantedThenTimedOut))
+    monkeypatch.setattr(kvl.threading, "Event", GrantedThenTimedOut)
     with kv_local_lock("k", P, timeout=1):
         assert (P, "k") in kvl._table and n_waiters("k") == 0
 
@@ -389,45 +399,57 @@ def test_locked_wrappers_reject_the_wrong_kind_of_function():
         asyncio.run(async_kv_local_locked(lambda keys, partition_id: None, "a", P))
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
-@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
-def test_forked_child_drops_the_parents_locks_leases_and_managers(monkeypatch):
+def test_child_process_uses_the_parents_local_lock_actor():
+    script = """
+import ray
+import transfer_queue as tq
+
+ray.init(address="auto", logging_level="ERROR")
+result = "acquired"
+try:
+    with tq.kv_local_lock("family", "p", timeout=0.3):
+        pass
+except TimeoutError:
+    result = "timeout"
+finally:
+    ray.shutdown()
+print(result)
+"""
+
+    def child_result():
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=E2E_TIMEOUT,
+            check=True,
+        )
+        return completed.stdout.strip()
+
+    assert kvl._PROCESS_FAMILY_ENV in os.environ
+    with kv_local_lock("family", P, timeout=TIMEOUT):
+        assert child_result() == "timeout"
+    assert child_result() == "acquired"
+
+
+def test_fork_reset_drops_the_parents_locks_leases_and_managers(monkeypatch):
     monkeypatch.setattr(kvl, "_registry", threading.Condition())
     monkeypatch.setattr(kvl, "_leases", {"parent-token": object()})
     monkeypatch.setattr(kvl, "_renewer_running", True)
     monkeypatch.setattr(kvl, "_managers", {0: object()})
-    release, registry_held = threading.Event(), threading.Event()
+    monkeypatch.setattr(kvl, "_table", {(P, "a"): object()})
 
-    def hold_registry():
-        with kvl._registry:
-            registry_held.set()
-            release.wait(TIMEOUT)
+    old_registry = kvl._registry
+    kvl._reset_after_fork()
 
-    registry_holder = threading.Thread(target=hold_registry)
-    registry_holder.start()
-    assert registry_held.wait(TIMEOUT)
-    key_holder = start_holder("a", release)
-    try:
-        pid = os.fork()
-        if pid == 0:
-            ok = False
-            try:
-                with kv_local_lock("a", P, timeout=1):
-                    ok = kvl._leases == {} and kvl._managers == {} and not kvl._renewer_running
-                    ok = ok and kvl._registry.acquire(blocking=False)
-            finally:
-                os._exit(0 if ok else 1)
-        deadline = time.monotonic() + TIMEOUT
-        while (status := os.waitpid(pid, os.WNOHANG))[0] == 0:
-            if time.monotonic() > deadline:
-                os.kill(pid, signal.SIGKILL)
-                pytest.fail("forked child hung")
-            time.sleep(0.01)
-        assert os.waitstatus_to_exitcode(status[1]) == 0
-    finally:
-        release.set()
-        registry_holder.join()
-        key_holder.join()
+    assert kvl._table == {}
+    assert kvl._leases == {}
+    assert kvl._managers == {}
+    assert not kvl._renewer_running
+    assert kvl._registry is not old_registry
+    assert kvl._registry.acquire(blocking=False)
+    kvl._registry.release()
 
 
 def test_global_lock_shards_agree_across_processes_and_spread_keys():
@@ -448,18 +470,7 @@ def test_global_lock_shards_agree_across_processes_and_spread_keys():
         assert out.stdout.strip() == str(shards)
 
 
-@pytest.fixture
-def simple_storage_tq():
-    if not ray.is_initialized():
-        ray.init(namespace="TestKVLock")
-    backend = {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 200}}
-    tq.init(OmegaConf.create({"controller": {"polling_mode": True}, "backend": backend}))
-    yield
-    tq.close()
-    ray.shutdown()
-
-
-def test_kv_local_lock_serializes_simple_storage_read_modify_write(simple_storage_tq):
+def test_kv_local_lock_serializes_simple_storage_read_modify_write():
     tq.kv_put("counter", "lock_e2e", fields={"v": torch.tensor([0])})  # also creates the client on this thread
 
     def increment(key, partition_id):

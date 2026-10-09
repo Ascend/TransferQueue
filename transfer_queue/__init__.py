@@ -78,7 +78,7 @@ __all__ = (
         "KVBatchMeta",
     ]
     + [
-        # KV key locks: process-local and cluster-wide
+        # KV key locks: process-family-local and cluster-wide
         "kv_local_lock",
         "async_kv_local_lock",
         "kv_local_locked",

@@ -45,7 +45,7 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
-from transfer_queue.kv_lock import _detach_lock_managers
+from transfer_queue.kv_lock import _detach_lock_managers, _process_lock_manager_name
 from transfer_queue.lock_manager import TransferQueueLockManager
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
@@ -212,13 +212,17 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
-        # Created here rather than on first lock: a non-detached actor dies with its creator.
-        _TQ_LOCK_MANAGERS = [
+        # Created here rather than on first lock: non-detached actors die with their creator.
+        global_lock_managers = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]
                 name=f"TransferQueueLockManager_{i}", namespace="transfer_queue", get_if_exists=True
             ).remote(num_lock_shards)
             for i in range(num_lock_shards)
         ]
+        process_lock_manager = TransferQueueLockManager.options(  # type: ignore[attr-defined]
+            name=_process_lock_manager_name(), namespace="transfer_queue", get_if_exists=True
+        ).remote(1)
+        _TQ_LOCK_MANAGERS = [*global_lock_managers, process_lock_manager]
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
