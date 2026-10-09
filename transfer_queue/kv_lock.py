@@ -390,9 +390,15 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     The locks live in the ``lock.num_shards`` actors that ``tq.init()`` creates,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
     background thread renews. Each actor grants in arrival order: a request waits behind
-    every earlier one that shares a key with it. Keys on several actors are taken one actor
-    at a time, each all at once, so keys already granted stay held while a later actor's
-    keys are awaited.
+    every earlier one that shares a key with it.
+
+    Keys on several actors are taken one actor at a time, each all at once, so a request
+    holds the keys already granted while it waits for a later actor's. The hash decides
+    which keys share an actor, so whether a request is all-or-nothing is not up to the
+    caller: with 8 shards, two keys land on different actors 7 times in 8. A request queues
+    afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
+    others even if it then times out. Lock the fewest keys you can and keep the block short.
+
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever), and ``RuntimeError`` when nested, taken while holding a
     ``kv_local_lock``, or called with a running event loop. Raises ``LockLostError`` on
@@ -461,7 +467,7 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
     """Return ``{"holders": [...], "waiters": n}`` for live global locks, optionally in one partition.
 
     Each holder has ``partition_id``, ``key``, ``holder`` (node IP, pid, thread), ``held_s`` and
-    ``lease_remaining_s``.
+    ``lease_remaining_s``. A holder may still be waiting for its keys on other actors.
     """
     replies = ray.get([_lock_manager(shard).list_locks.remote(partition_id) for shard in range(_shard_count())])
     return {"holders": [h for r in replies for h in r["holders"]], "waiters": sum(r["waiters"] for r in replies)}
