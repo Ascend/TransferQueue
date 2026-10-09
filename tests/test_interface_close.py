@@ -53,7 +53,7 @@ def test_owner_close_kills_controller(fake):
 
     iface.init(OmegaConf.create({}))
     client, lock_managers = iface._TQ_CLIENT, iface._TQ_LOCK_MANAGERS
-    assert iface._TQ_IS_OWNER and len(lock_managers) == 9
+    assert iface._TQ_IS_OWNER and len(lock_managers) == 8
 
     iface.close()
     client.close.assert_called_once()

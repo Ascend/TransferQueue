@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Async Ray actor that holds leased global-shard or process-family KV locks."""
+"""Server side of ``kv_global_lock``: async Ray actors, each holding leased locks on the keys that hash to it."""
 
 import asyncio
 import heapq
@@ -29,7 +29,7 @@ _WITHDRAWN_TTL_S = 300
 # default of 1000 to keep renew and release from queueing behind waiters.
 @ray.remote(num_cpus=0, max_concurrency=10_000)
 class TransferQueueLockManager:
-    """Exclusive leased locks on ``(partition_id, key)`` managed on one event loop."""
+    """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
 
     def __init__(self, num_shards: int):
         # Kept so that a process that never ran tq.init() can learn how many shards to hash over.
@@ -117,10 +117,8 @@ class TransferQueueLockManager:
         alive = {}
         for token in tokens:
             lease = self._leases.get(token)
-            is_alive = lease is not None and lease["expires_at"] > now
-            alive[token] = is_alive
-            if is_alive:
-                assert lease is not None
+            alive[token] = lease is not None and lease["expires_at"] > now
+            if lease is not None and alive[token]:
                 lease["expires_at"] = now + lease["lease_s"]
                 heapq.heappush(self._expiries, (lease["expires_at"], token))
         return alive

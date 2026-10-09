@@ -16,11 +16,11 @@
 """Advisory locks on TransferQueue KV keys.
 
 ``kv_local_lock`` and ``async_kv_local_lock`` hold an exclusive mutex per
-``(partition_id, key)`` across one process family: the process that initialized
-TransferQueue, its child processes, and their threads and tasks. A process-local
-FIFO queue avoids unnecessary actor calls within one process; an inherited family
-identifier routes every family member to one Ray actor. Unrelated processes on the
-same node use different actors.
+``(partition_id, key)``, shared by every thread and asyncio task of this process. They
+are advisory: KV calls never check them. They do not exclude other processes or Ray
+actors. Waiters on a key are served in FIFO order. Nesting is rejected; pass all keys
+to a single call. ``kv_local_locked`` and ``async_kv_local_locked`` run one KV call
+under the lock without repeating its keys and partition.
 
 ``kv_global_lock`` and ``async_kv_global_lock`` do the same across the Ray cluster through
 ``TransferQueueLockManager`` actors that split keys by hash, under a lease that renews
@@ -38,7 +38,6 @@ import zlib
 from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
-from typing import Any
 
 import ray
 from ray.exceptions import RayActorError
@@ -49,12 +48,9 @@ from ray.exceptions import RayActorError
 # while waiting.
 _state_lock = threading.Lock()
 _table: dict[tuple[str, str], deque["_Waiter"]] = {}
-# Whether this thread or task holds (or is acquiring) a family-local lock. A global lock
+# Whether this thread or task holds (or is acquiring) a local lock. A future global lock
 # reads it to enforce the "global, then local" order.
 _holding: ContextVar[bool] = ContextVar("_holding_kv_lock", default=False)
-_PROCESS_LOCAL_SHARD = -1
-_PROCESS_LOCAL_LEASE_S = 30.0
-_PROCESS_FAMILY_ENV = "TQ_KV_LOCK_PROCESS_FAMILY"
 
 
 class _Waiter:
@@ -163,52 +159,38 @@ def _reject_running_loop(kind: str) -> None:
 
 @contextmanager
 def kv_local_lock(keys: str | list[str], partition_id: str, timeout: float | None = None):
-    """Hold an exclusive process-family lock on ``keys`` in ``partition_id``.
+    """Hold an exclusive process-local lock on ``keys`` in ``partition_id``.
 
-    The lock is shared by this process, its child processes, and their threads
-    and tasks. Blocks the calling thread, so use ``async_kv_local_lock`` inside
-    a running event loop. Raises ``TimeoutError`` if not all keys are acquired
-    within ``timeout`` seconds (``None`` waits forever), ``LockLostError`` if
-    its renewable actor lease is lost, and ``RuntimeError`` when nested.
+    Blocks the calling thread, so use ``async_kv_local_lock`` inside a running event loop.
+    Raises ``TimeoutError`` if not all keys are acquired within ``timeout`` seconds
+    (``None`` waits forever) and ``RuntimeError`` if a local lock is already held.
     """
     _reject_running_loop("kv_local_lock")
     names, acquired = _lock_names(keys, partition_id), []
     deadline = None if timeout is None else time.monotonic() + timeout
-    lease = None
     _holding.set(True)
     try:
         for name in names:
             _acquire(name, deadline)
             acquired.append(name)
-        lease = _new_process_local_lease(names)
-        _acquire_lease(lease, deadline)
         yield
-        lease.check()
     finally:
-        if lease is not None:
-            _release_lease(lease)
         _release_all(acquired)
         _holding.set(False)
 
 
 @asynccontextmanager
 async def async_kv_local_lock(keys: str | list[str], partition_id: str, timeout: float | None = None):
-    """Async version of ``kv_local_lock``. Child tasks cannot take another local lock."""
+    """Async version of ``kv_local_lock``. Tasks created inside the block cannot take a local lock."""
     names, acquired = _lock_names(keys, partition_id), []
     deadline = None if timeout is None else time.monotonic() + timeout
-    lease = None
     _holding.set(True)
     try:
         for name in names:
             await _acquire_async(name, deadline)
             acquired.append(name)
-        lease = _new_process_local_lease(names)
-        await _acquire_lease_async(lease, deadline)
         yield
-        lease.check()
     finally:
-        if lease is not None:
-            _release_lease(lease)
         _release_all(acquired)
         _holding.set(False)
 
@@ -244,27 +226,20 @@ _registry = threading.Condition()
 _leases: dict[str, "GlobalLease"] = {}
 _renewer_running = False
 _num_shards: int | None = None  # controller.num_lock_shards, asked of shard 0 on first use
-_managers: dict[int, Any] = {}  # shard -> lock manager handle, looked up on first use
-_NOT_INITIALIZED = "TransferQueue lock manager not found; call tq.init() first"
+_managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
+_NOT_INITIALIZED = "TransferQueueLockManager not found; call tq.init() first"
 _MANAGER_GONE = "The TransferQueueLockManager actor is gone; did the process that ran tq.init() call tq.close()?"
 
 
 class LockLostError(RuntimeError):
-    """A lock lease ran out or failed to renew, so another holder may own the keys."""
+    """A kv_global_lock lease ran out or failed to renew, so another holder may own the keys."""
 
 
 class GlobalLease:
     """Yielded by ``kv_global_lock``. ``fence`` maps each key to a fencing token that grows with every grant."""
 
-    def __init__(
-        self,
-        names: list[tuple[str, str]],
-        shards: dict[int, list[tuple[str, str]]],
-        lease_s: float,
-        kind: str = "kv_global_lock",
-    ):
+    def __init__(self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], lease_s: float):
         self.names, self.shards, self.lease_s = names, shards, lease_s
-        self.kind = kind
         self.token = f"{os.getpid()}:{uuid.uuid4().hex}"
         self.fence: dict[str, int] = {}
         self.deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
@@ -274,21 +249,7 @@ class GlobalLease:
     def check(self) -> None:
         """Raise ``LockLostError`` if the lease was lost; call it right before writes in long sections."""
         if self.lost or time.monotonic() >= self.deadline:
-            raise LockLostError(f"{self.kind} lease on {self.names} was lost")
-
-
-def _process_family_id() -> str:
-    """Return a process-family id inherited by child processes through the environment."""
-    family_id = os.environ.get(_PROCESS_FAMILY_ENV)
-    if family_id is None:
-        family_id = f"{os.getpid()}_{uuid.uuid4().hex}"
-        os.environ[_PROCESS_FAMILY_ENV] = family_id
-    return family_id
-
-
-def _process_lock_manager_name() -> str:
-    """Return the Ray actor name shared by one process and its descendants."""
-    return f"TransferQueueProcessLockManager_{_process_family_id()}"
+            raise LockLostError(f"kv_global_lock lease on {self.names} was lost")
 
 
 def _shard_count() -> int:
@@ -309,11 +270,8 @@ def _shard(name: tuple[str, str], num_shards: int) -> int:
 
 def _lock_manager(shard: int):
     if shard not in _managers:
-        if not ray.is_initialized():
-            raise RuntimeError(_NOT_INITIALIZED)
-        name = _process_lock_manager_name() if shard == _PROCESS_LOCAL_SHARD else f"TransferQueueLockManager_{shard}"
         try:
-            _managers[shard] = ray.get_actor(name, namespace="transfer_queue")
+            _managers[shard] = ray.get_actor(f"TransferQueueLockManager_{shard}", namespace="transfer_queue")
         except ValueError:
             raise RuntimeError(_NOT_INITIALIZED) from None
     return _managers[shard]
@@ -332,11 +290,6 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
     return GlobalLease(names, dict(sorted(shards.items())), lease_s)
 
 
-def _new_process_local_lease(names: list[tuple[str, str]]) -> GlobalLease:
-    """Create the hidden renewable lease shared by one process family."""
-    return GlobalLease(names, {_PROCESS_LOCAL_SHARD: names}, _PROCESS_LOCAL_LEASE_S, "kv_local_lock")
-
-
 def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
     manager = _lock_manager(shard)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
@@ -347,7 +300,7 @@ def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
 def _take_grant(lease: GlobalLease, shard: int, reply, sent: float) -> None:
     if reply is None:
         lease.pending.remove(shard)
-        raise TimeoutError(f"Timed out waiting for {lease.kind} on {lease.names}")
+        raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
     fences, waited = reply
     lease.fence.update(fences)
     # The grant happened at least `waited` after `sent`, so this never outlives the shard's lease.
@@ -361,7 +314,7 @@ def _start_lease(lease: GlobalLease) -> None:
         _registry.notify()  # a shorter lease_s shortens the renewal period
         if not _renewer_running:
             _renewer_running = True
-            threading.Thread(target=_renew_loop, name="kv_lock_renewer", daemon=True).start()
+            threading.Thread(target=_renew_loop, name="kv_global_lock_renewer", daemon=True).start()
 
 
 def _release_lease(lease: GlobalLease) -> None:
@@ -399,7 +352,7 @@ def _renew_loop() -> None:
         # Count from the send time: the server extends the lease from when the call arrives,
         # which is later, so the local deadline never outlives the server's.
         last = time.monotonic()
-        calls: dict[int, Any] = {}
+        calls = {}
         renewed: set[tuple[int, str]] = set()
         for shard, tokens in by_shard.items():
             try:
@@ -418,30 +371,6 @@ def _renew_loop() -> None:
                 lease.deadline = last + lease.lease_s
             else:
                 lease.lost = True
-
-
-def _acquire_lease(lease: GlobalLease, deadline: float | None) -> None:
-    """Acquire every manager route for a sync lock and start lease renewal."""
-    for shard in lease.shards:
-        sent = time.monotonic()
-        try:
-            reply = ray.get(_send_acquire(lease, shard, deadline))
-        except RayActorError as e:
-            raise RuntimeError(_MANAGER_GONE) from e
-        _take_grant(lease, shard, reply, sent)
-    _start_lease(lease)
-
-
-async def _acquire_lease_async(lease: GlobalLease, deadline: float | None) -> None:
-    """Acquire every manager route for an async lock and start lease renewal."""
-    for shard in lease.shards:
-        sent = time.monotonic()
-        try:
-            reply = await _send_acquire(lease, shard, deadline)
-        except RayActorError as e:
-            raise RuntimeError(_MANAGER_GONE) from e
-        _take_grant(lease, shard, reply, sent)
-    _start_lease(lease)
 
 
 @contextmanager
@@ -465,7 +394,14 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     try:
         # Every caller visits shards in ascending order, so no two callers can each hold a
         # shard the other awaits: multi-shard requests cannot deadlock.
-        _acquire_lease(lease, deadline)
+        for shard in lease.shards:
+            sent = time.monotonic()
+            try:
+                reply = ray.get(_send_acquire(lease, shard, deadline))
+            except RayActorError as e:
+                raise RuntimeError(_MANAGER_GONE) from e
+            _take_grant(lease, shard, reply, sent)
+        _start_lease(lease)
         yield lease
         lease.check()
     finally:
@@ -482,7 +418,14 @@ async def async_kv_global_lock(
     deadline = None if timeout is None else time.monotonic() + timeout
     _holding_global.set(True)
     try:
-        await _acquire_lease_async(lease, deadline)
+        for shard in lease.shards:
+            sent = time.monotonic()
+            try:
+                reply = await _send_acquire(lease, shard, deadline)
+            except RayActorError as e:
+                raise RuntimeError(_MANAGER_GONE) from e
+            _take_grant(lease, shard, reply, sent)
+        _start_lease(lease)
         yield lease
         lease.check()
     finally:
