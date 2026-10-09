@@ -235,12 +235,16 @@ class GlobalLease:
 
 
 def _shard_count() -> int:
+    """Return lock.num_shards, looking every lock actor up on first use."""
     global _num_shards
     if _num_shards is None:
         try:
-            _num_shards = ray.get(_lock_manager(0).num_shards.remote())
+            num_shards = ray.get(_lock_manager(0).num_shards.remote())
         except RayActorError as e:
             raise RuntimeError(_MANAGER_GONE) from e
+        for shard in range(1, num_shards):
+            _lock_manager(shard)
+        _num_shards = num_shards
     return _num_shards
 
 
@@ -418,6 +422,8 @@ async def async_kv_global_lock(
     keys: str | list[str], partition_id: str, timeout: float | None = None, lease_s: float = 30
 ):
     """Async version of ``kv_global_lock``. Tasks created inside the block cannot take a global lock."""
+    if _num_shards is None:  # the first use waits on Ray's GCS, so keep it off the event loop
+        await asyncio.to_thread(_shard_count)
     lease = _new_lease(keys, partition_id, lease_s)
     deadline = None if timeout is None else time.monotonic() + timeout
     _holding_global.set(True)

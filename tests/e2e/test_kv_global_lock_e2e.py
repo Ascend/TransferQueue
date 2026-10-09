@@ -223,6 +223,28 @@ def test_waiting_on_a_later_shard_keeps_the_earlier_keys_held():
     wait_until(lambda: holders() == set())
 
 
+def test_async_first_use_looks_the_actors_up_off_the_event_loop(monkeypatch):
+    monkeypatch.setattr(kvl, "_num_shards", None)
+    monkeypatch.setattr(kvl, "_managers", {})
+    on_loop = []
+    for name in ("get", "get_actor"):
+        real = getattr(ray, name)
+
+        def spy(*args, _real=real, **kwargs):
+            on_loop.append(threading.current_thread() is threading.main_thread())
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(ray, name, spy)
+
+    async def main():
+        async with tq.async_kv_global_lock("first_use", P, timeout=TIMEOUT_S):
+            pass
+
+    asyncio.run(main())
+    assert on_loop and not any(on_loop)
+    assert len(kvl._managers) == kvl._num_shards == 8
+
+
 def test_release_before_acquire_withdraws_it():
     lock_manager = manager("w")
     ray.get(lock_manager.release.remote("early"), timeout=TIMEOUT_S)
