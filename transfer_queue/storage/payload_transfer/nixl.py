@@ -25,9 +25,10 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import uuid4
 
+import zmq
 import zmq.asyncio
 
-from transfer_queue.storage.payload_transfer.base import PayloadTransfer, PayloadTransferError
+from transfer_queue.storage.payload_transfer.base import PayloadTransfer, PayloadTransferError, PayloadTransferTimeout
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import NixlError, NixlRuntime
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
@@ -178,7 +179,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         global_indexes: list[int],
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
-    ) -> None:
+    ) -> int:
         frames = tuple(encode(data))
         descriptor = PayloadDescriptor(
             transfer_id=uuid4().hex,
@@ -217,9 +218,17 @@ class NixlPayloadTransfer(PayloadTransfer):
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
             self._expect(response, ZMQRequestType.PUT_DATA_RESPONSE, target_id)
             remote_may_be_prepared = False
-        except BaseException:
+            return descriptor.payload_bytes
+        except BaseException as exc:
             if remote_may_be_prepared:
                 await self._cancel(sender_id, target_id, ZMQRequestType.PUT_DATA_CANCEL, descriptor.transfer_id)
+            if isinstance(exc, zmq.error.Again):
+                # Only a missing answer is retried by the caller; the transfer_id above is
+                # fresh per attempt, so replaying the whole put cannot duplicate a commit.
+                raise PayloadTransferTimeout(
+                    f"ZMQ recv timeout during put to storage unit {target_id}",
+                    wire_bytes=descriptor.payload_bytes,
+                ) from exc
             raise
 
     async def get(
@@ -267,11 +276,14 @@ class NixlPayloadTransfer(PayloadTransfer):
             remote_prepared = False
             payload = await asyncio.wrap_future(self.receive(descriptor))
             return decode(unpack_from(payload))
-        except BaseException:
+        except BaseException as exc:
             if receive_prepared and descriptor is not None:
                 self.cancel_receive(descriptor.transfer_id)
             if remote_prepared:
                 await self._cancel(sender_id, target_id, ZMQRequestType.GET_DATA_CANCEL, transfer_id)
+            if isinstance(exc, zmq.error.Again):
+                # A retried get prepares a fresh transfer_id, so replaying cannot duplicate.
+                raise PayloadTransferTimeout(f"ZMQ recv timeout during get from storage unit {target_id}") from exc
             raise
 
     def handle_request(

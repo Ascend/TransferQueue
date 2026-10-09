@@ -133,3 +133,27 @@ def get_env_bool(env_key: str, default: bool = False) -> bool:
 
     true_values = {"true", "1", "yes", "y", "on"}
     return env_value_lower in true_values
+
+
+# Thresholds above which a single request earns a log line. Both sit far above the normal range
+# of single-digit milliseconds, so tripping either one is itself the finding.
+TQ_STORAGE_SLOW_REQUEST_SECONDS = float(os.environ.get("TQ_STORAGE_SLOW_REQUEST_SECONDS", 5.0))
+TQ_STORAGE_LARGE_PAYLOAD_MB = float(os.environ.get("TQ_STORAGE_LARGE_PAYLOAD_MB", 256))
+
+
+def log_heavy_operation(component_id: str, operation: str, elapsed: float, payload_bytes: int, detail: str) -> None:
+    """Warn about one slow or unusually large request; stay silent otherwise.
+
+    Args:
+        component_id: Storage manager or storage unit reporting the request.
+        operation: Operation name, e.g. ``put`` or ``get``.
+        elapsed: Wall time spent on the request, in seconds.
+        payload_bytes: Serialized size of the payload on the wire.
+        detail: Request shape, appended to the message verbatim.
+    """
+    payload_mb = payload_bytes / 2**20
+    if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
+        return
+    logger.warning(
+        f"[{component_id}]: heavy {operation} {detail} serialized_mb={payload_mb:.1f} elapsed={elapsed:.2f}s"
+    )

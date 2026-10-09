@@ -13,9 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import itertools
+import os
 import socket
+import threading
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, TypeAlias
@@ -32,6 +38,18 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
+# Identity prefixes of the peers allowed to reach a storage unit. The storage proxy drops
+# anything else, so an identity built without these prefixes is silently unreachable.
+STORAGE_MANAGER_IDENTITY_PREFIX = "TQ_STORAGE_"
+METRICS_COLLECTOR_IDENTITY_PREFIX = "metrics_collector_"
+STORAGE_CLIENT_IDENTITY_PREFIXES = (
+    STORAGE_MANAGER_IDENTITY_PREFIX.encode(),
+    METRICS_COLLECTOR_IDENTITY_PREFIX.encode(),
+)
+
+# Cap for every pool; see ZMQSocketPool for what it bounds. Small because it multiplies by
+# peer count, and one socket per peer already avoids the repeated handshake.
+TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 4))
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 
@@ -359,47 +377,263 @@ def create_zmq_socket(
     return socket
 
 
+def _lease_owner() -> Any:
+    """The running event loop, or the current thread outside one.
+
+    A ZMQ socket is safe on neither a second thread nor a second event loop, so leases
+    never cross either. pyzmq silently rebinds an async socket to whatever loop it next
+    sees, and one bound to a *closed* loop is the "Bad file descriptor / SIGABRT" failure
+    that per-call context churn used to cause. Returning the thread outside a loop lets
+    synchronous callers (the metrics collector) share this pool unchanged.
+    """
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return threading.current_thread()
+
+
+def _owner_finished(owner: Any) -> bool:
+    """Whether a lease owner can no longer serve its sockets."""
+    if isinstance(owner, threading.Thread):
+        return not owner.is_alive()
+    return owner.is_closed()
+
+
+# Addresses whose permit the current task already holds. A ContextVar because asyncio
+# copies the context per task, so siblings under one gather do not see each other's.
+_held_permits: ContextVar[frozenset[str]] = ContextVar("_held_permits", default=frozenset())
+
+
+class ZMQSocketPool:
+    """Lends connected DEALER sockets for one request scenario, reusing them across calls.
+
+    One pool serves one kind of request -- controller RPC, storage RPC, notify, metrics --
+    so ``socket_name`` and ``timeout`` are fixed here and every socket it holds is
+    interchangeable but for the address it is connected to. Separate pools per scenario also
+    keep them from interfering: a pool shared across scenarios reused nothing anyway, since
+    scenarios differ by owning loop, socket name, or timeout.
+
+    A lease is exclusive. Responses do not echo their request's ``request_id`` (see
+    ``ZMQMessage.create``), so a reply is matched to its request only by arrival order:
+    two concurrent users of one socket would read each other's replies. Each caller
+    therefore gets a socket to itself and returns it only after a clean send/recv.
+
+    Reuse avoids a TCP + ZMTP handshake per request and stops the peer's ROUTER from
+    accreting a fresh identity every call.
+    """
+
+    def __init__(
+        self,
+        ctx: zmq.Context,
+        owner_id: str,
+        socket_name: str,
+        *,
+        timeout: int | None = None,
+        maxsize: int | None = None,
+    ):
+        """
+        Args:
+            ctx: Long-lived context to open sockets on, sync or async. The pool borrows it
+                and never terminates it; the owner outlives the pool.
+            owner_id: Identity prefix for pooled sockets, for readable peer-side logs.
+            socket_name: Port key in ``ZMQServerInfo.ports`` that every lease dials.
+            timeout: Send/recv timeout in seconds applied to every socket, or None for none.
+            maxsize: Idle sockets kept per bucket, at least 1, defaulting to
+                ``TQ_SOCKET_POOL_SIZE``. A soft cap: a burst beyond it still gets sockets,
+                and the excess is closed on return rather than made to wait. Counted per
+                (owner, address), not per pool, so a pool dialling N peers may hold
+                N*maxsize idle sockets.
+        """
+        # Resolved here rather than in the signature so the env var stays patchable; a
+        # default bound at import froze whatever the environment held when this module loaded.
+        maxsize = TQ_SOCKET_POOL_SIZE if maxsize is None else maxsize
+        if maxsize < 1:
+            # Below 1 nothing is ever parked, so every request pays a fresh connect while
+            # still looking pooled. Reject it rather than silently disable reuse.
+            raise ValueError(f"ZMQ socket pool size must be at least 1, got {maxsize}")
+        self._ctx = ctx
+        self._owner_id = owner_id
+        self._socket_name = socket_name
+        self._timeout = timeout
+        self._maxsize = maxsize
+        # Keyed by lease owner (see _lease_owner), then by address rather than peer id: a peer
+        # restarted under the same id at a new address must not get a socket wired to the old.
+        self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
+        self._lock = threading.Lock()
+        # One semaphore per (owner, address), keyed like _idle because a semaphore belongs
+        # to the loop that awaits it. Used by alease only; see there.
+        self._permits: dict[Any, dict[str, asyncio.Semaphore]] = {}
+        # A ROUTER silently drops a second peer claiming an identity it already has, and
+        # owner_id alone repeats across nodes because client ids are pid-derived.
+        self._identity_prefix = f"{owner_id}_{uuid4().hex[:8]}"
+        self._counter = itertools.count()
+
+    @contextmanager
+    def lease(self, peer: ZMQServerInfo) -> Iterator[zmq.Socket]:
+        """Yield a socket connected to ``peer``, returning it to the pool only on success.
+
+        A plain (non-async) contextmanager on purpose: ``with`` still sees exceptions and
+        ``CancelledError`` raised across ``await``s in its body, so this one definition
+        serves both async and synchronous callers.
+
+        Concurrency beyond ``maxsize`` opens extra sockets here rather than waiting; async
+        callers that want the cap enforced use ``alease``.
+        """
+        address = self._address(peer)
+        sock = self._take(address) or self._connect(peer, address)
+        try:
+            yield sock
+        except BaseException:
+            # Poisoned: the request may already be on the wire, so its reply could still
+            # arrive and the next lessee would read it as its own. Cancellation counts too.
+            sock.close(linger=0)
+            raise
+        else:
+            self._release(address, sock)
+
+    @asynccontextmanager
+    async def alease(self, peer: ZMQServerInfo) -> AsyncIterator[zmq.Socket]:
+        """Like ``lease``, but waits for a socket instead of opening one past ``maxsize``.
+
+        This bounds sockets in flight at ``maxsize`` per (owner, address), so the context's
+        socket budget follows configuration rather than peak concurrency.
+
+        A permit is held for the whole body, so a task that leases inside another lease can
+        wait on a permit it -- or a sibling mid-cycle -- already holds, and that hangs with
+        no timeout. Any nesting therefore raises, including across pools: an RPC's reply is
+        what releases its permit, so a second RPC belongs after the first returns. Notify
+        already works this way, running once the puts it reports have completed.
+        """
+        address = self._address(peer)
+        held = _held_permits.get()
+        if held:
+            raise RuntimeError(
+                f"Lease on {address} from a task already holding {sorted(held)}. A lease "
+                f"keeps its permit until its body ends, so nesting one inside another can "
+                f"wait on a permit that is already held and hang. Complete the outer "
+                f"request first, then start this one."
+            )
+        token = _held_permits.set(held | {address})
+        permit = self._permit(address)
+        try:
+            async with permit:
+                with self.lease(peer) as sock:
+                    yield sock
+        finally:
+            _held_permits.reset(token)
+
+    def _address(self, peer: ZMQServerInfo) -> str:
+        port = peer.ports.get(self._socket_name)
+        if port is None:
+            raise RuntimeError(f"Socket '{self._socket_name}' not configured for server '{peer.id}'")
+        return format_zmq_address(peer.ip, port)
+
+    def _permit(self, address: str) -> asyncio.Semaphore:
+        """The permit gating this (owner, address), created on first use by that owner."""
+        with self._lock:
+            return self._permits.setdefault(_lease_owner(), {}).setdefault(address, asyncio.Semaphore(self._maxsize))
+
+    def _owner_buckets(self) -> dict[str, list[zmq.Socket]]:
+        """Buckets for the current lease owner, first evicting any owner that has finished.
+
+        Callers must hold ``self._lock``. A closed loop's sockets must not linger: a pooled
+        async socket keeps its loop referenced, so they would never be collected, and reusing
+        one is the SIGABRT hazard in _lease_owner. Sweeping here needs no background thread,
+        and the loop count stays tiny (one per client, plus one per notify thread).
+        """
+        for owner in [o for o in self._idle if _owner_finished(o)]:
+            self._close_all(self._idle.pop(owner))
+            self._permits.pop(owner, None)
+        return self._idle.setdefault(_lease_owner(), {})
+
+    def _take(self, address: str) -> zmq.Socket | None:
+        """Pop a live idle socket for *address*, discarding any found closed."""
+        with self._lock:
+            bucket = self._owner_buckets().get(address)
+            while bucket:
+                sock = bucket.pop()
+                if not sock.closed:
+                    return sock
+        return None
+
+    def _release(self, address: str, sock: zmq.Socket) -> None:
+        """Return a socket, closing it if already closed or its bucket is full."""
+        with self._lock:
+            # A caller may close the socket itself without raising, as the notify path does
+            # to discard a possibly-late ACK.
+            if not sock.closed:
+                bucket = self._owner_buckets().setdefault(address, [])
+                if len(bucket) < self._maxsize:
+                    bucket.append(sock)
+                    return
+        sock.close(linger=0)
+
+    def _connect(self, peer: ZMQServerInfo, address: str) -> zmq.Socket:
+        """Open and connect a new DEALER socket to *address*."""
+        identity = f"{self._identity_prefix}_to_{peer.id}_{next(self._counter)}".encode()
+        sock = create_zmq_socket(self._ctx, zmq.DEALER, peer.ip, identity=identity)
+        try:
+            if self._timeout is not None:
+                sock.setsockopt(zmq.RCVTIMEO, self._timeout * 1000)
+                sock.setsockopt(zmq.SNDTIMEO, self._timeout * 1000)
+            sock.connect(address)
+        except BaseException:
+            # Nothing owns the socket until it is handed to a lease, so close it here or it
+            # leaks. connect() raises on a malformed endpoint or a terminating context.
+            sock.close(linger=0)
+            raise
+        return sock
+
+    def close(self) -> None:
+        """Close every idle socket. Safe to call twice, and after the context is gone.
+
+        The pool stays usable afterwards: a lease still outstanding returns its socket to a
+        fresh bucket. Callers destroy the context right after, so nothing is reused.
+        """
+        with self._lock:
+            owned = list(self._idle.values())
+            self._idle = {}
+        for buckets in owned:
+            self._close_all(buckets)
+
+    def _close_all(self, buckets: dict[str, list[zmq.Socket]]) -> None:
+        """Close every socket in *buckets*, tolerating an already-destroyed context."""
+        for sock in itertools.chain.from_iterable(buckets.values()):
+            try:
+                if not sock.closed:
+                    sock.close(linger=0)
+            except Exception as e:
+                logger.debug(f"[{self._owner_id}]: Error closing pooled socket: {e}")
+
+
 def with_zmq_socket(
-    socket_name: str,
     *,
-    get_identity: Callable[[Any], str],
     get_peer: Callable[[Any, str | None], ZMQServerInfo],
-    get_context: Callable[[Any], "zmq.asyncio.Context"],
+    get_pool: Callable[[Any], ZMQSocketPool],
     resolve_target: Callable[[tuple, dict], str | None] | None = None,
-    timeout: int | None = None,
 ):
-    """Create a reusable async decorator for request sockets.
+    """Create a reusable async decorator that injects a pooled request socket.
 
-    Lifecycle: get owner's shared context -> create/connect socket -> inject -> close socket.
+    Lifecycle: resolve peer -> lease a socket from ``self``'s pool -> inject as the
+    ``socket`` kwarg -> return it to the pool if the call succeeded, else discard it.
 
-    The context comes from ``self`` via ``get_context`` and is long-lived; only the DEALER
-    socket is per-call. Do NOT create or terminate a context here -- per-call churn corrupts
-    libzmq's signaler file descriptors under concurrency (Bad file descriptor / SIGABRT) and
-    can hang on term(). Contexts are thread-safe and loop-agnostic, so sharing one is safe.
+    The socket name and timeout come from the pool, which serves one request scenario.
 
     Args:
-        socket_name: Socket port key in ``ZMQServerInfo.ports``.
-        get_identity: Callable that extracts owner identity from ``self``.
-            Example: ``lambda self: self.client_id``
         get_peer: Callable that returns ``ZMQServerInfo`` for the target.
             For single-target scenarios, ignore the target parameter.
             Example: ``lambda self, target: self.server_info``
             Example: ``lambda self, target: self.storage_unit_infos[target]``
-        get_context: Callable that returns the owner's long-lived ``zmq.asyncio.Context``.
-            Example: ``lambda self: self.zmq_context``
+        get_pool: Callable that returns the pool for this scenario.
+            Example: ``lambda self: self.controller_rpc_pool``
         resolve_target: Optional callable that extracts target identifier from
             function arguments. Receives (args, kwargs) and returns target name.
             Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
-        timeout: Optional timeout (seconds) for both send/recv operations.
     """
 
     def decorator(func: Callable):
         @wraps(func)
         async def wrapper(self, *args, **kwargs):
-            owner_id = get_identity(self)
-            if owner_id is None:
-                raise RuntimeError("get_identity returned None")
-
             target_name: str | None = None
             if resolve_target is not None:
                 target_name = resolve_target(args, kwargs)
@@ -408,31 +642,13 @@ def with_zmq_socket(
             if server_info is None:
                 raise RuntimeError(f"get_peer returned None for target '{target_name}'")
 
-            port = server_info.ports.get(socket_name)
-            if port is None:
-                raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
+            pool = get_pool(self)
+            if pool is None:
+                raise RuntimeError("get_pool returned None")
 
-            # Reuse the owner's long-lived context; only the socket is per-call.
-            context = get_context(self)
-            if context is None:
-                raise RuntimeError("get_context returned None")
-
-            sock = None
-            try:
-                address = format_zmq_address(server_info.ip, port)
-                identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
-                sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
-                sock.connect(address)
-                if timeout is not None:
-                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+            async with pool.alease(server_info) as sock:
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
-            finally:
-                # Close the per-call socket only; the context outlives the call. linger=0
-                # drops unsent frames so close never blocks the event loop.
-                if sock is not None and not sock.closed:
-                    sock.close(linger=0)
 
         return wrapper
 

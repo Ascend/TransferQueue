@@ -23,10 +23,10 @@ from typing import Any, Callable, NoReturn
 import zmq
 import zmq.asyncio
 
-from transfer_queue.storage.payload_transfer.base import PayloadTransfer
+from transfer_queue.storage.payload_transfer.base import PayloadTransfer, PayloadTransferTimeout
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, frame_nbytes
 
 logger = get_logger(__name__)
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
@@ -46,22 +46,25 @@ class ZmqPayloadTransfer(PayloadTransfer):
         global_indexes: list[int],
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
-    ) -> None:
+    ) -> int:
         request = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,
             sender_id=sender_id,
             receiver_id=target_id,
             body={"global_indexes": global_indexes, "data": data, "data_parser": data_parser},
         )
+        frames = request.serialize()
+        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
         try:
-            await control_socket.send_multipart(request.serialize(), copy=False)
+            await control_socket.send_multipart(frames, copy=False)
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
             if response.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
                 raise RuntimeError(
                     f"Failed to put data to storage unit {target_id}: {response.body.get('message', 'Unknown error')}"
                 )
+            return wire_bytes
         except zmq.error.Again as exc:
-            self._raise_timeout(sender_id, target_id, "put", exc)
+            self._raise_timeout(sender_id, target_id, "put", exc, wire_bytes=wire_bytes)
         except Exception as exc:
             logger.error(
                 f"[{sender_id}]: Unexpected error during put to storage unit {target_id}: {type(exc).__name__}: {exc}"
@@ -77,6 +80,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
         global_indexes: list[int],
         fields: list[str],
     ) -> dict[str, Any]:
+        from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
+
         request = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=sender_id,
@@ -87,12 +92,14 @@ class ZmqPayloadTransfer(PayloadTransfer):
             await control_socket.send_multipart(request.serialize())
             response = ZMQMessage.deserialize(await control_socket.recv_multipart(copy=False))
             if response.request_type != ZMQRequestType.GET_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to get data from storage unit {target_id}: {response.body.get('message', 'Unknown error')}"
-                )
+                message = response.body.get("message", "Unknown error")
+                error_type = StorageKeyNotFoundError if KEY_NOT_FOUND_MARKER in message else RuntimeError
+                raise error_type(f"Failed to get data from storage unit {target_id}: {message}")
             return response.body["data"]
         except zmq.error.Again as exc:
             self._raise_timeout(sender_id, target_id, "get", exc)
+        except StorageKeyNotFoundError:
+            raise
         except Exception as exc:
             logger.error(f"[{sender_id}]: Unexpected error from storage unit {target_id}: {type(exc).__name__}: {exc}")
             raise RuntimeError(
@@ -159,17 +166,23 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ZMQMessage.create(request_type=request_type, sender_id=sender_id, body=body or {})
 
     @staticmethod
-    def _raise_timeout(sender_id: str, target_id: str, operation: str, error: Exception) -> NoReturn:
+    def _raise_timeout(
+        sender_id: str, target_id: str, operation: str, error: Exception, *, wire_bytes: int = 0
+    ) -> NoReturn:
         timeout = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
         if operation == "put":
             logger.error(
                 f"[{sender_id}]: ZMQ recv timeout ({timeout}s) during put to storage unit {target_id}. "
                 "The storage unit may be overloaded or crashed."
             )
-            raise RuntimeError(f"ZMQ recv timeout ({timeout}s) during put to storage unit {target_id}") from error
+            raise PayloadTransferTimeout(
+                f"ZMQ recv timeout ({timeout}s) during put to storage unit {target_id}", wire_bytes=wire_bytes
+            ) from error
 
         logger.error(
             f"[{sender_id}]: ZMQ recv timeout ({timeout}s) from storage unit {target_id}. "
             "The storage unit may be overloaded or crashed."
         )
-        raise RuntimeError(f"ZMQ recv timeout ({timeout}s) from storage unit {target_id}") from error
+        raise PayloadTransferTimeout(
+            f"ZMQ recv timeout ({timeout}s) from storage unit {target_id}", wire_bytes=wire_bytes
+        ) from error
