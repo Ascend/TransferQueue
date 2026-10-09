@@ -672,6 +672,31 @@ def test_load_waits_for_other_units_before_raising(tq_system, monkeypatch):
     assert not notified
 
 
+def test_load_publishes_metadata_updates_concurrently(tq_system, monkeypatch):
+    manager = tq.get_client().storage_manager
+    num_updates = 3
+
+    async def publish_all():
+        started, ready = [], asyncio.Event()
+
+        async def load(shards, target_storage_unit):
+            updates = [{"global_indexes": [i], "field_schema": {}} for i in range(num_updates)]
+            return {"bytes_read": 0, "updates": updates}
+
+        async def notify(partition_id, global_indexes, field_schema):
+            started.append(global_indexes)
+            if len(started) == num_updates:
+                ready.set()
+            # Every update waits for all the others, so this finishes only if they run at once.
+            await asyncio.wait_for(ready.wait(), timeout=2)
+
+        monkeypatch.setattr(manager, "_load_selected_rows", load)
+        monkeypatch.setattr(manager, "notify_data_update", notify)
+        await manager.load_rows_by_index("p", [{"path": "shard", "records": [{"target_index": 0}]}])
+
+    asyncio.run(publish_all())
+
+
 def test_dump_waits_for_writers_before_cleanup_can_start(tq_system, dump_dir, monkeypatch):
     manager = tq.get_client().storage_manager
     units = list(manager.storage_unit_infos)

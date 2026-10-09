@@ -962,13 +962,21 @@ class AsyncSimpleStorageManager(StorageManager):
             *(self._load_selected_rows(shards, target_storage_unit=unit_id) for unit_id, shards in assignments.items()),
             return_exceptions=True,
         )
+        loaded = []
         for result in results:
             if isinstance(result, BaseException):
                 raise result
-        for result in results:
-            for update in result["updates"]:
-                await self.notify_data_update(partition_id, update["global_indexes"], update["field_schema"])
-        bytes_read = sum(result["bytes_read"] for result in results)
+            loaded.append(result)
+        # One update per (shard, unit, batch, field set): sequential round trips would
+        # dominate a wide cross-topology load. The notify pool bounds the concurrency.
+        await asyncio.gather(
+            *(
+                self.notify_data_update(partition_id, update["global_indexes"], update["field_schema"])
+                for result in loaded
+                for update in result["updates"]
+            )
+        )
+        bytes_read = sum(result["bytes_read"] for result in loaded)
         logger.info(
             "[%s]: loaded %s bytes across %s units",
             self.storage_manager_id,
