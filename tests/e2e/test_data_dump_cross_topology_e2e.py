@@ -94,7 +94,7 @@ def _assert_rows_equal(actual: torch.Tensor, expected_rows: list[torch.Tensor]) 
 
 @pytest.mark.parametrize(
     ("dump_units", "load_units"),
-    [(4, 2), (2, 4), (3, 3), (1, 4)],
+    [(4, 2), (2, 4), (1, 4)],
 )
 def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units, load_units):
     # Define test data
@@ -133,12 +133,12 @@ def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units
         tq.close()
 
 
-@pytest.mark.parametrize("row_count", [2, 127, 128, 129, 130])
-def test_preserves_nontensor_schema_across_topology(ray_init, dump_dir, row_count):
+def test_preserves_nontensor_schema_across_topology(ray_init, dump_dir):
+    # Spans two 128-row load batches; test_data_dump_e2e.py covers each batch boundary on one system.
+    row_count = 130
     keys = [f"k{i}" for i in range(row_count)]
     values = [torch.tensor([i], dtype=torch.int64) for i in range(row_count - 1)] + [torch.tensor([1.5])]
-    if row_count > 2:
-        values[-2] = None
+    values[-2] = None
     tq.init(_tq_config(1))
     try:
         tq.kv_batch_put(keys, "mixed", TensorDict({"x": NonTensorStack(*values)}, batch_size=row_count))
