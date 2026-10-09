@@ -305,6 +305,8 @@ def test_invalid_and_nested_use_is_rejected():
 
             with pytest.raises(RuntimeError, match="Nested"):
                 await asyncio.create_task(child())
+            later = asyncio.create_task(child())
+        await later  # starts after the block exited, so it no longer counts as nested
 
     asyncio.run(main())
 

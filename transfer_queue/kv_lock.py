@@ -48,9 +48,16 @@ from transfer_queue.lock_manager import TransferQueueLockManager
 # while waiting.
 _state_lock = threading.Lock()
 _table: dict[tuple[str, str], deque["_Waiter"]] = {}
-# Whether this thread or task holds (or is acquiring) a local lock. A future global lock
-# reads it to enforce the "global, then local" order.
-_holding: ContextVar[bool] = ContextVar("_holding_kv_lock", default=False)
+# Whether this thread or task holds (or is acquiring) a local lock; the global lock reads it
+# to enforce the "global, then local" order. It holds a cell, not a bool: a task created
+# inside the block copies the context, and must see the cell cleared once the block exits.
+_holding: ContextVar[list[bool] | None] = ContextVar("_holding_kv_lock", default=None)
+
+
+def _mark(held: ContextVar[list[bool] | None]) -> list[bool]:
+    cell = [True]
+    held.set(cell)
+    return cell
 
 
 class _Waiter:
@@ -132,12 +139,15 @@ async def _acquire_async(name: tuple[str, str], deadline: float | None) -> None:
 
 
 def _lock_names(
-    keys: str | list[str], partition_id: str, held: ContextVar[bool] = _holding, kind: str = "kv_local_lock"
+    keys: str | list[str],
+    partition_id: str,
+    held: ContextVar[list[bool] | None] = _holding,
+    kind: str = "kv_local_lock",
 ) -> list[tuple[str, str]]:
     keys = [keys] if isinstance(keys, str) else keys
     if not keys:
         raise ValueError(f"{kind} needs at least one key")
-    if held.get():
+    if held.get() == [True]:
         raise RuntimeError(f"Nested {kind} is not supported; pass all keys to a single call")
     # A fixed order keeps two overlapping multi-key calls from deadlocking.
     return [(partition_id, key) for key in sorted(set(keys))]
@@ -168,7 +178,7 @@ def kv_local_lock(keys: str | list[str], partition_id: str, timeout: float | Non
     _reject_running_loop("kv_local_lock")
     names, acquired = _lock_names(keys, partition_id), []
     deadline = None if timeout is None else time.monotonic() + timeout
-    _holding.set(True)
+    held = _mark(_holding)
     try:
         for name in names:
             _acquire(name, deadline)
@@ -176,15 +186,15 @@ def kv_local_lock(keys: str | list[str], partition_id: str, timeout: float | Non
         yield
     finally:
         _release_all(acquired)
-        _holding.set(False)
+        held[0] = False
 
 
 @asynccontextmanager
 async def async_kv_local_lock(keys: str | list[str], partition_id: str, timeout: float | None = None):
-    """Async version of ``kv_local_lock``. Tasks created inside the block cannot take a local lock."""
+    """Async version of ``kv_local_lock``. Tasks created inside the block cannot take a local lock while it lasts."""
     names, acquired = _lock_names(keys, partition_id), []
     deadline = None if timeout is None else time.monotonic() + timeout
-    _holding.set(True)
+    held = _mark(_holding)
     try:
         for name in names:
             await _acquire_async(name, deadline)
@@ -192,10 +202,10 @@ async def async_kv_local_lock(keys: str | list[str], partition_id: str, timeout:
         yield
     finally:
         _release_all(acquired)
-        _holding.set(False)
+        held[0] = False
 
 
-_holding_global: ContextVar[bool] = ContextVar("_holding_kv_global_lock", default=False)
+_holding_global: ContextVar[list[bool] | None] = ContextVar("_holding_kv_global_lock", default=None)
 # This process's leases, renewed in batches by one daemon thread that runs while any exist.
 _registry = threading.Condition()
 _leases: dict[str, "GlobalLease"] = {}
@@ -269,7 +279,7 @@ def _lock_manager(shard: int):
 
 def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> GlobalLease:
     names = _lock_names(keys, partition_id, _holding_global, "kv_global_lock")
-    if _holding.get():
+    if _holding.get() == [True]:
         raise RuntimeError("Take kv_global_lock before kv_local_lock, not while holding one")
     if lease_s <= 0:
         raise ValueError("lease_s must be positive")
@@ -393,7 +403,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     _reject_running_loop("kv_global_lock")
     lease = _new_lease(keys, partition_id, lease_s)
     deadline = None if timeout is None else time.monotonic() + timeout
-    _holding_global.set(True)
+    held = _mark(_holding_global)
     try:
         # Every caller visits shards in ascending order, so no two callers can each hold a
         # shard the other awaits: multi-shard requests cannot deadlock.
@@ -414,19 +424,19 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
         lease.check()
     finally:
         _release_lease(lease)
-        _holding_global.set(False)
+        held[0] = False
 
 
 @asynccontextmanager
 async def async_kv_global_lock(
     keys: str | list[str], partition_id: str, timeout: float | None = None, lease_s: float = 30
 ):
-    """Async version of ``kv_global_lock``. Tasks created inside the block cannot take a global lock."""
+    """Async version of ``kv_global_lock``. Tasks created inside the block cannot take a global lock while it lasts."""
     if _num_shards is None:  # the first use waits on Ray's GCS, so keep it off the event loop
         await asyncio.to_thread(_shard_count)
     lease = _new_lease(keys, partition_id, lease_s)
     deadline = None if timeout is None else time.monotonic() + timeout
-    _holding_global.set(True)
+    held = _mark(_holding_global)
     try:
         for shard in lease.shards:
             granted = False
@@ -444,7 +454,7 @@ async def async_kv_global_lock(
         lease.check()
     finally:
         _release_lease(lease)
-        _holding_global.set(False)
+        held[0] = False
 
 
 def kv_lock_list(partition_id: str | None = None) -> dict:
