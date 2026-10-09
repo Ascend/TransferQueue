@@ -17,6 +17,7 @@
 
 import asyncio
 import importlib
+import threading
 import time
 
 import pytest
@@ -199,6 +200,27 @@ def test_cancelled_waiter_is_withdrawn_and_never_granted():
     # A ghost grant to the cancelled waiter would hold "c" for its whole 30 s lease.
     with tq.kv_global_lock("c", P, timeout=5):
         pass
+
+
+def test_waiting_on_a_later_shard_keeps_the_earlier_keys_held():
+    early, late = keys_on_two_shards("lw")
+    worker = Worker.remote()
+    ray.get(worker.hold.remote(late), timeout=TIMEOUT_S)
+    entered = []
+
+    def take_both():
+        with tq.kv_global_lock([early, late], P, timeout=TIMEOUT_S, lease_s=2) as lease:
+            entered.append(lease)
+
+    thread = threading.Thread(target=take_both)
+    thread.start()
+    wait_until(lambda: holders() == {early, late})
+    time.sleep(3)  # longer than our lease: unrenewed, the grant on `early` would have expired
+    assert holders() == {early, late}
+    ray.get(worker.release.remote(), timeout=TIMEOUT_S)
+    thread.join(TIMEOUT_S)
+    assert len(entered) == 1  # entered without LockLostError
+    wait_until(lambda: holders() == set())
 
 
 def test_release_before_acquire_withdraws_it():

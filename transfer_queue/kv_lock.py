@@ -223,6 +223,7 @@ class GlobalLease:
         self.deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
         self.lost = False
         self.pending: list[int] = []  # shards that may hold or await this token, so exit must release them
+        self.granted: list[int] = []  # shards that granted it, so the renewer keeps their leases alive
 
     def check(self) -> None:
         """Raise ``LockLostError`` if the lease was lost; call it right before writes in long sections."""
@@ -282,16 +283,15 @@ def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
 
 
 def _take_grant(lease: GlobalLease, shard: int, waited: float | None, sent: float) -> None:
+    global _renewer_running
     if waited is None:
         lease.pending.remove(shard)
         raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
     # The grant happened at least `waited` after `sent`, so this never outlives the shard's lease.
     lease.deadline = min(lease.deadline, sent + waited + lease.lease_s)
-
-
-def _start_lease(lease: GlobalLease) -> None:
-    global _renewer_running
+    # Renew from the first grant on: waiting on a later shard may outlast an earlier one's lease.
     with _registry:
+        lease.granted.append(shard)
         _leases[lease.token] = lease
         _registry.notify()  # a shorter lease_s shortens the renewal period
         if not _renewer_running:
@@ -326,10 +326,10 @@ def _renew_loop() -> None:
                 if remaining <= 0:
                     break
                 _registry.wait(remaining)
-            batch = dict(_leases)
+            batch = {token: (lease, list(lease.granted)) for token, lease in _leases.items()}
         by_shard: dict[int, list[str]] = {}
-        for token, lease in batch.items():
-            for shard in lease.shards:
+        for token, (_, shards) in batch.items():
+            for shard in shards:
                 by_shard.setdefault(shard, []).append(token)
         # Count from the send time: the server extends the lease from when the call arrives,
         # which is later, so the local deadline never outlives the server's.
@@ -347,12 +347,13 @@ def _renew_loop() -> None:
             except Exception:  # a dead lock manager or a timeout
                 continue
             renewed.update((shard, token) for token, ok in alive.items() if ok)
-        # A lease is lost as soon as any one of its shards fails to renew it.
-        for token, lease in batch.items():
-            if all((shard, token) in renewed for shard in lease.shards):
-                lease.deadline = last + lease.lease_s
-            else:
+        # A lease is lost as soon as any one of its shards fails to renew it. A shard granted
+        # since the snapshot was not renewed here, so it keeps the deadline _take_grant set.
+        for token, (lease, shards) in batch.items():
+            if not all((shard, token) in renewed for shard in shards):
                 lease.lost = True
+            elif len(lease.granted) == len(shards):
+                lease.deadline = last + lease.lease_s
 
 
 @contextmanager
@@ -367,9 +368,10 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     keys are awaited.
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever), and ``RuntimeError`` when nested, taken while holding a
-    ``kv_local_lock``, or called with a running event loop. Exit always releases the lock,
-    then raises ``LockLostError`` if the lease was lost, unless the body already raised:
-    an exception from the body is never masked.
+    ``kv_local_lock``, or called with a running event loop. Raises ``LockLostError`` on
+    entry if an earlier key's lease was lost while a later one was awaited. Exit always
+    releases the lock, then raises ``LockLostError`` if the lease was lost, unless the body
+    already raised: an exception from the body is never masked.
     """
     _reject_running_loop("kv_global_lock")
     lease = _new_lease(keys, partition_id, lease_s)
@@ -385,7 +387,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
             except RayActorError as e:
                 raise RuntimeError(_MANAGER_GONE) from e
             _take_grant(lease, shard, waited, sent)
-        _start_lease(lease)
+        lease.check()
         yield lease
         lease.check()
     finally:
@@ -409,7 +411,7 @@ async def async_kv_global_lock(
             except RayActorError as e:
                 raise RuntimeError(_MANAGER_GONE) from e
             _take_grant(lease, shard, waited, sent)
-        _start_lease(lease)
+        lease.check()
         yield lease
         lease.check()
     finally:
