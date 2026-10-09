@@ -38,6 +38,7 @@ from .interface import (
     save_checkpoint,
 )
 from .kv_lock import (
+    GlobalLease,
     LockLostError,
     async_kv_global_lock,
     async_kv_local_lock,
@@ -80,6 +81,7 @@ __all__ = (
         "kv_global_lock",
         "async_kv_global_lock",
         "kv_lock_list",
+        "GlobalLease",
         "LockLostError",
     ]
     + [

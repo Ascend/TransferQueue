@@ -417,5 +417,6 @@ def test_one_lock_shard_still_works():
     tq.init(OmegaConf.create({**CONF, "lock": {"enabled": True, "num_shards": 1}}))
     assert actors_named("TransferQueueLockManager_") == ["TransferQueueLockManager_0"]
     with tq.kv_global_lock(["a", "b"], P, timeout=5) as lease:
+        assert isinstance(lease, tq.GlobalLease)
         assert holders() == {"a", "b"} and list(lease.shards) == [0]
     wait_until(lambda: holders() == set())
