@@ -42,7 +42,8 @@ from transfer_queue.data_dump import _read_row_index
 
 os.environ["RAY_DEDUP_LOGS"] = "0"
 
-_NUM_STORAGE_UNITS = 4
+# CI runners have four CPUs, and the controller and each storage unit reserve one.
+_NUM_STORAGE_UNITS = 3
 
 
 def _tq_config(num_storage_units: int) -> OmegaConf:
