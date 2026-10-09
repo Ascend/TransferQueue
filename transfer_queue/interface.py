@@ -1193,11 +1193,8 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
     tmp_dir.mkdir(parents=True)
 
     try:
-        row_index = (
-            client.describe_data_dump(partition_id, unique_keys)
-            if unique_keys
-            else {"partition_id": partition_id, "rows": {}, "field_schema": {}}
-        )
+        description = client.kv_describe(unique_keys, partition_id) if unique_keys else {"rows": {}, "field_schema": {}}
+        row_index = {"partition_id": partition_id, **description}
         rows = row_index["rows"]
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.

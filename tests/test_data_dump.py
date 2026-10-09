@@ -67,8 +67,7 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     batch = torch.arange(64 * 4096).reshape(64, 4096)
     tag = {"nested": [SimpleNamespace(value=batch[0])]}
     client = SimpleNamespace(
-        describe_data_dump=lambda *_: {
-            "partition_id": "p",
+        kv_describe=lambda *_: {
             "rows": {"key": {"global_index": 0, "fields": [], "tag": tag}},
             "field_schema": {},
         }

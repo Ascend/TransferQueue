@@ -1737,22 +1737,21 @@ class TransferQueueController:
 
         return keys
 
-    # ==================== Selective Data Dump API ====================
+    def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
+        """Describe each key's row and the declared types of its fields, without payloads.
 
-    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
-        """Describe the key-addressed rows a selective dump needs, without copying them.
-
-        Returns only metadata, so the caller can write a row index and route the payload
-        dump to the storage units that hold it. Deliberately avoids ``to_snapshot``: a
-        dump needs a handful of lookups per key, not a deep copy of the whole partition.
+        Unlike ``kv_retrieve_meta``, which keeps only the fields every row has produced and
+        drops missing keys, this reports each row's own field set and fails on a missing
+        key. Avoids ``to_snapshot``: a handful of lookups per key, not a partition copy.
 
         Args:
-            partition_id: Partition that owns ``keys``.
             keys: Keys to describe, already deduplicated by the caller.
+            partition_id: Partition that owns ``keys``.
 
         Returns:
-            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``. ``fields``
-            is empty for a row that exists in metadata but has no produced field yet.
+            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
+            {"is_nested", "is_non_tensor"}}}``. ``fields`` is empty for a row with no
+            produced field yet; ``field_schema`` covers the fields of the described rows.
 
         Raises:
             KeyError: The partition or any key does not exist.
@@ -1766,7 +1765,7 @@ class TransferQueueController:
         if missing_keys:
             raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
 
-        return {
+        rows = {
             key: {
                 "global_index": global_index,
                 "fields": sorted(
@@ -1778,6 +1777,13 @@ class TransferQueueController:
             }
             for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True)
         }
+        # Only the declared types: row dtypes and shapes live with the storage units.
+        field_schema = {
+            name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
+            for name, meta in partition.field_metadata.items()
+            if any(name in row["fields"] for row in rows.values())
+        }
+        return {"rows": rows, "field_schema": field_schema}
 
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
@@ -2002,7 +2008,7 @@ class TransferQueueController:
             ZMQRequestType.KV_RETRIEVE_META: self._handle_kv_retrieve_meta_request,
             ZMQRequestType.KV_RETRIEVE_KEYS: self._handle_kv_retrieve_keys_request,
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
-            ZMQRequestType.DESCRIBE_ROWS_BY_KEY: self._handle_describe_rows_by_key_request,
+            ZMQRequestType.KV_DESCRIBE: self._handle_kv_describe_request,
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
@@ -2201,6 +2207,11 @@ class TransferQueueController:
         )
         return self._make_response(request_msg, ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE, {"keys": keys})
 
+    def _handle_kv_describe_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        description = self.kv_describe(params["keys"], params["partition_id"])
+        return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
+
     def _handle_kv_list_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         requested_partition_id = request_msg.body["partition_id"]
         partition_ids = list(self.partitions.keys()) if requested_partition_id is None else [requested_partition_id]
@@ -2235,22 +2246,6 @@ class TransferQueueController:
             request_msg,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
             {"success": True},
-        )
-
-    def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        params = request_msg.body
-        rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
-        partition = self.partitions[params["partition_id"]]
-        # Only the declared types: row dtypes and shapes come from the storage units.
-        field_schema = {
-            name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
-            for name, meta in partition.field_metadata.items()
-            if any(name in row["fields"] for row in rows.values())
-        }
-        return self._make_response(
-            request_msg,
-            ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
-            {"success": True, "partition_id": params["partition_id"], "rows": rows, "field_schema": field_schema},
         )
 
     def _handle_validate_dump_schema_request(self, request_msg: ZMQMessage) -> ZMQMessage:

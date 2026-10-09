@@ -1067,6 +1067,30 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
+    @with_controller_socket
+    async def async_kv_describe(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, Any]:
+        """Asynchronously describe each key's row and its fields' declared types, without payloads.
+
+        Unlike ``kv_retrieve_meta``, every row keeps its own produced fields, and a missing
+        key raises instead of being dropped.
+
+        Returns:
+            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
+            {"is_nested", "is_non_tensor"}}}``.
+        """
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_DESCRIBE,
+            response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1125,22 +1149,6 @@ class AsyncTransferQueueClient:
         return True
 
     # ==================== Selective Data Dump API ====================
-    @with_controller_socket
-    async def async_describe_data_dump(
-        self,
-        partition_id: str,
-        keys: list[str],
-        socket: zmq.asyncio.Socket | None = None,
-    ) -> dict[str, Any]:
-        """Fetch selected rows and their fields' declared types without payloads."""
-        response = await self._request_controller(
-            socket=socket,
-            request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY,
-            response_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
-            body={"partition_id": partition_id, "keys": keys},
-        )
-        return {name: response.body[name] for name in ("partition_id", "rows", "field_schema")}
-
     @with_controller_socket
     async def async_validate_dump_schema(
         self,
@@ -1395,7 +1403,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
-        self._describe_data_dump = _make_sync(self.async_describe_data_dump)
+        self._kv_describe = _make_sync(self.async_kv_describe)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
@@ -1835,10 +1843,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         return self._kv_list(partition_id=partition_id)
 
+    def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
+        """Synchronously describe each key's row and its fields' declared types, without payloads.
+
+        See ``async_kv_describe``.
+        """
+        return self._kv_describe(keys, partition_id)
+
     # ==================== Selective Data Dump API ====================
-    def describe_data_dump(self, partition_id: str, keys: list[str]) -> dict[str, Any]:
-        """Fetch the row index and the selected fields' declared types for a selective dump."""
-        return self._describe_data_dump(partition_id, keys)
 
     def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:
         """Reject incompatible destination fields before restoring payloads."""
