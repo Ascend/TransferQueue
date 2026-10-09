@@ -24,8 +24,7 @@ import pytest
 import torch
 
 from transfer_queue import data_dump, interface
-from transfer_queue.storage.dump_io import validate_dump_values
-from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData
+from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData, validate_dump_values
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 

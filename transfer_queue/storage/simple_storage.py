@@ -48,7 +48,6 @@ import ray
 import torch
 import zmq
 
-from transfer_queue.storage.dump_io import read_dump_row, select_dump_schema, validate_dump_values
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
@@ -720,6 +719,53 @@ class HybridStorageUnitData(StorageUnitData):
     def close(self) -> None:
         """Release SSD resources owned by this hybrid store."""
         self._ssd_store.close()
+
+
+# Readers for the selective dump records that SimpleStorageUnit._handle_dump_rows writes.
+def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
+    """Read and validate exactly one record against its expected index and fields."""
+    file.seek(offset)
+    payload = file.read(length)
+    if len(payload) != length:
+        raise ValueError(f"Truncated dump row {global_index} in {file.name}")
+    row = pickle.loads(payload)
+    if row["global_index"] != global_index or set(row["fields"]) != set(fields):
+        raise ValueError(f"Dump row {global_index} disagrees with the row index in {file.name}")
+    return row["fields"]
+
+
+def validate_dump_values(values: dict, schema: dict, source_index: int) -> None:
+    """Validate persisted tensor values without changing their type or dtype."""
+    for name, value in values.items():
+        field = schema[name]
+        if field["is_non_tensor"]:
+            continue
+        shape = field.get("per_sample_shapes", {}).get(source_index) if field["is_nested"] else field["shape"]
+        if shape is None:
+            raise ValueError(f"Dump field {name!r} has no saved shape at row {source_index}")
+        actual_shape = tuple(value.shape) if isinstance(value, torch.Tensor) else None
+        # Existing dense scalar fields use a one-element metadata shape.
+        scalar = actual_shape == () and tuple(shape) == (1,) and not field["is_nested"]
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.dtype != field["dtype"]
+            or (actual_shape != tuple(shape) and not scalar)
+        ):
+            raise ValueError(f"Dump field {name!r} disagrees with its saved schema at row {source_index}")
+
+
+def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: list[int], names: tuple) -> dict:
+    """Remap only the selected nested shapes to the current destination indexes."""
+    selected = {}
+    for name in names:
+        field = dict(schema[name])
+        if field["is_nested"]:
+            field["per_sample_shapes"] = {
+                target: field["per_sample_shapes"][source]
+                for source, target in zip(source_indexes, target_indexes, strict=True)
+            }
+        selected[name] = field
+    return selected
 
 
 @ray.remote(num_cpus=1)
