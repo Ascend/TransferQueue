@@ -165,7 +165,12 @@ class TransferQueueLockManager:
             waiter["done"].set()  # its pending call finds no lease and returns None
         else:
             now = time.monotonic()
-            self._withdrawn = {t: until for t, until in self._withdrawn.items() if until > now}
+            # One TTL for all, so insertion order is expiry order: expired tombstones lead.
+            while self._withdrawn:
+                oldest, until = next(iter(self._withdrawn.items()))
+                if until > now:
+                    break
+                del self._withdrawn[oldest]
             self._withdrawn[token] = now + _WITHDRAWN_TTL_S
 
     def list_locks(self, partition_id: str | None = None) -> dict:
