@@ -268,16 +268,18 @@ class StorageUnitData:
         self.put_data(computed, global_indexes)
         return {field: _describe_stored_values(values) for field, values in computed.items()}
 
-    def clear(self, keys: list[int]) -> None:
+    def clear(self, keys: list[int], fields: list[str] | None = None) -> None:
         """Remove data at given global index keys, immediately freeing memory.
 
         Args:
             keys: Global indexes to remove.
+            fields: If given, remove only these fields and keep the samples.
         """
-        for f in self.field_data:
+        for f in self.field_data if fields is None else set(fields) & self.field_data.keys():
             for key in keys:
                 self.field_data[f].pop(key, None)
-        self._active_keys -= set(keys)
+        if fields is None:
+            self._active_keys -= set(keys)
 
     def save_checkpoint(self, path: str | Path, storage_unit_id: str) -> None:
         """Write in-memory storage state to a checkpoint."""
@@ -654,15 +656,17 @@ class HybridStorageUnitData(StorageUnitData):
                 values[position] = self._decode_sample(raw, entry)
         return result
 
-    def clear(self, keys: list) -> None:
+    def clear(self, keys: list, fields: list[str] | None = None) -> None:
         """Remove values and unlink any files they reference."""
         ssd_values: list[_SSDValueRef] = []
-        for values in self.field_data.values():
+        for field, values in self.field_data.items():
+            if fields is not None and field not in fields:
+                continue
             for key in set(keys):
                 value = values.get(key)
                 if isinstance(value, _SSDValueRef):
                     ssd_values.append(value)
-        super().clear(keys)
+        super().clear(keys, fields)
         self._ssd_active_values -= len(ssd_values)
         self._ssd_active_bytes -= sum(value.size_bytes for value in ssd_values)
         for value in ssd_values:
@@ -1321,7 +1325,7 @@ class SimpleStorageUnit:
         Handle clear request, clear data in storage unit according to given global_indexes.
 
         Args:
-            data_parts: ZMQMessage from client, including target global_indexes.
+            data_parts: ZMQMessage from client, including target global_indexes and optional fields.
 
         Returns:
             Clear data success response ZMQMessage.
@@ -1332,7 +1336,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
             ):
-                self.storage_data.clear(global_indexes)
+                self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]

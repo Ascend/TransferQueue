@@ -23,7 +23,6 @@ from .interface import (
     async_kv_batch_put,
     async_kv_batch_update,
     async_kv_clear,
-    async_kv_empty,
     async_kv_list,
     async_kv_put,
     async_kv_update,
@@ -37,7 +36,6 @@ from .interface import (
     kv_batch_put,
     kv_batch_update,
     kv_clear,
-    kv_empty,
     kv_list,
     kv_put,
     kv_update,
@@ -67,7 +65,6 @@ __all__ = (
         "kv_list",
         "kv_clear",
         "kv_update",
-        "kv_empty",
         "async_kv_put",
         "async_kv_batch_put",
         "async_kv_batch_update",
@@ -76,7 +73,6 @@ __all__ = (
         "async_kv_list",
         "async_kv_clear",
         "async_kv_update",
-        "async_kv_empty",
         "KVBatchMeta",
     ]
     + [

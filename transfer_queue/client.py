@@ -1010,6 +1010,29 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}] Failed in async_kv_retrieve_meta: {e}") from e
 
+    async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
+        """Clear fields of existing keys while keeping the keys, tags and consumption status.
+
+        The controller marks the fields as unproduced before storage deletes them, so no
+        reader sees a ready field whose value is gone.
+        """
+        metadata = await self._kv_clear_fields_in_controller(keys, partition_id, fields)
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata, fields=metadata.field_names)
+
+    @with_controller_socket
+    async def _kv_clear_fields_in_controller(
+        self, keys: list[str], partition_id: str, fields: list[str], socket=None
+    ) -> BatchMeta:
+        """Clear fields in the controller and return the cleared cells' metadata."""
+        response_msg = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_CLEAR_FIELDS,
+            response_type=ZMQRequestType.KV_CLEAR_FIELDS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "fields": fields},
+        )
+        return response_msg.body["metadata"]
+
     @with_controller_socket
     async def async_kv_retrieve_keys(
         self,

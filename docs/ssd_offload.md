@@ -216,7 +216,7 @@ memory use while values are read or encoded.
 ### Dense batches can retain shared backing memory
 
 SimpleStorage slices dense batches without copying. The rows therefore share
-the batch allocation, and replacing or emptying one row does not release its
+the batch allocation, and replacing or clearing one row does not release its
 share while another stored row still references that allocation. This is the
 memory trade-off for zero-copy batch distribution; clear or replace every
 sibling row before expecting the full allocation to be released.

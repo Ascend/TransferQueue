@@ -347,12 +347,13 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement get_data")
 
     @abstractmethod
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """
         Clear data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be cleared from the storage.
+            fields: If given, delete only these fields and keep the samples.
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
@@ -839,9 +840,13 @@ class KVStorageManager(StorageManager):
         )
         return self._merge_tensors_to_tensordict(metadata, values)
 
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Remove stored data associated with the given metadata."""
 
+        if fields is not None:
+            metadata = metadata.select_fields(fields)
+            if not metadata.field_names:
+                return
         if not metadata.field_names:
             raise RuntimeError(
                 "Fail to clear_data for key-value based backends due to lack of `field_names` in BatchMeta"

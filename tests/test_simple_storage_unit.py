@@ -472,6 +472,12 @@ def test_storage_unit_data_direct():
     assert 0 not in storage_data.field_data["log_probs"]  # key gone
     assert 1 in storage_data.field_data["log_probs"]  # other key intact
 
+    # field-level clear keeps the sample and its other fields
+    storage_data.clear([1], fields=["rewards", "missing"])
+    assert 1 not in storage_data.field_data["rewards"]
+    assert 1 in storage_data.field_data["log_probs"]
+    assert storage_data._active_keys == {1}
+
 
 def test_storage_unit_data_capacity_uses_active_keys():
     """Capacity check must use _active_keys, not scan field_data."""
@@ -543,6 +549,31 @@ def test_hybrid_storage_routes_each_sample_by_payload_size_and_clears(tmp_path):
         storage.close()
 
     assert not (tmp_path / "transfer_queue_ssd_offload" / "test-run").exists()
+
+
+def test_hybrid_storage_field_clear_unlinks_only_that_field(tmp_path):
+    storage = HybridStorageUnitData(
+        storage_size=10,
+        threshold_bytes=64,
+        ssd_path=str(tmp_path),
+        run_id="test-run",
+        unit_id="test-unit",
+    )
+    try:
+        storage.put_data({"pixel_values": [b"p" * 100], "ids": [b"i" * 100]}, [1])
+        assert storage.ssd_active_values == 2
+
+        storage.clear([1], fields=["pixel_values"])
+
+        assert storage.ssd_active_values == 1
+        assert storage.ssd_active_bytes == 100
+        assert len(list(tmp_path.rglob("*.bin"))) == 1
+        assert storage.active_key_count == 1
+        assert storage.get_data(["ids"], [1]) == {"ids": [b"i" * 100]}
+        with pytest.raises(StorageKeyNotFoundError):
+            storage.get_data(["pixel_values"], [1])
+    finally:
+        storage.close()
 
 
 def test_hybrid_storage_cleans_completed_ssd_writes_after_batch_failure(tmp_path, monkeypatch):

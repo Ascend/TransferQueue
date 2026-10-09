@@ -153,8 +153,8 @@ def demonstrate_kv_api():
     tq.kv_put(key=key_for_update_tags, partition_id=partition_id, fields=None, tag=tag_update)
     print(f"  ✓ Update success: Samples '0_0' now has tag as {tag_update}.")
 
-    # Step 5: Concatenate a field with kv_update, then empty it
-    print("\n[Step 5] Updating a field with kv_update (concat, then empty)...")
+    # Step 5: Concatenate a field with kv_update, then clear only that field
+    print("\n[Step 5] Updating a field with kv_update (concat, then clear the field)...")
     tq.kv_put(key=key, partition_id=partition_id, fields={"scratch": torch.tensor([1, 2])})
     tq.kv_update(
         key=key,
@@ -163,8 +163,8 @@ def demonstrate_kv_api():
         merge_fn=lambda old, new: torch.cat([old, new]),
     )
     print("  ✓ kv_update concat: scratch of '0_0' is now [1, 2, 3, 4].")
-    tq.kv_empty(keys=key, partition_id=partition_id, fields="scratch")
-    print("  ✓ tq.kv_empty: scratch of '0_0' is stored as None (key remains).")
+    tq.kv_clear(keys=key, partition_id=partition_id, fields="scratch")
+    print("  ✓ tq.kv_clear(fields=...): scratch of '0_0' is removed (key and other fields remain).")
 
     # Step 6: List all keys and tags in a partition
     print("\n[Step 6] Listing all keys and tags in partition...")
@@ -218,7 +218,7 @@ def main():
         3. (async_)kv_update       - Merge new values into produced fields with merge_fn(old, new)
         4. (async_)kv_batch_get    - Retrieve samples (by keys), supporting column selection (by fields)
         5. (async_)kv_list         - List keys and tags (metadata) in a partition
-        6. (async_)kv_clear        - Remove key-value pairs from storage
+        6. (async_)kv_clear        - Remove key-value pairs, or only selected fields, from storage
 
         Key Features:
         ✓ Redis-style Semantics  - Familiar KV interface (Put/Get/List) for zero learning curve

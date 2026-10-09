@@ -481,6 +481,24 @@ def test_put_data_without_custom_backend_meta(mock_notify, test_data_for_put_dat
 
 
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
+def test_clear_data_with_fields_deletes_only_those_keys(test_data_for_put_data):
+    mock_storage_client = MagicMock()
+    with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
+        manager = KVStorageManager(controller_info=MagicMock(), config={"client_name": "MockClient"})
+    metadata = test_data_for_put_data["metadata"]
+    metadata._custom_backend_meta = [{"text": f"t{i}", "label": f"l{i}"} for i in range(3)]
+
+    asyncio.run(manager.clear_data(metadata, fields=["text"]))
+    mock_storage_client.clear.assert_called_once_with(
+        keys=["0@text", "1@text", "2@text"], custom_backend_meta=["t0", "t1", "t2"]
+    )
+
+    mock_storage_client.clear.reset_mock()
+    asyncio.run(manager.clear_data(metadata, fields=["missing"]))
+    mock_storage_client.clear.assert_not_called()
+
+
+@patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
 def test_put_data_custom_backend_meta_length_mismatch_raises_error(test_data_for_put_data):
     """Test that put_data raises ValueError when custom_backend_meta length doesn't match keys."""
     # Create a mock storage client that returns mismatched custom_backend_meta length

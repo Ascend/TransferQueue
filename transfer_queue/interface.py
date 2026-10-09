@@ -585,7 +585,7 @@ def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     return tq_client._run_coroutine(async_kv_list(partition_id=partition_id))
 
 
-def kv_clear(keys: list[str] | str, partition_id: str) -> None:
+def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Clear key-value pairs from TransferQueue.
 
     This removes the specified keys and their associated data from both
@@ -594,6 +594,9 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     Args:
         keys: Single key or list of keys to clear
         partition_id: Partition containing the keys
+        fields: If given, clear only these fields and keep the keys. A cleared field
+            reads as never written: it is not ready and can be put again. Tags and
+            consumption status are kept. Missing keys and fields are ignored.
 
     Example:
         >>> import transfer_queue as tq
@@ -602,10 +605,12 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
         >>> tq.kv_clear(keys="sample_1", partition_id="train")
         >>> # Clear multiple keys
         >>> tq.kv_clear(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> # Release one field but keep the keys
+        >>> tq.kv_clear(keys=["sample_1", "sample_2"], partition_id="train", fields="pixel_values")
     """
 
     tq_client = _maybe_create_tq_client()
-    tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id))
+    tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id, fields=fields))
 
 
 def kv_update(
@@ -661,12 +666,6 @@ def kv_batch_update(
     return tq_client._run_coroutine(
         async_kv_batch_update(keys=keys, partition_id=partition_id, fields=fields, merge_fn=merge_fn)
     )
-
-
-def kv_empty(keys: str | list[str], partition_id: str, fields: str | list[str]) -> KVBatchMeta:
-    """Release produced fields by storing ``None`` while keeping the keys ready."""
-    tq_client = _maybe_create_tq_client()
-    return tq_client._run_coroutine(async_kv_empty(keys=keys, partition_id=partition_id, fields=fields))
 
 
 # ==================== KV Interface API ====================
@@ -1021,7 +1020,7 @@ async def async_kv_list(partition_id: str | None = None) -> dict[str, dict[str, 
     return partition_info
 
 
-async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
+async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Asynchronously clear key-value pairs from TransferQueue.
 
     This removes the specified keys and their associated data from both
@@ -1030,6 +1029,7 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
     Args:
         keys: Single key or list of keys to clear
         partition_id: Partition containing the keys
+        fields: If given, clear only these fields and keep the keys. See ``kv_clear``.
 
     Example:
         >>> import transfer_queue as tq
@@ -1038,12 +1038,20 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
         >>> await tq.async_kv_clear(keys="sample_1", partition_id="train")
         >>> # Clear multiple keys
         >>> await tq.async_kv_clear(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> # Release one field but keep the keys
+        >>> await tq.async_kv_clear(keys=["sample_1", "sample_2"], partition_id="train", fields="pixel_values")
     """
 
     if isinstance(keys, str):
         keys = [keys]
 
     tq_client = _maybe_create_tq_client()
+    if fields is not None:
+        await tq_client.async_kv_clear_fields(
+            keys=keys, partition_id=partition_id, fields=[fields] if isinstance(fields, str) else fields
+        )
+        return
+
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
@@ -1108,43 +1116,6 @@ async def async_kv_batch_update(
 
     batch_meta = await tq_client.async_update(metadata=batch_meta, values=fields, merge_fn=merge_fn)
 
-    return KVBatchMeta(
-        keys=keys,
-        tags=batch_meta.custom_meta,
-        partition_id=partition_id,
-        fields=batch_meta.field_names,
-        extra_info=batch_meta.extra_info,
-    )
-
-
-async def async_kv_empty(keys: str | list[str], partition_id: str, fields: str | list[str]) -> KVBatchMeta:
-    """Asynchronously release fields by storing ``None`` through the ordinary put path."""
-    if isinstance(keys, str):
-        keys = [keys]
-    if isinstance(fields, str):
-        field_names = [fields]
-    elif isinstance(fields, list) and fields and all(isinstance(name, str) for name in fields):
-        field_names = list(dict.fromkeys(fields))
-    else:
-        raise TypeError("fields must be a field name or a non-empty list of field names")
-    if not keys:
-        raise ValueError("keys must not be empty")
-
-    tq_client = _maybe_create_tq_client()
-    if not isinstance(tq_client.storage_manager, AsyncSimpleStorageManager):
-        raise NotImplementedError("kv_empty requires the SimpleStorage backend")
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
-    if batch_meta.size != len(keys):
-        raise ValueError("Some keys or the partition were not found")
-    missing_fields = sorted(set(field_names) - set(batch_meta.field_names))
-    if missing_fields:
-        raise ValueError(f"Fields are not produced for every key: {missing_fields}")
-
-    empty_values = TensorDict(
-        {field_name: NonTensorStack(*([None] * len(keys))) for field_name in field_names},
-        batch_size=[len(keys)],
-    )
-    batch_meta = await tq_client.async_put(empty_values, batch_meta)
     return KVBatchMeta(
         keys=keys,
         tags=batch_meta.custom_meta,

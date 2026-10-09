@@ -1070,6 +1070,34 @@ class TestKVClearE2E:
         # Clean up
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
+    def test_kv_clear_fields_keeps_keys_and_other_fields(self, controller, tq_api):
+        """Field-level clear removes only the selected fields; the field can be put again."""
+        partition_id = "test_partition"
+        keys = ["clear_fields_0", "clear_fields_1"]
+        tq_api.kv_batch_put(
+            keys=keys,
+            partition_id=partition_id,
+            fields=TensorDict(
+                {"pixel_values": torch.ones(2, 4), "input_ids": torch.tensor([[1, 2], [3, 4]])},
+                batch_size=2,
+            ),
+            tags=[{"id": 0}, {"id": 1}],
+        )
+        tq_api.kv_put(key="clear_fields_other", partition_id=partition_id, fields={"input_ids": torch.tensor([5, 6])})
+
+        tq_api.kv_clear(keys=keys + ["nonexistent_key"], partition_id=partition_id, fields=["pixel_values", "missing"])
+
+        assert tq_api.kv_list(partition_id=partition_id)[partition_id][keys[0]] == {"id": 0}
+        data = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
+        assert list(data.keys()) == ["input_ids"]
+        assert_tensor_equal(data["input_ids"], torch.tensor([[1, 2], [3, 4]]))
+        partition = get_controller_partition(controller, partition_id)
+        assert "pixel_values" not in partition.field_metadata
+
+        tq_api.kv_put(key=keys[0], partition_id=partition_id, fields={"pixel_values": torch.zeros(3)})
+        restored = tq_api.kv_batch_get(keys=keys[0], partition_id=partition_id, select_fields="pixel_values")
+        assert_tensor_equal(restored["pixel_values"][0], torch.zeros(3))
+
 
 class TestKVE2ECornerCases:
     """End-to-end tests for corner cases."""
@@ -1111,14 +1139,14 @@ class TestKVE2ECornerCases:
 
 
 class TestKVUpdateE2E:
-    """SimpleStorage merge and empty behavior through sync and async public APIs."""
+    """SimpleStorage merge behavior through sync and async public APIs."""
 
-    def test_update_then_empty_preserves_partition_field_metadata(self, controller, tq_api, backend_name):
+    def test_update_then_clear_field_keeps_partition_field_metadata(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":
             pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
 
         partition_id = "test_partition"
-        keys = ["empty_0", "empty_1", "empty_2"]
+        keys = ["clear_field_0", "clear_field_1", "clear_field_2"]
         tq_api.kv_batch_put(
             keys=keys,
             partition_id=partition_id,
@@ -1135,14 +1163,13 @@ class TestKVUpdateE2E:
             merge_fn=concat,
         )
         assert "tokens" in meta.fields
-        tq_api.kv_empty(keys=keys[0], partition_id=partition_id, fields="tokens")
-        emptied = tq_api.kv_batch_get(keys=keys[0], partition_id=partition_id, select_fields="tokens")
-        assert emptied["tokens"][0] is None
+        tq_api.kv_clear(keys=keys[0], partition_id=partition_id, fields="tokens")
 
         partition = get_controller_partition(controller, partition_id)
         col = partition.field_name_mapping["tokens"]
         global_idx = partition.keys_mapping[keys[0]]
-        assert partition.production_status[global_idx, col] == 1
+        assert partition.production_status[global_idx, col] == 0
+        assert global_idx not in partition.field_metadata["tokens"].global_indexes
         assert partition.field_metadata["tokens"].is_non_tensor is False
         assert partition.field_metadata["tokens"].dtype == torch.int64
 
@@ -1211,10 +1238,11 @@ class TestKVUpdateE2E:
             global_idx = partition.keys_mapping[key]
             assert tuple(tokens.per_sample_shapes[global_idx]) == (length + 1,)
 
-        tq_api.kv_empty(keys=keys, partition_id=partition_id, fields=["tokens", "score"])
-        emptied = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
-        assert all(value is None for value in emptied["tokens"])
-        assert all(value is None for value in emptied["score"])
+        tq_api.kv_clear(keys=keys, partition_id=partition_id, fields=["tokens", "score"])
+        partition = get_controller_partition(controller, partition_id)
+        assert "tokens" not in partition.field_metadata
+        assert "score" not in partition.field_metadata
+        assert set(tq_api.kv_list(partition_id=partition_id)[partition_id]) == set(keys)
 
     def test_rejects_missing_key_unproduced_field_and_incompatible_result(self, tq_api, backend_name):
         if backend_name != "SimpleStorage":

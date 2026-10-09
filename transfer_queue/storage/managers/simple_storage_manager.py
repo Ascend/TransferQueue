@@ -885,13 +885,14 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Error getting data from storage unit {target_storage_unit}: {type(e).__name__}: {e}"
             ) from e
 
-    async def clear_data(self, metadata: BatchMeta) -> None:
+    async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
 
         Routes to each SU using global_idx % num_su (hash routing).
 
         Args:
             metadata: BatchMeta that contains metadata for data clearing.
+            fields: If given, delete only these fields and keep the samples.
         """
 
         logger.debug(f"[{self.storage_manager_id}]: receive clear_data request, clearing {metadata.size} samples.")
@@ -902,7 +903,7 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._clear_single_storage_unit(group.global_indexes, target_storage_unit=su_id)
+            self._clear_single_storage_unit(group.global_indexes, fields=fields, target_storage_unit=su_id)
             for su_id, group in routing.items()
         ]
 
@@ -913,13 +914,13 @@ class AsyncSimpleStorageManager(StorageManager):
                 logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
 
     @with_storage_unit_socket
-    async def _clear_single_storage_unit(self, global_indexes, target_storage_unit=None, socket=None):
+    async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
         try:
             request_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.CLEAR_DATA,
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"global_indexes": global_indexes},
+                body={"global_indexes": global_indexes, "fields": fields},
             )
 
             await socket.send_multipart(request_msg.serialize())
