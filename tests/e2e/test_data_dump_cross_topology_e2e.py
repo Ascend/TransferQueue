@@ -92,9 +92,11 @@ def _assert_rows_equal(actual: torch.Tensor, expected_rows: list[torch.Tensor]) 
         assert torch.equal(actual_row, expected_row)
 
 
+# The controller and each storage unit reserve one CPU, and CI runners have four,
+# so more than three units never get scheduled there.
 @pytest.mark.parametrize(
     ("dump_units", "load_units"),
-    [(4, 2), (2, 4), (1, 4)],
+    [(3, 2), (2, 3), (1, 3)],
 )
 def test_dump_restores_across_storage_unit_counts(ray_init, dump_dir, dump_units, load_units):
     # Define test data
