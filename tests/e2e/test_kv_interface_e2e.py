@@ -771,6 +771,34 @@ class TestKVBatchGetParserE2E:
         full = tq_api.kv_batch_get(keys="parser_3", partition_id=partition_id, select_fields="images")
         assert len(full["images"][0]) == len(image_lists[3])
 
+    def test_kv_batch_get_parser_selects_video_frames_mixed_with_images(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_video_0", "parser_video_1"]
+        # Each row is image, three same-shaped video frames, image, as a VLM row stores them.
+        rows = [
+            [torch.full((3, 4, 8), float(10 * k))]
+            + [torch.full((3, 4, 4), float(10 * k + f + 1)) for f in range(3)]
+            + [torch.full((3, 8, 4), float(10 * k + 9))]
+            for k in range(len(keys))
+        ]
+        fields = TensorDict({"images": NonTensorStack(*rows)}, batch_size=len(keys))
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{} for _ in keys])
+
+        for parser_args in ([[1], [2]], [[1, 2, 3], [3, 1, 2]], [[0, 2, 4], [1, 3]]):
+            retrieved = tq_api.kv_batch_get(
+                keys=keys,
+                partition_id=partition_id,
+                select_fields="images",
+                parser=tq.select_list_items,
+                parser_args=parser_args,
+            )
+            got_rows = list(retrieved["images"])
+            assert len(got_rows) == len(rows)
+            for got_row, row, item_indices in zip(got_rows, rows, parser_args, strict=True):
+                assert isinstance(got_row, list) and len(got_row) == len(item_indices)
+                for got, item_idx in zip(got_row, item_indices, strict=True):
+                    assert_tensor_equal(got, row[item_idx])
+
     def test_kv_batch_get_parser_empty_selection(self, controller, tq_api):
         partition_id = "test_partition"
         keys = ["parser_empty_0", "parser_empty_1"]
