@@ -28,10 +28,9 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
 
 import transfer_queue as tq
-from transfer_queue import async_kv_local_lock, async_kv_local_locked, kv_local_lock, kv_local_locked
+from transfer_queue import async_kv_local_lock, kv_local_lock
 
 # `transfer_queue.kv_lock` resolves to the re-exported function, so fetch the module itself.
 kvl = importlib.import_module("transfer_queue.kv_lock")
@@ -310,85 +309,6 @@ def test_invalid_and_nested_use_is_rejected():
     asyncio.run(main())
 
 
-def is_held_elsewhere(keys):
-    """Whether another thread's kv_local_lock on `keys` times out."""
-    outcome = []
-
-    def run():
-        try:
-            with kv_local_lock(keys, P, timeout=0):
-                outcome.append(False)
-        except TimeoutError:
-            outcome.append(True)
-
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join(TIMEOUT)
-    assert not thread.is_alive()
-    return outcome == [True]
-
-
-def test_locked_wrapper_passes_arguments_through_and_holds_the_lock_during_the_call():
-    def fn(keys, partition_id, **kwargs):
-        assert is_held_elsewhere(keys)
-        return keys, partition_id, kwargs
-
-    assert kv_local_locked(fn, "a", P, lock_timeout=TIMEOUT, x=1) == ("a", P, {"x": 1})
-    assert kv_local_locked(fn, ["b", "a"], P) == (["b", "a"], P, {})
-    assert not is_held_elsewhere(["a", "b"])
-
-    def boom(keys, partition_id):
-        raise ValueError("boom")
-
-    with pytest.raises(ValueError, match="boom"):
-        kv_local_locked(boom, "a", P)
-    assert not is_held_elsewhere("a")
-
-
-def test_async_locked_wrapper_holds_the_lock_and_releases_on_error():
-    async def fn(keys, partition_id, **kwargs):
-        assert is_held_elsewhere(keys)
-        return keys, partition_id, kwargs
-
-    async def boom(keys, partition_id):
-        raise ValueError("boom")
-
-    async def main():
-        assert await async_kv_local_locked(fn, ["a", "b"], P, lock_timeout=TIMEOUT, x=1) == (["a", "b"], P, {"x": 1})
-        with pytest.raises(ValueError, match="boom"):
-            await async_kv_local_locked(boom, "a", P)
-
-    asyncio.run(main())
-    assert not is_held_elsewhere(["a", "b"])
-
-
-def test_locked_wrapper_lock_timeout_skips_the_call():
-    calls, release = [], threading.Event()
-    holder = start_holder("k", release)
-
-    async def async_fn(keys, partition_id):
-        calls.append(keys)
-
-    with pytest.raises(TimeoutError):
-        kv_local_locked(lambda keys, partition_id: calls.append(keys), ["j", "k"], P, lock_timeout=0.05)
-    with pytest.raises(TimeoutError):
-        asyncio.run(async_kv_local_locked(async_fn, "k", P, lock_timeout=0.05))
-    assert calls == [] and n_waiters("k") == 0
-    release.set()
-    holder.join(TIMEOUT)
-    assert not holder.is_alive()
-
-
-def test_locked_wrappers_reject_the_wrong_kind_of_function():
-    async def async_fn(keys, partition_id):
-        pass
-
-    with pytest.raises(TypeError, match="async_kv_local_locked"):
-        kv_local_locked(async_fn, "a", P)
-    with pytest.raises(TypeError, match="coroutine function"):
-        asyncio.run(async_kv_local_locked(lambda keys, partition_id: None, "a", P))
-
-
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
 def test_forked_child_drops_the_parents_locks_leases_and_managers(monkeypatch):
@@ -466,27 +386,16 @@ def test_kv_local_lock_serializes_simple_storage_read_modify_write(simple_storag
         value = tq.kv_batch_get(key, partition_id)["v"]
         tq.kv_put(key, partition_id, fields={"v": value[0] + 1})
 
-    def context_worker():
+    def worker():
         for _ in range(50):
             with tq.kv_local_lock("counter", "lock_e2e", timeout=E2E_TIMEOUT):
                 increment("counter", "lock_e2e")
 
-    def wrapper_worker():
-        for _ in range(50):
-            tq.kv_local_locked(increment, "counter", "lock_e2e", lock_timeout=E2E_TIMEOUT)
-
-    threads = [threading.Thread(target=worker) for worker in [context_worker, wrapper_worker] * 4]
+    threads = [threading.Thread(target=worker) for _ in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(E2E_TIMEOUT)
         assert not thread.is_alive()
     assert tq.kv_batch_get("counter", "lock_e2e")["v"][0].item() == 400
-
-    fields = TensorDict({"v": torch.tensor([[1], [2]])}, batch_size=2)
-    tq.kv_local_locked(tq.kv_batch_put, ["a", "b"], "lock_e2e", fields=fields)
-    data = tq.kv_local_locked(tq.kv_batch_get, ["a", "b"], "lock_e2e", select_fields="v")
-    assert [row.tolist() for row in data["v"]] == [[1], [2]]  # rows may come back as a nested tensor
-    data = asyncio.run(tq.async_kv_local_locked(tq.async_kv_batch_get, "b", "lock_e2e", lock_timeout=E2E_TIMEOUT))
-    assert [row.tolist() for row in data["v"]] == [[2]]
-    tq.kv_clear(["counter", "a", "b"], "lock_e2e")
+    tq.kv_clear("counter", "lock_e2e")

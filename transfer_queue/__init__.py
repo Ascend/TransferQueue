@@ -40,13 +40,9 @@ from .interface import (
 from .kv_lock import (
     LockLostError,
     async_kv_global_lock,
-    async_kv_global_locked,
     async_kv_local_lock,
-    async_kv_local_locked,
     kv_global_lock,
-    kv_global_locked,
     kv_local_lock,
-    kv_local_locked,
     kv_lock_list,
 )
 from .metadata import BatchMeta, KVBatchMeta
@@ -81,12 +77,8 @@ __all__ = (
         # KV key locks: process-local and cluster-wide
         "kv_local_lock",
         "async_kv_local_lock",
-        "kv_local_locked",
-        "async_kv_local_locked",
         "kv_global_lock",
         "async_kv_global_lock",
-        "kv_global_locked",
-        "async_kv_global_locked",
         "kv_lock_list",
         "LockLostError",
     ]
