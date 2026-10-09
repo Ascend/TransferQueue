@@ -106,8 +106,15 @@ class TransferQueueLockManager:
             self._timer_at = self._expiries[0][0]
             self._timer = asyncio.get_running_loop().call_later(max(0.0, self._timer_at - now), self._expire)
 
-    async def acquire(self, names, token, timeout, lease_s, holder_info):
+    async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards):
         """Grant all ``names`` at once; return the seconds waited, or None on timeout or withdrawal."""
+        # A caller that hashed over another shard count may send a key to the wrong shard,
+        # where nothing excludes the callers that sent it to the right one.
+        if num_shards != self._num_shards:
+            raise ValueError(
+                f"kv_global_lock hashed keys over {num_shards} lock shards, but lock.num_shards is "
+                f"{self._num_shards}; TransferQueue restarted, so call tq.close() and tq.init() again"
+            )
         start = time.monotonic()
         if self._withdrawn.pop(token, None) is not None:
             return None

@@ -276,7 +276,9 @@ def _send_acquire(lease: GlobalLease, shard: int, deadline: float | None):
     manager = _lock_manager(shard)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
     lease.pending.append(shard)
-    return manager.acquire.remote(lease.shards[shard], lease.token, _remaining(deadline), lease.lease_s, holder)
+    return manager.acquire.remote(
+        lease.shards[shard], lease.token, _remaining(deadline), lease.lease_s, holder, _shard_count()
+    )
 
 
 def _take_grant(lease: GlobalLease, shard: int, waited: float | None, sent: float) -> None:

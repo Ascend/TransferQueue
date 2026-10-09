@@ -204,7 +204,7 @@ def test_cancelled_waiter_is_withdrawn_and_never_granted():
 def test_release_before_acquire_withdraws_it():
     lock_manager = manager("w")
     ray.get(lock_manager.release.remote("early"), timeout=TIMEOUT_S)
-    assert ray.get(lock_manager.acquire.remote([(P, "w")], "early", None, 5, {}), timeout=TIMEOUT_S) is None
+    assert ray.get(lock_manager.acquire.remote([(P, "w")], "early", None, 5, {}, 8), timeout=TIMEOUT_S) is None
     assert holders() == set()
 
 
@@ -216,12 +216,19 @@ def own_manager():
     ray.kill(lock_manager)
 
 
-def acquire(lock_manager, keys, token, timeout=None, lease_s=30):
-    return lock_manager.acquire.remote([(P, key) for key in keys], token, timeout, lease_s, {})
+def acquire(lock_manager, keys, token, timeout=None, lease_s=30, num_shards=1):
+    return lock_manager.acquire.remote([(P, key) for key in keys], token, timeout, lease_s, {}, num_shards)
 
 
 def n_waiters(lock_manager):
     return ray.get(lock_manager.list_locks.remote(P), timeout=TIMEOUT_S)["waiters"]
+
+
+def test_acquire_rejects_a_caller_hashing_over_another_shard_count(own_manager):
+    # e.g. a process that attached before TransferQueue restarted with a new lock.num_shards
+    with pytest.raises(ValueError, match="lock.num_shards is 1"):
+        ray.get(acquire(own_manager, ["a"], "stale", num_shards=8), timeout=TIMEOUT_S)
+    assert ray.get(acquire(own_manager, ["a"], "fresh", timeout=0), timeout=TIMEOUT_S) is not None
 
 
 def test_waiters_are_granted_in_arrival_order(own_manager):
