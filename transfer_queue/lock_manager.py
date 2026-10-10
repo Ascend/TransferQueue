@@ -26,7 +26,7 @@ import ray
 _WITHDRAWN_TTL_S = 300
 
 
-# A waiting acquire or wait call holds a concurrency slot for at most the caller's poll
+# A waiting acquire call holds a concurrency slot for at most the caller's poll
 # window, so even if waiters take every slot, renew and release get one within that window.
 @ray.remote(num_cpus=0, max_concurrency=10_000)
 class TransferQueueLockManager:
@@ -106,8 +106,13 @@ class TransferQueueLockManager:
             self._timer_at = self._expiries[0][0]
             self._timer = asyncio.get_running_loop().call_later(max(0.0, self._timer_at - now), self._expire)
 
-    async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards):
-        """Queue ``token`` for all ``names`` at once, then wait for the grant as ``wait`` does."""
+    async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards) -> float | None:
+        """Grant all ``names`` to ``token`` at once; return the seconds left on its lease.
+
+        Returns None if still queued after ``timeout``. Calling again with the same token keeps
+        its place in the queues; only ``release`` withdraws it. A token that is neither queued
+        nor held (its grant expired before the caller saw it) queues afresh.
+        """
         # A caller that hashed over another shard count may send a key to the wrong shard,
         # where nothing excludes the callers that sent it to the right one.
         if num_shards != self._num_shards:
@@ -115,21 +120,15 @@ class TransferQueueLockManager:
                 f"kv_global_lock hashed keys over {num_shards} lock shards, but lock.num_shards is "
                 f"{self._num_shards}; TransferQueue restarted, so call tq.close() and tq.init() again"
             )
-        if self._withdrawn.pop(token, None) is not None:
+        if token in self._withdrawn:  # kept until it expires: a retried call may still arrive
             return None
-        if not any(name in self._holder or name in self._queues for name in names):
-            self._grant(token, names, lease_s, holder_info)
-        else:
-            self._waiting[token] = dict(names=names, lease_s=lease_s, info=holder_info, done=asyncio.Event())
-            for name in names:
-                self._queues.setdefault(name, deque()).append(token)
-        return await self.wait(token, timeout)
-
-    async def wait(self, token: str, timeout: float) -> float | None:
-        """Return the seconds left on ``token``'s lease once granted, else None after ``timeout``.
-
-        A waiter that times out keeps its place in the queues; only ``release`` withdraws it.
-        """
+        if token not in self._leases and token not in self._waiting:
+            if not any(name in self._holder or name in self._queues for name in names):
+                self._grant(token, names, lease_s, holder_info)
+            else:
+                self._waiting[token] = dict(names=names, lease_s=lease_s, info=holder_info, done=asyncio.Event())
+                for name in names:
+                    self._queues.setdefault(name, deque()).append(token)
         waiter = self._waiting.get(token)
         if waiter is not None:
             try:

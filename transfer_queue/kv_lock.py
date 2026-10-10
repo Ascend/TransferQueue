@@ -296,13 +296,12 @@ def _poll_window(deadline: float | None) -> float:
 
 
 def _send_acquire(lease: GlobalLease, shard: int, window: float):
-    """Queue for ``shard`` on the first call, then keep waiting there; reply as the actor's ``wait``."""
-    manager = _lock_manager(shard)
-    if shard in lease.pending:
-        return manager.wait.remote(lease.token, window)
+    if shard not in lease.pending:
+        lease.pending.append(shard)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
-    lease.pending.append(shard)
-    return manager.acquire.remote(lease.shards[shard], lease.token, window, lease.lease_s, holder, _shard_count())
+    return _lock_manager(shard).acquire.remote(
+        lease.shards[shard], lease.token, window, lease.lease_s, holder, _shard_count()
+    )
 
 
 def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: float, deadline: float | None) -> bool:

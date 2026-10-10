@@ -223,6 +223,24 @@ def test_waiting_on_a_later_shard_keeps_the_earlier_keys_held():
     wait_until(lambda: holders() == set())
 
 
+def test_a_grant_that_expires_while_the_caller_stalls_is_taken_again(monkeypatch):
+    worker = Worker.remote()
+    ray.get(worker.hold.remote("stall"), timeout=TIMEOUT_S)
+    real_take_grant, stalled = kvl._take_grant, []
+
+    def take_grant(lease, shard, remaining, *args):
+        if remaining is None and not stalled:  # queued behind the worker: free the key, then stall past our lease
+            stalled.append(True)
+            ray.get(worker.release.remote(), timeout=TIMEOUT_S)
+            time.sleep(1)
+        return real_take_grant(lease, shard, remaining, *args)
+
+    monkeypatch.setattr(kvl, "_take_grant", take_grant)
+    with tq.kv_global_lock("stall", P, timeout=10, lease_s=0.3):
+        assert stalled and holders() == {"stall"}
+    wait_until(lambda: holders() == set())
+
+
 def test_async_first_use_looks_the_actors_up_off_the_event_loop(monkeypatch):
     monkeypatch.setattr(kvl, "_num_shards", None)
     monkeypatch.setattr(kvl, "_managers", {})
@@ -248,8 +266,9 @@ def test_async_first_use_looks_the_actors_up_off_the_event_loop(monkeypatch):
 def test_release_before_acquire_withdraws_it():
     lock_manager = manager("w")
     ray.get(lock_manager.release.remote("early"), timeout=TIMEOUT_S)
-    assert ray.get(lock_manager.acquire.remote([(P, "w")], "early", None, 5, {}, 8), timeout=TIMEOUT_S) is None
-    assert holders() == set()
+    for _ in range(2):  # a retried call that arrives late is withdrawn too
+        assert ray.get(lock_manager.acquire.remote([(P, "w")], "early", None, 5, {}, 8), timeout=TIMEOUT_S) is None
+    assert holders() == set() and tq.kv_lock_list(P)["waiters"] == 0
 
 
 @pytest.fixture
@@ -297,10 +316,24 @@ def test_a_timed_out_call_keeps_its_place_until_withdrawn(own_manager):
     second = acquire(own_manager, ["a"], "second")
     wait_until(lambda: n_waiters(own_manager) == 2)
     ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
-    assert ray.get(own_manager.wait.remote("first", TIMEOUT_S), timeout=TIMEOUT_S) > 0
+    assert ray.get(acquire(own_manager, ["a"], "first"), timeout=TIMEOUT_S) > 0  # calling again keeps the place
     assert n_waiters(own_manager) == 1
     ray.get(own_manager.release.remote("first"), timeout=TIMEOUT_S)
     assert ray.get(second, timeout=TIMEOUT_S) is not None
+
+
+def test_a_grant_that_expires_before_the_caller_sees_it_queues_afresh(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    assert ray.get(acquire(own_manager, ["a"], "slow", timeout=0, lease_s=0.3), timeout=TIMEOUT_S) is None
+    ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)  # grants "slow" between its calls
+    wait_until(lambda: n_waiters(own_manager) == 0)
+    time.sleep(0.6)  # the grant expires unseen
+    assert ray.get(acquire(own_manager, ["a"], "other"), timeout=TIMEOUT_S) is not None
+    # Calling again must not spin on an unknown token: it queues behind the current holder.
+    assert ray.get(acquire(own_manager, ["a"], "slow", timeout=0.1), timeout=TIMEOUT_S) is None
+    assert n_waiters(own_manager) == 1
+    ray.get(own_manager.release.remote("other"), timeout=TIMEOUT_S)
+    assert ray.get(acquire(own_manager, ["a"], "slow"), timeout=TIMEOUT_S) > 0
 
 
 def test_a_waiter_that_withdraws_lets_the_next_one_through(own_manager):
