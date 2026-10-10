@@ -15,6 +15,15 @@ controller:
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 
+# Cluster-wide KV key locks (kv_global_lock). The process-local kv_local_lock needs none of this.
+lock:
+  # Whether tq.init() starts the lock actors; kv_global_lock raises while this is false.
+  enabled: false
+  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
+  num_shards: 8
+  # Calls each lock actor serves at once, waiting acquires included (>= 1); see kv_global_lock
+  max_concurrency: 10000
+
 
 backend:
   # Pluggable storage/transport backend of TransferQueue. Choose from:

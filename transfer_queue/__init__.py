@@ -43,6 +43,15 @@ from .interface import (
     load_data_by_key,
     save_checkpoint,
 )
+from .kv_lock import (
+    GlobalLease,
+    LockLostError,
+    async_kv_global_lock,
+    async_kv_local_lock,
+    kv_global_lock,
+    kv_local_lock,
+    kv_lock_list,
+)
 from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
 from .sampler.grpo_group_n_sampler import GRPOGroupNSampler
@@ -74,6 +83,16 @@ __all__ = (
         "async_kv_clear",
         "async_kv_update",
         "KVBatchMeta",
+    ]
+    + [
+        # KV key locks: process-local and cluster-wide
+        "kv_local_lock",
+        "async_kv_local_lock",
+        "kv_global_lock",
+        "async_kv_global_lock",
+        "kv_lock_list",
+        "GlobalLease",
+        "LockLostError",
     ]
     + [
         # Checkpoint Interface
