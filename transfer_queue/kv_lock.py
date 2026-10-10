@@ -214,8 +214,11 @@ _num_shards: int | None = None  # lock.num_shards, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
-# the queue position. Bounding each call keeps waiters from pinning the actor's concurrency slots.
-_POLL_S = 1.0
+# the queue position. Bounding each call keeps waiters from pinning the actor's concurrency
+# slots, and the bound is long because one actor serves only a few thousand calls a second:
+# at 1 s, 8,000 idle waiters starved every other call on their shard, renewals included.
+_POLL_S = 5.0
+_REPLY_SLACK_S = 1.0  # how late a reply may arrive past its window before the caller re-polls
 _NOT_INITIALIZED = (
     "TransferQueueLockManager not found; kv_global_lock needs `lock.enabled: true` "
     "in the config of the tq.init() that starts TransferQueue"
@@ -290,9 +293,11 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
     return GlobalLease(names, dict(sorted(shards.items())), lease_s)
 
 
-def _poll_window(deadline: float | None) -> float:
-    remaining = _remaining(deadline)
-    return _POLL_S if remaining is None else min(_POLL_S, remaining)
+def _poll_window(deadline: float | None, lease_s: float) -> float:
+    # Even when waiters take every actor slot, a renewal waits at most one window for a slot,
+    # so a window up to lease_s / 3 leaves it most of the lease, as the renewer's period does.
+    window, remaining = min(_POLL_S, lease_s / 3), _remaining(deadline)
+    return window if remaining is None else min(window, remaining)
 
 
 def _send_acquire(lease: GlobalLease, shard: int, window: float):
@@ -415,10 +420,10 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
         for shard in lease.shards:
             granted = False
             while not granted:
-                window, sent = _poll_window(deadline), time.monotonic()
+                window, sent = _poll_window(deadline, lease.lease_s), time.monotonic()
                 try:
                     # Bounded, so an unresponsive actor cannot outlast the caller's timeout.
-                    remaining = ray.get(_send_acquire(lease, shard, window), timeout=window + _POLL_S)
+                    remaining = ray.get(_send_acquire(lease, shard, window), timeout=window + _REPLY_SLACK_S)
                 except GetTimeoutError:
                     remaining = None
                 except RayActorError as e:
@@ -446,9 +451,9 @@ async def async_kv_global_lock(
         for shard in lease.shards:
             granted = False
             while not granted:
-                window, sent = _poll_window(deadline), time.monotonic()
+                window, sent = _poll_window(deadline, lease.lease_s), time.monotonic()
                 try:
-                    remaining = await asyncio.wait_for(_send_acquire(lease, shard, window), window + _POLL_S)
+                    remaining = await asyncio.wait_for(_send_acquire(lease, shard, window), window + _REPLY_SLACK_S)
                 except asyncio.TimeoutError:
                     remaining = None
                 except RayActorError as e:

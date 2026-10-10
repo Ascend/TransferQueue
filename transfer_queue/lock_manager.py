@@ -24,8 +24,8 @@ import ray
 
 # A withdrawal whose acquire never arrives (e.g. the caller died first) is dropped after this.
 _WITHDRAWN_TTL_S = 300
-# A queued caller re-polls at least every second, so a waiter with no call in flight for this
-# long has died. Hand-off skips it instead of granting it a lease that would only expire; if it
+# A queued caller sends its next call as soon as one returns, so a waiter with no call in
+# flight for this long has died. Hand-off skips it instead of granting it a lease that would only expire; if it
 # was merely stalled, its next call queues it again at the back.
 _ABANDONED_S = 5.0
 

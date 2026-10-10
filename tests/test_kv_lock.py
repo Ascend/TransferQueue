@@ -370,6 +370,12 @@ def test_global_lock_shards_agree_across_processes_and_spread_keys():
         assert out.stdout.strip() == str(shards)
 
 
+def test_global_lock_poll_window_fits_the_lease_and_the_timeout():
+    assert kvl._poll_window(None, 30) == kvl._POLL_S
+    assert kvl._poll_window(None, 0.6) == pytest.approx(0.2)  # a renewal waits at most a third of the lease
+    assert kvl._poll_window(time.monotonic() + 0.05, 30) <= 0.05
+
+
 @pytest.fixture
 def simple_storage_tq():
     if not ray.is_initialized():
