@@ -18,6 +18,7 @@
 from transfer_queue.storage.payload_transfer.base import (
     PayloadTransfer,
     PayloadTransferError,
+    PayloadTransferTimeout,
 )
 from transfer_queue.storage.payload_transfer.factory import (
     create_payload_transfer,
@@ -27,6 +28,7 @@ from transfer_queue.storage.payload_transfer.factory import (
 __all__ = [
     "PayloadTransfer",
     "PayloadTransferError",
+    "PayloadTransferTimeout",
     "create_payload_transfer",
     "parse_payload_transfer_config",
 ]

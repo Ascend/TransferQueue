@@ -36,7 +36,14 @@ from torch import Tensor
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
+from transfer_queue.utils.zmq_utils import (
+    STORAGE_MANAGER_IDENTITY_PREFIX,
+    ZMQMessage,
+    ZMQRequestType,
+    ZMQServerInfo,
+    ZMQSocketPool,
+    create_zmq_socket,
+)
 
 logger = get_logger(__name__)
 
@@ -70,7 +77,7 @@ class StorageManager(ABC):
         config: DictConfig,
         zmq_context: zmq.asyncio.Context | None = None,
     ):
-        self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
+        self.storage_manager_id = f"{STORAGE_MANAGER_IDENTITY_PREFIX}{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
 
@@ -81,6 +88,9 @@ class StorageManager(ABC):
         # creates when handed nothing. Only an owner tears its context down (see close()).
         self._owns_zmq_context = zmq_context is None
         self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
+        # Notify runs on a dedicated loop, so it could not share sockets with another
+        # scenario in any case.
+        self.notify_pool = ZMQSocketPool(self.zmq_context, self.storage_manager_id, "request_handle_socket")
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -265,56 +275,39 @@ class StorageManager(ABC):
 
     async def _notify_and_wait(self, request_msg: list) -> None:
         """Send a data status notification to the controller and block until ACK is received."""
-        identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(
-            ctx=self.zmq_context, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
-        )
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(self.controller_info.to_addr("request_handle_socket"))
+        # Acquiring the lease sits outside the handler below: a missing socket name or a dead
+        # context is a configuration/lifecycle fault the caller must see, not a slow ACK.
+        async with self.notify_pool.alease(self.controller_info) as sock:
+            try:
+                await sock.send_multipart(request_msg)
+                logger.debug(
+                    f"[{self.storage_manager_id}]: Sent data status update request "
+                    f"to controller id #{self.controller_info.id} successfully."
+                )
 
-        try:
-            await sock.send_multipart(request_msg)
-            logger.debug(
-                f"[{self.storage_manager_id}]: Sent data status update request "
-                f"to controller id #{self.controller_info.id} successfully."
-            )
-
-            response_received = False
-            timeout = TQ_DATA_UPDATE_RESPONSE_TIMEOUT
-
-            while not response_received and timeout > 0:
-                try:
-                    poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
-                    messages = await asyncio.wait_for(
-                        sock.recv_multipart(copy=False),
-                        timeout=poll_interval,
-                    )
+                # One deadline for the whole wait, so unrelated traffic on this socket cannot
+                # extend it and a quiet controller still gets the full budget.
+                deadline = time.monotonic() + TQ_DATA_UPDATE_RESPONSE_TIMEOUT
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"no ACK from controller {self.controller_info.id} after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s"
+                        )
+                    messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=remaining)
                     response_msg = ZMQMessage.deserialize(messages)
 
                     if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        response_received = True
                         logger.debug(
                             f"[{self.storage_manager_id}]: Get data status update ACK response "
                             f"from controller id #{response_msg.sender_id} successfully."
                         )
-                        break
-                except asyncio.TimeoutError:
-                    timeout -= poll_interval
-                except Exception as e:
-                    logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
-                    break
-
-            if not response_received:
-                logger.error(
-                    f"[{self.storage_manager_id}]: Timeout waiting for data status update ACK "
-                    f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
-                )
-        finally:
-            try:
-                if not sock.closed:
-                    sock.close(linger=0)
-            except Exception:
-                pass
+                        return
+            except Exception as e:
+                # Logged rather than raised, so a slow controller does not fail the put. Close
+                # the socket: a late ACK would otherwise be read as the next lessee's reply.
+                logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
+                sock.close(linger=0)
 
     @abstractmethod
     async def put_data(
@@ -383,6 +376,11 @@ class StorageManager(ABC):
     def close(self) -> None:
         """Close all ZMQ sockets/contexts and stop the notify loop."""
 
+        # A subclass may reject its config before super().__init__() runs, and __del__ calls
+        # close() anyway; return rather than bury that error under an AttributeError.
+        if not hasattr(self, "notify_pool"):
+            return
+
         if self.controller_handshake_socket:
             try:
                 if not self.controller_handshake_socket.closed:
@@ -402,13 +400,16 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
+        # This manager always owns its notify pool, even over a borrowed context. Only once
+        # the notify thread is gone: Socket.close() is not thread-safe and it holds the leases.
+        if notify_thread_stopped:
+            self.notify_pool.close()
+
         if self._owns_zmq_context:
             # destroy() calls Socket.close(), which is not thread-safe, so it must run only
             # after the notify thread holding sockets is gone. If that thread outlived its
             # join, leak the context rather than risk a crash on a terminating process.
             if notify_thread_stopped:
-                # linger=0 force-closes sockets left by an interrupted request, so this
-                # cannot hang on term().
                 self.zmq_context.destroy(linger=0)
             else:
                 logger.warning(

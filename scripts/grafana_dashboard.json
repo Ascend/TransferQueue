@@ -370,6 +370,68 @@
         { "expr": "sum(tq_storage_active_keys_total)", "legendFormat": "Total Active Keys (all storage units)" }
       ],
       "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 86 },
+      "id": 104,
+      "title": "Storage Request-Loss Diagnostics",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Arrivals count logical PUT, GET, and CLEAR operations when they start. NIXL PREPARE is counted once; COMMIT continues that operation. A sustained gap can indicate started operations that did not reach the measured completion path. Neither series identifies an individual request.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 87 },
+      "id": 40,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Arrived vs Completed (per second)",
+      "targets": [
+        { "expr": "sum by (op_type) (rate(tq_storage_arrivals_by_op{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "arrived {{ op_type }}" },
+        { "expr": "sum by (op_type) (rate(tq_storage_request_ops{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "completed {{ op_type }}" }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Peak is a high-water mark since the probe started, so it never decreases. Only present when TQ_ACCEPT_PROBE_INTERVAL is set.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 87 },
+      "id": 41,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Accept-Queue Peak vs Backlog",
+      "targets": [
+        { "expr": "tq_storage_accept_queue_peak", "legendFormat": "peak {{ storage_unit_id }}" },
+        { "expr": "tq_storage_accept_queue_backlog", "legendFormat": "backlog {{ storage_unit_id }}" }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "The kernel charges sk_drops for several connection-establishment failures, of which a full accept queue is only one, so a rise locates the socket, not the cause.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 95 },
+      "id": 42,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Listening-Socket Drops (per second)",
+      "targets": [
+        { "expr": "sum by (storage_unit_id) (rate(tq_storage_socket_drops[$__rate_interval]))", "legendFormat": "{{ storage_unit_id }}" }
+      ],
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "description": "Namespace-wide, not per port. A non-zero 'other' series means raising the backlog would not have prevented every drop in the window.",
+      "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 95 },
+      "id": 43,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Overflow vs Other Establishment Drops (per second)",
+      "targets": [
+        { "expr": "sum (rate(tq_storage_listen_overflows[$__rate_interval]))", "legendFormat": "accept-queue overflow" },
+        { "expr": "sum (rate(tq_storage_listen_other_drops[$__rate_interval]))", "legendFormat": "other establishment drops" }
+      ],
+      "type": "timeseries"
     }
   ],
   "refresh": "10s",
