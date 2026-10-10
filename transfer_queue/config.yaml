@@ -21,6 +21,8 @@ lock:
   enabled: false
   # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
   num_shards: 8
+  # Calls each lock actor serves at once, waiting acquires included (>= 1); see kv_global_lock
+  max_concurrency: 10000
 
 
 backend:

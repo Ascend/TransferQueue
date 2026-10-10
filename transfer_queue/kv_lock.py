@@ -403,6 +403,13 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
 
+    Each actor serves ``lock.max_concurrency`` calls at once, and a waiting request takes one
+    of them on the actor it is waiting at. With keys hashing evenly, about ``num_shards *
+    max_concurrency`` requests can wait at once, so raise ``lock.num_shards`` for more in total;
+    all waiters on one key share one actor, so raise ``lock.max_concurrency`` for a hot key.
+    Past the limit, calls queue in Ray: a waiting call frees its slot within its poll window
+    (5 s, or ``lease_s / 3`` if shorter), so renewal and release are delayed, never stuck.
+
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever); an unresponsive lock actor can stretch that by up to about
     1 s, the time allowed for its last reply. Raises ``RuntimeError`` when nested, taken
@@ -480,8 +487,10 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
 
 def _check_lock_conf(lock_conf) -> None:
     """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
-    if lock_conf.enabled and (not isinstance(lock_conf.num_shards, int) or lock_conf.num_shards < 1):
-        raise ValueError(f"lock.num_shards must be an integer >= 1, got {lock_conf.num_shards!r}")
+    for field in ("num_shards", "max_concurrency"):
+        value = lock_conf[field]
+        if lock_conf.enabled and (not isinstance(value, int) or value < 1):
+            raise ValueError(f"lock.{field} must be an integer >= 1, got {value!r}")
 
 
 def _start_lock_managers(lock_conf) -> None:
@@ -491,7 +500,10 @@ def _start_lock_managers(lock_conf) -> None:
         # Created here rather than on first lock: a non-detached actor dies with its creator.
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]
-                name=_manager_name(shard), namespace="transfer_queue", get_if_exists=True
+                name=_manager_name(shard),
+                namespace="transfer_queue",
+                get_if_exists=True,
+                max_concurrency=lock_conf.max_concurrency,
             ).remote(lock_conf.num_shards)
             for shard in range(lock_conf.num_shards)
         ]

@@ -30,9 +30,10 @@ _WITHDRAWN_TTL_S = 300
 _ABANDONED_S = 5.0
 
 
-# A waiting acquire call holds a concurrency slot for at most the caller's poll
-# window, so even if waiters take every slot, renew and release get one within that window.
-@ray.remote(num_cpus=0, max_concurrency=10_000)
+# tq.init() sets max_concurrency from lock.max_concurrency. A waiting acquire call holds a
+# slot for at most the caller's poll window, so even if waiters take every slot, renew and
+# release get one within that window.
+@ray.remote(num_cpus=0)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
 

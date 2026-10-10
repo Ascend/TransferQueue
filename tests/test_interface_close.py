@@ -68,13 +68,24 @@ def test_owner_close_kills_controller(fake, lock_enabled):
     assert kvl._owned == []
 
 
-@pytest.mark.parametrize("num_shards", [0, "8"])
-def test_init_rejects_invalid_lock_num_shards(fake, num_shards):
+@pytest.mark.parametrize(
+    "field, value", [("num_shards", 0), ("num_shards", "8"), ("max_concurrency", 0), ("max_concurrency", 1.5)]
+)
+def test_init_rejects_invalid_lock_sizes(fake, field, value):
     ray, _, controller_cls = fake
     ray.get_actor.side_effect = ValueError("no controller yet")
-    with pytest.raises(ValueError, match="lock.num_shards"):
-        iface.init(OmegaConf.create({"lock": {"enabled": True, "num_shards": num_shards}}))
+    with pytest.raises(ValueError, match=f"lock.{field}"):
+        iface.init(OmegaConf.create({"lock": {"enabled": True, field: value}}))
     controller_cls.options.assert_not_called()
+
+
+def test_init_gives_every_lock_actor_the_configured_max_concurrency(fake):
+    ray, _, _ = fake
+    ray.get_actor.side_effect = ValueError("no controller yet")
+    iface.init(OmegaConf.create({"lock": {"enabled": True, "num_shards": 3, "max_concurrency": 64}}))
+    calls = kvl.TransferQueueLockManager.options.call_args_list
+    assert [c.kwargs["max_concurrency"] for c in calls] == [64, 64, 64]
+    iface.close()
 
 
 @pytest.mark.parametrize("lost_creation_race", [False, True], ids=["existing", "lost_creation_race"])
