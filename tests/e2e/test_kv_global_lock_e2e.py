@@ -447,6 +447,7 @@ def test_owner_close_kills_the_managers_and_fails_waiters():
     wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 1)
 
     tq.close()
+    wait_until(lambda: not kvl._renewer_running)  # even though the block has not exited
     with pytest.raises(RuntimeError, match="TransferQueueLockManager actor is gone"):
         ray.get(waiting, timeout=TIMEOUT_S)
     with pytest.raises(tq.LockLostError):

@@ -317,10 +317,10 @@ def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: f
             # Still queued there, so exit's release must withdraw it: the shard stays pending.
             raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
         return False
-    # The reply left the actor after `sent`, so this never outlives the shard's lease.
-    lease.deadline = min(lease.deadline, sent + remaining)
     # Renew from the first grant on: waiting on a later shard may outlast an earlier one's lease.
-    with _registry:
+    with _registry:  # the renewer also moves the deadline
+        # The reply left the actor after `sent`, so this never outlives the shard's lease.
+        lease.deadline = min(lease.deadline, sent + remaining)
         lease.granted.append(shard)
         _leases[lease.token] = lease
         _registry.notify()  # a shorter lease_s shortens the renewal period
@@ -404,11 +404,12 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     others even if it then times out. Lock the fewest keys you can and keep the block short.
 
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
-    (``None`` waits forever), and ``RuntimeError`` when nested, taken while holding a
-    ``kv_local_lock``, or called with a running event loop. Raises ``LockLostError`` on
-    entry if an earlier key's lease was lost while a later one was awaited. Exit always
-    releases the lock, then raises ``LockLostError`` if the lease was lost, unless the body
-    already raised: an exception from the body is never masked.
+    (``None`` waits forever); an unresponsive lock actor can stretch that by up to about
+    1 s, the time allowed for its last reply. Raises ``RuntimeError`` when nested, taken
+    while holding a ``kv_local_lock``, or called with a running event loop. Raises
+    ``LockLostError`` on entry if an earlier key's lease was lost while a later one was
+    awaited. Exit always releases the lock, then raises ``LockLostError`` if the lease was
+    lost, unless the body already raised: an exception from the body is never masked.
     """
     _reject_running_loop("kv_global_lock")
     lease = _new_lease(keys, partition_id, lease_s)
@@ -499,8 +500,10 @@ def _start_lock_managers(lock_conf) -> None:
 def _close_lock_managers() -> None:
     """Called by ``tq.close()``: give up this process's leases, then kill the actors it created."""
     global _num_shards, _managers, _owned
-    with _registry:
+    with _registry:  # emptied so the renewer stops now, not when the blocks holding them exit
         leases = list(_leases.values())
+        _leases.clear()
+        _registry.notify()
     for lease in leases:
         lease.lost = True
         if not _owned:  # the owner kills the actors, so releasing would only hand keys to doomed waiters
