@@ -24,6 +24,10 @@ import ray
 
 # A withdrawal whose acquire never arrives (e.g. the caller died first) is dropped after this.
 _WITHDRAWN_TTL_S = 300
+# A queued caller re-polls at least every second, so a waiter with no call in flight for this
+# long has died. Hand-off skips it instead of granting it a lease that would only expire; if it
+# was merely stalled, its next call queues it again at the back.
+_ABANDONED_S = 5.0
 
 
 # A waiting acquire call holds a concurrency slot for at most the caller's poll
@@ -49,7 +53,8 @@ class TransferQueueLockManager:
         # requests cannot starve an older multi-key one. All queues share one arrival order, so the
         # oldest waiter heads all of its queues and the wait can never form a cycle.
         self._queues: dict[tuple[str, str], deque[str]] = {}
-        self._waiting: dict[str, dict] = {}  # token -> names, lease_s, info, done (set on grant or withdrawal)
+        # token -> names, lease_s, info, done (set on grant or withdrawal), calls in flight, seen (last call end)
+        self._waiting: dict[str, dict] = {}
         self._withdrawn: dict[str, float] = {}  # token -> when its tombstone expires
 
     def _grant(self, token: str, names: list[tuple[str, str]], lease_s: float, info: dict) -> None:
@@ -74,14 +79,19 @@ class TransferQueueLockManager:
 
     def _hand_off(self, names: list[tuple[str, str]]) -> None:
         """Grant each free name to the first waiter in its queue, if that waiter now heads all of its queues."""
-        for name in names:
+        names, now = list(names), time.monotonic()
+        while names:
+            name = names.pop()
             if name in self._holder or name not in self._queues:
                 continue
             token = self._queues[name][0]
-            wanted = self._waiting[token]["names"]
-            if all(n not in self._holder and self._queues[n][0] == token for n in wanted):
-                waiter = self._leave_queues(token)
-                self._grant(token, wanted, waiter["lease_s"], waiter["info"])
+            waiter = self._waiting[token]
+            if waiter["calls"] == 0 and now - waiter["seen"] > _ABANDONED_S:
+                self._leave_queues(token)
+                names.extend(waiter["names"])  # each of its queues has a new head
+            elif all(n not in self._holder and self._queues[n][0] == token for n in waiter["names"]):
+                self._leave_queues(token)
+                self._grant(token, waiter["names"], waiter["lease_s"], waiter["info"])
                 waiter["done"].set()
 
     def _free(self, token: str) -> bool:
@@ -126,15 +136,21 @@ class TransferQueueLockManager:
             if not any(name in self._holder or name in self._queues for name in names):
                 self._grant(token, names, lease_s, holder_info)
             else:
-                self._waiting[token] = dict(names=names, lease_s=lease_s, info=holder_info, done=asyncio.Event())
+                self._waiting[token] = dict(
+                    names=names, lease_s=lease_s, info=holder_info, done=asyncio.Event(), calls=0, seen=time.monotonic()
+                )
                 for name in names:
                     self._queues.setdefault(name, deque()).append(token)
         waiter = self._waiting.get(token)
         if waiter is not None:
+            waiter["calls"] += 1
             try:
                 await asyncio.wait_for(waiter["done"].wait(), timeout)
             except asyncio.TimeoutError:
                 pass
+            finally:
+                waiter["calls"] -= 1
+                waiter["seen"] = time.monotonic()
         lease = self._leases.get(token)
         return None if lease is None else lease["expires_at"] - time.monotonic()
 

@@ -355,6 +355,18 @@ def test_expired_leases_pass_the_key_down_the_queue(own_manager):
     assert ray.get(first, timeout=TIMEOUT_S) is not None
 
 
+def test_a_waiter_that_stopped_polling_is_skipped(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    # Queued once, then its caller died: granting it would idle the key for its whole lease.
+    assert ray.get(acquire(own_manager, ["a"], "dead", timeout=0, lease_s=TIMEOUT_S), timeout=TIMEOUT_S) is None
+    live = acquire(own_manager, ["a"], "live")
+    wait_until(lambda: n_waiters(own_manager) == 2)
+    time.sleep(6)  # past the manager's abandonment threshold
+    ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
+    assert ray.get(live, timeout=5) is not None
+    assert n_waiters(own_manager) == 0
+
+
 def test_killed_holder_frees_the_key_after_its_lease():
     worker = Worker.remote()
     ray.get(worker.hold.remote("k", lease_s=1.5), timeout=TIMEOUT_S)
