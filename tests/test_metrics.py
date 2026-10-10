@@ -13,15 +13,35 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
-from unittest.mock import MagicMock
+from threading import Thread
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 try:
+    import zmq
+
     from transfer_queue.metrics import TQMetricsExporter
+    from transfer_queue.utils.enum_utils import Role
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
     _HAS_DEPS = True
 except (ImportError, OSError):
@@ -93,6 +113,18 @@ class TestMetricDefinitions:
             "tq_storage_active_keys_total",
             "tq_storage_utilization_ratio",
             "tq_storage_memory_rss_bytes",
+            "tq_storage_ssd_offload_enabled",
+            "tq_storage_ssd_active_values",
+            "tq_storage_ssd_active_bytes",
+            "tq_storage_ssd_fallback_values_total",
+            "tq_storage_requests_arrived",
+            "tq_storage_arrivals_by_op",
+            "tq_storage_accept_queue_backlog",
+            "tq_storage_accept_queue_peak",
+            "tq_storage_accept_queue_peak_utilization_ratio",
+            "tq_storage_socket_drops",
+            "tq_storage_listen_overflows",
+            "tq_storage_listen_other_drops",
         ]
 
         registered = {m.name for m in exporter.registry.collect()}
@@ -207,6 +239,77 @@ class TestMeasureContextManager:
 # ---------------------------------------------------------------------------
 
 
+class TestStorageQuerySocketPool:
+    def test_pool_borrows_the_owner_context(self):
+        """The exporter must query storage units over the context it was handed.
+
+        The controller already holds a long-lived synchronous context. A second one would
+        add another native I/O thread and leave a context nobody closes, since the exporter
+        lives for the whole life of its Ray actor.
+        """
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            with patch("zmq.Context") as minted:
+                exporter._get_socket_pool()
+            minted.assert_not_called()
+        finally:
+            ctx.destroy(linger=0)
+
+    def test_missing_context_is_reported(self):
+        """Without a context there is nothing to query over, so say so rather than mint one."""
+        exporter = TQMetricsExporter()
+        with pytest.raises(RuntimeError, match="without a ZMQ context"):
+            exporter._get_socket_pool()
+
+    def test_collector_parks_no_socket_between_queries(self):
+        """A queried unit must leave nothing in the pool.
+
+        Collection walks every unit once per cycle, so a parked socket is reused only a
+        cycle later while holding a slot in the controller context's budget for the whole
+        walk. At a few thousand units that budget is what runs out first.
+        """
+        identities: set[bytes] = set()
+        ctx_peer = zmq.Context()
+        router = ctx_peer.socket(zmq.ROUTER)
+        port = router.bind_to_random_port("tcp://127.0.0.1")
+        running = True
+
+        def serve():
+            poller = zmq.Poller()
+            poller.register(router, zmq.POLLIN)
+            while running:
+                if not dict(poller.poll(50)):
+                    continue
+                identity, _ = router.recv_multipart()
+                identities.add(bytes(identity))
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.METRICS_RESPONSE,
+                    sender_id="storage_0",
+                    body={},
+                )
+                router.send_multipart([identity, *response.serialize()])
+
+        server = Thread(target=serve, daemon=True)
+        server.start()
+
+        su_info = ZMQServerInfo(role=Role.STORAGE, id="storage_0", ip="127.0.0.1", ports={"put_get_socket": port})
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            for _ in range(3):
+                assert exporter._query_storage_unit(su_info, "storage_0") == {}
+            # A parked socket would be reused, so a fresh identity per query is the
+            # externally visible proof that nothing was kept.
+            assert len(identities) == 3, "a queried unit left its socket in the pool"
+        finally:
+            running = False
+            server.join(timeout=2.0)
+            ctx.destroy(linger=0)
+            router.close(linger=0)
+            ctx_peer.term()
+
+
 class TestStorageMetricsCollection:
     def test_collect_with_no_storage_units(self):
         """No storage units registered — collect should be a no-op."""
@@ -229,6 +332,10 @@ class TestStorageMetricsCollection:
                 "capacity": 1000,
                 "active_keys": 250,
                 "process_rss_bytes": 512 * 1024 * 1024,
+                "ssd_offload_enabled": 1,
+                "ssd_active_values": 120,
+                "ssd_active_bytes": 4 * 1024 * 1024 * 1024,
+                "ssd_fallback_values_total": 7,
             }
         )
 
@@ -238,6 +345,84 @@ class TestStorageMetricsCollection:
         assert exporter.storage_active_keys.labels(storage_unit_id="SU_001")._value.get() == 250
         assert exporter.storage_utilization.labels(storage_unit_id="SU_001")._value.get() == 0.25
         assert exporter.storage_memory_rss.labels(storage_unit_id="SU_001")._value.get() == 512 * 1024 * 1024
+        assert exporter.storage_ssd_offload_enabled.labels(storage_unit_id="SU_001")._value.get() == 1
+        assert exporter.storage_ssd_active_values.labels(storage_unit_id="SU_001")._value.get() == 120
+        assert exporter.storage_ssd_active_bytes.labels(storage_unit_id="SU_001")._value.get() == 4 * 1024 * 1024 * 1024
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 7
+
+        exporter._query_storage_unit.return_value["ssd_fallback_values_total"] = 9
+        exporter.collect_storage_metrics()
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_001")._value.get() == 9
+
+    def test_arrival_counters_are_exported(self):
+        """Arrival counts reach Prometheus, so a dashboard can compare them with completions."""
+        exporter = TQMetricsExporter()
+        fake_su_info = MagicMock()
+        fake_su_info.id = "SU_001"
+        exporter._storage_unit_infos = {"SU_001": fake_su_info}
+        exporter._query_storage_unit = MagicMock(
+            return_value={
+                "storage_unit_id": "SU_001",
+                "capacity": 1000,
+                "active_keys": 1,
+                "requests_arrived": 42,
+                "arrivals_by_op": {"GET_DATA": 30, "PUT_DATA": 12},
+            }
+        )
+
+        exporter.collect_storage_metrics()
+
+        assert exporter.storage_requests_arrived.labels(storage_unit_id="SU_001")._value.get() == 42
+        by_op = exporter.storage_arrivals_by_op
+        assert by_op.labels(storage_unit_id="SU_001", op_type="GET_DATA")._value.get() == 30
+        assert by_op.labels(storage_unit_id="SU_001", op_type="PUT_DATA")._value.get() == 12
+
+    def test_accept_queue_metrics_are_exported(self):
+        """The overflow/non-overflow split is what tells a dashboard if backlog is the issue."""
+        exporter = TQMetricsExporter()
+        fake_su_info = MagicMock()
+        fake_su_info.id = "SU_001"
+        exporter._storage_unit_infos = {"SU_001": fake_su_info}
+        exporter._query_storage_unit = MagicMock(
+            return_value={
+                "storage_unit_id": "SU_001",
+                "capacity": 1000,
+                "active_keys": 1,
+                "accept_queue": {
+                    "backlog": 4096,
+                    "peak_recv_q": 97,
+                    "peak_utilization": 0.02,
+                    "sk_drops_delta": 5,
+                    "listen_overflow_delta": 2,
+                    "non_overflow_drop_delta": 3,
+                },
+            }
+        )
+
+        exporter.collect_storage_metrics()
+
+        label = {"storage_unit_id": "SU_001"}
+        assert exporter.storage_accept_queue_backlog.labels(**label)._value.get() == 4096
+        assert exporter.storage_accept_queue_peak.labels(**label)._value.get() == 97
+        assert exporter.storage_socket_drops.labels(**label)._value.get() == 5
+        assert exporter.storage_listen_overflows.labels(**label)._value.get() == 2
+        assert exporter.storage_listen_other_drops.labels(**label)._value.get() == 3
+
+    def test_accept_queue_series_absent_when_the_probe_is_off(self):
+        """The probe is opt-in; reporting 0 drops would read as 'measured, and none'."""
+        exporter = TQMetricsExporter()
+        fake_su_info = MagicMock()
+        fake_su_info.id = "SU_001"
+        exporter._storage_unit_infos = {"SU_001": fake_su_info}
+        exporter._query_storage_unit = MagicMock(
+            return_value={"storage_unit_id": "SU_001", "capacity": 1000, "active_keys": 1}
+        )
+
+        exporter.collect_storage_metrics()
+
+        exported = {sample.name for metric in exporter.registry.collect() for sample in metric.samples}
+        assert "tq_storage_socket_drops" not in exported
+        assert "tq_storage_accept_queue_backlog" not in exported
 
     def test_storage_metrics_handles_query_failure(self):
         """If a storage unit query fails, other units should still be collected."""
@@ -271,6 +456,32 @@ class TestStorageMetricsCollection:
         assert exporter.storage_capacity.labels(storage_unit_id="SU_002")._value.get() == 500
         assert call_count == 2
 
+    def test_payload_metrics_collected_and_removed_when_backend_no_longer_reports_them(self):
+        exporter = TQMetricsExporter()
+        exporter._storage_unit_infos = {"storage": MagicMock()}
+        snapshot = {
+            "storage_unit_id": "storage",
+            "payload_transfer": {"idle_receive_bytes": 128, "queue_wait_seconds": 2.5},
+        }
+        exporter._query_storage_unit = MagicMock(return_value=snapshot)
+
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            == 128
+        )
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_queue_wait_seconds", {"storage_unit_id": "storage"})
+            == 2.5
+        )
+
+        snapshot.pop("payload_transfer")
+        exporter.collect_storage_metrics()
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_idle_receive_bytes", {"storage_unit_id": "storage"})
+            is None
+        )
+
     def test_storage_metrics_skips_capacity_when_none(self):
         """When capacity is None (unlimited storage), capacity/utilization
         gauges must not be populated, but other metrics still are.
@@ -302,6 +513,10 @@ class TestStorageMetricsCollection:
         # active_keys and memory_rss are still reported
         assert exporter.storage_active_keys.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 42
         assert exporter.storage_memory_rss.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 128 * 1024 * 1024
+        assert exporter.storage_ssd_offload_enabled.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_active_values.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_active_bytes.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
+        assert exporter.storage_ssd_fallback_values.labels(storage_unit_id="SU_UNLIMITED")._value.get() == 0
 
     def test_storage_metrics_prunes_stale_capacity_on_switch_to_unlimited(self):
         """If a storage unit transitions from a numeric capacity to unlimited,

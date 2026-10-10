@@ -13,44 +13,163 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import math
 import os
 import pickle
+import shutil
+import socket
 import time
 import weakref
-from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
+from dataclasses import dataclass
+from pathlib import Path
+from queue import Empty, SimpleQueue
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import numpy as np
 import psutil
 import ray
+import torch
 import zmq
 
-from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
-from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.storage.payload_transfer import DeferredResponse, PayloadTransfer, create_payload_transfer
+from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
+    STORAGE_CLIENT_IDENTITY_PREFIXES,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
     create_zmq_socket,
     format_zmq_address,
+    frame_nbytes,
     get_free_port,
     get_node_ip_address,
 )
 
 if TYPE_CHECKING:
     from transfer_queue.metrics import TQMetricsExporter
+    from transfer_queue.utils.accept_probe import AcceptQueueProbe
 
 logger = get_logger(__name__)
 
+
+def _storage_arrival_op_type(operation: ZMQRequestType) -> str | None:
+    """Map a tracked logical storage operation's first message to its metric label."""
+    return {
+        ZMQRequestType.PUT_DATA: "PUT_DATA",
+        ZMQRequestType.GET_DATA: "GET_DATA",
+        ZMQRequestType.CLEAR_DATA: "CLEAR_DATA",
+        ZMQRequestType.PUT_DATA_PREPARE: "PUT_DATA",
+        ZMQRequestType.GET_DATA_PREPARE: "GET_DATA",
+    }.get(operation)
+
+
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+DEFAULT_SSD_OFFLOAD_THRESHOLD_BYTES = 1024 * 1024
+DEFAULT_SSD_READ_THREADS = 32
+DEFAULT_SSD_WRITE_THREADS = 8
+SSD_OFFLOAD_DIRECTORY_NAME = "transfer_queue_ssd_offload"
+
+_HYBRID_CHECKPOINT_FORMAT = "transfer_queue_hybrid_storage_v1"
+
+
+@dataclass(frozen=True)
+class SSDEncodedSample:
+    """One sample represented in a form that can be written directly to SSD."""
+
+    payload: memoryview
+    codec: str
+    dtype: str | np.dtype[Any] | None = None
+    shape: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True)
+class _SSDValueRef:
+    """Internal reference to one SSD-backed value."""
+
+    path: Path
+    size_bytes: int
+    codec: str
+    dtype: str | np.dtype[Any] | None = None
+    shape: tuple[int, ...] | None = None
+
 
 # Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+# Accept-queue depth for the client-facing ROUTER. A full queue loses connections silently.
+TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
+
+# Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
+TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+
+def _queue_deferred_response(
+    identity: bytes | bytearray | zmq.Frame,
+    response: DeferredResponse,
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    wakeup: socket.socket,
+    shutdown_event: Event,
+) -> None:
+    """Wake the owning worker when an asynchronous response becomes ready."""
+    routing_identity = bytes(identity)
+
+    def ready(future: Future[ZMQMessage]) -> None:
+        if shutdown_event.is_set():
+            return
+        completions.put((routing_identity, future))
+        try:
+            wakeup.send(b"\0")
+        except (BlockingIOError, OSError):
+            pass
+
+    response.future.add_done_callback(ready)
+
+
+def _drain_deferred_responses(
+    completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
+    worker_socket: zmq.Socket,
+    storage_id: str,
+    measurements: dict[Future[ZMQMessage], ExitStack],
+) -> None:
+    """Send completed responses from the only thread that owns the ZMQ socket."""
+    while True:
+        try:
+            identity, future = completions.get_nowait()
+        except Empty:
+            return
+        with measurements.pop(future):
+            try:
+                response = future.result()
+            except Exception as exc:
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_GET_ERROR,
+                    sender_id=storage_id,
+                    body={"message": f"{storage_id}, deferred response failed: {exc}."},
+                )
+        worker_socket.send_multipart([identity] + response.serialize(), copy=False)
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -87,6 +206,26 @@ class StorageUnitData:
     def active_key_count(self) -> int:
         """Number of active keys currently stored."""
         return len(self._active_keys)
+
+    @property
+    def ssd_offload_enabled(self) -> bool:
+        """Whether this storage data offloads values to SSD."""
+        return False
+
+    @property
+    def ssd_active_values(self) -> int:
+        """Number of active field values stored on SSD."""
+        return 0
+
+    @property
+    def ssd_active_bytes(self) -> int:
+        """Logical bytes held by active SSD-backed values."""
+        return 0
+
+    @property
+    def ssd_fallback_values_total(self) -> int:
+        """Values retained in memory because SSD encoding was unavailable."""
+        return 0
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Get data by global index keys.
@@ -149,6 +288,498 @@ class StorageUnitData:
                 self.field_data[f].pop(key, None)
         self._active_keys -= set(keys)
 
+    def save_checkpoint(self, path: str | Path, storage_unit_id: str) -> None:
+        """Write in-memory storage state to a checkpoint."""
+        state = {
+            "storage_unit_id": storage_unit_id,
+            "storage_unit_size": self.storage_size,
+            "field_data": self.field_data,
+            "active_keys": self._active_keys,
+        }
+        with open(path, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_checkpoint(self, path: str | Path) -> int | None:
+        """Replace in-memory storage state from a checkpoint."""
+        with open(path, "rb") as f:
+            state = pickle.load(f)
+        if state.get("format") == _HYBRID_CHECKPOINT_FORMAT:
+            raise ValueError("An SSD checkpoint requires SSD offload to be enabled")
+
+        checkpoint_size = state["storage_unit_size"]
+        restored_field_data = state["field_data"]
+        restored_active_keys = set(state["active_keys"])
+        self.field_data = restored_field_data
+        self._active_keys = restored_active_keys
+        return checkpoint_size
+
+    def close(self) -> None:
+        """Release resources owned by this storage data."""
+        return None
+
+
+class SSDFileStore:
+    """Own and read/write one SSD file per offloaded value."""
+
+    def __init__(
+        self,
+        ssd_path: str,
+        run_id: str,
+        unit_id: str,
+    ) -> None:
+        self._closed = False
+        configured_path = Path(ssd_path).resolve()
+        if configured_path.exists() and not configured_path.is_dir():
+            raise ValueError(f"SSD offload path is not a directory: {configured_path}")
+        configured_path.mkdir(parents=True, exist_ok=True)
+        self._ssd_root = configured_path / SSD_OFFLOAD_DIRECTORY_NAME
+        self._ssd_root.mkdir(exist_ok=True)
+        if self._ssd_root.is_symlink() or not self._ssd_root.is_dir():
+            raise ValueError(f"SSD offload working path must be a directory, not a symlink: {self._ssd_root}")
+        self._base_path = self._ssd_root / run_id / unit_id
+        self._base_path.mkdir(parents=True)
+        for prefix in range(256):
+            (self._base_path / f"{prefix:02x}").mkdir()
+        self._read_pool = ThreadPoolExecutor(
+            max_workers=DEFAULT_SSD_READ_THREADS,
+            thread_name_prefix="tq-ssd-read",
+        )
+        self._write_pool = ThreadPoolExecutor(
+            max_workers=DEFAULT_SSD_WRITE_THREADS,
+            thread_name_prefix="tq-ssd-write",
+        )
+
+    @staticmethod
+    def _write_all_bytes(fd: int, payload: memoryview) -> None:
+        """Write the entire payload to an open file descriptor, handling partial writes."""
+        view = payload.cast("B")
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError("SSDFileStore write returned no progress")
+            view = view[written:]
+
+    def _write_value_file(
+        self,
+        encoded_value: SSDEncodedSample,
+    ) -> _SSDValueRef:
+        """Atomically write one encoded value to a new SSD file and return its reference."""
+        token = uuid4().hex
+        directory = self._base_path / token[:2]
+        temp_path = directory / f".tmp-{token}"
+        final_path = directory / f"{token}.bin"
+        try:
+            fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                self._write_all_bytes(fd, encoded_value.payload)
+            finally:
+                os.close(fd)
+            temp_path.rename(final_path)
+        except Exception:
+            for path in (temp_path, final_path):
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        return _SSDValueRef(
+            path=final_path,
+            size_bytes=encoded_value.payload.nbytes,
+            codec=encoded_value.codec,
+            dtype=encoded_value.dtype,
+            shape=encoded_value.shape,
+        )
+
+    def write_values(
+        self,
+        encoded_values: list[SSDEncodedSample],
+    ) -> list[_SSDValueRef]:
+        """Write encoded values concurrently in input order and remove completed files if the batch fails."""
+        refs: list[_SSDValueRef | None] = [None] * len(encoded_values)
+        futures = {
+            self._write_pool.submit(self._write_value_file, encoded_value): position
+            for position, encoded_value in enumerate(encoded_values)
+        }
+        first_error: Exception | None = None
+        for future, position in futures.items():
+            try:
+                refs[position] = future.result()
+            except Exception as e:
+                if first_error is None:
+                    first_error = e
+        if first_error is not None:
+            for ref in refs:
+                if ref is not None:
+                    self.unlink(ref)
+            raise first_error
+        return [ref for ref in refs if ref is not None]
+
+    def import_file(self, source: Path, metadata: dict[str, Any]) -> _SSDValueRef:
+        """Copy one checkpoint blob into this store without materializing it."""
+        token = uuid4().hex
+        directory = self._base_path / token[:2]
+        temp_path = directory / f".tmp-{token}"
+        final_path = directory / f"{token}.bin"
+        try:
+            shutil.copyfile(source, temp_path)
+            actual_size = temp_path.stat().st_size
+            if actual_size != metadata["size_bytes"]:
+                raise OSError(
+                    f"SSD checkpoint blob has {actual_size} bytes, expected {metadata['size_bytes']}: {source}"
+                )
+            temp_path.rename(final_path)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
+        return _SSDValueRef(
+            path=final_path,
+            size_bytes=metadata["size_bytes"],
+            codec=metadata["codec"],
+            dtype=metadata["dtype"],
+            shape=metadata["shape"],
+        )
+
+    @staticmethod
+    def unlink(entry: _SSDValueRef) -> None:
+        """Delete one offloaded value, tolerating cleanup failures."""
+        try:
+            entry.path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Failed to delete superseded SSD sample {entry.path}: {e}")
+
+    def read_values(self, refs: list[_SSDValueRef]) -> list[bytes]:
+        """Read SSD-backed values concurrently and return their payloads in input order."""
+        return list(self._read_pool.map(self._read_value_file, refs))
+
+    @staticmethod
+    def _read_value_file(ref: _SSDValueRef) -> bytes:
+        """Read one SSD value file and verify its size against the stored reference."""
+        payload = ref.path.read_bytes()
+        if len(payload) != ref.size_bytes:
+            raise OSError(
+                f"SSDFileStore short read from {ref.path}: expected {ref.size_bytes} bytes, got {len(payload)}"
+            )
+        return payload
+
+    def close(self) -> None:
+        """Stop I/O workers and delete the storage directory."""
+        if self._closed:
+            return
+        self._closed = True
+        self._write_pool.shutdown(wait=True)
+        self._read_pool.shutdown(wait=True)
+        shutil.rmtree(self._base_path, ignore_errors=True)
+        try:
+            self._base_path.parent.rmdir()
+        except OSError:
+            pass
+
+
+class HybridStorageUnitData(StorageUnitData):
+    """Store each value inline or as an SSD file reference in one field map."""
+
+    def __init__(
+        self,
+        storage_size: int | None,
+        ssd_path: str,
+        run_id: str,
+        unit_id: str,
+        threshold_bytes: int = DEFAULT_SSD_OFFLOAD_THRESHOLD_BYTES,
+    ) -> None:
+        if threshold_bytes <= 0:
+            raise ValueError("SSD offload threshold must be greater than zero")
+        super().__init__(storage_size)
+        self._ssd_store = SSDFileStore(ssd_path, run_id, unit_id)
+        self._threshold = threshold_bytes
+        self._ssd_active_values = 0
+        self._ssd_active_bytes = 0
+        self._ssd_fallback_values_total = 0
+
+    @property
+    def ssd_offload_enabled(self) -> bool:
+        """Whether this storage data offloads values to SSD."""
+        return True
+
+    @property
+    def ssd_active_values(self) -> int:
+        """Number of active field values stored on SSD."""
+        return self._ssd_active_values
+
+    @property
+    def ssd_active_bytes(self) -> int:
+        """Logical bytes held by active SSD-backed values."""
+        return self._ssd_active_bytes
+
+    @property
+    def ssd_fallback_values_total(self) -> int:
+        """Values retained in memory because SSD encoding was unavailable."""
+        return self._ssd_fallback_values_total
+
+    @staticmethod
+    def _sample_from_value(value: Any) -> SSDEncodedSample | None:
+        if isinstance(value, torch.Tensor):
+            if value.is_nested or value.is_sparse:
+                return None
+            try:
+                tensor = value.detach()
+                if tensor.device.type != "cpu":
+                    tensor = tensor.cpu()
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                payload = memoryview(tensor.flatten().view(torch.uint8).numpy()).cast("B")
+            except (RuntimeError, TypeError, ValueError):
+                return None
+            return SSDEncodedSample(
+                payload=payload,
+                codec="tensor",
+                dtype=str(tensor.dtype).removeprefix("torch."),
+                shape=tuple(tensor.shape),
+            )
+        if isinstance(value, np.ndarray) and not value.dtype.hasobject:
+            try:
+                array = value if value.flags["C_CONTIGUOUS"] else np.ascontiguousarray(value)
+                payload = memoryview(array.view(np.uint8).ravel()).cast("B")
+            except (TypeError, ValueError):
+                return None
+            return SSDEncodedSample(
+                payload=payload,
+                codec="numpy",
+                dtype=array.dtype,
+                shape=tuple(array.shape),
+            )
+        if isinstance(value, bytes):
+            return SSDEncodedSample(payload=memoryview(value), codec="bytes")
+        try:
+            pickled_payload = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            return None
+        return SSDEncodedSample(payload=memoryview(pickled_payload), codec="pickle")
+
+    @staticmethod
+    def _decode_sample(raw: bytes, entry: _SSDValueRef) -> Any:
+        if entry.codec == "tensor":
+            if entry.dtype is None or entry.shape is None:
+                raise ValueError("Tensor SSD entry is missing dtype or shape")
+            dtype = getattr(torch, entry.dtype)
+            return torch.frombuffer(raw, dtype=dtype).view(entry.shape)
+        if entry.codec == "numpy":
+            if entry.dtype is None or entry.shape is None:
+                raise ValueError("NumPy SSD entry is missing dtype or shape")
+            return np.frombuffer(raw, dtype=np.dtype(entry.dtype)).reshape(entry.shape)
+        if entry.codec == "bytes":
+            return raw
+        if entry.codec == "pickle":
+            return pickle.loads(raw)
+        raise ValueError(f"Unsupported SSD codec: {entry.codec}")
+
+    def _prepare_field_values(
+        self,
+        values: Any,
+    ) -> tuple[list[Any], list[_SSDValueRef], int]:
+        """Encode one field and write its offloaded values to the active SSD directory."""
+        logical_samples = list(values.unbind()) if isinstance(values, torch.Tensor) else list(values)
+        encoded_samples = [self._sample_from_value(sample) for sample in logical_samples]
+        prepared_values: list[Any] = []
+        ssd_positions: list[int] = []
+        ssd_samples: list[SSDEncodedSample] = []
+        fallback_values = 0
+        for position, (value, encoded) in enumerate(zip(logical_samples, encoded_samples, strict=True)):
+            if encoded is not None and encoded.payload.nbytes >= self._threshold:
+                ssd_positions.append(position)
+                ssd_samples.append(encoded)
+                prepared_values.append(None)
+            else:
+                prepared_values.append(value)
+                if encoded is None:
+                    fallback_values += 1
+
+        entries = self._ssd_store.write_values(ssd_samples)
+        for position, entry in zip(ssd_positions, entries, strict=True):
+            prepared_values[position] = entry
+        return prepared_values, entries, fallback_values
+
+    def put_data(
+        self,
+        field_data: dict[str, Any],
+        global_indexes: list,
+    ) -> None:
+        """Store each sample in memory or SSD according to its encoded size."""
+        if not global_indexes or not field_data:
+            super().put_data(field_data, global_indexes)
+            return
+
+        unique_global_indexes = set(global_indexes)
+        has_duplicate_indexes = len(unique_global_indexes) != len(global_indexes)
+
+        for field, values in field_data.items():
+            prepared_values, entries, fallback_values = self._prepare_field_values(values)
+
+            stored_field = self.field_data.get(field, {})
+            old_ssd_values = []
+            for global_index in unique_global_indexes:
+                old_value = stored_field.get(global_index)
+                if isinstance(old_value, _SSDValueRef):
+                    old_ssd_values.append(old_value)
+            try:
+                super().put_data({field: prepared_values}, global_indexes)
+            except Exception:
+                for entry in entries:
+                    self._ssd_store.unlink(entry)
+                raise
+
+            obsolete_ssd_values = old_ssd_values
+            if has_duplicate_indexes:
+                retained_ssd_paths = set()
+                for global_index in unique_global_indexes:
+                    retained_value = self.field_data[field][global_index]
+                    if isinstance(retained_value, _SSDValueRef):
+                        retained_ssd_paths.add(retained_value.path)
+                obsolete_ssd_values.extend(entry for entry in entries if entry.path not in retained_ssd_paths)
+
+            self._ssd_active_values += len(entries) - len(obsolete_ssd_values)
+            self._ssd_active_bytes += sum(entry.size_bytes for entry in entries) - sum(
+                value.size_bytes for value in obsolete_ssd_values
+            )
+            self._ssd_fallback_values_total += fallback_values
+            for obsolete_value in obsolete_ssd_values:
+                self._ssd_store.unlink(obsolete_value)
+
+    def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
+        """Read mixed memory- and SSD-backed samples in request order."""
+        result = super().get_data(fields, global_indexes)
+        for values in result.values():
+            ssd_values = [(position, value) for position, value in enumerate(values) if isinstance(value, _SSDValueRef)]
+            raw_values = self._ssd_store.read_values([value for _, value in ssd_values])
+            for (position, entry), raw in zip(ssd_values, raw_values, strict=True):
+                values[position] = self._decode_sample(raw, entry)
+        return result
+
+    def clear(self, keys: list) -> None:
+        """Remove values and unlink any files they reference."""
+        ssd_values: list[_SSDValueRef] = []
+        for values in self.field_data.values():
+            for key in set(keys):
+                value = values.get(key)
+                if isinstance(value, _SSDValueRef):
+                    ssd_values.append(value)
+        super().clear(keys)
+        self._ssd_active_values -= len(ssd_values)
+        self._ssd_active_bytes -= sum(value.size_bytes for value in ssd_values)
+        for value in ssd_values:
+            self._ssd_store.unlink(value)
+
+    def save_checkpoint(self, path: str | Path, storage_unit_id: str) -> None:
+        """Write memory values to a manifest and copy SSD values beside it."""
+        manifest_path = Path(path)
+        blob_dir = Path(f"{manifest_path}.blobs")
+        shutil.rmtree(blob_dir, ignore_errors=True)
+        checkpoint_fields: dict[str, dict[int, Any]] = {}
+        ssd_index: dict[str, dict[int, dict[str, Any]]] = {}
+        try:
+            for field, values in self.field_data.items():
+                checkpoint_values = {}
+                field_ssd_index = {}
+                for global_index, value in values.items():
+                    if not isinstance(value, _SSDValueRef):
+                        checkpoint_values[global_index] = value
+                        continue
+
+                    blob_dir.mkdir(parents=True, exist_ok=True)
+                    filename = value.path.name
+                    destination = blob_dir / filename
+                    shutil.copyfile(value.path, destination)
+                    actual_size = destination.stat().st_size
+                    if actual_size != value.size_bytes:
+                        raise OSError(f"SSD value has {actual_size} bytes, expected {value.size_bytes}: {value.path}")
+                    field_ssd_index[global_index] = {
+                        "filename": filename,
+                        "size_bytes": value.size_bytes,
+                        "codec": value.codec,
+                        "dtype": value.dtype,
+                        "shape": value.shape,
+                    }
+                checkpoint_fields[field] = checkpoint_values
+                if field_ssd_index:
+                    ssd_index[field] = field_ssd_index
+
+            state = {
+                "format": _HYBRID_CHECKPOINT_FORMAT,
+                "storage_unit_id": storage_unit_id,
+                "storage_unit_size": self.storage_size,
+                "field_data": checkpoint_fields,
+                "ssd_index": ssd_index,
+                "active_keys": set(self._active_keys),
+            }
+            with open(manifest_path, "wb") as f:
+                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:
+            manifest_path.unlink(missing_ok=True)
+            shutil.rmtree(blob_dir, ignore_errors=True)
+            raise
+
+    def load_checkpoint(self, path: str | Path) -> int | None:
+        """Replace memory and SSD state after all checkpoint data is ready."""
+        manifest_path = Path(path)
+        with open(manifest_path, "rb") as f:
+            state = pickle.load(f)
+        checkpoint_format = state.get("format")
+        if checkpoint_format not in (None, _HYBRID_CHECKPOINT_FORMAT):
+            raise ValueError(f"Unsupported HybridStorageUnitData checkpoint format: {checkpoint_format}")
+        checkpoint_size = state["storage_unit_size"]
+        field_data = state["field_data"]
+        restored_active_keys = set(state["active_keys"])
+        old_ssd_values = [
+            value for values in self.field_data.values() for value in values.values() if isinstance(value, _SSDValueRef)
+        ]
+        restored_ssd_values: list[_SSDValueRef] = []
+        restored_fallback_values = 0
+
+        try:
+            if checkpoint_format == _HYBRID_CHECKPOINT_FORMAT:
+                blob_dir = Path(f"{manifest_path}.blobs")
+                restored_field_data = {field: dict(values) for field, values in field_data.items()}
+                for field, entries in state["ssd_index"].items():
+                    restored_values = restored_field_data.setdefault(field, {})
+                    for global_index, metadata in entries.items():
+                        filename = metadata["filename"]
+                        if Path(filename).name != filename:
+                            raise ValueError(f"Invalid SSD checkpoint blob name: {filename}")
+                        restored_value = self._ssd_store.import_file(blob_dir / filename, metadata)
+                        restored_ssd_values.append(restored_value)
+                        restored_values[global_index] = restored_value
+            else:
+                restored_field_data = {}
+                for field, values in field_data.items():
+                    if not values:
+                        restored_field_data[field] = {}
+                        continue
+                    indexes = list(values)
+                    prepared_values, entries, fallback_values = self._prepare_field_values(
+                        [values[key] for key in indexes]
+                    )
+                    restored_ssd_values.extend(entries)
+                    restored_fallback_values += fallback_values
+                    restored_field_data[field] = dict(zip(indexes, prepared_values, strict=True))
+            restored_ssd_active_values = len(restored_ssd_values)
+            restored_ssd_active_bytes = sum(value.size_bytes for value in restored_ssd_values)
+        except Exception:
+            for value in restored_ssd_values:
+                self._ssd_store.unlink(value)
+            raise
+
+        self.field_data = restored_field_data
+        self._active_keys = restored_active_keys
+        self._ssd_active_values = restored_ssd_active_values
+        self._ssd_active_bytes = restored_ssd_active_bytes
+        self._ssd_fallback_values_total += restored_fallback_values
+        for value in old_ssd_values:
+            self._ssd_store.unlink(value)
+        return checkpoint_size
+
+    def close(self) -> None:
+        """Release SSD resources owned by this hybrid store."""
+        self._ssd_store.close()
+
 
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
@@ -168,23 +799,49 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    def __init__(
-        self,
-        storage_unit_size: int | None = None,
-        payload_transfer: Mapping[str, object] | None = None,
-    ):
-        """Initialize a SimpleStorageUnit with the specified size.
+    _requests_arrived = 0
+    _arrivals_by_op: dict[str, int] = {}
+    _accept_probe = None
+
+    def __init__(self, config: dict[str, Any]):
+        """Initialize a SimpleStorageUnit from the SimpleStorage config.
 
         Args:
-            storage_unit_size: Maximum number of elements that can be stored in this storage unit.
-                If None, the storage unit has unlimited capacity.
-            payload_transfer: Backend and optional backend-specific settings.
+            config: The ``backend.SimpleStorage`` configuration. Bootstrap adds one
+                shared internal run ID.
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
-        self.storage_unit_size = storage_unit_size
+        total_storage_size = config.get("total_storage_size")
+        num_data_storage_units = int(config.get("num_data_storage_units", 1))
+        self.storage_unit_size = (
+            math.ceil(total_storage_size / num_data_storage_units) if total_storage_size is not None else None
+        )
+        self.storage_data: StorageUnitData
 
-        self.storage_data = StorageUnitData(self.storage_unit_size)
-        self.payload_transfer = create_payload_transfer(payload_transfer)
+        ssd_config = config.get("ssd_offload")
+        if ssd_config is not None and ssd_config.get("enabled", False):
+            ssd_path = ssd_config.get("path")
+            if not ssd_path:
+                raise ValueError("SimpleStorage SSD offload requires backend.SimpleStorage.ssd_offload.path")
+            threshold_bytes = int(ssd_config.get("threshold_bytes", DEFAULT_SSD_OFFLOAD_THRESHOLD_BYTES))
+            self.storage_data = HybridStorageUnitData(
+                storage_size=self.storage_unit_size,
+                ssd_path=str(ssd_path),
+                run_id=str(config.get("_run_id") or uuid4().hex),
+                unit_id=self.storage_unit_id,
+                threshold_bytes=threshold_bytes,
+            )
+            logger.info(
+                f"[{self.storage_unit_id}]: SSD offload enabled — "
+                f"path={Path(ssd_path).resolve() / SSD_OFFLOAD_DIRECTORY_NAME}, "
+                f"threshold={threshold_bytes} B/sample"
+            )
+        else:
+            self.storage_data = StorageUnitData(self.storage_unit_size)
+
+        self.payload_transfer = create_payload_transfer(config.get("payload_transfer"))
+        self._requests_arrived = 0
+        self._arrivals_by_op = {}
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -212,8 +869,16 @@ class SimpleStorageUnit:
             self.proxy_thread,
             self.zmq_context,
             self.put_get_socket,
+            self._accept_probe,
+            self.worker_socket,
+            self.storage_data,
             self.payload_transfer,
         )
+
+    def shutdown(self) -> None:
+        """Stop request processing and release this storage unit's resources."""
+        if self._finalizer.alive:
+            self._finalizer()
 
     def _init_zmq_socket(self) -> None:
         """
@@ -226,6 +891,7 @@ class SimpleStorageUnit:
 
         # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
+        self.put_get_socket.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
 
         while True:
             try:
@@ -235,6 +901,18 @@ class SimpleStorageUnit:
             except zmq.ZMQError:
                 logger.warning(f"[{self.storage_unit_id}]: Try to bind ZMQ sockets failed, retrying...")
                 continue
+
+        if TQ_ACCEPT_PROBE_INTERVAL > 0:
+            # Lazy: the probe shells out to ``ss`` on a timer, so keep it out of runs that
+            # have not enabled it.
+            from transfer_queue.utils.accept_probe import AcceptQueueProbe
+
+            self._accept_probe = AcceptQueueProbe(
+                port=self._put_get_socket_port,
+                owner_id=str(self.storage_unit_id),
+                interval_s=TQ_ACCEPT_PROBE_INTERVAL,
+            )
+            self._accept_probe.start()
 
         # Backend: DEALER for worker communication (connected via zmq.proxy)
         self.worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
@@ -271,8 +949,33 @@ class SimpleStorageUnit:
     def _proxy_routine(self) -> None:
         """ZMQ proxy for message forwarding between frontend ROUTER and backend DEALER."""
         logger.info(f"[{self.storage_unit_id}]: start ZMQ proxy...")
+        assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
+        front, back = self.put_get_socket, self.worker_socket
+        poller = zmq.Poller()
+        poller.register(front, zmq.POLLIN)
+        poller.register(back, zmq.POLLIN)
         try:
-            zmq.proxy(self.put_get_socket, self.worker_socket)
+            # Forwarding by hand rather than via zmq.proxy() so a non-TransferQueue peer on
+            # this exposed TCP port cannot reach the worker and terminate its request loop.
+            while not self._shutdown_event.is_set():
+                events = dict(poller.poll(1000))
+                if front in events:
+                    messages = front.recv_multipart(copy=False)
+                    try:
+                        identity = bytes(messages[0]) if messages else b""
+                        if not identity.startswith(STORAGE_CLIENT_IDENTITY_PREFIXES):
+                            logger.warning(
+                                "[%s]: dropping request with unrecognized ZMQ identity",
+                                self.storage_unit_id,
+                            )
+                            continue
+                        back.send_multipart(messages, copy=False)
+                    finally:
+                        # This thread outlives each request, so drop forwarded payload frames while idle.
+                        del messages
+
+                if back in events:
+                    front.send_multipart(back.recv_multipart(copy=False), copy=False)
         except zmq.ContextTerminated:
             logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy stopped gracefully (Context Terminated)")
         except Exception as e:
@@ -289,6 +992,13 @@ class SimpleStorageUnit:
 
         poller = zmq.Poller()
         poller.register(worker_socket, zmq.POLLIN)
+        wakeup_reader, wakeup_writer = socket.socketpair()
+        wakeup_reader.setblocking(False)
+        wakeup_writer.setblocking(False)
+        wakeup_fd = wakeup_reader.fileno()
+        poller.register(wakeup_fd, zmq.POLLIN)
+        deferred_completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]] = SimpleQueue()
+        deferred_measurements: dict[Future[ZMQMessage], ExitStack] = {}
 
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
@@ -296,7 +1006,8 @@ class SimpleStorageUnit:
         while not self._shutdown_event.is_set():
             monitor = self._metrics if self._metrics is not None else perf_monitor
             try:
-                socks = dict(poller.poll(TQ_STORAGE_POLLER_TIMEOUT * 1000))
+                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
             except zmq.error.ContextTerminated:
                 # ZMQ context was terminated, exit gracefully
                 logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
@@ -308,77 +1019,43 @@ class SimpleStorageUnit:
             if self._shutdown_event.is_set():
                 break
 
-            if worker_socket in socks:
-                # Messages received from proxy: [identity, serialized_msg_frame1, ...]
-                messages = worker_socket.recv_multipart(copy=False)
-                identity = messages[0]
-                serialized_msg = messages[1:]
-
-                request_msg = ZMQMessage.deserialize(serialized_msg)
-                operation = request_msg.request_type
-
+            if wakeup_fd in socks:
+                # Wakeup bytes only signal work; the queue owns the responses.
                 try:
-                    logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
-
-                    metric_op = {
-                        ZMQRequestType.PUT_DATA: "PUT_DATA",
-                        ZMQRequestType.GET_DATA: "GET_DATA",
-                        ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
-                        ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
-                    }.get(operation)
-                    if metric_op is not None:
-                        with monitor.measure(op_type=metric_op):
-                            response_msg = self.payload_transfer.handle_request(
-                                request_msg,
-                                storage_id=self.storage_unit_id,
-                                load_data=self._load_data,
-                                store_data=self._put_decoded_data,
-                            )
-                    else:
-                        response_msg = self.payload_transfer.handle_request(
-                            request_msg,
-                            storage_id=self.storage_unit_id,
-                            load_data=self._load_data,
-                            store_data=self._put_decoded_data,
-                        )
-
-                    if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="CLEAR_DATA"):
-                            response_msg = self._handle_clear(request_msg)
-                    elif response_msg is None and operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
-                        response_msg = self._handle_get_metrics()
-                    elif response_msg is None and operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
-                        response_msg = self._handle_save_checkpoint(request_msg)
-                    elif response_msg is None and operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
-                        response_msg = self._handle_load_checkpoint(request_msg)
-                    elif response_msg is None:
-                        response_msg = ZMQMessage.create(
-                            request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
-                            sender_id=self.storage_unit_id,
-                            body={
-                                "message": f"Storage unit id #{self.storage_unit_id} "
-                                f"receive invalid operation: {operation}."
-                            },
-                        )
-                except Exception as e:
-                    logger.error(
-                        f"[{self.storage_unit_id}]: worker error during {operation} "
-                        f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
+                    while wakeup_reader.recv(4096):
+                        pass
+                except BlockingIOError:
+                    pass
+                try:
+                    _drain_deferred_responses(
+                        deferred_completions, worker_socket, self.storage_unit_id, deferred_measurements
                     )
-                    response_msg = ZMQMessage.create(
-                        request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
-                        sender_id=self.storage_unit_id,
-                        body={
-                            "message": f"{self.storage_unit_id}, worker encountered error "
-                            f"during operation {operation}: {str(e)}."
-                        },
-                    )
+                except zmq.ZMQError as exc:
+                    logger.warning(f"[{self.storage_unit_id}]: deferred response send failed: {exc}")
+                    break
 
-                # Send response back with identity for routing
-                worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+            if worker_socket in socks:
+                # Keep request handling in a separate scope so payload references are
+                # released before the worker waits for the next request.
+                identity, response_msg = self._process_one_worker_request(worker_socket, monitor, deferred_measurements)
+                if isinstance(response_msg, DeferredResponse):
+                    _queue_deferred_response(
+                        identity,
+                        response_msg,
+                        deferred_completions,
+                        wakeup_writer,
+                        self._shutdown_event,
+                    )
+                else:
+                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
+        for measurement in deferred_measurements.values():
+            measurement.close()
+        poller.unregister(wakeup_fd)
         poller.unregister(worker_socket)
+        wakeup_reader.close()
+        wakeup_writer.close()
         worker_socket.close(linger=0)
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
@@ -405,6 +1082,120 @@ class SimpleStorageUnit:
                         f"expected {original_length}, got {new_length}"
                     )
         self.storage_data.put_data(field_data, global_indexes)
+
+    def _process_one_worker_request(
+        self,
+        worker_socket: zmq.Socket,
+        monitor: Any,
+        deferred_measurements: dict[Future[ZMQMessage], ExitStack],
+    ) -> tuple[bytes | zmq.Frame, ZMQMessage | DeferredResponse]:
+        """Process one storage request and return its response for the worker socket."""
+        # Messages received from proxy: [identity, serialized_msg_frame1, ...]
+        messages = worker_socket.recv_multipart(copy=False)
+        identity = messages[0]
+        serialized_msg = messages[1:]
+
+        try:
+            request_msg = ZMQMessage.deserialize(serialized_msg)
+        except Exception as e:
+            # The identity filter cannot cover this: an allowed peer can still send
+            # frames that fail to decode, and decoding here used to kill the thread.
+            logger.error(
+                f"[{self.storage_unit_id}]: undecodable request from "
+                f"identity={bytes(identity)!r}: {type(e).__name__}: {e}"
+            )
+            error_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"message": f"undecodable request: {type(e).__name__}: {e}"},
+            )
+            return identity, error_msg
+
+        operation = request_msg.request_type
+        started = time.perf_counter()
+
+        measurement = ExitStack()
+        measurement_deferred = False
+        try:
+            # Count each logical PUT/GET once at its first message; NIXL commit/cancel
+            # messages continue that request and must not inflate arrivals.
+            arrival_op = _storage_arrival_op_type(operation)
+            if arrival_op is not None:
+                self._requests_arrived += 1
+                self._arrivals_by_op[arrival_op] = self._arrivals_by_op.get(arrival_op, 0) + 1
+
+            logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
+
+            # The payload transfer owns PUT/GET operations; everything else stays with the unit.
+            metric_op = {
+                ZMQRequestType.PUT_DATA: "PUT_DATA",
+                ZMQRequestType.GET_DATA: "GET_DATA",
+                ZMQRequestType.PUT_DATA_COMMIT: "PUT_DATA",
+                ZMQRequestType.GET_DATA_COMMIT: "GET_DATA",
+            }.get(operation)
+            if metric_op is not None:
+                measurement.enter_context(monitor.measure(op_type=metric_op))
+            response_msg = self.payload_transfer.handle_request(
+                request_msg,
+                storage_id=self.storage_unit_id,
+                load_data=self._load_data,
+                store_data=self._put_decoded_data,
+            )
+            if isinstance(response_msg, DeferredResponse):
+                # Keep the request timing open until its asynchronous transfer finishes.
+                deferred_measurements[response_msg.future] = measurement
+                measurement_deferred = True
+
+            if response_msg is None and operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
+                with monitor.measure(op_type="CLEAR_DATA"):
+                    response_msg = self._handle_clear(request_msg)
+            elif response_msg is None and operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+                response_msg = self._handle_get_metrics()
+            elif response_msg is None and operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                response_msg = self._handle_save_checkpoint(request_msg)
+            elif response_msg is None and operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
+                response_msg = self._handle_load_checkpoint(request_msg)
+            elif response_msg is None:
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
+                    sender_id=self.storage_unit_id,
+                    body={
+                        "message": f"Storage unit id #{self.storage_unit_id} receive invalid operation: {operation}."
+                    },
+                )
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_unit_id}]: worker error during {operation} "
+                f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
+            )
+            response_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={
+                    "message": f"{self.storage_unit_id}, worker encountered error "
+                    f"during operation {operation}: {str(e)}."
+                },
+            )
+
+        finally:
+            if not measurement_deferred:
+                measurement.close()
+
+        if isinstance(response_msg, DeferredResponse):
+            return identity, response_msg
+
+        response_frames = response_msg.serialize()
+        if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+            # This end serializes the get response, so its frames give the true wire size.
+            log_heavy_operation(
+                self.storage_unit_id,
+                "get",
+                time.perf_counter() - started,
+                sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                f"samples={len(request_msg.body.get('global_indexes', []))} "
+                f"fields={list(request_msg.body.get('fields', []))}",
+            )
+        return identity, response_msg
 
     @staticmethod
     def _field_length(value: Any) -> int | None:
@@ -472,7 +1263,28 @@ class SimpleStorageUnit:
             "capacity": self.storage_unit_size,
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
+            "ssd_offload_enabled": int(self.storage_data.ssd_offload_enabled),
+            "ssd_active_values": self.storage_data.ssd_active_values,
+            "ssd_active_bytes": self.storage_data.ssd_active_bytes,
+            "ssd_fallback_values_total": self.storage_data.ssd_fallback_values_total,
+            # Counted on arrival; op_stats below only advances on completion.
+            "requests_arrived": self._requests_arrived,
+            "arrivals_by_op": dict(self._arrivals_by_op),
         }
+        if self._accept_probe is not None:
+            stats = self._accept_probe.stats
+            metrics["accept_queue"] = {
+                "backlog": stats.backlog,
+                "peak_recv_q": stats.peak_recv_q,
+                "peak_utilization": stats.peak_utilization,
+                "sk_drops_delta": stats.sk_drops_delta,
+                "listen_overflow_delta": stats.overflow_delta,
+                "non_overflow_drop_delta": stats.non_overflow_drop_delta,
+                "samples": stats.samples,
+            }
+        payload_metrics = self.payload_transfer.diagnostics
+        if payload_metrics:
+            metrics["payload_transfer"] = payload_metrics
 
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
@@ -503,11 +1315,11 @@ class SimpleStorageUnit:
         )
 
     def _handle_save_checkpoint(self, data_parts) -> ZMQMessage:
-        """Serialize storage unit data directly to a file.
+        """Write storage unit data directly to its checkpoint path.
 
         Args:
             data_parts: ZMQMessage from client, containing ``path`` in body:
-                absolute path for the output .pkl file. The caller must ensure
+                absolute path for the output manifest. The caller must ensure
                 this path is reachable from the node running this actor
                 (shared filesystem required for multi-node setups).
 
@@ -517,14 +1329,7 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            state = {
-                "storage_unit_id": self.storage_unit_id,
-                "storage_unit_size": self.storage_unit_size,
-                "field_data": self.storage_data.field_data,
-                "active_keys": self.storage_data._active_keys,
-            }
-            with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+            self.storage_data.save_checkpoint(path, self.storage_unit_id)
             logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
@@ -540,7 +1345,7 @@ class SimpleStorageUnit:
             )
 
     def _handle_load_checkpoint(self, data_parts) -> ZMQMessage:
-        """Restore storage unit data directly from a file.
+        """Restore storage unit data directly from its checkpoint path.
 
         Args:
             data_parts: ZMQMessage from client, containing ``path`` in body:
@@ -555,28 +1360,24 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            with open(path, "rb") as f:
-                data = pickle.load(f)
+            previous_key_count = self.storage_data.active_key_count
+            checkpoint_size = self.storage_data.load_checkpoint(path)
 
-            if data["storage_unit_size"] != self.storage_unit_size:
+            if checkpoint_size != self.storage_unit_size:
                 logger.warning(
                     f"[{self.storage_unit_id}]: storage_unit_size mismatch — "
-                    f"checkpoint={data['storage_unit_size']}, current={self.storage_unit_size}"
+                    f"checkpoint={checkpoint_size}, current={self.storage_unit_size}"
                 )
 
-            if self.storage_data._active_keys:
+            if previous_key_count:
                 logger.warning(
-                    f"[{self.storage_unit_id}]: overwriting {len(self.storage_data._active_keys)} "
+                    f"[{self.storage_unit_id}]: overwriting {previous_key_count} "
                     f"existing keys with checkpoint data from {path}"
                 )
-            self.storage_data.field_data.clear()
-            self.storage_data._active_keys.clear()
-            self.storage_data.field_data = data["field_data"]
-            self.storage_data._active_keys = data["active_keys"]
 
             logger.info(
                 f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "
-                f"{len(data['active_keys'])} keys, {len(data['field_data'])} fields"
+                f"{self.storage_data.active_key_count} keys, {len(self.storage_data.field_data)} fields"
             )
             return ZMQMessage.create(
                 request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
@@ -631,29 +1432,39 @@ class SimpleStorageUnit:
         proxy_thread: Thread | None,
         zmq_context: zmq.Context | None,
         put_get_socket: zmq.Socket | None,
-        payload_transfer: PayloadTransfer,
+        accept_probe: "AcceptQueueProbe | None" = None,
+        worker_socket: zmq.Socket | None = None,
+        storage_data: StorageUnitData | None = None,
+        payload_transfer: PayloadTransfer | None = None,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")
 
-        # Signal all threads to stop
         shutdown_event.set()
 
-        # Terminate put_get_socket
+        # Before the ZMQ teardown: the probe runs on its own timer and would outlive the unit.
+        if accept_probe is not None:
+            accept_probe.stop()
+
+        if worker_thread and worker_thread.is_alive():
+            worker_thread.join()
+        if proxy_thread and proxy_thread.is_alive():
+            proxy_thread.join()
+
         if put_get_socket:
             put_get_socket.close(linger=0)
-
-        # Terminate ZMQ context to unblock proxy and workers
+        if worker_socket:
+            worker_socket.close(linger=0)
         if zmq_context:
             zmq_context.term()
+        if storage_data is not None:
+            try:
+                storage_data.close()
+            except Exception as e:
+                logger.warning(f"Error closing storage data on shutdown: {e}")
 
-        # Wait for threads to finish (with timeout)
-        if worker_thread and worker_thread.is_alive():
-            worker_thread.join(timeout=5)
-        if proxy_thread and proxy_thread.is_alive():
-            proxy_thread.join(timeout=5)
-
-        payload_transfer.close()
+        if payload_transfer is not None:
+            payload_transfer.close()
 
         logger.info("SimpleStorageUnit resources shutdown complete.")
 

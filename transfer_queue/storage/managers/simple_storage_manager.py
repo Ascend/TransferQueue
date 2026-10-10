@@ -15,9 +15,11 @@
 
 import asyncio
 import os
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
+from functools import partial
 from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -30,13 +32,16 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.payload_transfer import create_payload_transfer
+from transfer_queue.storage.payload_transfer import PayloadTransferTimeout, create_payload_transfer
 from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
+from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    TQ_SOCKET_POOL_SIZE,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    ZMQSocketPool,
     with_zmq_socket,
 )
 
@@ -44,19 +49,57 @@ logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
+# Attempts per storage-unit request, including the first. Each one must use a new connection: a
+# DEALER silently queues messages for a peer it never reached, so no timeout can catch that.
+TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3))
+
+# Timeout for the post-failure probe, which only has to answer whether the unit still serves.
+TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TIMEOUT", 10))
+
+
+class StorageUnitTimeout(RuntimeError):
+    """A storage unit did not answer within the send/recv timeout.
+
+    Distinct from an error the unit reported: only a missing answer is worth a new connection.
+    """
+
+
+def _describe_unit_state(body: dict[str, Any]) -> str:
+    """Summarize a successful probe: the unit is serving again, plus its own counters.
+
+    Draws no conclusion about the timed-out request: the counters are cumulative per
+    operation and carry no request identity, so no value of them locates one request.
+    """
+    parts = [
+        f"requests_arrived={body.get('requests_arrived')}",
+        f"arrivals_by_op={body.get('arrivals_by_op')}",
+        f"active_keys={body.get('active_keys')}",
+        f"rss_gb={body.get('process_rss_bytes', 0) / 2**30:.2f}",
+    ]
+    op_stats = body.get("op_stats") or {}
+    if op_stats:
+        parts.append(f"completed={ {op: stats.get('request_count') for op, stats in op_stats.items()} }")
+    else:
+        # Only with Prometheus enabled; an empty dict would read as "served nothing".
+        parts.append("completed=unavailable(prometheus_disabled)")
+    return f"verdict=unit_serving_again ({' '.join(parts)})"
+
+
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
 
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
-    "put_get_socket",
-    get_identity=lambda self: self.storage_manager_id,
     get_peer=lambda self, target: self.storage_unit_infos[target],
-    # Long-lived context from the base StorageManager, shared with the notify path. Safe
-    # because the context is loop-agnostic and each socket stays per-call.
-    get_context=lambda self: self.zmq_context,
+    get_pool=lambda self: self.storage_rpc_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-    timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+)
+
+# Same endpoint as above but with the short diagnostic timeout, used only after a failure.
+with_storage_unit_probe_socket = with_zmq_socket(
+    get_peer=lambda self, target: self.storage_unit_infos[target],
+    get_pool=lambda self: self.storage_probe_pool,
+    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
 
 
@@ -82,6 +125,20 @@ class AsyncSimpleStorageManager(StorageManager):
         zmq_context: zmq.asyncio.Context | None = None,
     ):
         super().__init__(controller_info, config, zmq_context=zmq_context)
+        # Storage-unit RPC, on whichever context the base class settled on.
+        self.storage_rpc_pool = ZMQSocketPool(
+            self.zmq_context,
+            self.storage_manager_id,
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+        )
+        self.storage_probe_pool = ZMQSocketPool(
+            self.zmq_context,
+            f"{self.storage_manager_id}_probe",
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_PROBE_TIMEOUT,
+            maxsize=1,
+        )
 
         self.config = config
         server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
@@ -104,6 +161,28 @@ class AsyncSimpleStorageManager(StorageManager):
             peer_infos=config.get("payload_transfer_infos", {}) or {},
             control_peer_infos=self.storage_unit_infos,
         )
+        self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
+
+    def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
+        """Warn when the pool may park more sockets than the context can hold.
+
+        The cap is per (owner, address), so it multiplies by storage-unit count while the
+        context ceiling does not. At a few thousand units the product passes ZMQ_MAX_SOCKETS,
+        where a lease fails with EMFILE instead of degrading.
+        """
+        try:
+            budget = self.zmq_context.get(zmq.MAX_SOCKETS)
+        except zmq.ZMQError:  # pragma: no cover - context already terminating
+            return
+        worst_case = (TQ_SOCKET_POOL_SIZE + 1) * num_units
+        if worst_case > budget:
+            logger.warning(
+                f"[{self.storage_manager_id}]: storage RPC pool may hold up to "
+                f"({TQ_SOCKET_POOL_SIZE} + 1 probe) x {num_units} = {worst_case} idle sockets, above this "
+                f"context's ZMQ_MAX_SOCKETS ({budget}). Concurrent requests can then fail to "
+                f"open a socket. Lower TQ_SOCKET_POOL_SIZE or raise TQ_CLIENT_ZMQ_MAX_SOCKETS "
+                f"(with enough file descriptors, see ulimit -n)."
+            )
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.
@@ -150,6 +229,105 @@ class AsyncSimpleStorageManager(StorageManager):
             gi_lists[key].append(global_idx)
             pos_lists[key].append(pos)
         return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+
+    def _describe_storage_unit(self, storage_unit_id: str) -> str:
+        """Return ``ip:port`` for a storage unit, for use in diagnostics.
+
+        The unit id is a random uuid4 fragment that carries no location, so a bare id in an
+        error message cannot be traced back to a node. Never raises: it is only ever called
+        while reporting another failure, and must not mask it.
+        """
+        info = self.storage_unit_infos.get(storage_unit_id)
+        if info is None:
+            return "endpoint unknown (unit not registered with this manager)"
+        return f"{info.ip}:{info.ports.get('put_get_socket')}"
+
+    @with_storage_unit_probe_socket
+    async def _probe_storage_unit(self, target_storage_unit: str, socket: zmq.Socket = None) -> dict[str, Any]:
+        """Ask a storage unit for its own counters over a brand-new socket.
+
+        Served by the same worker thread as put and get, so an answer proves the unit is serving.
+        """
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.GET_METRICS,  # type: ignore[arg-type]
+            sender_id=f"{self.storage_manager_id}_probe",
+            receiver_id=target_storage_unit,
+            body={},
+        )
+        await socket.send_multipart(request_msg.serialize())
+        messages = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(messages)
+        if response_msg.request_type != ZMQRequestType.METRICS_RESPONSE:
+            raise RuntimeError(f"unexpected probe response type {response_msg.request_type}")
+        return response_msg.body
+
+    async def _diagnose_storage_unit(self, target_storage_unit: str) -> str:
+        """Report whether the unit is reachable and serving after a request to it timed out.
+
+        Returns one log line and never raises: it runs while another failure is being reported.
+        Says nothing about where that request went; no per-request state exists to show it.
+        """
+        info = self.storage_unit_infos.get(target_storage_unit)
+        if info is None:
+            return "verdict=unknown(unit_not_registered)"
+
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(info.ip, info.ports.get("put_get_socket")), timeout=5
+            )
+            writer.close()
+            tcp = "tcp=up"
+        except Exception as e:
+            tcp = f"tcp=down({type(e).__name__})"
+
+        try:
+            body = await self._probe_storage_unit(target_storage_unit=target_storage_unit)
+        except zmq.error.Again:
+            return f"{tcp} verdict=unit_not_serving (no probe answer in {TQ_SIMPLE_STORAGE_PROBE_TIMEOUT}s)"
+        except Exception as e:
+            return f"{tcp} verdict=unknown (probe failed: {type(e).__name__}: {e})"
+
+        return f"{tcp} {_describe_unit_state(body)}"
+
+    async def _request_with_retry(
+        self,
+        operation: str,
+        target_storage_unit: str,
+        request_context: str,
+        make_request: Callable[[], Any],
+        max_attempts: int | None = None,
+    ):
+        """Run one storage-unit request, retrying a missing answer on a fresh connection.
+
+        Args:
+            operation: Operation name for logs, e.g. ``get`` or ``put``.
+            target_storage_unit: Unit this request is routed to.
+            request_context: Request shape, so both ends of a failure can be correlated.
+            make_request: Zero-arg callable returning a coroutine for one attempt. Must build a
+                new socket per call, which ``with_storage_unit_socket`` does.
+            max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
+                for a request that must not be replayed.
+        """
+        # Floored at one: a nonpositive count would skip the request and report success, which for
+        # put would publish metadata for data that was never sent.
+        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS if max_attempts is None else max_attempts)
+        for attempt in range(1, attempts_allowed + 1):
+            try:
+                return await make_request()
+            except StorageUnitTimeout as e:
+                # The exception already names the unit, its endpoint and the timeout, so these
+                # lines only add what it cannot know: which attempt this was, and the shape.
+                if attempt < attempts_allowed:
+                    logger.warning(
+                        f"[{self.storage_manager_id}]: {operation} retry {attempt + 1}/{attempts_allowed} "
+                        f"on a new connection. {request_context} {e}"
+                    )
+                    continue
+                logger.error(
+                    f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
+                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
+                )
+                raise
 
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
@@ -264,24 +442,37 @@ class AsyncSimpleStorageManager(StorageManager):
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
-        tasks = [
-            self._put_to_single_storage_unit(
-                group.global_indexes,
-                {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
-                target_storage_unit=su_id,
-                data_parser=data_parser,
+        # Parser-backed puts are not replayed: the public API does not constrain parser side effects.
+        max_attempts = 1 if data_parser is not None else None
+        tasks = []
+        for su_id, group in routing.items():
+            storage_data = {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()}
+            tasks.append(
+                self._request_with_retry(
+                    "put",
+                    su_id,
+                    f"samples={len(group.global_indexes)} fields={list(storage_data.keys())}",
+                    partial(
+                        self._put_to_single_storage_unit,
+                        group.global_indexes,
+                        storage_data,
+                        target_storage_unit=su_id,
+                        data_parser=data_parser,
+                    ),
+                    max_attempts=max_attempts,
+                )
             )
-            for su_id, group in routing.items()
-        ]
 
         try:
             await asyncio.gather(*tasks)
         except Exception as e:
+            # The offending unit is named in the error itself; the full routing list can run to
+            # hundreds of ids, which buries it.
             logger.error(
                 f"[{self.storage_manager_id}]: put_data failed. "
                 f"partition_id={metadata.partition_ids[0]}, "
                 f"num_samples={metadata.size}, "
-                f"storage_units={list(routing.keys())}, "
+                f"num_storage_units={len(routing)}, "
                 f"error={type(e).__name__}: {e}"
             )
             raise
@@ -306,14 +497,39 @@ class AsyncSimpleStorageManager(StorageManager):
         Send data to a specific storage unit.
         """
 
-        await self.payload_transfer.put(
-            control_socket=socket,
-            sender_id=self.storage_manager_id,
-            target_id=target_storage_unit,
-            global_indexes=global_indexes,
-            data=storage_data,
-            data_parser=data_parser,
-        )
+        started = time.perf_counter()
+        try:
+            # The payload transfer owns the wire protocol and reports the payload bytes it
+            # moved; this end waits out the round trip, so it holds both the true wire size
+            # and the end-to-end latency.
+            wire_bytes = await self.payload_transfer.put(
+                control_socket=socket,
+                sender_id=self.storage_manager_id,
+                target_id=target_storage_unit,
+                global_indexes=global_indexes,
+                data=storage_data,
+                data_parser=data_parser,
+            )
+            log_heavy_operation(
+                self.storage_manager_id,
+                "put",
+                time.perf_counter() - started,
+                wire_bytes,
+                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
+                f"samples={len(global_indexes)} fields={list(storage_data.keys())}",
+            )
+        except PayloadTransferTimeout as e:
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
+                f"serialized_mb={e.wire_bytes / 2**20:.1f}"
+            ) from e
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_manager_id}]: Unexpected error during put to storage unit "
+                f"{target_storage_unit}: {type(e).__name__}: {e}"
+            )
+            raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -386,7 +602,17 @@ class AsyncSimpleStorageManager(StorageManager):
         routing = self._group_by_hash(metadata.global_indexes)
 
         tasks = [
-            self._get_from_single_storage_unit(group.global_indexes, metadata.field_names, target_storage_unit=su_id)
+            self._request_with_retry(
+                "get",
+                su_id,
+                f"samples={len(group.global_indexes)} fields={list(metadata.field_names)}",
+                partial(
+                    self._get_from_single_storage_unit,
+                    group.global_indexes,
+                    metadata.field_names,
+                    target_storage_unit=su_id,
+                ),
+            )
             for su_id, group in routing.items()
         ]
         try:
@@ -434,7 +660,13 @@ class AsyncSimpleStorageManager(StorageManager):
                 global_indexes=global_indexes,
                 fields=fields,
             )
+        except PayloadTransferTimeout as e:
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
+                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
+            ) from e
         except StorageKeyNotFoundError:
+            # Already logged at debug by the storage unit; propagate for the caller to classify.
             raise
         except Exception as exc:
             if KEY_NOT_FOUND_MARKER in str(exc):
@@ -617,8 +849,22 @@ class AsyncSimpleStorageManager(StorageManager):
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
     def close(self) -> None:
-        """Close payload transfer resources before ZMQ ownership is released."""
+        """Close payload transfer and pooled sockets before ZMQ ownership is released."""
+        # Before super(), which may destroy the context these live on. getattr guards the
+        # base-constructor-raised case (a failed handshake does), and __del__ still calls this.
+        transfer = getattr(self, "payload_transfer", None)
+        pool = getattr(self, "storage_rpc_pool", None)
+        probe_pool = getattr(self, "storage_probe_pool", None)
         try:
-            self.payload_transfer.close()
+            if transfer is not None:
+                transfer.close()
         finally:
-            super().close()
+            try:
+                if pool is not None:
+                    pool.close()
+            finally:
+                try:
+                    if probe_pool is not None:
+                        probe_pool.close()
+                finally:
+                    super().close()

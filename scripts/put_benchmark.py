@@ -17,7 +17,6 @@ import argparse
 import asyncio
 import json
 import logging
-import math
 import os
 import time
 
@@ -267,6 +266,10 @@ class TQBandwidthTester:
         )
 
         total_storage_size = self.tq_config.global_batch_size * 2
+        storage_config = {
+            "total_storage_size": total_storage_size,
+            "num_data_storage_units": self.num_storage_units,
+        }
 
         logger.info(f"Initializing Storage Units (Remote={self.remote_mode}, Target={self.target_ip})...")
 
@@ -277,7 +280,7 @@ class TQBandwidthTester:
                     num_cpus=1,
                     resources={f"node:{self.target_ip}": 0.001},
                     runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
-                ).remote(storage_unit_size=math.ceil(total_storage_size / self.num_storage_units))
+                ).remote(config=storage_config)
         else:
             # Local Mode: Use placement group
             self.storage_placement_group = get_placement_group(self.num_storage_units, num_cpus_per_actor=2)
@@ -286,7 +289,7 @@ class TQBandwidthTester:
                     placement_group=self.storage_placement_group,
                     placement_group_bundle_index=rank,
                     runtime_env={"env_vars": {"OMP_NUM_THREADS": "2"}},
-                ).remote(storage_unit_size=math.ceil(total_storage_size / self.num_storage_units))
+                ).remote(config=storage_config)
 
         # Controller Init
         self.data_system_controller = TransferQueueController.remote()

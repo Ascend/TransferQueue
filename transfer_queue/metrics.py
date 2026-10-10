@@ -13,12 +13,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 from contextlib import contextmanager
 from threading import Thread
 from typing import Any
-from uuid import uuid4
 
 import psutil
 import zmq
@@ -26,11 +40,11 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    METRICS_COLLECTOR_IDENTITY_PREFIX,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    create_zmq_socket,
-    format_zmq_address,
+    ZMQSocketPool,
 )
 
 logger = get_logger(__name__)
@@ -67,13 +81,22 @@ class TQMetricsExporter:
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
 
-    def __init__(self, role: str = "controller"):
+    def __init__(self, role: str = "controller", zmq_context: zmq.Context | None = None):
+        """
+        Args:
+            role: Which process this exporter runs in; only "controller" collects from
+                storage units, so only that role needs a context.
+            zmq_context: The owner's long-lived synchronous context, borrowed for
+                storage-unit queries and never terminated here. Minting one instead would
+                add a second context and its native I/O thread with nobody to close them,
+                since the exporter lives as long as its Ray actor.
+        """
         self._start_time = time.time()
         self._process = psutil.Process()
         self._role = role
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
-        self._zmq_ctx: zmq.Context | None = None
-        self._zmq_sockets: dict[str, zmq.Socket] = {}
+        self._zmq_ctx = zmq_context
+        self._zmq_socket_pool: ZMQSocketPool | None = None
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
@@ -176,6 +199,109 @@ class TQMetricsExporter:
         self.storage_memory_rss = Gauge(
             "tq_storage_memory_rss_bytes", "Storage unit process RSS memory", ["storage_unit_id"], registry=r
         )
+        self.storage_ssd_offload_enabled = Gauge(
+            "tq_storage_ssd_offload_enabled",
+            "Whether SSD offload is enabled for the storage unit",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_active_values = Gauge(
+            "tq_storage_ssd_active_values",
+            "Active field values stored on SSD",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_active_bytes = Gauge(
+            "tq_storage_ssd_active_bytes",
+            "Logical bytes held by active SSD-backed values",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_ssd_fallback_values = Gauge(
+            "tq_storage_ssd_fallback_values_total",
+            "Values retained in memory because SSD encoding was unavailable",
+            ["storage_unit_id"],
+            registry=r,
+        )
+
+        # ---- Storage-unit request-loss diagnostics ----
+        # Read against tq_storage_request_ops, which advances only on completion: a gap
+        # between the two is tracked operations starting and not reaching completion.
+        self.storage_requests_arrived = Gauge(
+            "tq_storage_requests_arrived",
+            "Logical PUT, GET, and CLEAR operations started by the storage unit worker",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_arrivals_by_op = Gauge(
+            "tq_storage_arrivals_by_op",
+            "Logical PUT, GET, and CLEAR operations started by the worker, by operation",
+            ["storage_unit_id", "op_type"],
+            registry=r,
+        )
+
+        # ---- Accept-queue probe (only populated when TQ_ACCEPT_PROBE_INTERVAL > 0) ----
+        self.storage_accept_queue_backlog = Gauge(
+            "tq_storage_accept_queue_backlog",
+            "Configured accept-queue depth of the storage unit's listening socket",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_accept_queue_peak = Gauge(
+            "tq_storage_accept_queue_peak",
+            "Deepest accept-queue occupancy seen by the probe",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_accept_queue_peak_utilization = Gauge(
+            "tq_storage_accept_queue_peak_utilization_ratio",
+            "Peak accept-queue occupancy as a fraction of the backlog",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_socket_drops = Gauge(
+            "tq_storage_socket_drops",
+            "Connections dropped on this listening socket since the probe started",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        # Split because sk_drops covers several establishment failures, not only a full
+        # queue; the difference is what says whether a bigger backlog would have helped.
+        self.storage_listen_overflows = Gauge(
+            "tq_storage_listen_overflows",
+            "Namespace-wide accept-queue overflows since the probe started",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        self.storage_listen_other_drops = Gauge(
+            "tq_storage_listen_other_drops",
+            "Namespace-wide establishment drops that were not accept-queue overflows",
+            ["storage_unit_id"],
+            registry=r,
+        )
+        # Remote runtime snapshots use gauges, like the request snapshots below.
+        self.storage_payload_metrics = {
+            name: Gauge(f"tq_storage_payload_{name}", description, ["storage_unit_id"], registry=r)
+            for name, description in {
+                "receive_buffer_cache_bytes": "Configured receive buffer cache capacity in bytes",
+                "registered_bytes": "Registered payload backing bytes",
+                "idle_receive_bytes": "Cached unused receive bytes",
+                "pending_receive_bytes": "Prepared receive bytes",
+                "leased_receive_bytes": "Receive bytes still referenced by data readers",
+                "quarantined_bytes": "Receive bytes retained after uncertain writes or cleanup failures",
+                "receive_buffer_registrations": "Cumulative receive buffer registrations",
+                "receive_buffer_reuses": "Cumulative receive buffer cache hits",
+                "receive_buffer_evictions": "Cumulative receive buffer deregistrations",
+                "outstanding_sends": "Queued and running payload sends",
+                "sender_executors": "Retained sender executors",
+                "failed_send_peers": "Failed native sender sessions",
+                "failed_get_targets": "GET targets stopped after uncertain completion",
+                "queue_wait_seconds": "Cumulative queue wait for started sends in seconds",
+                "registration_seconds": "Cumulative memory registration time in seconds",
+                "data_transfer_seconds": "Cumulative native time for writes reaching a terminal status, in seconds",
+                "total_seconds": "Cumulative started send time including queue wait and cleanup, in seconds",
+            }.items()
+        }
 
         # ---- Storage request metrics (collected via ZMQ, exposed as gauges) ----
         # P50/P99 are pre-computed on the storage unit side and sent via ZMQ,
@@ -353,6 +479,48 @@ class TQMetricsExporter:
                             pass
                 self.storage_active_keys.labels(storage_unit_id=label).set(active)
                 self.storage_memory_rss.labels(storage_unit_id=label).set(metrics.get("process_rss_bytes", 0))
+                self.storage_ssd_offload_enabled.labels(storage_unit_id=label).set(
+                    metrics.get("ssd_offload_enabled", 0)
+                )
+                self.storage_ssd_active_values.labels(storage_unit_id=label).set(metrics.get("ssd_active_values", 0))
+                self.storage_ssd_active_bytes.labels(storage_unit_id=label).set(metrics.get("ssd_active_bytes", 0))
+                self.storage_ssd_fallback_values.labels(storage_unit_id=label).set(
+                    metrics.get("ssd_fallback_values_total", 0)
+                )
+
+                self.storage_requests_arrived.labels(storage_unit_id=label).set(metrics.get("requests_arrived", 0))
+                for op_type, arrived in (metrics.get("arrivals_by_op") or {}).items():
+                    self.storage_arrivals_by_op.labels(storage_unit_id=label, op_type=op_type).set(arrived)
+
+                # Drop the series rather than report zero when the probe is off, so a
+                # disabled probe is not read as "measured, and no drops".
+                accept_queue = metrics.get("accept_queue")
+                accept_gauges = (
+                    (self.storage_accept_queue_backlog, "backlog"),
+                    (self.storage_accept_queue_peak, "peak_recv_q"),
+                    (self.storage_accept_queue_peak_utilization, "peak_utilization"),
+                    (self.storage_socket_drops, "sk_drops_delta"),
+                    (self.storage_listen_overflows, "listen_overflow_delta"),
+                    (self.storage_listen_other_drops, "non_overflow_drop_delta"),
+                )
+                for gauge, key in accept_gauges:
+                    if accept_queue is None:
+                        try:
+                            gauge.remove(label)
+                        except (KeyError, ValueError):
+                            pass
+                    else:
+                        gauge.labels(storage_unit_id=label).set(accept_queue.get(key, 0))
+
+                payload_metrics = metrics.get("payload_transfer", {})
+                for name, gauge in self.storage_payload_metrics.items():
+                    if name in payload_metrics:
+                        gauge.labels(storage_unit_id=label).set(payload_metrics[name])
+                    else:
+                        try:
+                            gauge.remove(label)
+                        except (KeyError, ValueError):
+                            pass
 
                 # Per-operation request stats
                 for op_type, op_data in metrics.get("op_stats", {}).items():
@@ -371,49 +539,50 @@ class TQMetricsExporter:
             except Exception as e:
                 logger.warning(f"Failed to collect metrics from storage unit {su_id}: {e}")
 
-    def _get_or_create_socket(self, su_id: str, su_info: ZMQServerInfo) -> zmq.Socket:
-        """Return a cached ZMQ DEALER socket for *su_id*, creating one if needed."""
-        if self._zmq_ctx is None:
-            self._zmq_ctx = zmq.Context()
-
-        sock = self._zmq_sockets.get(su_id)
-        if sock is not None and not sock.closed:
-            return sock
-
-        identity = f"metrics_collector_{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(self._zmq_ctx, zmq.DEALER, su_info.ip, identity)
-        timeout_ms = TQ_METRICS_STORAGE_TIMEOUT * 1000
-        address = format_zmq_address(su_info.ip, su_info.ports["put_get_socket"])
-        sock.connect(address)
-        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)
-        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        self._zmq_sockets[su_id] = sock
-        return sock
+    def _get_socket_pool(self) -> ZMQSocketPool:
+        """Return the lazily-created socket pool for storage-unit queries."""
+        if self._zmq_socket_pool is None:
+            if self._zmq_ctx is None:
+                raise RuntimeError(
+                    "TQMetricsExporter was built without a ZMQ context, so it cannot query "
+                    "storage units; pass zmq_context= from the owning process."
+                )
+            self._zmq_socket_pool = ZMQSocketPool(
+                self._zmq_ctx,
+                # The storage proxy drops identities without this prefix, and the pool
+                # builds each socket's identity from the owner id.
+                METRICS_COLLECTOR_IDENTITY_PREFIX.rstrip("_"),
+                "put_get_socket",
+                timeout=TQ_METRICS_STORAGE_TIMEOUT,
+            )
+        return self._zmq_socket_pool
 
     def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> dict[str, Any] | None:
         """Send a synchronous GET_METRICS request to a single storage unit."""
         try:
-            sock = self._get_or_create_socket(su_id, su_info)
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.GET_METRICS,
-                sender_id="metrics_collector",
-                body={},
-            )
-            sock.send_multipart(request_msg.serialize())
-            response_frames = sock.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(response_frames)
-            if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
-                return response_msg.body
-            return None
+            pool = self._get_socket_pool()
+            with pool.lease(su_info) as sock:
+                request_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.GET_METRICS,
+                    sender_id="metrics_collector",
+                    body={},
+                )
+                sock.send_multipart(request_msg.serialize())
+                response_frames = sock.recv_multipart(copy=False)
+                response_msg = ZMQMessage.deserialize(response_frames)
+                # Closed rather than parked: collection walks every unit once per cycle, so
+                # a kept socket holds budget for the whole walk to save one handshake.
+                sock.close(linger=0)
+                if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
+                    return response_msg.body
+                return None
         except zmq.error.Again:
+            # The pool discarded the socket, so the next cycle starts clean. Reusing it
+            # would read this reply, if it lands late, as the answer to that cycle's query.
             logger.debug(f"Timeout querying metrics from {su_id}")
             return None
         except Exception as e:
             logger.warning(f"Error querying metrics from {su_id}: {e}")
-            # Close broken socket so it gets recreated next cycle
-            sock = self._zmq_sockets.pop(su_id, None)
-            if sock and not sock.closed:
-                sock.close(linger=0)
             return None
 
     def start(self, node_ip: str = "0.0.0.0", port: int = 0) -> str:

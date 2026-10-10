@@ -21,7 +21,7 @@ import ray
 import torch
 import zmq
 
-from transfer_queue.controller import TransferQueueController
+from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1463,6 +1463,27 @@ class TestTransferQueueControllerCheckpoint:
             ray.get(tq_controller.load_checkpoint.remote(missing))
 
         print("✓ load_checkpoint raises on missing file")
+
+
+class TestControllerSocketBudget:
+    """The controller's context must hold more sockets than libzmq's default 1023.
+
+    The metrics exporter borrows this context to query storage units, so the budget has to
+    cover the fleet rather than just the controller's own two ROUTERs. Past the ceiling a
+    socket cannot be opened at all, which would take out the control plane too.
+    """
+
+    def test_context_ceiling_is_raised_above_the_libzmq_default(self, ray_setup):
+        controller = TransferQueueController.remote()
+        try:
+            # Read it from inside the actor: the ceiling is only meaningful on the context
+            # the controller actually built.
+            budget = ray.get(controller.__ray_call__.remote(lambda self: self.zmq_context.get(zmq.MAX_SOCKETS)))
+        finally:
+            ray.kill(controller)
+
+        assert budget > 1023, "the controller kept libzmq's default socket ceiling"
+        assert budget == TQ_CONTROLLER_ZMQ_MAX_SOCKETS
 
 
 class TestTransferQueueControllerBadRequests:

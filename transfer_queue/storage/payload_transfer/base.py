@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -28,8 +30,33 @@ class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
 
 
+class PayloadTransferTimeout(PayloadTransferError):
+    """A payload transfer control message was not answered within the timeout.
+
+    Distinct from an error the peer reported: only a missing answer is worth retrying on a
+    new connection. Carries the request's payload bytes so the caller can report the wire
+    size of the attempt that timed out.
+    """
+
+    def __init__(self, message: str, *, wire_bytes: int = 0):
+        super().__init__(message)
+        self.wire_bytes = wire_bytes
+
+
+@dataclass(frozen=True)
+class DeferredResponse:
+    """A response that the SimpleStorage worker must send after completion."""
+
+    future: Future[ZMQMessage]
+
+
 class PayloadTransfer(ABC):
     """Complete SimpleStorage payload strategy, including its wire protocol."""
+
+    @property
+    def diagnostics(self) -> dict[str, float | int]:
+        """Return backend metrics for the storage metrics response."""
+        return {}
 
     @abstractmethod
     async def put(
@@ -41,8 +68,12 @@ class PayloadTransfer(ABC):
         global_indexes: list[int],
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
-    ) -> None:
-        """Put decoded storage data through this strategy."""
+    ) -> int:
+        """Put decoded storage data through this strategy.
+
+        Returns the payload bytes moved, so callers can report transfer sizes without
+        knowing the wire protocol.
+        """
 
     @abstractmethod
     async def get(
@@ -64,7 +95,7 @@ class PayloadTransfer(ABC):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
-    ) -> ZMQMessage | None:
+    ) -> ZMQMessage | DeferredResponse | None:
         """Handle a strategy-owned request on a SimpleStorageUnit."""
 
     def bootstrap_info(self) -> dict[str, Any] | None:
