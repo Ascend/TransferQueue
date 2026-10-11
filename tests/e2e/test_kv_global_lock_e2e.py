@@ -362,7 +362,9 @@ def test_a_waiter_that_stopped_polling_is_skipped(own_manager):
 
 def test_renewal_and_release_run_while_waiters_fill_the_actor(own_manager):
     ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
-    first, second = acquire(own_manager, ["a"], "first"), acquire(own_manager, ["a"], "second")
+    first = acquire(own_manager, ["a"], "first")
+    wait_until(lambda: n_waiters(own_manager) == 1)  # an async actor may run two calls out of order
+    second = acquire(own_manager, ["a"], "second")
     wait_until(lambda: n_waiters(own_manager) == 2)
     # Both waiting slots are taken: a third waiter is answered at once and keeps its place.
     assert ray.get(acquire(own_manager, ["a"], "third"), timeout=1) is None
