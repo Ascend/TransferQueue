@@ -79,12 +79,13 @@ def test_init_rejects_invalid_lock_sizes(fake, field, value):
     controller_cls.options.assert_not_called()
 
 
-def test_init_gives_every_lock_actor_the_configured_max_concurrency(fake):
+def test_init_sizes_every_lock_actor_from_max_concurrency(fake):
     ray, _, _ = fake
     ray.get_actor.side_effect = ValueError("no controller yet")
     iface.init(OmegaConf.create({"lock": {"enabled": True, "num_shards": 3, "max_concurrency": 64}}))
-    calls = kvl.TransferQueueLockManager.options.call_args_list
-    assert [c.kwargs["max_concurrency"] for c in calls] == [64, 64, 64]
+    options = kvl.TransferQueueLockManager.options
+    assert [c.kwargs["max_concurrency"] for c in options.call_args_list] == [64 + kvl._RESERVED_SLOTS] * 3
+    assert [c.args for c in options.return_value.remote.call_args_list] == [(3, 64)] * 3
     iface.close()
 
 

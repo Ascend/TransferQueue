@@ -26,7 +26,7 @@ import torch
 from omegaconf import OmegaConf
 
 import transfer_queue as tq
-from transfer_queue.lock_manager import TransferQueueLockManager
+from transfer_queue.lock_manager import _ABANDONED_S, TransferQueueLockManager
 
 kvl = importlib.import_module("transfer_queue.kv_lock")
 P = "global_lock_e2e"
@@ -263,8 +263,11 @@ def test_release_before_acquire_withdraws_it():
 
 @pytest.fixture
 def own_manager():
-    """A lock actor of its own, so these tests control every request it sees."""
-    lock_manager = TransferQueueLockManager.remote(1)
+    """A lock actor of its own, so these tests control every request it sees.
+
+    Sized as tq.init() sizes one for ``lock.max_concurrency: 2``.
+    """
+    lock_manager = TransferQueueLockManager.options(max_concurrency=2 + kvl._RESERVED_SLOTS).remote(1, 2)
     yield lock_manager
     ray.kill(lock_manager)
 
@@ -351,10 +354,24 @@ def test_a_waiter_that_stopped_polling_is_skipped(own_manager):
     assert ray.get(acquire(own_manager, ["a"], "dead", timeout=0, lease_s=TIMEOUT_S), timeout=TIMEOUT_S) is None
     live = acquire(own_manager, ["a"], "live")
     wait_until(lambda: n_waiters(own_manager) == 2)
-    time.sleep(6)  # past the manager's abandonment threshold
+    time.sleep(_ABANDONED_S + 1)
     ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
     assert ray.get(live, timeout=5) is not None
     assert n_waiters(own_manager) == 0
+
+
+def test_renewal_and_release_run_while_waiters_fill_the_actor(own_manager):
+    ray.get(acquire(own_manager, ["a"], "holder"), timeout=TIMEOUT_S)
+    first, second = acquire(own_manager, ["a"], "first"), acquire(own_manager, ["a"], "second")
+    wait_until(lambda: n_waiters(own_manager) == 2)
+    # Both waiting slots are taken: a third waiter is answered at once and keeps its place.
+    assert ray.get(acquire(own_manager, ["a"], "third"), timeout=1) is None
+    assert ray.get(own_manager.renew_many.remote(["holder"]), timeout=1) == {"holder": True}
+    for token, call in (("holder", first), ("first", second)):
+        ray.get(own_manager.release.remote(token), timeout=1)
+        assert ray.get(call, timeout=TIMEOUT_S) is not None
+    ray.get(own_manager.release.remote("second"), timeout=1)
+    assert ray.get(acquire(own_manager, ["a"], "third"), timeout=1) > 0
 
 
 def test_killed_holder_frees_the_key_after_its_lease():

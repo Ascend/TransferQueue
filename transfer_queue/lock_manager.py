@@ -24,22 +24,25 @@ import ray
 
 # A withdrawal whose acquire never arrives (e.g. the caller died first) is dropped after this.
 _WITHDRAWN_TTL_S = 300
-# A queued caller sends its next call as soon as one returns, so a waiter with no call in
-# flight for this long has died. Hand-off skips it instead of granting it a lease that would only expire; if it
-# was merely stalled, its next call queues it again at the back.
-_ABANDONED_S = 5.0
+# A queued caller calls again at least once per poll window (5 s at most), even when a full
+# actor turned it away, so a waiter with no call in flight for twice that has died. Hand-off
+# skips it instead of granting it a lease that would only expire; if it was merely stalled,
+# its next call queues it again at the back.
+_ABANDONED_S = 10.0
+# Slots beyond lock.max_concurrency for calls that never wait: renew, release, list_locks and
+# acquires turned away. Parked acquires never take them, so renewal and release always run.
+_RESERVED_SLOTS = 16
 
 
-# tq.init() sets max_concurrency from lock.max_concurrency. A waiting acquire call holds a
-# slot for up to the caller's poll window, and renew and release queue behind every call
-# ahead of them, so more waiters than slots can starve them.
+# tq.init() runs each actor with lock.max_concurrency + _RESERVED_SLOTS slots.
 @ray.remote(num_cpus=0)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
 
-    def __init__(self, num_shards: int):
+    def __init__(self, num_shards: int, max_parked: int):
         # Kept so that a process that never ran tq.init() can learn how many shards to hash over.
         self._num_shards = num_shards
+        self._max_parked, self._parked = max_parked, 0  # acquire calls waiting inside the actor
         self._holder: dict[tuple[str, str], str] = {}  # name -> token
         self._leases: dict[str, dict] = {}  # token -> names, lease_s, expires_at, granted_at, info
         # Min-heap of (expires_at, token). Release and renewal leave stale entries behind, which
@@ -120,9 +123,10 @@ class TransferQueueLockManager:
     async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards) -> float | None:
         """Grant all ``names`` to ``token`` at once; return the seconds left on its lease.
 
-        Returns None if still queued after ``timeout``. Calling again with the same token keeps
-        its place in the queues; only ``release`` withdraws it. A token that is neither queued
-        nor held (its grant expired before the caller saw it) queues afresh.
+        Returns None if still queued after ``timeout``, or at once if ``max_parked`` calls are
+        already waiting. Calling again with the same token keeps its place in the queues; only
+        ``release`` withdraws it. A token that is neither queued nor held (its grant expired
+        before the caller saw it) queues afresh.
         """
         # A caller that hashed over another shard count may send a key to the wrong shard,
         # where nothing excludes the callers that sent it to the right one.
@@ -144,13 +148,17 @@ class TransferQueueLockManager:
                     self._queues.setdefault(name, deque()).append(token)
         waiter = self._waiting.get(token)
         if waiter is not None:
+            if self._parked >= self._max_parked:
+                timeout = 0  # keep the reserved slots free: the caller polls again after its window
             waiter["calls"] += 1
+            self._parked += 1
             try:
                 await asyncio.wait_for(waiter["done"].wait(), timeout)
             except asyncio.TimeoutError:
                 pass
             finally:
                 waiter["calls"] -= 1
+                self._parked -= 1
                 waiter["seen"] = time.monotonic()
         lease = self._leases.get(token)
         return None if lease is None else lease["expires_at"] - time.monotonic()

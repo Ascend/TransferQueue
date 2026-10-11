@@ -40,7 +40,7 @@ from contextvars import ContextVar
 import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
-from transfer_queue.lock_manager import TransferQueueLockManager
+from transfer_queue.lock_manager import _RESERVED_SLOTS, TransferQueueLockManager
 
 # Not asyncio.Lock: it is bound to one event loop and is not thread-safe, while a process
 # may run several loops plus plain threads. A key is held exactly while it is in _table,
@@ -294,7 +294,8 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
 
 
 def _poll_window(deadline: float | None, lease_s: float) -> float:
-    # Up to lease_s / 3, so a grant made between two polls is seen with most of its lease left.
+    # Up to lease_s / 3, so a grant made between two polls, e.g. to a caller a full actor turned
+    # away, is seen with most of its lease left.
     window, remaining = min(_POLL_S, lease_s / 3), _remaining(deadline)
     return window if remaining is None else min(window, remaining)
 
@@ -402,13 +403,14 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
 
-    Each actor serves ``lock.max_concurrency`` calls at once, and a waiting request takes one
-    of them on the actor it is waiting at. With keys hashing evenly, about ``num_shards *
-    max_concurrency`` requests can wait at once, so raise ``lock.num_shards`` for more in total;
-    all waiters on one key share one actor, so raise ``lock.max_concurrency`` for a hot key.
-    Past the limit, calls queue in Ray behind the waiting ones, renewal and release included,
-    so holders on that actor can lose their leases and waiters can time out: keep the waiters
-    on one actor below ``max_concurrency``.
+    A waiting request keeps one call waiting on the actor it is waiting at, and each actor lets
+    at most ``lock.max_concurrency`` calls wait at once; renewal and release have slots of
+    their own, so waiting requests cannot hold them up. Past the limit, a request keeps its
+    place in the queue but polls once per window (5 s, or ``lease_s / 3`` if shorter), so it
+    may see its grant up to a window late. With keys hashing evenly, about ``num_shards *
+    max_concurrency`` requests can wait without that delay, so raise ``lock.num_shards`` for
+    more in total; all waiters on one key share one actor, so raise ``lock.max_concurrency``
+    for a hot key.
 
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever); an unresponsive lock actor can stretch that by up to about
@@ -440,6 +442,8 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
                 except RayActorError as e:
                     raise RuntimeError(_MANAGER_GONE) from e
                 granted = _take_grant(lease, shard, remaining, sent, deadline)
+                if not granted:  # a reply before the window ends means the actor was full
+                    time.sleep(max(0.0, sent + window - time.monotonic()))
         lease.check()
         yield lease
         lease.check()
@@ -473,6 +477,8 @@ async def async_kv_global_lock(
                 except RayActorError as e:
                     raise RuntimeError(_MANAGER_GONE) from e
                 granted = _take_grant(lease, shard, remaining, sent, deadline)
+                if not granted:
+                    await asyncio.sleep(max(0.0, sent + window - time.monotonic()))
         lease.check()
         yield lease
         lease.check()
@@ -509,8 +515,8 @@ def _start_lock_managers(lock_conf) -> None:
                 name=_manager_name(shard),
                 namespace="transfer_queue",
                 get_if_exists=True,
-                max_concurrency=lock_conf.max_concurrency,
-            ).remote(lock_conf.num_shards)
+                max_concurrency=lock_conf.max_concurrency + _RESERVED_SLOTS,
+            ).remote(lock_conf.num_shards, lock_conf.max_concurrency)
             for shard in range(lock_conf.num_shards)
         ]
 
