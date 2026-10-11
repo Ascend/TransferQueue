@@ -204,6 +204,33 @@ def test_waiting_on_a_later_shard_keeps_the_earlier_keys_held():
     wait_until(lambda: holders() == set())
 
 
+@pytest.mark.parametrize("use_async", [False, True], ids=["sync", "async"])
+def test_a_late_reply_is_awaited_instead_of_sent_again(monkeypatch, use_async):
+    lock_manager = manager("late")
+    ray.get(lock_manager.acquire.remote([(P, "late")], "holder", 0, 30, {}, 8), timeout=TIMEOUT_S)
+    real_send, sends = kvl._send_acquire, []
+
+    def send_acquire(lease, shard, window):
+        # The actor keeps the call past the caller's wait, as a call queued behind others would be.
+        sends.append(window)
+        return real_send(lease, shard, TIMEOUT_S)
+
+    async def take_async():
+        async with tq.async_kv_global_lock("late", P, timeout=2.5, lease_s=1.5):
+            pass
+
+    monkeypatch.setattr(kvl, "_send_acquire", send_acquire)
+    with pytest.raises(TimeoutError):  # 0.5 s polls, each awaited for up to 1.5 s
+        if use_async:
+            asyncio.run(take_async())
+        else:
+            with tq.kv_global_lock("late", P, timeout=2.5, lease_s=1.5):
+                pass
+    assert len(sends) == 1
+    ray.get(lock_manager.release.remote("holder"), timeout=TIMEOUT_S)
+    wait_until(lambda: tq.kv_lock_list(P) == {"holders": [], "waiters": 0})
+
+
 def test_async_first_use_looks_the_actors_up_off_the_event_loop(monkeypatch):
     monkeypatch.setattr(kvl, "_num_shards", None)
     monkeypatch.setattr(kvl, "_managers", {})

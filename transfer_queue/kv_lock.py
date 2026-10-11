@@ -218,7 +218,7 @@ _owned: list = []  # the lock actors this process's tq.init() created, killed by
 # slots, and the bound is long because one actor serves only a few thousand calls a second:
 # at 1 s, 8,000 idle waiters starved every other call on their shard, renewals included.
 _POLL_S = 5.0
-_REPLY_SLACK_S = 1.0  # how late a reply may arrive past its window before the caller re-polls
+_REPLY_SLACK_S = 1.0  # how late a reply may arrive past its window before the caller checks its timeout
 _NOT_INITIALIZED = (
     "TransferQueueLockManager not found; kv_global_lock needs `lock.enabled: true` "
     "in the config of the tq.init() that starts TransferQueue"
@@ -426,12 +426,15 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
         # Every caller visits shards in ascending order, so no two callers can each hold a
         # shard the other awaits: multi-shard requests cannot deadlock.
         for shard in lease.shards:
-            granted = False
+            call, granted = None, False
             while not granted:
-                window, sent = _poll_window(deadline, lease.lease_s), time.monotonic()
+                window = _poll_window(deadline, lease.lease_s)
+                if call is None:  # a late reply is awaited again, not re-sent, so calls never pile up
+                    call, sent = _send_acquire(lease, shard, window), time.monotonic()
                 try:
                     # Bounded, so an unresponsive actor cannot outlast the caller's timeout.
-                    remaining = ray.get(_send_acquire(lease, shard, window), timeout=window + _REPLY_SLACK_S)
+                    remaining = ray.get(call, timeout=window + _REPLY_SLACK_S)
+                    call = None
                 except GetTimeoutError:
                     remaining = None
                 except RayActorError as e:
@@ -457,11 +460,14 @@ async def async_kv_global_lock(
     held = _mark(_holding_global)
     try:
         for shard in lease.shards:
-            granted = False
+            call, granted = None, False
             while not granted:
-                window, sent = _poll_window(deadline, lease.lease_s), time.monotonic()
+                window = _poll_window(deadline, lease.lease_s)
+                if call is None:
+                    call, sent = asyncio.ensure_future(_send_acquire(lease, shard, window)), time.monotonic()
                 try:
-                    remaining = await asyncio.wait_for(_send_acquire(lease, shard, window), window + _REPLY_SLACK_S)
+                    remaining = await asyncio.wait_for(asyncio.shield(call), window + _REPLY_SLACK_S)
+                    call = None
                 except asyncio.TimeoutError:
                     remaining = None
                 except RayActorError as e:
