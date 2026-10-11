@@ -294,8 +294,7 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
 
 
 def _poll_window(deadline: float | None, lease_s: float) -> float:
-    # Even when waiters take every actor slot, a renewal waits at most one window for a slot,
-    # so a window up to lease_s / 3 leaves it most of the lease, as the renewer's period does.
+    # Up to lease_s / 3, so a grant made between two polls is seen with most of its lease left.
     window, remaining = min(_POLL_S, lease_s / 3), _remaining(deadline)
     return window if remaining is None else min(window, remaining)
 
@@ -407,8 +406,9 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     of them on the actor it is waiting at. With keys hashing evenly, about ``num_shards *
     max_concurrency`` requests can wait at once, so raise ``lock.num_shards`` for more in total;
     all waiters on one key share one actor, so raise ``lock.max_concurrency`` for a hot key.
-    Past the limit, calls queue in Ray: a waiting call frees its slot within its poll window
-    (5 s, or ``lease_s / 3`` if shorter), so renewal and release are delayed, never stuck.
+    Past the limit, calls queue in Ray behind the waiting ones, renewal and release included,
+    so holders on that actor can lose their leases and waiters can time out: keep the waiters
+    on one actor below ``max_concurrency``.
 
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever); an unresponsive lock actor can stretch that by up to about

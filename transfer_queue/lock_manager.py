@@ -31,8 +31,8 @@ _ABANDONED_S = 5.0
 
 
 # tq.init() sets max_concurrency from lock.max_concurrency. A waiting acquire call holds a
-# slot for at most the caller's poll window, so even if waiters take every slot, renew and
-# release get one within that window.
+# slot for up to the caller's poll window, and renew and release queue behind every call
+# ahead of them, so more waiters than slots can starve them.
 @ray.remote(num_cpus=0)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
