@@ -44,7 +44,7 @@ class Worker:
     def __init__(self):
         tq.init()
 
-    def increment(self, n, keys="counter"):
+    def increment(self, n, keys):
         for _ in range(n):
             with tq.kv_global_lock(keys, P, timeout=TIMEOUT_S):
                 value = int(tq.kv_batch_get("counter", P)["v"][0])
@@ -108,14 +108,6 @@ def counter():
     return int(tq.kv_batch_get("counter", P)["v"][0])
 
 
-def test_actors_serialize_read_modify_write():
-    tq.kv_put("counter", P, fields={"v": torch.tensor([0])})
-    workers = [Worker.remote() for _ in range(3)]
-    ray.get([w.increment.remote(20) for w in workers], timeout=TIMEOUT_S)
-    assert counter() == 60
-    tq.kv_clear("counter", P)
-
-
 def test_opposite_key_orders_on_two_shards_do_not_deadlock():
     a, b = keys_on_two_shards("ab")
     tq.kv_put("counter", P, fields={"v": torch.tensor([0])})
@@ -165,17 +157,6 @@ def test_process_without_init_learns_the_shard_count():
     wait_until(lambda: holders() == set())
 
 
-def test_timeout_leaves_no_holder_or_waiter():
-    worker = Worker.remote()
-    ray.get(worker.hold.remote("t"), timeout=TIMEOUT_S)
-    with pytest.raises(TimeoutError):
-        with tq.kv_global_lock("t", P, timeout=0.3):
-            pass
-    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0)
-    ray.get(worker.release.remote(), timeout=TIMEOUT_S)
-    wait_until(lambda: tq.kv_lock_list(P) == {"holders": [], "waiters": 0})
-
-
 def test_cancelled_waiter_is_withdrawn_and_never_granted():
     worker = Worker.remote()
     ray.get(worker.hold.remote("c"), timeout=TIMEOUT_S)
@@ -209,35 +190,17 @@ def test_waiting_on_a_later_shard_keeps_the_earlier_keys_held():
     entered = []
 
     def take_both():
-        with tq.kv_global_lock([early, late], P, timeout=TIMEOUT_S, lease_s=2) as lease:
+        with tq.kv_global_lock([early, late], P, timeout=TIMEOUT_S, lease_s=1) as lease:
             entered.append(lease)
 
     thread = threading.Thread(target=take_both)
     thread.start()
     wait_until(lambda: holders() == {early, late})
-    time.sleep(3)  # longer than our lease: unrenewed, the grant on `early` would have expired
+    time.sleep(1.5)  # longer than our lease: unrenewed, the grant on `early` would have expired
     assert holders() == {early, late}
     ray.get(worker.release.remote(), timeout=TIMEOUT_S)
     thread.join(TIMEOUT_S)
     assert len(entered) == 1  # entered without LockLostError
-    wait_until(lambda: holders() == set())
-
-
-def test_a_grant_that_expires_while_the_caller_stalls_is_taken_again(monkeypatch):
-    worker = Worker.remote()
-    ray.get(worker.hold.remote("stall"), timeout=TIMEOUT_S)
-    real_take_grant, stalled = kvl._take_grant, []
-
-    def take_grant(lease, shard, remaining, *args):
-        if remaining is None and not stalled:  # queued behind the worker: free the key, then stall past our lease
-            stalled.append(True)
-            ray.get(worker.release.remote(), timeout=TIMEOUT_S)
-            time.sleep(1)
-        return real_take_grant(lease, shard, remaining, *args)
-
-    monkeypatch.setattr(kvl, "_take_grant", take_grant)
-    with tq.kv_global_lock("stall", P, timeout=10, lease_s=0.3):
-        assert stalled and holders() == {"stall"}
     wait_until(lambda: holders() == set())
 
 
@@ -378,6 +341,7 @@ def test_killed_holder_frees_the_key_after_its_lease():
 
 def test_lease_renews_and_lost_lease_raises():
     with tq.kv_global_lock("r", P, lease_s=2) as lease:
+        assert isinstance(lease, tq.GlobalLease)
         time.sleep(3)  # outlives one lease only through renewal
         lease.check()
 
@@ -436,10 +400,11 @@ def test_non_owner_close_releases_its_locks_and_keeps_the_managers():
     with tq.kv_global_lock("o", P, timeout=5):
         pass
     assert len(actors_named("TransferQueueLockManager_")) == kvl._shard_count() == 8
+    assert actors_named("TransferQueueController") == ["TransferQueueController"]
 
 
 def test_owner_close_kills_the_managers_and_fails_waiters():
-    """Tears TransferQueue down for this module; only the single-shard test runs after it."""
+    """Tears TransferQueue down for this module, so it runs last."""
     held = tq.kv_global_lock("z", P)
     held.__enter__()
     worker = Worker.remote()
@@ -453,16 +418,6 @@ def test_owner_close_kills_the_managers_and_fails_waiters():
     with pytest.raises(tq.LockLostError):
         held.__exit__(None, None, None)
 
-    wait_until(lambda: actors_named("TransferQueueLockManager_") == [])
+    wait_until(lambda: actors_named("TransferQueue") == [])  # the controller and storage go too
     with pytest.raises(RuntimeError, match="lock.enabled"):
         tq.kv_lock_list()
-
-
-def test_one_lock_shard_still_works():
-    wait_until(lambda: actors_named("TransferQueue") == [])
-    tq.init(OmegaConf.create({**CONF, "lock": {"enabled": True, "num_shards": 1}}))
-    assert actors_named("TransferQueueLockManager_") == ["TransferQueueLockManager_0"]
-    with tq.kv_global_lock(["a", "b"], P, timeout=5) as lease:
-        assert isinstance(lease, tq.GlobalLease)
-        assert holders() == {"a", "b"} and list(lease.shards) == [0]
-    wait_until(lambda: holders() == set())

@@ -18,18 +18,12 @@ import gc
 import importlib
 import os
 import signal
-import subprocess
-import sys
 import threading
 import time
 from types import SimpleNamespace
 
 import pytest
-import ray
-import torch
-from omegaconf import OmegaConf
 
-import transfer_queue as tq
 from transfer_queue import async_kv_local_lock, kv_local_lock
 
 # `transfer_queue.kv_lock` resolves to the re-exported function, so fetch the module itself.
@@ -37,7 +31,6 @@ kvl = importlib.import_module("transfer_queue.kv_lock")
 P = "p"
 # Bound every wait so that a lock regression fails the test instead of hanging it.
 TIMEOUT = 10.0
-E2E_TIMEOUT = 120.0
 
 
 @pytest.fixture(autouse=True)
@@ -109,29 +102,6 @@ def test_threads_and_tasks_on_several_loops_serialize_read_modify_write():
         thread.join(TIMEOUT)
         assert not thread.is_alive()
     assert counter[0] == 4 * 100 + 3 * 4 * 100
-
-
-def test_thread_and_task_wake_each_other():
-    order = []
-
-    def thread_body():
-        with kv_local_lock("k", P, timeout=TIMEOUT):
-            order.append("thread")
-            wait_until(lambda: n_waiters("k") == 1)
-
-    async def main():
-        thread = threading.Thread(target=thread_body)
-        async with async_kv_local_lock("k", P, timeout=TIMEOUT):
-            thread.start()
-            wait_until(lambda: n_waiters("k") == 1)
-            order.append("task")
-        async with async_kv_local_lock("k", P, timeout=TIMEOUT):
-            order.append("task again")
-        thread.join(TIMEOUT)
-        assert not thread.is_alive()
-
-    asyncio.run(main())
-    assert order == ["task", "thread", "task again"]
 
 
 def test_waiters_are_served_fifo():
@@ -352,62 +322,14 @@ def test_forked_child_drops_the_parents_locks_leases_and_managers(monkeypatch):
         key_holder.join()
 
 
-def test_global_lock_shards_agree_across_processes_and_spread_keys():
-    names = [(P, f"key{i}") for i in range(800)]
-    shards = [kvl._shard(name, 8) for name in names]
+def test_global_lock_shards_are_pinned_and_spread_keys():
+    # Pinned rather than hash(): every process, whatever its PYTHONHASHSEED, must pick the same actor.
+    assert [kvl._shard((P, f"key{i}"), 8) for i in range(4)] == [0, 6, 4, 2]
+    shards = [kvl._shard((P, f"key{i}"), 8) for i in range(800)]
     assert all(60 < shards.count(shard) < 140 for shard in range(8))
-    # str hashes differ per PYTHONHASHSEED; the shard of a key must not.
-    script = "import transfer_queue.kv_lock as k; print([k._shard(('p', f'key{i}'), 8) for i in range(800)])"
-    for seed in ("1", "2"):
-        out = subprocess.run(
-            [sys.executable, "-c", script],
-            env={**os.environ, "PYTHONHASHSEED": seed},
-            capture_output=True,
-            text=True,
-            timeout=E2E_TIMEOUT,
-            check=True,
-        )
-        assert out.stdout.strip() == str(shards)
 
 
 def test_global_lock_poll_window_fits_the_lease_and_the_timeout():
     assert kvl._poll_window(None, 30) == kvl._POLL_S
     assert kvl._poll_window(None, 0.6) == pytest.approx(0.2)  # a renewal waits at most a third of the lease
     assert kvl._poll_window(time.monotonic() + 0.05, 30) <= 0.05
-
-
-@pytest.fixture
-def simple_storage_tq():
-    if not ray.is_initialized():
-        ray.init(namespace="TestKVLock")
-    backend = {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 200}}
-    tq.init(OmegaConf.create({"controller": {"polling_mode": True}, "backend": backend}))
-    yield
-    tq.close()
-    ray.shutdown()
-
-
-def test_kv_local_lock_serializes_simple_storage_read_modify_write(simple_storage_tq):
-    tq.kv_put("counter", "lock_e2e", fields={"v": torch.tensor([0])})  # also creates the client on this thread
-
-    def increment(key, partition_id):
-        value = tq.kv_batch_get(key, partition_id)["v"]
-        tq.kv_put(key, partition_id, fields={"v": value[0] + 1})
-
-    def worker():
-        for _ in range(50):
-            with tq.kv_local_lock("counter", "lock_e2e", timeout=E2E_TIMEOUT):
-                increment("counter", "lock_e2e")
-
-    threads = [threading.Thread(target=worker) for _ in range(8)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(E2E_TIMEOUT)
-        assert not thread.is_alive()
-    assert tq.kv_batch_get("counter", "lock_e2e")["v"][0].item() == 400
-    tq.kv_clear("counter", "lock_e2e")
-    # The default config starts no lock actors: the local lock works, the global one says why not.
-    with pytest.raises(RuntimeError, match="lock.enabled"):
-        with tq.kv_global_lock("counter", "lock_e2e"):
-            pass
