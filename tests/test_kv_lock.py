@@ -17,7 +17,6 @@ import asyncio
 import importlib
 import threading
 import time
-from collections import Counter
 from unittest.mock import MagicMock
 
 import pytest
@@ -130,18 +129,50 @@ def test_timeout_is_a_total_deadline_and_partial_acquisition_is_released():
         assert not holder.is_alive()
 
 
-def test_lock_actors_are_spread_evenly_over_the_alive_nodes(monkeypatch):
-    a, b, c, dead = ("01" * 28, "02" * 28, "03" * 28, "04" * 28)  # Ray checks node IDs are hex
-    nodes = [{"NodeID": node, "Alive": True} for node in (c, a, b)] + [{"NodeID": dead, "Alive": False}]
+A, B, C = "01" * 28, "02" * 28, "03" * 28  # Ray checks node IDs are hex
+
+
+@pytest.fixture
+def fake_lock_actors(monkeypatch):
+    """Three alive nodes and one dead one; yields the mocked lock actor class instead of starting actors."""
+    nodes = [{"NodeID": node, "Alive": True} for node in (C, A, B)] + [{"NodeID": "04" * 28, "Alive": False}]
     monkeypatch.setattr(kvl.ray, "nodes", lambda: nodes)
     manager_cls = MagicMock()
     monkeypatch.setattr(kvl, "TransferQueueLockManager", manager_cls)
     monkeypatch.setattr(kvl, "_owned", [])
+    monkeypatch.setenv("TQ_ENABLE_KV_GLOBAL_LOCK", "1")
+    monkeypatch.setenv("TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES", "2")
+    yield manager_cls
 
-    kvl._start_lock_managers(max_waiting_acquires=2)
 
-    strategies = [call.kwargs["scheduling_strategy"] for call in manager_cls.options.call_args_list]
-    assert [s.node_id for s in strategies] == [a, b, c, a, b, c, a, b]
-    assert Counter(s.node_id for s in strategies) == {a: 3, b: 3, c: 2}
+@pytest.mark.parametrize(
+    "num_shards, expected",
+    [(None, [A, B, C, A, B, C, A, B]), ("3", [A, B, C])],  # None: unset, so the default 8
+)
+def test_lock_actors_are_spread_evenly_over_the_alive_nodes(fake_lock_actors, monkeypatch, num_shards, expected):
+    if num_shards is not None:
+        monkeypatch.setenv("TQ_KV_GLOBAL_LOCK_NUM_SHARDS", num_shards)
+    else:
+        monkeypatch.delenv("TQ_KV_GLOBAL_LOCK_NUM_SHARDS", raising=False)
+
+    kvl._start_lock_managers(kvl._lock_settings())
+
+    strategies = [call.kwargs["scheduling_strategy"] for call in fake_lock_actors.options.call_args_list]
+    assert [s.node_id for s in strategies] == expected  # per-node counts differ by at most 1
     assert not any(s.soft for s in strategies)
-    manager_cls.options.return_value.remote.assert_called_with(kvl._NUM_SHARDS, 2)
+    fake_lock_actors.options.return_value.remote.assert_called_with(len(expected), 2)
+
+
+@pytest.mark.parametrize("name", ["TQ_KV_GLOBAL_LOCK_NUM_SHARDS", "TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES"])
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "true", "2.5"])
+def test_invalid_lock_settings_raise_before_any_actor_starts(fake_lock_actors, monkeypatch, name, value):
+    monkeypatch.setenv(name, value)
+    with pytest.raises(ValueError, match=f"{name} must be an integer >= 1"):
+        kvl._lock_settings()
+    fake_lock_actors.options.assert_not_called()
+
+
+def test_lock_settings_are_ignored_while_the_lock_is_off(monkeypatch):
+    monkeypatch.delenv("TQ_ENABLE_KV_GLOBAL_LOCK", raising=False)
+    monkeypatch.setenv("TQ_KV_GLOBAL_LOCK_NUM_SHARDS", "0")
+    assert kvl._lock_settings() is None
