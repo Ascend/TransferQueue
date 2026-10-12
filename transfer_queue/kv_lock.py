@@ -520,7 +520,7 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
 
 def _check_lock_conf(lock_conf) -> None:
     """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
-    for field in ("num_shards", "max_concurrency"):
+    for field in ("num_shards", "max_waiting_acquires"):
         value = lock_conf[field]
         if lock_conf.enabled and (not isinstance(value, int) or value < 1):
             raise ValueError(f"lock.{field} must be an integer >= 1, got {value!r}")
@@ -536,8 +536,8 @@ def _start_lock_managers(lock_conf) -> None:
                 name=_manager_name(shard),
                 namespace="transfer_queue",
                 get_if_exists=True,
-                max_concurrency=lock_conf.max_concurrency + _RESERVED_SLOTS,
-            ).remote(lock_conf.num_shards, lock_conf.max_concurrency)
+                max_concurrency=lock_conf.max_waiting_acquires + _RESERVED_SLOTS,
+            ).remote(lock_conf.num_shards, lock_conf.max_waiting_acquires)
             for shard in range(lock_conf.num_shards)
         ]
 

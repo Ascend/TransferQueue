@@ -29,21 +29,21 @@ _WITHDRAWN_TTL_S = 300
 # lease. A live caller that stalled, or whose next call sat queued in Ray, is skipped too and
 # queues again at the back on its next call.
 _ABANDONED_S = 10.0
-# Slots beyond lock.max_concurrency, shared with no priority by calls that never wait: renew,
+# Slots beyond lock.max_waiting_acquires, shared with no priority by calls that never wait: renew,
 # release, list_locks and acquires turned away. They only keep parked acquires from taking
 # every slot; past the actor's call throughput, renewals still run late and leases can be lost.
 _RESERVED_SLOTS = 16
 
 
-# tq.init() runs each actor with lock.max_concurrency + _RESERVED_SLOTS slots.
+# tq.init() runs each actor with lock.max_waiting_acquires + _RESERVED_SLOTS slots.
 @ray.remote(num_cpus=0)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
 
-    def __init__(self, num_shards: int, max_parked: int):
+    def __init__(self, num_shards: int, max_waiting_acquires: int):
         # Kept so that a process that never ran tq.init() can learn how many shards to hash over.
         self._num_shards = num_shards
-        self._max_parked, self._parked = max_parked, 0  # acquire calls waiting inside the actor
+        self._max_parked, self._parked = max_waiting_acquires, 0  # acquire calls waiting inside the actor
         self._holder: dict[tuple[str, str], str] = {}  # name -> token
         self._leases: dict[str, dict] = {}  # token -> names, lease_s, expires_at, granted_at, info
         # Min-heap of (expires_at, token). Release and renewal leave stale entries behind, which
@@ -125,7 +125,7 @@ class TransferQueueLockManager:
     async def acquire(self, names, token, timeout, lease_s, holder_info, num_shards) -> float | None:
         """Grant all ``names`` to ``token`` at once; return the seconds left on its lease.
 
-        Returns None if still queued after ``timeout``, or at once if ``max_parked`` calls are
+        Returns None if still queued after ``timeout``, or at once if ``max_waiting_acquires`` calls are
         already waiting. Calling again with the same token keeps its place in the queues; only
         ``release`` withdraws it. A token that is neither queued nor held (its grant expired
         before the caller saw it, or it was skipped as abandoned) queues afresh.

@@ -184,7 +184,7 @@ def test_acquire_carries_the_shard_count_its_keys_were_hashed_with(monkeypatch):
 def own_manager():
     """A lock actor of its own, so these tests control every request it sees.
 
-    Sized as tq.init() sizes one for ``lock.max_concurrency: 2``.
+    Sized as tq.init() sizes one for ``lock.max_waiting_acquires: 2``.
     """
     lock_manager = TransferQueueLockManager.options(max_concurrency=2 + kvl._RESERVED_SLOTS).remote(1, 2)
     yield lock_manager
