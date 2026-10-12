@@ -176,7 +176,7 @@ def test_acquire_carries_the_shard_count_its_keys_were_hashed_with(monkeypatch):
     lease = kvl._new_lease(key, P, 30)
     monkeypatch.undo()
     with pytest.raises(ValueError, match="restarted"):
-        ray.get(kvl._send_acquire(lease, next(iter(lease.shards)), 0), timeout=TIMEOUT_S)
+        ray.get(kvl._send_acquire(lease, next(iter(lease._shards)), 0), timeout=TIMEOUT_S)
     kvl._release_lease(lease)
 
 
@@ -273,7 +273,7 @@ def test_killed_holder_frees_the_key_after_its_lease():
 
 def test_lease_renews_and_lost_lease_raises():
     with tq.kv_global_lock("r", P, lease_s=2) as lease:
-        assert isinstance(lease, tq.GlobalLease)
+        assert isinstance(lease, tq.GlobalLease) and lease.names == [(P, "r")]
         time.sleep(3)  # outlives one lease only through renewal
         lease.check()
 
@@ -286,8 +286,8 @@ def test_lease_renews_and_lost_lease_raises():
 
     with pytest.raises(ValueError, match="body"):  # never masked by LockLostError
         with tq.kv_global_lock("r", P, lease_s=1) as lease:
-            ray.get(manager("r").release.remote(lease.token), timeout=TIMEOUT_S)  # the server drops it
-            wait_until(lambda: lease.lost)
+            ray.get(manager("r").release.remote(lease._token), timeout=TIMEOUT_S)  # the server drops it
+            wait_until(lambda: lease._lost)
             raise ValueError("body")
     wait_until(lambda: holders() == set())
 

@@ -230,30 +230,34 @@ class LockLostError(RuntimeError):
 
 
 class GlobalLease:
-    """Yielded by ``kv_global_lock``; ``check()`` raises ``LockLostError`` once the lease is lost.
+    """Yielded by ``kv_global_lock``: call ``check()`` before writes; ``names`` lists the locked keys.
 
-    Call ``check()`` rather than reading ``lost``, which stays False when the lease merely ran
-    out locally. ``check()`` only narrows the window: KV calls take no fencing token, so a
-    write that outlasts the remaining lease can still land after another holder took the keys.
+    ``check()`` only narrows the window: KV calls take no fencing token, so a write that
+    outlasts the remaining lease can still land after another holder took the keys.
     """
 
     def __init__(
         self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], num_shards: int, lease_s: float
     ):
         # num_shards is the count the keys were hashed over, which every acquire must carry.
-        self.names, self.shards, self.num_shards, self.lease_s = names, shards, num_shards, lease_s
-        self.token = f"{os.getpid()}:{uuid.uuid4().hex}"
-        self.deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
-        self.lost = False
+        self._names, self._shards, self._num_shards, self._lease_s = names, shards, num_shards, lease_s
+        self._token = f"{os.getpid()}:{uuid.uuid4().hex}"
+        self._deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
+        self._lost = False
         # shard -> the actor handle each acquire went to: those may hold or await this token, so
         # exit must release it there, even after close() dropped this process's handles.
-        self.pending: dict = {}
-        self.granted: list[int] = []  # shards that granted it, so the renewer keeps their leases alive
+        self._pending: dict = {}
+        self._granted: list[int] = []  # shards that granted it, so the renewer keeps their leases alive
+
+    @property
+    def names(self) -> list[tuple[str, str]]:
+        """The locked ``(partition_id, key)`` pairs, deduplicated and sorted by key."""
+        return list(self._names)
 
     def check(self) -> None:
         """Raise ``LockLostError`` if the lease was lost; call it right before writes in long sections."""
-        if self.lost or time.monotonic() >= self.deadline:
-            raise LockLostError(f"kv_global_lock lease on {self.names} was lost")
+        if self._lost or time.monotonic() >= self._deadline:
+            raise LockLostError(f"kv_global_lock lease on {self._names} was lost")
 
 
 def _shard_count() -> int:
@@ -310,9 +314,9 @@ def _poll_window(deadline: float | None, lease_s: float) -> float:
 
 
 def _send_acquire(lease: GlobalLease, shard: int, window: float):
-    manager = lease.pending[shard] = _lock_manager(shard)
+    manager = lease._pending[shard] = _lock_manager(shard)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
-    return manager.acquire.remote(lease.shards[shard], lease.token, window, lease.lease_s, holder, lease.num_shards)
+    return manager.acquire.remote(lease._shards[shard], lease._token, window, lease._lease_s, holder, lease._num_shards)
 
 
 def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: float, deadline: float | None) -> bool:
@@ -321,14 +325,14 @@ def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: f
     if remaining is None:
         if deadline is not None and time.monotonic() >= deadline:
             # Still queued there, so exit's release must withdraw it: the shard stays pending.
-            raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease.names}")
+            raise TimeoutError(f"Timed out waiting for kv_global_lock on {lease._names}")
         return False
     # Renew from the first grant on: waiting on a later shard may outlast an earlier one's lease.
     with _registry:  # the renewer also moves the deadline
         # The reply left the actor after `sent`, so this never outlives the shard's lease.
-        lease.deadline = min(lease.deadline, sent + remaining)
-        lease.granted.append(shard)
-        _leases[lease.token] = lease
+        lease._deadline = min(lease._deadline, sent + remaining)
+        lease._granted.append(shard)
+        _leases[lease._token] = lease
         _registry.notify()  # a shorter lease_s shortens the renewal period
         if not _renewer_running:
             _renewer_running = True
@@ -338,13 +342,13 @@ def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: f
 
 def _release_lease(lease: GlobalLease) -> None:
     with _registry:
-        _leases.pop(lease.token, None)
-    managers, lease.pending = lease.pending, {}
+        _leases.pop(lease._token, None)
+    managers, lease._pending = lease._pending, {}
     for manager in managers.values():
         # Releasing by token also withdraws an acquire that is still waiting or in flight, so a
         # caller that left is never left holding a grant; ray.cancel would miss one already made.
         try:
-            manager.release.remote(lease.token)
+            manager.release.remote(lease._token)
         except Exception:  # Ray is shut down
             pass
 
@@ -358,12 +362,12 @@ def _renew_loop() -> None:
                 if not _leases:
                     _renewer_running = False
                     return
-                period = min(lease.lease_s for lease in _leases.values()) / 3
+                period = min(lease._lease_s for lease in _leases.values()) / 3
                 remaining = last + period - time.monotonic()
                 if remaining <= 0:
                     break
                 _registry.wait(remaining)
-            batch = {token: (lease, list(lease.granted)) for token, lease in _leases.items()}
+            batch = {token: (lease, list(lease._granted)) for token, lease in _leases.items()}
         by_shard: dict[int, list[str]] = {}
         for token, (_, shards) in batch.items():
             for shard in shards:
@@ -395,9 +399,9 @@ def _renew_loop() -> None:
             for token, (lease, shards) in batch.items():
                 answers = [replies.get((shard, token)) for shard in shards]
                 if False in answers:
-                    lease.lost = True
-                elif None not in answers and len(lease.granted) == len(shards):
-                    lease.deadline = last + lease.lease_s
+                    lease._lost = True
+                elif None not in answers and len(lease._granted) == len(shards):
+                    lease._deadline = last + lease._lease_s
 
 
 @contextmanager
@@ -418,6 +422,9 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     others even if it then times out. Lock the fewest keys you can and keep the block short.
     The ``lock`` section of ``config.yaml`` describes capacity limits.
 
+    Call the yielded lease's ``check()`` right before each write; its ``names`` lists the
+    locked ``(partition_id, key)`` pairs.
+
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
     (``None`` waits forever). The wait can overrun ``timeout`` by up to 1 s, the time allowed
     for the last reply, and the first call in a process also looks up the lock actors, which
@@ -436,10 +443,10 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     try:
         # Every caller visits shards in ascending order, so no two callers can each hold a
         # shard the other awaits: multi-shard requests cannot deadlock.
-        for shard in lease.shards:
+        for shard in lease._shards:
             call, granted = None, False
             while not granted:
-                window = _poll_window(deadline, lease.lease_s)
+                window = _poll_window(deadline, lease._lease_s)
                 if call is None:  # a late reply is awaited again, not re-sent, so calls never pile up
                     call, sent = _send_acquire(lease, shard, window), time.monotonic()
                 try:
@@ -475,10 +482,10 @@ async def async_kv_global_lock(
     deadline = None if timeout is None else time.monotonic() + timeout
     held = _mark(_holding_global)
     try:
-        for shard in lease.shards:
+        for shard in lease._shards:
             call, granted = None, False
             while not granted:
-                window = _poll_window(deadline, lease.lease_s)
+                window = _poll_window(deadline, lease._lease_s)
                 if call is None:
                     call, sent = asyncio.ensure_future(_send_acquire(lease, shard, window)), time.monotonic()
                 try:
@@ -543,7 +550,7 @@ def _close_lock_managers() -> None:
         _leases.clear()
         _registry.notify()
     for lease in leases:
-        lease.lost = True
+        lease._lost = True
         if not _owned:  # the owner kills the actors, so releasing would only hand keys to doomed waiters
             _release_lease(lease)
     for actor in _owned:
