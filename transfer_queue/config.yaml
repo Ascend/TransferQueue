@@ -19,10 +19,14 @@ controller:
 lock:
   # Whether tq.init() starts the lock actors; kv_global_lock raises while this is false.
   enabled: false
-  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1)
+  # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1). With keys
+  # hashing evenly, about num_shards * max_concurrency requests can wait without polling delay.
   num_shards: 8
-  # Acquire calls each lock actor lets wait at once (>= 1); renewal and release always have
-  # spare slots, and a request past this polls instead. See kv_global_lock
+  # Acquire calls each lock actor lets wait at once (>= 1). Past this, a request keeps its queue
+  # place but polls once per window (5 s, or lease_s / 3 if shorter), so it may see its grant up
+  # to a window late; all waiters on one key share one actor. 16 extra slots keep parked calls
+  # from taking the slots renewal and release need, but every waiter still costs one call per
+  # window: past the actor's call throughput, renewals are delayed and leases can be lost.
   max_concurrency: 10000
 
 

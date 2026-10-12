@@ -24,13 +24,14 @@ import ray
 
 # A withdrawal whose acquire never arrives (e.g. the caller died first) is dropped after this.
 _WITHDRAWN_TTL_S = 300
-# A queued caller calls again at least once per poll window (5 s at most), even when a full
-# actor turned it away, so a waiter with no call in flight for twice that has died. Hand-off
-# skips it instead of granting it a lease that would only expire; if it was merely stalled,
-# its next call queues it again at the back.
+# A live caller calls again once per poll window (5 s at most), so a waiter with no call in
+# flight for twice that is taken for dead, and hand-off skips it rather than grant it an idle
+# lease. A live caller that stalled, or whose next call sat queued in Ray, is skipped too and
+# queues again at the back on its next call.
 _ABANDONED_S = 10.0
-# Slots beyond lock.max_concurrency for calls that never wait: renew, release, list_locks and
-# acquires turned away. Parked acquires never take them, so renewal and release always run.
+# Slots beyond lock.max_concurrency, shared with no priority by calls that never wait: renew,
+# release, list_locks and acquires turned away. They only keep parked acquires from taking
+# every slot; past the actor's call throughput, renewals still run late and leases can be lost.
 _RESERVED_SLOTS = 16
 
 
@@ -53,9 +54,10 @@ class TransferQueueLockManager:
         self._timer: asyncio.TimerHandle | None = None
         self._timer_at = float("inf")
         # Waiting tokens per key in arrival order. A request is granted only when all its keys are
-        # free and it heads every one of their queues: no newcomer can barge, and single-key
-        # requests cannot starve an older multi-key one. All queues share one arrival order, so the
-        # oldest waiter heads all of its queues and the wait can never form a cycle.
+        # free and it heads every one of their queues: no newcomer can barge (bar a waiter skipped
+        # as abandoned), and single-key requests cannot starve an older multi-key one. All queues
+        # share one arrival order, so the oldest waiter heads all of its queues and the wait can
+        # never form a cycle.
         self._queues: dict[tuple[str, str], deque[str]] = {}
         # token -> names, lease_s, info, done (set on grant or withdrawal), calls in flight, seen (last call end)
         self._waiting: dict[str, dict] = {}
@@ -126,10 +128,11 @@ class TransferQueueLockManager:
         Returns None if still queued after ``timeout``, or at once if ``max_parked`` calls are
         already waiting. Calling again with the same token keeps its place in the queues; only
         ``release`` withdraws it. A token that is neither queued nor held (its grant expired
-        before the caller saw it) queues afresh.
+        before the caller saw it, or it was skipped as abandoned) queues afresh.
         """
-        # A caller that hashed over another shard count may send a key to the wrong shard,
-        # where nothing excludes the callers that sent it to the right one.
+        # A process whose cached shard count predates a restart with another lock.num_shards,
+        # yet finds these actors by name (e.g. a child forked after its parent's first lock),
+        # would send keys to the wrong shard, where nothing excludes the right shard's callers.
         if num_shards != self._num_shards:
             raise ValueError(
                 f"kv_global_lock hashed keys over {num_shards} lock shards, but lock.num_shards is "

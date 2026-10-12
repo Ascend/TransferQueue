@@ -251,7 +251,8 @@ def close():
 
     Every process closes its client and drops its handles. Only the process whose
     `init()` created TransferQueue also cleans up distributed storage and kills the
-    controller actor; processes that attached leave them running and may `init()` again.
+    controller and lock actors; processes that attached leave them running, release
+    their own `kv_global_lock` leases, and may `init()` again.
 
     Note:
         This function should be called when the TransferQueue system is no longer needed.

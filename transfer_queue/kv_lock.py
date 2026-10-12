@@ -214,9 +214,8 @@ _num_shards: int | None = None  # lock.num_shards, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
-# the queue position. Bounding each call keeps waiters from pinning the actor's concurrency
-# slots, and the bound is long because one actor serves only a few thousand calls a second:
-# at 1 s, 8,000 idle waiters starved every other call on their shard, renewals included.
+# the queue position. The bound is long because every waiter spends one call per window, and
+# those calls share the actor's limited throughput with everyone else's, renewals included.
 _POLL_S = 5.0
 _REPLY_SLACK_S = 1.0  # how late a reply may arrive past its window before the caller checks its timeout
 _NOT_INITIALIZED = (
@@ -231,7 +230,12 @@ class LockLostError(RuntimeError):
 
 
 class GlobalLease:
-    """Yielded by ``kv_global_lock``; ``check()`` raises ``LockLostError`` once the lease is lost."""
+    """Yielded by ``kv_global_lock``; ``check()`` raises ``LockLostError`` once the lease is lost.
+
+    Call ``check()`` rather than reading ``lost``, which stays False when the lease merely ran
+    out locally. ``check()`` only narrows the window: KV calls take no fencing token, so a
+    write that outlasts the remaining lease can still land after another holder took the keys.
+    """
 
     def __init__(self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], lease_s: float):
         self.names, self.shards, self.lease_s = names, shards, lease_s
@@ -335,8 +339,8 @@ def _release_lease(lease: GlobalLease) -> None:
         _leases.pop(lease.token, None)
     shards, lease.pending = lease.pending, []
     for shard in shards:
-        # Releasing by token also withdraws an acquire that is still waiting or in flight, so
-        # it is never granted to a caller that left; ray.cancel would miss a grant already made.
+        # Releasing by token also withdraws an acquire that is still waiting or in flight, so a
+        # caller that left is never left holding a grant; ray.cancel would miss one already made.
         try:
             _managers[shard].release.remote(lease.token)
         except Exception:  # close() dropped the handle, or the actor is gone
@@ -394,7 +398,8 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     The locks live in the ``lock.num_shards`` actors that ``tq.init()`` creates,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
     background thread renews. Each actor grants in arrival order: a request waits behind
-    every earlier one that shares a key with it.
+    every earlier one that shares a key with it, except one with no call in flight for 10 s:
+    that waiter is skipped as dead, and if it was alive, its next call queues it at the back.
 
     Keys on several actors are taken one actor at a time, each all at once, so a request
     holds the keys already granted while it waits for a later actor's. The hash decides
@@ -402,23 +407,18 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     caller: with 8 shards, two keys land on different actors 7 times in 8. A request queues
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
-
-    A waiting request keeps one call waiting on the actor it is waiting at, and each actor lets
-    at most ``lock.max_concurrency`` calls wait at once; renewal and release have slots of
-    their own, so waiting requests cannot hold them up. Past the limit, a request keeps its
-    place in the queue but polls once per window (5 s, or ``lease_s / 3`` if shorter), so it
-    may see its grant up to a window late. With keys hashing evenly, about ``num_shards *
-    max_concurrency`` requests can wait without that delay, so raise ``lock.num_shards`` for
-    more in total; all waiters on one key share one actor, so raise ``lock.max_concurrency``
-    for a hot key.
+    The ``lock`` section of ``config.yaml`` describes capacity limits.
 
     Raises ``TimeoutError`` if the keys are not all granted within ``timeout`` seconds
-    (``None`` waits forever); an unresponsive lock actor can stretch that by up to about
-    1 s, the time allowed for its last reply. Raises ``RuntimeError`` when nested, taken
-    while holding a ``kv_local_lock``, or called with a running event loop. Raises
+    (``None`` waits forever). The wait can overrun ``timeout`` by up to 1 s, the time allowed
+    for the last reply, and the first call in a process also looks up the lock actors, which
+    ``timeout`` does not bound. Raises ``RuntimeError`` if the lock actors were never started
+    (``lock.enabled: false``) or are gone, when nested, taken while holding a
+    ``kv_local_lock``, or called with a running event loop; ``ValueError`` for no keys,
+    ``lease_s <= 0``, or a ``lock.num_shards`` that changed since this process read it. Raises
     ``LockLostError`` on entry if an earlier key's lease was lost while a later one was
     awaited. Exit always releases the lock, then raises ``LockLostError`` if the lease was
-    lost, unless the body already raised: an exception from the body is never masked.
+    lost, unless the body already raised.
     """
     _reject_running_loop("kv_global_lock")
     lease = _new_lease(keys, partition_id, lease_s)
@@ -491,7 +491,8 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
     """Return ``{"holders": [...], "waiters": n}`` for live global locks, optionally in one partition.
 
     Each holder has ``partition_id``, ``key``, ``holder`` (node IP, pid, thread), ``held_s`` and
-    ``lease_remaining_s``. A holder may still be waiting for its keys on other actors.
+    ``lease_remaining_s``. A holder may still be waiting for its keys on other actors, and one
+    that just left its block may still be listed briefly: exit sends its release without waiting.
     """
     replies = ray.get([_lock_manager(shard).list_locks.remote(partition_id) for shard in range(_shard_count())])
     return {"holders": [h for r in replies for h in r["holders"]], "waiters": sum(r["waiters"] for r in replies)}
