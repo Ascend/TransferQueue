@@ -422,7 +422,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     caller: with N shards, two keys land on different actors N-1 times in N. A request queues
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
-    The ``lock`` section of ``config.yaml`` describes capacity limits.
+    The kv_global_lock section of README.md describes capacity limits.
 
     Call the yielded lease's ``check()`` right before each write; its ``names`` lists the
     locked ``(partition_id, key)`` pairs.
@@ -520,22 +520,26 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
     return {"holders": [h for r in replies for h in r["holders"]], "waiters": sum(r["waiters"] for r in replies)}
 
 
-def _check_lock_conf(lock_conf) -> None:
-    """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
-    value = lock_conf.max_waiting_acquires
-    if get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK") and (not isinstance(value, int) or value < 1):
-        raise ValueError(f"lock.max_waiting_acquires must be an integer >= 1, got {value!r}")
+def _lock_max_waiting_acquires() -> int | None:
+    """Return the acquire calls each lock actor lets wait at once, or None if kv_global_lock is off.
+
+    Called by ``tq.init()`` before it creates anything, so a bad value leaves nothing behind.
+    Only the process that creates TransferQueue reads these variables: others find the actors by name.
+    """
+    if not get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
+        return None
+    value = int(os.environ.get("TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES", 10000))
+    if value < 1:
+        raise ValueError(f"TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES must be >= 1, got {value}")
+    return value
 
 
-def _start_lock_managers(conf) -> None:
+def _start_lock_managers(max_waiting_acquires: int | None, backend) -> None:
     """Called by the ``tq.init()`` that created the controller: start the lock actors if enabled."""
     global _owned
-    # Read only here, by the creator: other processes find the actors by name, env or not.
-    if get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
+    if max_waiting_acquires is not None:
         # One lock actor per storage unit; backends without storage units get a single one.
-        backend = conf.backend
         num_shards = backend.SimpleStorage.num_data_storage_units if backend.storage_backend == "SimpleStorage" else 1
-        max_waiting_acquires = conf.lock.max_waiting_acquires
         # Created here rather than on first lock: a non-detached actor dies with its creator.
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]

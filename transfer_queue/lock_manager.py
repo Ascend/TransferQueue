@@ -29,13 +29,13 @@ _WITHDRAWN_TTL_S = 300
 # lease. A live caller that stalled, or whose next call sat queued in Ray, is skipped too and
 # queues again at the back on its next call.
 _ABANDONED_S = 10.0
-# Slots beyond lock.max_waiting_acquires, shared with no priority by calls that never wait: renew,
-# release, list_locks and acquires turned away. They only keep parked acquires from taking
-# every slot; past the actor's call throughput, renewals still run late and leases can be lost.
+# Slots beyond TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES, shared with no priority by calls that never
+# wait: renew, release, list_locks and acquires turned away. They only keep parked acquires from
+# taking every slot; past the actor's call throughput, renewals still run late and leases can be lost.
 _RESERVED_SLOTS = 16
 
 
-# tq.init() runs each actor with lock.max_waiting_acquires + _RESERVED_SLOTS slots.
+# tq.init() runs each actor with TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES + _RESERVED_SLOTS slots.
 @ray.remote(num_cpus=0)
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""

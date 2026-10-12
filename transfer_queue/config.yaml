@@ -15,22 +15,6 @@ controller:
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 
-# Cluster-wide KV key locks (kv_global_lock). The process-local kv_local_lock needs none of this.
-# tq.init() starts the lock actors only if the environment variable TQ_ENABLE_KV_GLOBAL_LOCK=1 is
-# set in the process whose call starts TransferQueue; kv_global_lock raises otherwise. It starts one
-# lock actor per storage unit (SimpleStorage num_data_storage_units; 1 for other backends) and
-# spreads keys over them by hash.
-lock:
-  # Acquire calls each lock actor lets wait at once (>= 1). Past this, a request keeps its queue
-  # place but polls once per window (5 s, or lease_s / 3 if shorter), so it may see its grant up
-  # to a window late. With keys hashing evenly, about (lock actors) * max_waiting_acquires requests
-  # can wait without that delay, but all waiters on one key share one actor. The actor's Ray max_concurrency is
-  # this plus 16 slots that keep waiting calls from taking the ones renewal and release need, but
-  # every waiter still costs one call per window: past the actor's call throughput, renewals are
-  # delayed and leases can be lost.
-  max_waiting_acquires: 10000
-
-
 backend:
   # Pluggable storage/transport backend of TransferQueue. Choose from:
   # SimpleStorage, Yuanrong, MooncakeStore, ...

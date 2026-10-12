@@ -45,7 +45,7 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import TransferQueueController
-from transfer_queue.kv_lock import _check_lock_conf, _close_lock_managers, _start_lock_managers
+from transfer_queue.kv_lock import _close_lock_managers, _lock_max_waiting_acquires, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
@@ -199,7 +199,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             sampler = globals()[final_conf.controller.sampler]
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
-    _check_lock_conf(final_conf.lock)
+    max_waiting_acquires = _lock_max_waiting_acquires()
 
     try:
         global _TQ_CONTROLLER, _TQ_IS_OWNER
@@ -208,7 +208,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
-        _start_lock_managers(final_conf)
+        _start_lock_managers(max_waiting_acquires, final_conf.backend)
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()
