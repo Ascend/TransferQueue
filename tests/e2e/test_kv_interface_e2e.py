@@ -823,7 +823,7 @@ class TestKVBatchGetParserE2E:
             keys=keys,
             partition_id=partition_id,
             select_fields="input_ids",
-            parser=lambda value, length: value[:length],
+            parser=tq.slice_tensor,
             parser_args=[1, 3, 2],
         )
 

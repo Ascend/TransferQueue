@@ -575,6 +575,14 @@ def kv_batch_get(
         ...     parser=tq.select_list_items,
         ...     parser_args=[[0, 2], [1]],
         ... )
+        >>> # Trim a padded tensor field to each key's real length as a view (only the slice is sent)
+        >>> data = tq.kv_batch_get(
+        ...     keys=["sample_1", "sample_2"],
+        ...     partition_id="train",
+        ...     select_fields="input_ids",
+        ...     parser=tq.slice_tensor,
+        ...     parser_args=[3, 5],
+        ... )
     """
     keys = [keys] if isinstance(keys, str) else keys
     validate_get_parser(parser, parser_args, len(keys))

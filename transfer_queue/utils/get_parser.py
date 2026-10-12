@@ -20,6 +20,7 @@ import reprlib
 from collections.abc import Callable, Sequence
 from typing import Any
 
+import torch
 from tensordict import NonTensorData, NonTensorStack
 
 GetParser = Callable[[Any, Any], Any]
@@ -36,6 +37,33 @@ def select_list_items(value: Sequence[Any], indices: Sequence[int]) -> list[Any]
     if out_of_range:
         raise IndexError(f"indices {out_of_range} are out of range for a list of {len(value)} items")
     return [value[index] for index in indices]
+
+
+def slice_tensor(value: torch.Tensor, index: int | slice | tuple[Any, ...]) -> torch.Tensor:
+    """Return a view of a tensor field sliced by ``index``, so only that slice is serialized on get.
+
+    An ``int`` is a dim-0 prefix length (``value[:index]``); a ``slice`` or ``tuple`` is applied as
+    ``value[index]``. A contiguous leading-dim prefix of a C-contiguous CPU tensor stays a
+    contiguous view, so the get encoder can extract its buffer without copying. Non-contiguous
+    results still work, but encoding will materialize them.
+    """
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"slice_tensor needs a torch.Tensor value, got {type(value).__name__}")
+    if value.is_nested:
+        raise TypeError("slice_tensor does not support nested tensors; pass a regular tensor field")
+    if isinstance(index, bool):
+        raise TypeError("slice_tensor index must be an int stop, a slice, or a tuple of slices/ints, not bool")
+    if isinstance(index, int):
+        if value.dim() == 0:
+            raise IndexError("slice_tensor cannot take a prefix length of a 0-dim tensor")
+        if not 0 <= index <= value.size(0):
+            raise IndexError(f"prefix length {index} is out of range for dim 0 of size {value.size(0)}")
+        return value[:index]
+    if isinstance(index, slice | tuple):
+        return value[index]
+    raise TypeError(
+        f"slice_tensor index must be an int stop, a slice, or a tuple of slices/ints, got {type(index).__name__}"
+    )
 
 
 def validate_get_parser(parser: GetParser | None, parser_args: Sequence[Any] | None, num_keys: int) -> None:

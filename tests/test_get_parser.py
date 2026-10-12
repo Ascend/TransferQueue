@@ -18,7 +18,7 @@ import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack
 
-from transfer_queue.utils.get_parser import apply_get_parser, select_list_items, validate_get_parser
+from transfer_queue.utils.get_parser import apply_get_parser, select_list_items, slice_tensor, validate_get_parser
 
 
 def test_select_list_items_keeps_requested_order():
@@ -42,6 +42,79 @@ def test_select_list_items_out_of_range_raises(indices):
 def test_select_list_items_non_list_value_raises():
     with pytest.raises(TypeError, match="needs a list or tuple value, got Tensor"):
         select_list_items(torch.zeros(3), [0])
+
+
+def test_slice_tensor_prefix_returns_contiguous_view():
+    value = torch.arange(12).view(3, 4)
+
+    sliced = slice_tensor(value, 2)
+
+    assert torch.equal(sliced, value[:2])
+    assert sliced.data_ptr() == value.data_ptr()
+    assert sliced.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+    assert sliced.is_contiguous()
+
+
+def test_slice_tensor_accepts_slice_and_tuple_indexes():
+    value = torch.arange(24).view(4, 3, 2)
+
+    assert torch.equal(slice_tensor(value, slice(1, 3)), value[1:3])
+    assert torch.equal(slice_tensor(value, (slice(None), slice(0, 2))), value[:, :2])
+    assert slice_tensor(value, (1, slice(None))).data_ptr() == value[1].data_ptr()
+
+
+def test_slice_tensor_empty_prefix_is_valid_view():
+    value = torch.arange(6).view(3, 2)
+
+    sliced = slice_tensor(value, 0)
+
+    assert sliced.shape == (0, 2)
+    assert sliced.untyped_storage().data_ptr() == value.untyped_storage().data_ptr()
+
+
+@pytest.mark.parametrize("index", [-1, 4])
+def test_slice_tensor_prefix_out_of_range_raises(index):
+    with pytest.raises(IndexError, match=re.escape(f"prefix length {index} is out of range for dim 0 of size 3")):
+        slice_tensor(torch.zeros(3, 2), index)
+
+
+def test_slice_tensor_rejects_non_tensor_and_nested():
+    with pytest.raises(TypeError, match="needs a torch.Tensor value, got list"):
+        slice_tensor([1, 2, 3], 1)
+    nested = torch.nested.as_nested_tensor([torch.ones(2), torch.ones(3)], layout=torch.jagged)
+    with pytest.raises(TypeError, match="does not support nested tensors"):
+        slice_tensor(nested, 1)
+
+
+def test_slice_tensor_rejects_bool_and_bad_index_type():
+    value = torch.zeros(3)
+    with pytest.raises(TypeError, match="not bool"):
+        slice_tensor(value, True)
+    with pytest.raises(TypeError, match="got list"):
+        slice_tensor(value, [0, 1])
+
+
+def test_apply_get_parser_slice_tensor_keeps_per_key_views():
+    field_data = {"input_ids": [torch.arange(4), torch.arange(10, 14)]}
+
+    parsed = apply_get_parser(field_data, slice_tensor, [2, 3], global_indexes=[0, 1])
+
+    assert torch.equal(parsed["input_ids"][0], torch.tensor([0, 1]))
+    assert torch.equal(parsed["input_ids"][1], torch.tensor([10, 11, 12]))
+    assert parsed["input_ids"][0].data_ptr() == field_data["input_ids"][0].data_ptr()
+    assert parsed["input_ids"][1].data_ptr() == field_data["input_ids"][1].data_ptr()
+
+
+def test_slice_tensor_encode_sends_only_sliced_bytes_without_copy():
+    from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    value = torch.arange(12, dtype=torch.int64).view(3, 4)
+    sliced = slice_tensor(value, 2)
+    buffers = MsgpackEncoder().encode(sliced)
+
+    assert buffers[1].nbytes == sliced.nbytes
+    assert buffers[1].nbytes < value.nbytes
+    assert torch.equal(MsgpackDecoder().decode(buffers), sliced)
 
 
 def test_validate_get_parser_rejects_args_without_parser():

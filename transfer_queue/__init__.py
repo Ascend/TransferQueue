@@ -59,7 +59,7 @@ from .sampler.rank_aware_sampler import RankAwareSampler
 from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
 from .storage import StorageKeyNotFoundError
-from .utils.get_parser import GetParser, select_list_items
+from .utils.get_parser import GetParser, select_list_items, slice_tensor
 
 __all__ = (
     [
@@ -86,6 +86,7 @@ __all__ = (
         "KVBatchMeta",
         "GetParser",
         "select_list_items",
+        "slice_tensor",
     ]
     + [
         # KV key locks: process-local and cluster-wide
