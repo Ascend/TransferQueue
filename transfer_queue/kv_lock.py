@@ -42,7 +42,7 @@ import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
 from transfer_queue.lock_manager import _RESERVED_SLOTS, TransferQueueLockManager
-from transfer_queue.utils.common import get_env_bool
+from transfer_queue.utils.common import get_env_bool, get_node_round_robin_scheduling_strategies
 
 # Not asyncio.Lock: it is bound to one event loop and is not thread-safe, while a process
 # may run several loops plus plain threads. A key is held exactly while it is in _table,
@@ -215,6 +215,7 @@ _renewer_running = False
 _num_shards: int | None = None  # the lock actor count, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
+_NUM_SHARDS = 8  # lock actors tq.init() starts; other processes ask shard 0, so only the creator reads this
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
 # the queue position. The bound is long because every waiter spends one call per window, and
 # those calls share the actor's limited throughput with everyone else's, renewals included.
@@ -410,7 +411,7 @@ def _renew_loop() -> None:
 def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | None = None, lease_s: float = 30):
     """Hold an exclusive cluster-wide lock on ``keys`` in ``partition_id``; yield a ``GlobalLease``.
 
-    The locks live in the actors that ``tq.init()`` creates, one per storage unit,
+    The locks live in the 8 actors that ``tq.init()`` spreads evenly over the nodes,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
     background thread renews. Each actor grants in arrival order: a request waits behind
     every earlier one that shares a key with it, except one with no call in flight for 10 s:
@@ -419,7 +420,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     Keys on several actors are taken one actor at a time, each all at once, so a request
     holds the keys already granted while it waits for a later actor's. The hash decides
     which keys share an actor, so whether a request is all-or-nothing is not up to the
-    caller: with N shards, two keys land on different actors N-1 times in N. A request queues
+    caller: two keys land on different actors 7 times in 8. A request queues
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
     The kv_global_lock section of README.md describes capacity limits.
@@ -534,21 +535,22 @@ def _lock_max_waiting_acquires() -> int | None:
     return value
 
 
-def _start_lock_managers(max_waiting_acquires: int | None, backend) -> None:
+def _start_lock_managers(max_waiting_acquires: int | None) -> None:
     """Called by the ``tq.init()`` that created the controller: start the lock actors if enabled."""
     global _owned
     if max_waiting_acquires is not None:
-        # One lock actor per storage unit; backends without storage units get a single one.
-        num_shards = backend.SimpleStorage.num_data_storage_units if backend.storage_backend == "SimpleStorage" else 1
-        # Created here rather than on first lock: a non-detached actor dies with its creator.
+        # Round-robin over the alive nodes, as for storage units, so one node's loss or load
+        # hits the fewest shards. Created here rather than on first lock: a non-detached actor
+        # dies with its creator.
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]
                 name=_manager_name(shard),
                 namespace="transfer_queue",
                 get_if_exists=True,
                 max_concurrency=max_waiting_acquires + _RESERVED_SLOTS,
-            ).remote(num_shards, max_waiting_acquires)
-            for shard in range(num_shards)
+                scheduling_strategy=strategy,
+            ).remote(_NUM_SHARDS, max_waiting_acquires)
+            for shard, strategy in enumerate(get_node_round_robin_scheduling_strategies(_NUM_SHARDS))
         ]
 
 

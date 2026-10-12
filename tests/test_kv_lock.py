@@ -17,6 +17,8 @@ import asyncio
 import importlib
 import threading
 import time
+from collections import Counter
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -126,3 +128,20 @@ def test_timeout_is_a_total_deadline_and_partial_acquisition_is_released():
     for holder in holders:
         holder.join(TIMEOUT)
         assert not holder.is_alive()
+
+
+def test_lock_actors_are_spread_evenly_over_the_alive_nodes(monkeypatch):
+    a, b, c, dead = ("01" * 28, "02" * 28, "03" * 28, "04" * 28)  # Ray checks node IDs are hex
+    nodes = [{"NodeID": node, "Alive": True} for node in (c, a, b)] + [{"NodeID": dead, "Alive": False}]
+    monkeypatch.setattr(kvl.ray, "nodes", lambda: nodes)
+    manager_cls = MagicMock()
+    monkeypatch.setattr(kvl, "TransferQueueLockManager", manager_cls)
+    monkeypatch.setattr(kvl, "_owned", [])
+
+    kvl._start_lock_managers(max_waiting_acquires=2)
+
+    strategies = [call.kwargs["scheduling_strategy"] for call in manager_cls.options.call_args_list]
+    assert [s.node_id for s in strategies] == [a, b, c, a, b, c, a, b]
+    assert Counter(s.node_id for s in strategies) == {a: 3, b: 3, c: 2}
+    assert not any(s.soft for s in strategies)
+    manager_cls.options.return_value.remote.assert_called_with(kvl._NUM_SHARDS, 2)
