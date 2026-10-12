@@ -130,9 +130,10 @@ class TransferQueueLockManager:
         ``release`` withdraws it. A token that is neither queued nor held (its grant expired
         before the caller saw it, or it was skipped as abandoned) queues afresh.
         """
-        # A process whose cached shard count predates a restart with another lock.num_shards,
-        # yet finds these actors by name (e.g. a child forked after its parent's first lock),
-        # would send keys to the wrong shard, where nothing excludes the right shard's callers.
+        # A caller whose keys were hashed before a restart with another lock.num_shards, yet
+        # finds these actors by name (e.g. a child forked after its parent's first lock, or a
+        # waiter whose process re-ran tq.init()), would send keys to the wrong shard, where
+        # nothing excludes the right shard's callers.
         if num_shards != self._num_shards:
             raise ValueError(
                 f"kv_global_lock hashed keys over {num_shards} lock shards, but lock.num_shards is "

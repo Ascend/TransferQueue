@@ -169,6 +169,17 @@ def test_a_late_reply_is_awaited_instead_of_sent_again(monkeypatch):
     wait_until(lambda: tq.kv_lock_list(P) == {"holders": [], "waiters": 0})
 
 
+def test_acquire_carries_the_shard_count_its_keys_were_hashed_with(monkeypatch):
+    n = kvl._shard_count()
+    key = next(k for k in map(str, range(50)) if kvl._shard((P, k), n + 1) < n)
+    monkeypatch.setattr(kvl, "_num_shards", n + 1)  # hashed before a restart with another lock.num_shards
+    lease = kvl._new_lease(key, P, 30)
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="restarted"):
+        ray.get(kvl._send_acquire(lease, next(iter(lease.shards)), 0), timeout=TIMEOUT_S)
+    kvl._release_lease(lease)
+
+
 @pytest.fixture
 def own_manager():
     """A lock actor of its own, so these tests control every request it sees.

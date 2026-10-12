@@ -237,8 +237,11 @@ class GlobalLease:
     write that outlasts the remaining lease can still land after another holder took the keys.
     """
 
-    def __init__(self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], lease_s: float):
-        self.names, self.shards, self.lease_s = names, shards, lease_s
+    def __init__(
+        self, names: list[tuple[str, str]], shards: dict[int, list[tuple[str, str]]], num_shards: int, lease_s: float
+    ):
+        # num_shards is the count the keys were hashed over, which every acquire must carry.
+        self.names, self.shards, self.num_shards, self.lease_s = names, shards, num_shards, lease_s
         self.token = f"{os.getpid()}:{uuid.uuid4().hex}"
         self.deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
         self.lost = False
@@ -296,7 +299,7 @@ def _new_lease(keys: str | list[str], partition_id: str, lease_s: float) -> Glob
     shards: dict[int, list[tuple[str, str]]] = {}
     for name in names:
         shards.setdefault(_shard(name, num_shards), []).append(name)
-    return GlobalLease(names, dict(sorted(shards.items())), lease_s)
+    return GlobalLease(names, dict(sorted(shards.items())), num_shards, lease_s)
 
 
 def _poll_window(deadline: float | None, lease_s: float) -> float:
@@ -309,7 +312,7 @@ def _poll_window(deadline: float | None, lease_s: float) -> float:
 def _send_acquire(lease: GlobalLease, shard: int, window: float):
     manager = lease.pending[shard] = _lock_manager(shard)
     holder = {"node_ip": ray.util.get_node_ip_address(), "pid": os.getpid(), "thread": threading.current_thread().name}
-    return manager.acquire.remote(lease.shards[shard], lease.token, window, lease.lease_s, holder, _shard_count())
+    return manager.acquire.remote(lease.shards[shard], lease.token, window, lease.lease_s, holder, lease.num_shards)
 
 
 def _take_grant(lease: GlobalLease, shard: int, remaining: float | None, sent: float, deadline: float | None) -> bool:
@@ -421,7 +424,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     ``timeout`` does not bound. Raises ``RuntimeError`` if the lock actors were never started
     (``lock.enabled: false``) or are gone, when nested, taken while holding a
     ``kv_local_lock``, or called with a running event loop; ``ValueError`` for no keys,
-    ``lease_s <= 0``, or a ``lock.num_shards`` that changed since this process read it. Raises
+    ``lease_s <= 0``, or a ``lock.num_shards`` that changed since this call hashed its keys. Raises
     ``LockLostError`` while waiting once the lease is lost: an earlier key's lease ran out while
     a later one was awaited, or this process's ``tq.close()`` gave it up. Exit always releases
     the lock, then raises ``LockLostError`` if the lease was lost, unless the body already raised.
