@@ -15,9 +15,11 @@
 
 """kv_global_lock across Ray actors: exclusion, timeouts, queue order, leases, and close()."""
 
+import asyncio
 import importlib
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 import ray
@@ -276,6 +278,33 @@ def test_lease_renews_and_lost_lease_raises():
             ray.get(manager("r").release.remote(lease.token), timeout=TIMEOUT_S)  # the server drops it
             wait_until(lambda: lease.lost)
             raise ValueError("body")
+    wait_until(lambda: holders() == set())
+
+
+@ray.remote(num_cpus=0)
+class Unresponsive:
+    """Stands in for a lock actor on a partitioned node: renewals never answer."""
+
+    async def renew_many(self, tokens):
+        await asyncio.sleep(3600)
+
+
+def test_an_unresponsive_shard_costs_no_lease_on_another(monkeypatch):
+    healthy, hung = keys_on_two_shards("ur")
+    other = tq.kv_global_lock(hung, P, timeout=TIMEOUT_S, lease_s=2)
+    with ThreadPoolExecutor(1) as pool:  # a lock of its own needs a thread of its own
+        other_lease = pool.submit(other.__enter__).result(TIMEOUT_S)
+    unresponsive = Unresponsive.remote()
+    with tq.kv_global_lock(healthy, P, timeout=TIMEOUT_S, lease_s=2) as lease:
+        monkeypatch.setitem(kvl._managers, shard_of(hung), unresponsive)
+        time.sleep(3)  # past both leases
+        lease.check()
+        with pytest.raises(tq.LockLostError):  # unanswered, it runs out once its deadline passes
+            other_lease.check()
+    with pytest.raises(tq.LockLostError):
+        other.__exit__(None, None, None)
+    monkeypatch.undo()
+    ray.kill(unresponsive)
     wait_until(lambda: holders() == set())
 
 

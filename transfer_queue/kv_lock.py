@@ -369,25 +369,32 @@ def _renew_loop() -> None:
         # which is later, so the local deadline never outlives the server's.
         last = time.monotonic()
         calls = {}
-        renewed: set[tuple[int, str]] = set()
         for shard, tokens in by_shard.items():
             try:
-                calls[shard] = _managers[shard].renew_many.remote(tokens)
+                calls[_managers[shard].renew_many.remote(tokens)] = shard
             except Exception:  # close() dropped the handle
                 pass
-        for shard, call in calls.items():
+        # One wait for all shards, so a shard that does not answer cannot delay the others'
+        # renewals. Its silence proves nothing: its leases just keep their deadline.
+        ready, _ = ray.wait(list(calls), num_returns=len(calls), timeout=period)
+        replies: dict[tuple[int, str], bool] = {}
+        for call in ready:
+            shard = calls[call]
             try:
-                alive = ray.get(call, timeout=max(0.0, last + 3 * period - time.monotonic()))
-            except Exception:  # a dead lock manager or a timeout
-                continue
-            renewed.update((shard, token) for token, ok in alive.items() if ok)
-        # A lease is lost as soon as any one of its shards fails to renew it. A shard granted
+                alive = ray.get(call)
+            except Exception:  # the lock manager died, and its leases with it
+                alive = {}
+            for token in by_shard[shard]:
+                replies[shard, token] = alive.get(token, False)
+        # A lease is lost as soon as any one of its shards refuses to renew it. A shard granted
         # since the snapshot was not renewed here, so it keeps the deadline _take_grant set.
-        for token, (lease, shards) in batch.items():
-            if not all((shard, token) in renewed for shard in shards):
-                lease.lost = True
-            elif len(lease.granted) == len(shards):
-                lease.deadline = last + lease.lease_s
+        with _registry:  # _take_grant also moves the deadline
+            for token, (lease, shards) in batch.items():
+                answers = [replies.get((shard, token)) for shard in shards]
+                if False in answers:
+                    lease.lost = True
+                elif None not in answers and len(lease.granted) == len(shards):
+                    lease.deadline = last + lease.lease_s
 
 
 @contextmanager
