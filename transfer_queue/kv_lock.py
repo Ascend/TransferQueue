@@ -212,7 +212,7 @@ _holding_global: ContextVar[list[bool] | None] = ContextVar("_holding_kv_global_
 _registry = threading.Condition()
 _leases: dict[str, "GlobalLease"] = {}
 _renewer_running = False
-_num_shards: int | None = None  # lock.num_shards, asked of shard 0 on first use
+_num_shards: int | None = None  # the lock actor count, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
@@ -263,7 +263,7 @@ class GlobalLease:
 
 
 def _shard_count() -> int:
-    """Return lock.num_shards, looking every lock actor up on first use."""
+    """Return the lock actor count, looking every lock actor up on first use."""
     global _num_shards
     if _num_shards is None:
         try:
@@ -410,7 +410,7 @@ def _renew_loop() -> None:
 def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | None = None, lease_s: float = 30):
     """Hold an exclusive cluster-wide lock on ``keys`` in ``partition_id``; yield a ``GlobalLease``.
 
-    The locks live in the ``lock.num_shards`` actors that ``tq.init()`` creates,
+    The locks live in the actors that ``tq.init()`` creates, one per storage unit,
     each key in the one its hash picks, and are held under a ``lease_s`` lease that a
     background thread renews. Each actor grants in arrival order: a request waits behind
     every earlier one that shares a key with it, except one with no call in flight for 10 s:
@@ -419,7 +419,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     Keys on several actors are taken one actor at a time, each all at once, so a request
     holds the keys already granted while it waits for a later actor's. The hash decides
     which keys share an actor, so whether a request is all-or-nothing is not up to the
-    caller: with 8 shards, two keys land on different actors 7 times in 8. A request queues
+    caller: with N shards, two keys land on different actors N-1 times in N. A request queues
     afresh at each later actor, so its waits add up, and the keys it holds meanwhile block
     others even if it then times out. Lock the fewest keys you can and keep the block short.
     The ``lock`` section of ``config.yaml`` describes capacity limits.
@@ -433,7 +433,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     ``timeout`` does not bound. Raises ``RuntimeError`` if the lock actors were never started
     (``TQ_ENABLE_KV_GLOBAL_LOCK`` unset) or are gone, when nested, taken while holding a
     ``kv_local_lock``, or called with a running event loop; ``ValueError`` for no keys,
-    ``lease_s <= 0``, or a ``lock.num_shards`` that changed since this call hashed its keys. Raises
+    ``lease_s <= 0``, or a shard count that changed since this call hashed its keys. Raises
     ``LockLostError`` while waiting once the lease is lost: an earlier key's lease ran out while
     a later one was awaited, or this process's ``tq.close()`` gave it up. Exit always releases
     the lock, then raises ``LockLostError`` if the lease was lost, unless the body already raised.
@@ -522,28 +522,29 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
 
 def _check_lock_conf(lock_conf) -> None:
     """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
-    if not get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
-        return
-    for field in ("num_shards", "max_waiting_acquires"):
-        value = lock_conf[field]
-        if not isinstance(value, int) or value < 1:
-            raise ValueError(f"lock.{field} must be an integer >= 1, got {value!r}")
+    value = lock_conf.max_waiting_acquires
+    if get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK") and (not isinstance(value, int) or value < 1):
+        raise ValueError(f"lock.max_waiting_acquires must be an integer >= 1, got {value!r}")
 
 
-def _start_lock_managers(lock_conf) -> None:
+def _start_lock_managers(conf) -> None:
     """Called by the ``tq.init()`` that created the controller: start the lock actors if enabled."""
     global _owned
     # Read only here, by the creator: other processes find the actors by name, env or not.
     if get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
+        # One lock actor per storage unit; backends without storage units get a single one.
+        backend = conf.backend
+        num_shards = backend.SimpleStorage.num_data_storage_units if backend.storage_backend == "SimpleStorage" else 1
+        max_waiting_acquires = conf.lock.max_waiting_acquires
         # Created here rather than on first lock: a non-detached actor dies with its creator.
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]
                 name=_manager_name(shard),
                 namespace="transfer_queue",
                 get_if_exists=True,
-                max_concurrency=lock_conf.max_waiting_acquires + _RESERVED_SLOTS,
-            ).remote(lock_conf.num_shards, lock_conf.max_waiting_acquires)
-            for shard in range(lock_conf.num_shards)
+                max_concurrency=max_waiting_acquires + _RESERVED_SLOTS,
+            ).remote(num_shards, max_waiting_acquires)
+            for shard in range(num_shards)
         ]
 
 

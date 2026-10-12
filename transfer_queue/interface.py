@@ -208,7 +208,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
-        _start_lock_managers(final_conf.lock)
+        _start_lock_managers(final_conf)
     except ValueError:
         logger.info("Some other rank has initialized TransferQueueController. Try to connect to existing controller.")
         _init_from_existing()

@@ -154,7 +154,7 @@ def test_multi_shard_timeout_releases_the_earlier_shard():
 
 def test_a_late_reply_is_awaited_instead_of_sent_again(monkeypatch):
     lock_manager = manager("late")
-    ray.get(lock_manager.acquire.remote([(P, "late")], "holder", 0, 30, {}, 8), timeout=TIMEOUT_S)
+    ray.get(lock_manager.acquire.remote([(P, "late")], "holder", 0, 30, {}, kvl._shard_count()), timeout=TIMEOUT_S)
     real_send, sends = kvl._send_acquire, []
 
     def send_acquire(lease, shard, window):
@@ -174,7 +174,7 @@ def test_a_late_reply_is_awaited_instead_of_sent_again(monkeypatch):
 def test_acquire_carries_the_shard_count_its_keys_were_hashed_with(monkeypatch):
     n = kvl._shard_count()
     key = next(k for k in map(str, range(50)) if kvl._shard((P, k), n + 1) < n)
-    monkeypatch.setattr(kvl, "_num_shards", n + 1)  # hashed before a restart with another lock.num_shards
+    monkeypatch.setattr(kvl, "_num_shards", n + 1)  # hashed before a restart with another shard count
     lease = kvl._new_lease(key, P, 30)
     monkeypatch.undo()
     with pytest.raises(ValueError, match="restarted"):
