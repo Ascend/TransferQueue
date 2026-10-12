@@ -36,7 +36,6 @@ TIMEOUT_S = 60
 CONF = {
     "controller": {"polling_mode": True},
     "backend": {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 100}},
-    "lock": {"enabled": True},
 }
 
 
@@ -88,7 +87,10 @@ class Worker:
 def tq_session():
     if not ray.is_initialized():
         ray.init(namespace="TestKVGlobalLockE2E")
-    tq.init(OmegaConf.create(CONF))
+    # Only the owner's tq.init() reads it; the Worker actors attach without it.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TQ_ENABLE_KV_GLOBAL_LOCK", "1")
+        tq.init(OmegaConf.create(CONF))
     yield
     tq.close()
     ray.shutdown()
@@ -356,5 +358,5 @@ def test_owner_close_kills_the_managers_and_fails_waiters():
         held.__exit__(None, None, None)
 
     wait_until(lambda: actors_named("TransferQueue") == [])  # the controller and storage go too
-    with pytest.raises(RuntimeError, match="lock.enabled"):
+    with pytest.raises(RuntimeError, match="TQ_ENABLE_KV_GLOBAL_LOCK"):
         tq.kv_lock_list()

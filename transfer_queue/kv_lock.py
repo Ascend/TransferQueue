@@ -23,8 +23,9 @@ to a single call.
 
 ``kv_global_lock`` and ``async_kv_global_lock`` do the same across the Ray cluster through
 ``TransferQueueLockManager`` actors that split keys by hash, under a lease that renews
-automatically. ``tq.init()`` starts those actors only with ``lock.enabled: true``. Take a
-global lock before a local one, never inside it.
+automatically. ``tq.init()`` starts those actors only if ``TQ_ENABLE_KV_GLOBAL_LOCK`` is set
+to a true value (e.g. ``1``) in the process whose call starts TransferQueue. Take a global
+lock before a local one, never inside it.
 """
 
 import asyncio
@@ -41,6 +42,7 @@ import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
 from transfer_queue.lock_manager import _RESERVED_SLOTS, TransferQueueLockManager
+from transfer_queue.utils.common import get_env_bool
 
 # Not asyncio.Lock: it is bound to one event loop and is not thread-safe, while a process
 # may run several loops plus plain threads. A key is held exactly while it is in _table,
@@ -219,8 +221,8 @@ _owned: list = []  # the lock actors this process's tq.init() created, killed by
 _POLL_S = 5.0
 _REPLY_SLACK_S = 1.0  # how late a reply may arrive past its window before the caller checks its timeout
 _NOT_INITIALIZED = (
-    "TransferQueueLockManager not found; kv_global_lock needs `lock.enabled: true` "
-    "in the config of the tq.init() that starts TransferQueue"
+    "TransferQueueLockManager not found; kv_global_lock needs TQ_ENABLE_KV_GLOBAL_LOCK=1 "
+    "set before the tq.init() that starts TransferQueue, in that process"
 )
 _MANAGER_GONE = "The TransferQueueLockManager actor is gone; did the process that ran tq.init() call tq.close()?"
 
@@ -429,7 +431,7 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
     (``None`` waits forever). The wait can overrun ``timeout`` by up to 1 s, the time allowed
     for the last reply, and the first call in a process also looks up the lock actors, which
     ``timeout`` does not bound. Raises ``RuntimeError`` if the lock actors were never started
-    (``lock.enabled: false``) or are gone, when nested, taken while holding a
+    (``TQ_ENABLE_KV_GLOBAL_LOCK`` unset) or are gone, when nested, taken while holding a
     ``kv_local_lock``, or called with a running event loop; ``ValueError`` for no keys,
     ``lease_s <= 0``, or a ``lock.num_shards`` that changed since this call hashed its keys. Raises
     ``LockLostError`` while waiting once the lease is lost: an earlier key's lease ran out while
@@ -520,16 +522,19 @@ def kv_lock_list(partition_id: str | None = None) -> dict:
 
 def _check_lock_conf(lock_conf) -> None:
     """Called by ``tq.init()`` before it creates anything, so a bad config leaves nothing behind."""
+    if not get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
+        return
     for field in ("num_shards", "max_waiting_acquires"):
         value = lock_conf[field]
-        if lock_conf.enabled and (not isinstance(value, int) or value < 1):
+        if not isinstance(value, int) or value < 1:
             raise ValueError(f"lock.{field} must be an integer >= 1, got {value!r}")
 
 
 def _start_lock_managers(lock_conf) -> None:
     """Called by the ``tq.init()`` that created the controller: start the lock actors if enabled."""
     global _owned
-    if lock_conf.enabled:
+    # Read only here, by the creator: other processes find the actors by name, env or not.
+    if get_env_bool("TQ_ENABLE_KV_GLOBAL_LOCK"):
         # Created here rather than on first lock: a non-detached actor dies with its creator.
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]

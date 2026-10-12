@@ -16,9 +16,9 @@ controller:
   zmq_info: null
 
 # Cluster-wide KV key locks (kv_global_lock). The process-local kv_local_lock needs none of this.
+# tq.init() starts the lock actors only if the environment variable TQ_ENABLE_KV_GLOBAL_LOCK=1 is
+# set in the process whose call starts TransferQueue; kv_global_lock raises otherwise.
 lock:
-  # Whether tq.init() starts the lock actors; kv_global_lock raises while this is false.
-  enabled: false
   # Number of lock actors that kv_global_lock spreads keys over by hash (>= 1). With keys
   # hashing evenly, about num_shards * max_waiting_acquires requests can wait without polling delay.
   num_shards: 8
