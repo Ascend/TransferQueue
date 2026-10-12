@@ -183,22 +183,23 @@ class TransferQueueLockManager:
         return alive
 
     async def release(self, token: str) -> None:
-        """Free ``token``'s locks, or withdraw its acquire if it is still waiting or has not arrived."""
+        """Free ``token``'s locks, or withdraw its acquire for good if it is still waiting or has not arrived."""
         if self._free(token):
             return
         if token in self._waiting:
             waiter = self._leave_queues(token)
             self._hand_off(waiter["names"])
             waiter["done"].set()  # its pending call finds no lease and returns None
-        else:
-            now = time.monotonic()
-            # One TTL for all, so insertion order is expiry order: expired tombstones lead.
-            while self._withdrawn:
-                oldest, until = next(iter(self._withdrawn.items()))
-                if until > now:
-                    break
-                del self._withdrawn[oldest]
-            self._withdrawn[token] = now + _WITHDRAWN_TTL_S
+        # Even a withdrawn waiter may have a call still on its way (Ray may run it after this
+        # release), which must not queue the token afresh.
+        now = time.monotonic()
+        # One TTL for all, so insertion order is expiry order: expired tombstones lead.
+        while self._withdrawn:
+            oldest, until = next(iter(self._withdrawn.items()))
+            if until > now:
+                break
+            del self._withdrawn[oldest]
+        self._withdrawn[token] = now + _WITHDRAWN_TTL_S
 
     def list_locks(self, partition_id: str | None = None) -> dict:
         """Return current holders and the number of waiters, optionally for one partition."""

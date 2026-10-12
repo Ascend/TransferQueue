@@ -16,6 +16,7 @@
 """kv_global_lock across Ray actors: exclusion, timeouts, queue order, leases, and close()."""
 
 import importlib
+import threading
 import time
 
 import pytest
@@ -60,6 +61,25 @@ class Worker:
 
     def release(self):
         self.held.__exit__(None, None, None)
+
+    def wait_in_thread(self, keys):
+        """Wait for ``keys`` on another thread, so ``close()`` can run meanwhile; ``outcome()`` reports the end."""
+
+        def wait():
+            try:
+                with tq.kv_global_lock(keys, P, timeout=TIMEOUT_S):
+                    self.ended = "entered"
+            except Exception as e:
+                self.ended = type(e).__name__
+
+        self.ended = None
+        threading.Thread(target=wait, daemon=True).start()
+
+    def outcome(self):
+        return self.ended
+
+    def close(self):
+        tq.close()
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -173,6 +193,9 @@ def test_waiters_are_granted_in_arrival_order(own_manager):
     # b is free, but granting it past the older [a, b] request would let single-key traffic starve it.
     assert ray.get(acquire(own_manager, ["b"], "newcomer", timeout=0), timeout=TIMEOUT_S) is None
     ray.get(own_manager.release.remote("newcomer"), timeout=TIMEOUT_S)  # as kv_global_lock does on timeout
+    # A call Ray runs after the withdrawal must not queue it again.
+    assert ray.get(acquire(own_manager, ["b"], "newcomer", timeout=0), timeout=TIMEOUT_S) is None
+    assert n_waiters(own_manager) == 1
     only_b = acquire(own_manager, ["b"], "only_b")
     wait_until(lambda: n_waiters(own_manager) == 2)
     ray.get(own_manager.release.remote("holder"), timeout=TIMEOUT_S)
@@ -258,6 +281,23 @@ def test_lease_renews_and_lost_lease_raises():
 
 def actors_named(prefix):
     return [a["name"] for a in ray.util.list_named_actors(all_namespaces=True) if a["name"].startswith(prefix)]
+
+
+def test_attached_close_gives_up_its_leases_and_leaves_tq_running():
+    early, late = keys_on_two_shards("ac")
+    holder, attached = Worker.remote(), Worker.remote()
+    ray.get(holder.hold.remote(late), timeout=TIMEOUT_S)
+    ray.get(attached.wait_in_thread.remote([early, late]), timeout=TIMEOUT_S)
+    wait_until(lambda: holders() == {early, late} and tq.kv_lock_list(P)["waiters"] == 1)
+
+    ray.get(attached.close.remote(), timeout=TIMEOUT_S)
+    # The waiter must stop, not queue its lost lease again behind the holder of `late`.
+    wait_until(lambda: ray.get(attached.outcome.remote(), timeout=TIMEOUT_S) == "LockLostError")
+    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0 and holders() == {late})
+    assert len(actors_named("TransferQueueLockManager_")) == kvl._shard_count()
+    assert actors_named("TransferQueueController") == ["TransferQueueController"]
+    ray.get(holder.release.remote(), timeout=TIMEOUT_S)
+    wait_until(lambda: tq.kv_lock_list(P) == {"holders": [], "waiters": 0})
 
 
 def test_owner_close_kills_the_managers_and_fails_waiters():
