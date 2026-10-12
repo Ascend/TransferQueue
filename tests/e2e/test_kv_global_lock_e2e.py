@@ -328,14 +328,14 @@ def actors_named(prefix):
 def test_attached_close_gives_up_its_leases_and_leaves_tq_running():
     early, late = keys_on_two_shards("ac")
     holder, attached = Worker.remote(), Worker.remote()
-    ray.get(holder.hold.remote(late), timeout=TIMEOUT_S)
+    ray.get(holder.hold.remote(early), timeout=TIMEOUT_S)
     ray.get(attached.wait_in_thread.remote([early, late]), timeout=TIMEOUT_S)
-    wait_until(lambda: holders() == {early, late} and tq.kv_lock_list(P)["waiters"] == 1)
+    wait_until(lambda: holders() == {early} and tq.kv_lock_list(P)["waiters"] == 1)
 
     ray.get(attached.close.remote(), timeout=TIMEOUT_S)
-    # The waiter must stop, not queue its lost lease again behind the holder of `late`.
+    # Still queued for its first shard, the waiter must stop rather than take the keys later.
     wait_until(lambda: ray.get(attached.outcome.remote(), timeout=TIMEOUT_S) == "LockLostError")
-    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0 and holders() == {late})
+    wait_until(lambda: tq.kv_lock_list(P)["waiters"] == 0 and holders() == {early})
     assert len(actors_named("TransferQueueLockManager_")) == kvl._shard_count()
     assert actors_named("TransferQueueController") == ["TransferQueueController"]
     ray.get(holder.release.remote(), timeout=TIMEOUT_S)

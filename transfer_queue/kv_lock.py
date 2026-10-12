@@ -215,6 +215,7 @@ _renewer_running = False
 _num_shards: int | None = None  # the lock actor count, asked of shard 0 on first use
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
+_closes = 0  # this process's tq.close() calls: a lease created before the latest one is given up
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
 # the queue position. The bound is long because every waiter spends one call per window, and
 # those calls share the actor's limited throughput with everyone else's, renewals included.
@@ -246,6 +247,7 @@ class GlobalLease:
         self._token = f"{os.getpid()}:{uuid.uuid4().hex}"
         self._deadline = float("inf")  # local monotonic time the lease is known to last until, once granted
         self._lost = False
+        self._closes = _closes
         # shard -> the actor handle each acquire went to: those may hold or await this token, so
         # exit must release it there, even after close() dropped this process's handles.
         self._pending: dict = {}
@@ -258,7 +260,7 @@ class GlobalLease:
 
     def check(self) -> None:
         """Raise ``LockLostError`` if the lease was lost; call it right before writes in long sections."""
-        if self._lost or time.monotonic() >= self._deadline:
+        if self._lost or self._closes != _closes or time.monotonic() >= self._deadline:
             raise LockLostError(f"kv_global_lock lease on {self._names} was lost")
 
 
@@ -462,8 +464,8 @@ def kv_global_lock(keys: str | list[str], partition_id: str, timeout: float | No
                     raise RuntimeError(_MANAGER_GONE) from e
                 granted = _take_grant(lease, shard, remaining, sent, deadline)
                 if not granted:
-                    # Stop once an earlier shard's lease ran out, or close() gave the lease up and
-                    # withdrew this wait. Otherwise a reply before the window ends means a full actor.
+                    # Stop once an earlier shard's lease ran out, or this process's tq.close() gave
+                    # the lease up. Otherwise a reply before the window ends means a full actor.
                     lease.check()
                     time.sleep(max(0.0, sent + window - time.monotonic()))
         lease.check()
@@ -564,13 +566,13 @@ def _start_lock_managers(settings: tuple[int, int] | None) -> None:
 
 def _close_lock_managers() -> None:
     """Called by ``tq.close()``: give up this process's leases, then kill the actors it created."""
-    global _num_shards, _managers, _owned
+    global _num_shards, _managers, _owned, _closes
     with _registry:  # emptied so the renewer stops now, not when the blocks holding them exit
         leases = list(_leases.values())
         _leases.clear()
         _registry.notify()
+        _closes += 1
     for lease in leases:
-        lease._lost = True
         if not _owned:  # the owner kills the actors, so releasing would only hand keys to doomed waiters
             _release_lease(lease)
     for actor in _owned:
