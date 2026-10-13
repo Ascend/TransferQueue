@@ -1244,25 +1244,58 @@ class TestKVUpdateE2E:
         assert "score" not in partition.field_metadata
         assert set(tq_api.kv_list(partition_id=partition_id)[partition_id]) == set(keys)
 
-    def test_rejects_missing_key_unproduced_field_and_incompatible_result(self, tq_api, backend_name):
+    def test_unfinalized_updates_stay_hidden_until_finalize(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":
             pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
 
-        with pytest.raises(ValueError, match="not found"):
-            tq_api.kv_update(
-                key="no_such",
-                partition_id="test_partition",
-                fields={"tokens": torch.tensor([1])},
-                merge_fn=lambda _old, new: new,
-            )
+        partition_id = "test_partition"
+        key = "streamed"
+
+        def concat(old, new):
+            return torch.cat([old, new])
+
+        def tokens_ready():
+            partition = get_controller_partition(controller, partition_id)
+            row, col = partition.keys_mapping[key], partition.field_name_mapping["tokens"]
+            return bool(partition.production_status[row, col])
+
+        tq_api.kv_put(key=key, partition_id=partition_id, fields={"prompt": torch.tensor([7])})
+        for chunk in ([1], [2]):
+            fields = {"tokens": torch.tensor(chunk)}
+            tq_api.kv_update(key=key, partition_id=partition_id, fields=fields, merge_fn=concat, finalize=False)
+            assert not tokens_ready()
+        assert set(tq_api.kv_batch_get(keys=key, partition_id=partition_id).keys()) == {"prompt"}
+
+        tq_api.kv_update(key=key, partition_id=partition_id, fields={"tokens": torch.tensor([3])}, merge_fn=concat)
+        assert tokens_ready()
+        data = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
+        assert_tensor_equal(data["tokens"][0], torch.tensor([1, 2, 3]))
+
+        # A non-final update hides a field that was already ready.
+        tq_api.kv_update(
+            key=key, partition_id=partition_id, fields={"tokens": torch.tensor([4])}, merge_fn=concat, finalize=False
+        )
+        assert not tokens_ready()
+
+    def test_creates_missing_key_and_field_and_rejects_incompatible_result(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
+
+        def fail(_old, _new):
+            raise AssertionError("merge_fn must not run for a missing value")
+
+        meta = tq_api.kv_update(
+            key="new_key", partition_id="test_partition", fields={"tokens": torch.tensor([1, 2])}, merge_fn=fail
+        )
+        assert meta.fields == ["tokens"]
+        tq_api.kv_update(
+            key="new_key", partition_id="test_partition", fields={"fresh": torch.tensor([9])}, merge_fn=fail
+        )
+        created = tq_api.kv_batch_get(keys="new_key", partition_id="test_partition")
+        assert_tensor_equal(created["tokens"][0], torch.tensor([1, 2]))
+        assert_tensor_equal(created["fresh"][0], torch.tensor([9]))
+
         tq_api.kv_put(key="sample", partition_id="test_partition", fields={"tokens": torch.tensor([1, 2])})
-        with pytest.raises(ValueError, match="not produced"):
-            tq_api.kv_update(
-                key="sample",
-                partition_id="test_partition",
-                fields={"fresh": torch.tensor([1])},
-                merge_fn=lambda _old, new: new,
-            )
         with pytest.raises(RuntimeError, match="keep dtype"):
             tq_api.kv_update(
                 key="sample",

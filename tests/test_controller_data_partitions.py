@@ -1350,6 +1350,18 @@ class TestFieldMetaIntegration:
         assert "pv" not in partition.field_metadata
         assert partition.global_indexes == {0, 1}
 
+    def test_unfinalized_write_records_metadata_but_stays_hidden(self):
+        partition = self._make_partition()
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        partition.update_production_status([0, 1], ["pv"], {"pv": t4})
+
+        assert partition.update_production_status([1], ["pv"], {"pv": t4}, ready=False)
+        assert partition.field_metadata["pv"].global_indexes == {0, 1}
+        assert partition.scan_data_status(["pv"], task_name="trainer") == [0]
+
+        partition.update_production_status([1], ["pv"], {"pv": t4})
+        assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
+
     def test_update_production_status_updates_field_metadata(self):
         """Test that update_production_status correctly updates field_metadata via _update_field_metadata."""
         partition = self._make_partition()

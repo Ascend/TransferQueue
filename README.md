@@ -116,15 +116,21 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
 - **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
-- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into already-produced fields with `merge_fn(old, new)`. SimpleStorage only.
+- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into fields with `merge_fn(old, new)`; a superset of put that adds missing keys and fields. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
 
-`kv_update` preserves each field's tensor/non-tensor type and tensor dtype. A
-timeout has an unknown outcome because a storage unit may commit after the
-caller stops waiting, so non-idempotent merge operations must not be retried
-blindly. Updates are atomic within one storage-unit request; a batch spanning
-multiple units is not a distributed transaction.
+`kv_update` stores a field the key does not hold yet as given, without calling
+`merge_fn`; a merge must preserve the stored value's tensor/non-tensor type and
+tensor dtype. A timeout has an unknown outcome because a storage unit may commit
+after the caller stops waiting, so non-idempotent merge operations must not be
+retried blindly. Updates are atomic within one storage-unit request; a batch
+spanning multiple units is not a distributed transaction.
+
+To build a field over several updates without exposing intermediate values, pass
+`finalize=False` to every `kv_update` except the last one, which uses the default
+`finalize=True`. Until then the field is stored but not ready, so samplers, the
+dataloader and `kv_batch_get` do not see it.
 
 **Key Features**
 

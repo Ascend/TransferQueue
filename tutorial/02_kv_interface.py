@@ -215,7 +215,7 @@ def main():
         Key Methods:
         1. (async_)kv_put          - Insert/Update a multi-column sample by key, with optional metadata tag
         2. (async_)kv_batch_put    - Put multiple key-value pairs efficiently in batch
-        3. (async_)kv_update       - Merge new values into produced fields with merge_fn(old, new)
+        3. (async_)kv_update       - Merge into fields with merge_fn(old, new), adding missing keys/fields
         4. (async_)kv_batch_get    - Retrieve samples (by keys), supporting column selection (by fields)
         5. (async_)kv_list         - List keys and tags (metadata) in a partition
         6. (async_)kv_clear        - Remove key-value pairs, or only selected fields, from storage

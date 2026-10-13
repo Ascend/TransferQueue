@@ -497,13 +497,15 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
+        finalize: bool = True,
     ) -> BatchMeta:
-        """Merge new values into produced fields on SimpleStorage units.
+        """Merge new values into fields on SimpleStorage units, storing them where absent.
 
         Args:
-            metadata: Samples to update. The key must already exist.
+            metadata: Samples to update, already registered with the controller.
             values: New values aligned with ``metadata``.
-            merge_fn: Called per sample per field as ``merge_fn(old, new)``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)`` when a value exists.
+            finalize: If False, keep the updated fields hidden from consumers.
 
         Returns:
             The same metadata with field_schema and production status updated.
@@ -519,8 +521,10 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
-        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn)
-        return metadata.apply_field_schema(field_schema)
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, finalize=finalize)
+        if not finalize:
+            metadata.production_status[:] = 0
+        return metadata.apply_field_schema(field_schema, set_all_ready=finalize)
 
     async def async_get_data(self, metadata: BatchMeta) -> TensorDict:
         """Asynchronously fetch data from storage units and organize into TensorDict.
@@ -1638,12 +1642,13 @@ class TransferQueueClient(AsyncTransferQueueClient):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
+        finalize: bool = True,
     ) -> BatchMeta:
-        """Synchronously merge new values into produced fields on SimpleStorage units.
+        """Synchronously merge or add values on SimpleStorage units.
 
         See ``async_update``.
         """
-        return self._update(metadata, values, merge_fn)
+        return self._update(metadata, values, merge_fn, finalize=finalize)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.

@@ -149,7 +149,14 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
     for source, target in [(1, 101), (6, 106)]:
         offset, length = reply.body["row_offsets"][source]
         records.append(
-            {"source_index": source, "target_index": target, "fields": ["x"], "offset": offset, "length": length}
+            {
+                "source_index": source,
+                "target_index": target,
+                "fields": ["x"],
+                "unfinalized": [],
+                "offset": offset,
+                "length": length,
+            }
         )
     loaded = unit._handle_load_rows(
         ZMQMessage.create(
@@ -182,7 +189,14 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
 def test_unit_rejects_invalid_records(unit, tmp_path, problem):
     path = tmp_path / "row.pkl"
     path.write_bytes(pickle.dumps({"global_index": 1, "fields": {"x": "value"}}))
-    record = {"source_index": 1, "target_index": 2, "offset": 0, "length": path.stat().st_size, "fields": ["x"]}
+    record = {
+        "source_index": 1,
+        "target_index": 2,
+        "offset": 0,
+        "length": path.stat().st_size,
+        "fields": ["x"],
+        "unfinalized": [],
+    }
     if problem == "wrong_index":
         record["source_index"] = 3
     elif problem == "truncated":

@@ -500,6 +500,7 @@ class DataPartitionStatus:
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        ready: bool = True,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -515,6 +516,8 @@ class DataPartitionStatus:
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional per-sample per-field
                 custom metadata provided by storage backend
+            ready: Whether consumers may see these cells. False records the stored
+                value (field metadata) but hides it until a finalizing kv_update.
 
         Returns:
             True if update was successful, False on error
@@ -543,7 +546,7 @@ class DataPartitionStatus:
             # Update production status
             if self.production_status is not None and global_indices and field_names:
                 field_indices = [self.field_name_mapping.get(f) for f in field_names]
-                self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
+                self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = int(ready)
 
             # Update field metadata
             self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
@@ -1130,6 +1133,7 @@ class TransferQueueController:
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        ready: bool = True,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -1140,6 +1144,7 @@ class TransferQueueController:
             global_indexes: List of sample indices to update
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}
             custom_backend_meta: Optional custom backend metadata
+            ready: False keeps the written cells hidden from consumers (unfinalized kv_update)
 
         Returns:
             True if update was successful, False otherwise
@@ -1150,11 +1155,13 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        success = partition.update_production_status(global_indexes, field_names, field_schema, custom_backend_meta)
+        success = partition.update_production_status(
+            global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
+        )
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
-                f"samples={global_indexes}, fields={field_names}"
+                f"samples={global_indexes}, fields={field_names}, ready={ready}"
             )
         return success
 
@@ -1783,9 +1790,10 @@ class TransferQueueController:
             partition_id: Partition that owns ``keys``.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
-            {"is_nested", "is_non_tensor"}}}``. ``fields`` is empty for a row with no
-            produced field yet; ``field_schema`` covers the fields of the described rows.
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "tag"}}, "field_schema":
+            {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` is empty for a row with no
+            produced field yet; ``unfinalized`` lists the stored fields not yet ready (written
+            by ``kv_update(finalize=False)``); ``field_schema`` covers the described rows' fields.
 
         Raises:
             KeyError: The partition or any key does not exist.
@@ -1799,18 +1807,23 @@ class TransferQueueController:
         if missing_keys:
             raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
 
-        rows: dict[str, dict[str, Any]] = {
-            key: {
+        rows: dict[str, dict[str, Any]] = {}
+        for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True):
+            fields = sorted(
+                field_name
+                for field_name, field_meta in partition.field_metadata.items()
+                if global_index in field_meta.global_indexes
+            )
+            rows[key] = {
                 "global_index": global_index,
-                "fields": sorted(
-                    field_name
-                    for field_name, field_meta in partition.field_metadata.items()
-                    if global_index in field_meta.global_indexes
-                ),
+                "fields": fields,
+                "unfinalized": [
+                    name
+                    for name in fields
+                    if not partition.production_status[global_index, partition.field_name_mapping[name]]
+                ],
                 "tag": partition.custom_meta.get(global_index, {}),
             }
-            for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True)
-        }
         # Only the declared types: row dtypes and shapes live with the storage units.
         field_schema = {
             name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
@@ -2097,6 +2110,7 @@ class TransferQueueController:
             global_indexes=global_indexes,
             field_schema=params.get("field_schema", {}),
             custom_backend_meta=params.get("custom_backend_meta", {}),
+            ready=params.get("ready", True),
         )
         if success:
             if self._metrics is not None:

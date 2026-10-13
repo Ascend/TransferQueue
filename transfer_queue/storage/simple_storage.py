@@ -235,11 +235,12 @@ class StorageUnitData:
         global_indexes: list[int],
         new_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
-        field_schema: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        """Merge produced values, validate their types, then write once.
+        """Merge into stored values, store new ones as is, validate, then write once.
 
-        All merge calls and type checks finish before one ``put_data`` call, so
+        A row that has no value for a field takes ``new`` without calling ``merge_fn``,
+        as a put would. A merge result must keep the old value's tensor/non-tensor kind
+        and tensor dtype. All merges and checks finish before one ``put_data`` call, so
         a merge error or incompatible result leaves storage unchanged.
 
         Returns:
@@ -248,23 +249,21 @@ class StorageUnitData:
         computed: dict[str, list] = {}
         for field, new_values in new_data.items():
             stored = self.field_data.get(field, {})
-            missing = [idx for idx in global_indexes if idx not in stored]
-            if missing:
-                raise ValueError(f"Cannot update unproduced field {field!r} for indexes {missing[:20]}")
-            old_values = self.get_data([field], global_indexes)[field]
-            computed[field] = [merge_fn(old, new_values[i]) for i, old in enumerate(old_values)]
-
-            expected = field_schema[field]
-            if expected.get("is_non_tensor"):
-                if any(isinstance(value, torch.Tensor) for value in computed[field]):
-                    raise TypeError(f"Merge result for non-tensor field {field!r} must remain non-tensor")
-            else:
-                for value in computed[field]:
-                    if not isinstance(value, torch.Tensor) or value.dtype != expected["dtype"]:
-                        actual = value.dtype if isinstance(value, torch.Tensor) else type(value).__name__
+            present = [i for i, idx in enumerate(global_indexes) if idx in stored]
+            old_values = self.get_data([field], [global_indexes[i] for i in present])[field] if present else []
+            values = list(new_values)
+            for i, old in zip(present, old_values, strict=True):
+                merged = merge_fn(old, new_values[i])
+                if isinstance(old, torch.Tensor):
+                    if not isinstance(merged, torch.Tensor) or merged.dtype != old.dtype:
+                        actual = merged.dtype if isinstance(merged, torch.Tensor) else type(merged).__name__
                         raise TypeError(
-                            f"Merge result for tensor field {field!r} must keep dtype {expected['dtype']}, got {actual}"
+                            f"Merge result for tensor field {field!r} must keep dtype {old.dtype}, got {actual}"
                         )
+                elif isinstance(merged, torch.Tensor):
+                    raise TypeError(f"Merge result for non-tensor field {field!r} must remain non-tensor")
+                values[i] = merged
+            computed[field] = values
         self.put_data(computed, global_indexes)
         return {field: _describe_stored_values(values) for field, values in computed.items()}
 
@@ -1243,12 +1242,11 @@ class SimpleStorageUnit:
             )
 
     def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """Merge existing fields, write once, and describe what was stored."""
+        """Merge or add fields, write once, and describe what was stored."""
         try:
             global_indexes = data_parts.body["global_indexes"]
             merge_fn = data_parts.body.get("merge_fn")
             new_data = data_parts.body.get("data")
-            field_schema = data_parts.body.get("field_schema")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
@@ -1257,9 +1255,7 @@ class SimpleStorageUnit:
                     raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
                 if not isinstance(new_data, dict) or not new_data:
                     raise TypeError("update data must be a non-empty dict")
-                if not isinstance(field_schema, dict) or set(field_schema) != set(new_data):
-                    raise ValueError("field_schema must describe every update field")
-                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, field_schema)
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -1511,19 +1507,23 @@ class SimpleStorageUnit:
                                     f, row["offset"], row["length"], row["source_index"], row["fields"]
                                 )
                                 validate_dump_values(fields, shard["field_schema"], row["source_index"])
-                                groups[tuple(row["fields"])].append((row, fields))
+                                groups[(tuple(row["fields"]), tuple(row["unfinalized"]))].append((row, fields))
                                 bytes_read += row["length"]
-                            for signature, rows in groups.items():
+                            for (signature, unfinalized), rows in groups.items():
                                 indexes = [row["target_index"] for row, _ in rows]
                                 values = {name: [fields[name] for _, fields in rows] for name in signature}
-                                schema = select_dump_schema(
-                                    shard["field_schema"],
-                                    [row["source_index"] for row, _ in rows],
-                                    indexes,
-                                    signature,
-                                )
                                 self.storage_data.put_data(values, indexes)
-                                updates.append({"global_indexes": indexes, "field_schema": schema})
+                                source_indexes = [row["source_index"] for row, _ in rows]
+                                finalized = tuple(name for name in signature if name not in unfinalized)
+                                # Publish each field with the readiness it had when dumped.
+                                for names, ready in ((finalized, True), (unfinalized, False)):
+                                    if names:
+                                        schema = select_dump_schema(
+                                            shard["field_schema"], source_indexes, indexes, names
+                                        )
+                                        updates.append(
+                                            {"global_indexes": indexes, "field_schema": schema, "ready": ready}
+                                        )
             logger.info(
                 "[%s]: loaded %s rows (%s bytes)",
                 self.storage_unit_id,

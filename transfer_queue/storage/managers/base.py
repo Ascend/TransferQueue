@@ -226,15 +226,17 @@ class StorageManager(ABC):
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
         custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        ready: bool = True,
     ) -> bool:
         """
-        Notify controller that new data is ready.
+        Notify controller that new data is stored.
 
         Args:
             partition_id: Current data partition id.
             global_indexes: Data update related global_indexes.
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}.
             custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
+            ready: Whether consumers may see the data now; False for a kv_update with finalize=False.
         """
 
         if not self.controller_info:
@@ -264,6 +266,7 @@ class StorageManager(ABC):
                 "global_indexes": global_indexes,
                 "field_schema": normalized_field_schema,
                 "custom_backend_meta": custom_backend_meta,
+                "ready": ready,
             },
         ).serialize()
 
@@ -362,13 +365,15 @@ class StorageManager(ABC):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
+        finalize: bool = True,
     ) -> dict[str, dict[str, Any]]:
-        """Merge new values on the unit that holds each sample.
+        """Merge new values on the unit that holds each sample, or store them if absent.
 
         Args:
             metadata: Samples to update.
             values: New values as a TensorDict aligned with ``metadata``.
-            merge_fn: Called per sample per field as ``merge_fn(old, new)``.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)`` when a value exists.
+            finalize: If False, keep the updated fields hidden from consumers.
 
         Returns:
             field_schema of the stored values, keyed by field name.
