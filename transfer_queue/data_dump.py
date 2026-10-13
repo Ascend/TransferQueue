@@ -42,7 +42,10 @@ from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-DUMP_FORMAT_VERSION = 3
+DUMP_FORMAT_VERSION = 4
+# Version 3 predates ``unfinalized``; every field it holds was ready. A version-3 reader
+# rejects version 4 instead of restoring hidden fields as ready.
+_READABLE_FORMAT_VERSIONS = (3, DUMP_FORMAT_VERSION)
 SHARD_SUBDIR = "shards"
 
 _DUMP_INFO_FILE = "dump_info.json"
@@ -171,10 +174,10 @@ def read_dump(dump_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         raise FileNotFoundError(f"{_DUMP_INFO_FILE} not found in {dump_dir}")
     with open(info_path, encoding="utf-8") as f:
         dump_info = json.load(f)
-    if dump_info["format_version"] != DUMP_FORMAT_VERSION:
+    if dump_info["format_version"] not in _READABLE_FORMAT_VERSIONS:
         raise ValueError(
             f"Unsupported dump format version {dump_info['format_version']} in {dump_dir}; "
-            f"this build reads version {DUMP_FORMAT_VERSION}"
+            f"this build reads versions {list(_READABLE_FORMAT_VERSIONS)}"
         )
 
     row_index = _read_row_index(dump_dir)
@@ -215,7 +218,6 @@ def read_dump(dump_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
                     "key": key,
                     "source_index": source_index,
                     "fields": rows[key]["fields"],
-                    # Older dumps lack this key; every field they hold was ready.
                     "unfinalized": rows[key].get("unfinalized", []),
                     "offset": offset,
                     "length": length,

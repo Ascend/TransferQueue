@@ -560,6 +560,12 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Batch size of values ({values.batch_size[0]}) does not match metadata size ({metadata.size})"
             )
         field_names = list(values.keys())
+        # Fields new to the partition have no column type yet; the rest must keep theirs.
+        column_types = {
+            name: {key: metadata.field_schema[name][key] for key in ("dtype", "is_non_tensor")}
+            for name in field_names
+            if name in metadata.field_schema
+        }
 
         routing = self._group_by_hash(metadata.global_indexes)
         tasks = []
@@ -575,6 +581,7 @@ class AsyncSimpleStorageManager(StorageManager):
                         group.global_indexes,
                         storage_data,
                         merge_fn,
+                        column_types,
                         target_storage_unit=su_id,
                     ),
                     # A merge reads stored state, so a replay after a lost answer
@@ -675,6 +682,7 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         storage_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
+        column_types: dict[str, dict[str, Any]],
         target_storage_unit: str,
         socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
@@ -683,6 +691,7 @@ class AsyncSimpleStorageManager(StorageManager):
             "global_indexes": global_indexes,
             "data": storage_data,
             "merge_fn": merge_fn,
+            "column_types": column_types,
         }
 
         request_msg = ZMQMessage.create(

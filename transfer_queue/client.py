@@ -972,6 +972,7 @@ class AsyncTransferQueueClient:
         keys: list[str] | str,
         partition_id: str,
         create: bool = False,
+        include_fields: list[str] | None = None,
         socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta by user-defined keys.
@@ -983,6 +984,7 @@ class AsyncTransferQueueClient:
             keys: List of keys to retrieve.
             partition_id: The ID of the logical partition to search for keys.
             create:  If True, automatically create entries for missing keys.
+            include_fields: Known fields to include even if not every key holds them ready.
             socket: ZMQ socket injected by @with_controller_socket.
 
         Returns:
@@ -1008,6 +1010,7 @@ class AsyncTransferQueueClient:
                     "keys": keys,
                     "partition_id": partition_id,
                     "create": create,
+                    "include_fields": include_fields,
                 },
             )
             return response_msg.body.get("metadata", BatchMeta.empty())
@@ -1137,8 +1140,8 @@ class AsyncTransferQueueClient:
         key raises instead of being dropped.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "tag"}}, "field_schema": {field:
-            {"is_nested", "is_non_tensor"}}}``.
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "tag"}}, "field_schema":
+            {field: {"is_nested", "is_non_tensor"}}}``.
         """
         response = await self._request_controller(
             socket=socket,

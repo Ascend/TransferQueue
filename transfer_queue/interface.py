@@ -539,6 +539,7 @@ def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[s
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a field in ``select_fields`` is not ready in every found key
 
     Example:
         >>> import transfer_queue as tq
@@ -594,6 +595,21 @@ def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     """
     tq_client = _maybe_create_tq_client()
     return tq_client._run_coroutine(async_kv_list(partition_id=partition_id))
+
+
+def kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str, Any]]:
+    """Describe which fields each key holds, including unfinalized ones.
+
+    See ``async_kv_describe``.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> rows = tq.kv_describe(keys=["sample_1", "sample_2"], partition_id="train")
+        >>> hidden = {key: row["unfinalized"] for key, row in rows.items() if row["unfinalized"]}
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_describe(keys=keys, partition_id=partition_id))
 
 
 def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
@@ -964,6 +980,7 @@ async def async_kv_batch_get(
     Raises:
         ValueError: If keys or partition are not found
         ValueError: If empty fields exist in any key (sample)
+        ValueError: If a field in ``select_fields`` is not ready in every found key
 
     Example:
         >>> import transfer_queue as tq
@@ -989,6 +1006,13 @@ async def async_kv_batch_get(
             fields_to_fetch = [select_fields]
         else:
             fields_to_fetch = select_fields
+        # The meta keeps only fields ready in every key; select_fields would drop the rest silently.
+        not_ready = [f for f in fields_to_fetch if f not in batch_meta.field_names]
+        if not_ready:
+            raise ValueError(
+                f"Fields {not_ready} are not ready in all the requested keys: missing, or written by "
+                "kv_update(finalize=False) and not finalized yet"
+            )
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
@@ -1038,6 +1062,35 @@ async def async_kv_list(partition_id: str | None = None) -> dict[str, dict[str, 
     partition_info = await tq_client.async_kv_list(partition_id)
 
     return partition_info
+
+
+async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str, Any]]:
+    """Asynchronously describe which fields each key holds, including unfinalized ones.
+
+    ``kv_batch_get`` returns only fields that are ready in every key, so this is the way
+    to find fields written by ``kv_update(finalize=False)`` and not yet finalized.
+
+    Args:
+        keys: Single key or list of keys to describe.
+        partition_id: Partition containing the keys.
+
+    Returns:
+        ``{key: {"global_index", "fields", "unfinalized", "tag"}}``. ``fields`` lists every
+        stored field of the key and ``unfinalized`` the subset still hidden from consumers.
+
+    Raises:
+        RuntimeError: If the partition or any key does not exist.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> rows = await tq.async_kv_describe(keys="sample_1", partition_id="train")
+        >>> print(rows["sample_1"]["unfinalized"])
+    """
+    keys = [keys] if isinstance(keys, str) else keys
+    tq_client = _maybe_create_tq_client()
+    description = await tq_client.async_kv_describe(list(dict.fromkeys(keys)), partition_id)
+    return description["rows"]
 
 
 async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
@@ -1135,7 +1188,9 @@ async def async_kv_batch_update(
             f"kv_update is not supported by {type(tq_client.storage_manager).__name__}; "
             "it requires the SimpleStorage backend"
         )
-    batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
+    batch_meta = await tq_client.async_kv_retrieve_meta(
+        keys=keys, partition_id=partition_id, create=True, include_fields=list(fields.keys())
+    )
 
     if batch_meta.size != len(keys):
         raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match {len(keys)} keys")

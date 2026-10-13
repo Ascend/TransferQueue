@@ -55,7 +55,10 @@ These count application reads, not filesystem read-ahead or physical disk traffi
 
 ## Format and compatibility
 
-Dumps use `format_version: 3`, the only version this build reads:
+Dumps use `format_version: 4`. Version 4 adds each row's `unfinalized` fields, which
+restore keeps hidden. This build also reads version 3 dumps, whose fields restore as
+ready. Builds that only read version 3 reject version 4 dumps instead of exposing
+hidden fields. The layout:
 
 ```text
 dump_info.json

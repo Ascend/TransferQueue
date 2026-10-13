@@ -1652,6 +1652,7 @@ class TransferQueueController:
         keys: list[str],
         partition_id: str,
         create: bool = False,
+        include_fields: list[str] | None = None,
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
@@ -1661,6 +1662,8 @@ class TransferQueueController:
             keys: List of keys to retrieve from the controller
             partition_id: Partition id to retrieve from the controller
             create: Whether to register new keys if not found.
+            include_fields: Fields whose column schema to include even if not every key holds
+                them ready, so kv_update can type-check the values it adds to them.
 
         Returns:
             metadata: BatchMeta of the requested keys
@@ -1720,6 +1723,9 @@ class TransferQueueController:
         data_fields = []
         for field_name, col_idx in partition.field_name_mapping.items():
             if col_idx < len(col_mask) and col_mask[col_idx]:
+                data_fields.append(field_name)
+        for field_name in include_fields or []:
+            if field_name in partition.field_metadata and field_name not in data_fields:
                 data_fields.append(field_name)
 
         return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
@@ -2241,6 +2247,7 @@ class TransferQueueController:
             keys=params["keys"],
             partition_id=params["partition_id"],
             create=params["create"],
+            include_fields=params.get("include_fields"),
         )
         return self._make_response(
             request_msg,

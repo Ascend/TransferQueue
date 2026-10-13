@@ -112,6 +112,16 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
 
 
+def _check_value_type(field: str, value: Any, is_tensor: bool, dtype: Any) -> None:
+    """Reject a value that would change its field's tensor/non-tensor kind or tensor dtype."""
+    if not is_tensor:
+        if isinstance(value, torch.Tensor):
+            raise TypeError(f"Value for non-tensor field {field!r} must remain non-tensor")
+    elif not isinstance(value, torch.Tensor) or (dtype is not None and value.dtype != dtype):
+        actual = value.dtype if isinstance(value, torch.Tensor) else type(value).__name__
+        raise TypeError(f"Value for tensor field {field!r} must keep dtype {dtype}, got {actual}")
+
+
 def _describe_stored_values(values: list) -> dict[str, Any]:
     """Describe per-sample stored values for the manager.
 
@@ -235,13 +245,15 @@ class StorageUnitData:
         global_indexes: list[int],
         new_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
+        column_types: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
         """Merge into stored values, store new ones as is, validate, then write once.
 
         A row that has no value for a field takes ``new`` without calling ``merge_fn``,
         as a put would. A merge result must keep the old value's tensor/non-tensor kind
-        and tensor dtype. All merges and checks finish before one ``put_data`` call, so
-        a merge error or incompatible result leaves storage unchanged.
+        and tensor dtype; a new row must match ``column_types``, the controller's column
+        type for fields it already knows. All merges and checks finish before one
+        ``put_data`` call, so a merge error or incompatible value leaves storage unchanged.
 
         Returns:
             Per-sample description of the stored values, keyed by field name.
@@ -253,16 +265,14 @@ class StorageUnitData:
             old_values = self.get_data([field], [global_indexes[i] for i in present])[field] if present else []
             values = list(new_values)
             for i, old in zip(present, old_values, strict=True):
-                merged = merge_fn(old, new_values[i])
-                if isinstance(old, torch.Tensor):
-                    if not isinstance(merged, torch.Tensor) or merged.dtype != old.dtype:
-                        actual = merged.dtype if isinstance(merged, torch.Tensor) else type(merged).__name__
-                        raise TypeError(
-                            f"Merge result for tensor field {field!r} must keep dtype {old.dtype}, got {actual}"
-                        )
-                elif isinstance(merged, torch.Tensor):
-                    raise TypeError(f"Merge result for non-tensor field {field!r} must remain non-tensor")
-                values[i] = merged
+                values[i] = merge_fn(old, new_values[i])
+                _check_value_type(field, values[i], isinstance(old, torch.Tensor), getattr(old, "dtype", None))
+            column = column_types.get(field)
+            if column is not None:
+                merged = set(present)
+                for i, value in enumerate(values):
+                    if i not in merged:
+                        _check_value_type(field, value, not column["is_non_tensor"], column["dtype"])
             computed[field] = values
         self.put_data(computed, global_indexes)
         return {field: _describe_stored_values(values) for field, values in computed.items()}
@@ -1247,6 +1257,7 @@ class SimpleStorageUnit:
             global_indexes = data_parts.body["global_indexes"]
             merge_fn = data_parts.body.get("merge_fn")
             new_data = data_parts.body.get("data")
+            column_types = data_parts.body.get("column_types")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
@@ -1255,7 +1266,9 @@ class SimpleStorageUnit:
                     raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
                 if not isinstance(new_data, dict) or not new_data:
                     raise TypeError("update data must be a non-empty dict")
-                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn)
+                if not isinstance(column_types, dict):
+                    raise TypeError("update request must carry column_types")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, column_types)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]

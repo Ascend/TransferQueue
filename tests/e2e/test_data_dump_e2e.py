@@ -272,6 +272,25 @@ class TestDumpLoadRoundtrip:
         retrieved = tq.kv_batch_get(keys="u1", partition_id=partition_id, select_fields="response")
         _assert_rows_equal(retrieved["response"], [torch.tensor([1, 2, 3])])
 
+    def test_restores_a_version_3_dump_as_ready(self, tq_system, dump_dir, controller):
+        partition_id = "d_version3"
+        _put_rows(partition_id, ["w0"])
+        tq.dump_data_by_key(dump_dir, ["w0"], partition_id)
+
+        # Rewrite it as version 3 wrote it: no ``unfinalized`` in the row index.
+        row_index = _read_row_index(dump_dir)
+        del row_index["rows"]["w0"]["unfinalized"]
+        torch.save(row_index, dump_dir / "row_index.pt")
+        info_path = dump_dir / "dump_info.json"
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["format_version"] = 3
+        info_path.write_text(json.dumps(info), encoding="utf-8")
+
+        ray.get(controller.clear_partition.remote(partition_id))
+        tq.load_data_by_key(dump_dir)
+        retrieved = tq.kv_batch_get(keys="w0", partition_id=partition_id, select_fields="input_ids")
+        _assert_rows_equal(retrieved["input_ids"], [_row_input_ids(0)])
+
     def test_other_partitions_are_untouched(self, tq_system, dump_dir, controller):
         """Restoring merges by key, unlike a checkpoint load which replaces everything."""
         # Define test data

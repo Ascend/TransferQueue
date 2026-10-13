@@ -53,7 +53,7 @@ def test_apply_update_concatenates_and_keeps_field_name():
     data = StorageUnitData()
     data.put_data({"sequence_ids": [torch.tensor([10, 11, 12])]}, [0])
 
-    described = data.apply_update([0], {"sequence_ids": [torch.tensor([20, 21])]}, _concat)
+    described = data.apply_update([0], {"sequence_ids": [torch.tensor([20, 21])]}, _concat, {})
 
     assert described["sequence_ids"] == {"dtype": torch.int64, "shapes": [(5,)]}
     assert torch.equal(data.field_data["sequence_ids"][0], torch.tensor([10, 11, 12, 20, 21]))
@@ -69,7 +69,7 @@ def test_apply_update_is_atomic_on_merge_error():
         raise RuntimeError("merge failed")
 
     with pytest.raises(RuntimeError, match="merge failed"):
-        data.apply_update([7], {"tokens": [torch.tensor([9])]}, fail)
+        data.apply_update([7], {"tokens": [torch.tensor([9])]}, fail, {})
     assert torch.equal(data.field_data["tokens"][7], original)
 
 
@@ -83,7 +83,7 @@ def test_apply_update_stores_missing_values_without_merging():
         return torch.cat([old, new])
 
     described = data.apply_update(
-        [3, 4], {"tokens": [torch.tensor([2]), torch.tensor([5])], "fresh": [{"a": 1}, {"a": 2}]}, concat
+        [3, 4], {"tokens": [torch.tensor([2]), torch.tensor([5])], "fresh": [{"a": 1}, {"a": 2}]}, concat, {}
     )
 
     assert len(merged) == 1
@@ -106,7 +106,7 @@ def test_apply_update_rejects_incompatible_tensor_results_before_writing(merge_f
     data.put_data({"tokens": [original.clone()]}, [0])
 
     with pytest.raises(TypeError, match=error):
-        data.apply_update([0], {"tokens": [torch.tensor([3])]}, merge_fn)
+        data.apply_update([0], {"tokens": [torch.tensor([3])]}, merge_fn, {})
     assert torch.equal(data.field_data["tokens"][0], original)
 
 
@@ -115,8 +115,26 @@ def test_apply_update_rejects_tensor_result_for_non_tensor_field():
     data.put_data({"meta": [{"step": 1}]}, [0])
 
     with pytest.raises(TypeError, match="must remain non-tensor"):
-        data.apply_update([0], {"meta": [{"step": 2}]}, lambda _old, _new: torch.tensor([2]))
+        data.apply_update([0], {"meta": [{"step": 2}]}, lambda _old, _new: torch.tensor([2]), {})
     assert data.field_data["meta"][0] == {"step": 1}
+
+
+@pytest.mark.parametrize(
+    "column, value, error",
+    [
+        ({"dtype": torch.float32, "is_non_tensor": False}, torch.tensor([1]), "keep dtype"),
+        ({"dtype": torch.float32, "is_non_tensor": False}, {"not": "a tensor"}, "keep dtype"),
+        ({"dtype": None, "is_non_tensor": True}, torch.tensor([1.0]), "must remain non-tensor"),
+    ],
+)
+def test_apply_update_checks_new_rows_against_column_type_before_writing(column, value, error):
+    data = StorageUnitData()
+    data.put_data({"score": [torch.tensor([0.5])]}, [0])
+
+    with pytest.raises(TypeError, match=error):
+        data.apply_update([0, 1], {"score": [torch.tensor([0.25]), value]}, _concat, {"score": column})
+    assert set(data.field_data["score"]) == {0}
+    assert torch.equal(data.field_data["score"][0], torch.tensor([0.5]))
 
 
 def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
@@ -127,7 +145,7 @@ def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
     data.put_data({"tokens": [prompt]}, [0])
     assert data.ssd_active_values == 1
 
-    data.apply_update([0], {"tokens": [torch.tensor([99])]}, _concat)
+    data.apply_update([0], {"tokens": [torch.tensor([99])]}, _concat, {})
 
     assert torch.equal(data.get_data(["tokens"], [0])["tokens"][0], torch.cat([prompt, torch.tensor([99])]))
     assert data.ssd_active_values == 1
@@ -153,7 +171,7 @@ def test_apply_update_is_atomic_when_a_later_field_fails_to_reach_ssd(tmp_path, 
         monkeypatch.setattr(data._ssd_store, "write_values", fail_second_field)
         new_data = {"tokens": [torch.tensor([99])], "mask": [torch.tensor([1])]}
         with pytest.raises(OSError, match="No space left"):
-            data.apply_update([0], new_data, _concat)
+            data.apply_update([0], new_data, _concat, {})
 
         stored = data.get_data(["tokens", "mask"], [0])
         assert torch.equal(stored["tokens"][0], prompt)
