@@ -14,11 +14,18 @@
 
 import re
 
+import numpy as np
 import pytest
 import torch
 from tensordict import NonTensorData, NonTensorStack
 
-from transfer_queue.utils.get_parser import apply_get_parser, select_list_items, slice_tensor, validate_get_parser
+from transfer_queue.utils.get_parser import (
+    apply_get_parser,
+    check_parser_select_fields,
+    select_list_items,
+    slice_tensor,
+    validate_get_parser,
+)
 
 
 def test_select_list_items_keeps_requested_order():
@@ -90,8 +97,15 @@ def test_slice_tensor_rejects_bool_and_bad_index_type():
     value = torch.zeros(3)
     with pytest.raises(TypeError, match="not bool"):
         slice_tensor(value, True)
-    with pytest.raises(TypeError, match="got list"):
-        slice_tensor(value, [0, 1])
+    with pytest.raises(TypeError, match="got str"):
+        slice_tensor(value, "0:2")
+
+
+def test_slice_tensor_rejects_index_list_unlike_select_list_items():
+    """slice_tensor is not advanced indexing; a list of indices is select_list_items-only."""
+    value = torch.arange(6).view(3, 2)
+    with pytest.raises(TypeError, match="does not take a list of indices"):
+        slice_tensor(value, [0, 2])
 
 
 def test_apply_get_parser_slice_tensor_keeps_per_key_views():
@@ -105,16 +119,40 @@ def test_apply_get_parser_slice_tensor_keeps_per_key_views():
     assert parsed["input_ids"][1].data_ptr() == field_data["input_ids"][1].data_ptr()
 
 
-def test_slice_tensor_encode_sends_only_sliced_bytes_without_copy():
+def test_slice_tensor_prefix_encode_sends_only_sliced_nbytes():
     from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 
     value = torch.arange(12, dtype=torch.int64).view(3, 4)
     sliced = slice_tensor(value, 2)
+    assert sliced.is_contiguous()
     buffers = MsgpackEncoder().encode(sliced)
 
     assert buffers[1].nbytes == sliced.nbytes
     assert buffers[1].nbytes < value.nbytes
     assert torch.equal(MsgpackDecoder().decode(buffers), sliced)
+
+
+def test_slice_tensor_noncontiguous_slice_encodes_correct_values():
+    """Column / stride slices are correct; MsgpackEncoder may .contiguous() them first."""
+    from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
+
+    value = torch.arange(12, dtype=torch.int64).view(3, 4)
+    for index in ((slice(None), slice(0, 2)), slice(None, None, 2)):
+        sliced = slice_tensor(value, index)
+        assert not sliced.is_contiguous()
+        assert torch.equal(MsgpackDecoder().decode(MsgpackEncoder().encode(sliced)), sliced)
+
+
+def test_check_parser_select_fields_rejects_multi_field_without_select_fields():
+    with pytest.raises(ValueError, match="omits select_fields but the keys have multiple fields"):
+        check_parser_select_fields(select_list_items, None, ["images", "input_ids"])
+
+
+def test_check_parser_select_fields_allows_select_fields_or_single_field():
+    check_parser_select_fields(select_list_items, "images", ["images", "input_ids"])
+    check_parser_select_fields(select_list_items, ["images"], ["images", "input_ids"])
+    check_parser_select_fields(select_list_items, None, ["images"])
+    check_parser_select_fields(None, None, ["images", "input_ids"])
 
 
 def test_validate_get_parser_rejects_args_without_parser():
@@ -130,6 +168,89 @@ def test_validate_get_parser_rejects_non_callable():
 def test_validate_get_parser_rejects_misaligned_args():
     with pytest.raises(ValueError, match="parser_args has 1 entries but 2 keys are fetched"):
         validate_get_parser(select_list_items, [[0]], num_keys=2)
+
+
+def test_validate_get_parser_keeps_plain_int_list_and_slice_args():
+    ints = [2, 3]
+    assert validate_get_parser(slice_tensor, ints, num_keys=2) is ints
+    slices = [slice(0, 2), (slice(None), slice(0, 1))]
+    assert validate_get_parser(slice_tensor, slices, num_keys=2) is slices
+    nested = [[0, 2], [1]]
+    assert validate_get_parser(select_list_items, nested, num_keys=2) is nested
+
+
+@pytest.mark.parametrize(
+    "parser_args",
+    [
+        torch.tensor(2),
+        torch.tensor([2]),
+        np.int64(2),
+        np.array(2),
+        np.array([2]),
+    ],
+)
+def test_validate_get_parser_coerces_scalar_length_for_slice_tensor(parser_args):
+    coerced = validate_get_parser(slice_tensor, [parser_args], num_keys=1)
+
+    assert coerced == [2]
+    assert all(type(x) is int for x in coerced)
+    assert torch.equal(slice_tensor(torch.arange(5), coerced[0]), torch.arange(2))
+
+
+@pytest.mark.parametrize(
+    "parser_args",
+    [
+        torch.tensor([2, 3]),
+        np.array([2, 3]),
+        [torch.tensor(2), np.int64(3)],
+        [np.array(2), torch.tensor([3])],
+    ],
+)
+def test_validate_get_parser_coerces_1d_lengths_to_list_int(parser_args):
+    coerced = validate_get_parser(slice_tensor, parser_args, num_keys=2)
+
+    assert coerced == [2, 3]
+    assert all(type(x) is int for x in coerced)
+    field_data = {"input_ids": [torch.arange(4), torch.arange(10, 14)]}
+    parsed = apply_get_parser(field_data, slice_tensor, coerced, global_indexes=[0, 1])
+    assert torch.equal(parsed["input_ids"][0], torch.tensor([0, 1]))
+    assert torch.equal(parsed["input_ids"][1], torch.tensor([10, 11, 12]))
+
+
+def test_validate_get_parser_rejects_bad_tensor_shapes_early():
+    with pytest.raises(ValueError, match="parser_args tensor/array must be 1-d with length 2"):
+        validate_get_parser(slice_tensor, torch.tensor([[2, 3]]), num_keys=2)
+    with pytest.raises(ValueError, match=r"parser_args\[0\] must be a 0-d or single-element integer tensor"):
+        validate_get_parser(slice_tensor, [torch.zeros(2, 2, dtype=torch.int64)], num_keys=1)
+    with pytest.raises(ValueError, match=r"parser_args\[0\] must be a 0-d or single-element integer tensor"):
+        validate_get_parser(slice_tensor, [torch.tensor([[2]])], num_keys=1)
+    with pytest.raises(TypeError, match=r"parser_args\[0\] must be an integer tensor"):
+        validate_get_parser(slice_tensor, [torch.tensor(2.0)], num_keys=1)
+
+
+def test_validate_get_parser_coerces_0d_tensor_as_whole_args_for_one_key():
+    assert validate_get_parser(slice_tensor, torch.tensor(2), num_keys=1) == [2]
+    assert validate_get_parser(slice_tensor, np.array(2), num_keys=1) == [2]
+
+
+def test_validate_get_parser_does_not_coerce_select_list_items_args():
+    """Coerce is slice_tensor-only; index tensors must stay Sequence-like, not bare int."""
+    single = [torch.tensor([2])]
+    assert validate_get_parser(select_list_items, single, num_keys=1) is single
+    assert select_list_items(["a", "b", "c"], single[0]) == ["c"]
+
+    for indices in (torch.tensor([0, 2]), np.array([0, 2])):
+        args = [indices]
+        assert validate_get_parser(select_list_items, args, num_keys=1) is args
+        assert select_list_items(["a", "b", "c"], indices) == ["a", "c"]
+
+
+def test_validate_get_parser_custom_callable_skips_length_coerce():
+    def custom(value, parser_arg):
+        return value
+
+    args = [torch.tensor([2])]
+    assert validate_get_parser(custom, args, num_keys=1) is args
 
 
 def test_apply_get_parser_uses_each_key_arg_on_every_field():

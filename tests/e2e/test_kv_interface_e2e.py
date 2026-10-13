@@ -851,7 +851,25 @@ class TestKVBatchGetParserE2E:
         self.put_image_lists(tq_api, partition_id, keys)
 
         with pytest.raises(RuntimeError, match="ZeroDivisionError"):
-            tq_api.kv_batch_get(keys=keys, partition_id=partition_id, parser=lambda value, arg: 1 / 0)
+            tq_api.kv_batch_get(
+                keys=keys,
+                partition_id=partition_id,
+                select_fields="images",
+                parser=lambda value, arg: 1 / 0,
+            )
+
+    def test_kv_batch_get_parser_requires_select_fields_for_multi_field(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_multi_0"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        with pytest.raises(ValueError, match="omits select_fields but the keys have multiple fields"):
+            tq_api.kv_batch_get(
+                keys=keys,
+                partition_id=partition_id,
+                parser=tq.select_list_items,
+                parser_args=[[0]],
+            )
 
     def test_kv_batch_get_parser_missing_key_raises(self, controller, tq_api):
         partition_id = "test_partition"

@@ -793,7 +793,8 @@ class AsyncSimpleStorageManager(StorageManager):
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
-            parser: Optional ``parser(value, parser_arg)`` each SU applies to every requested value before replying.
+            parser: Optional ``parser(value, parser_arg)`` each SU applies after load/decode; only the parsed
+                subset is serialized on the wire (Hybrid/SSD may still read the full blob first).
             parser_args: Optional per-sample parser arguments, aligned with ``metadata.global_indexes``.
 
         Returns:
@@ -804,7 +805,7 @@ class AsyncSimpleStorageManager(StorageManager):
 
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
-        validate_get_parser(parser, parser_args, metadata.size)
+        parser_args = validate_get_parser(parser, parser_args, metadata.size)
 
         routing = self._group_by_hash(metadata.global_indexes)
 

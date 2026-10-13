@@ -1295,6 +1295,7 @@ class SimpleStorageUnit:
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
+                # get_data may read/decode the full SSD-backed blob; the parser only shrinks the reply wire size.
                 result_data = self.storage_data.get_data(fields, global_indexes)
                 if parser is not None:
                     result_data = apply_get_parser(
