@@ -73,7 +73,8 @@ In the data plane, we utilize a pluggable design, enabling TransferQueue to inte
 Specifically, we provide a `StorageManager` abstraction class that defines the core APIs as follows:
 
 - `async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None`
-- `async def get_data(self, metadata: BatchMeta) -> TensorDict`
+- `async def get_data(self, metadata: BatchMeta, parser=None, parser_args=None) -> TensorDict`
+  (`parser` / `parser_args` are optional kwargs for managers that support get parsers, e.g. SimpleStorage; custom managers may keep `get_data(self, metadata)` and still work for plain gets without a parser)
 - `async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None`
 
 This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.

@@ -108,6 +108,40 @@ def test_slice_tensor_rejects_index_list_unlike_select_list_items():
         slice_tensor(value, [0, 2])
 
 
+def test_slice_tensor_restores_indexing_tuple_after_zmq_roundtrip():
+    """msgpack turns indexing tuples into lists; RPC parser_args must still slice multi-dim."""
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+    index = (slice(None), slice(0, 2))
+    msg = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA,
+        sender_id="test",
+        body={"parser_args": [index, (1, slice(None))]},
+    )
+    decoded_args = ZMQMessage.deserialize(msg.serialize()).body["parser_args"]
+    assert all(isinstance(arg, list) for arg in decoded_args)
+
+    value = torch.arange(24).view(4, 3, 2)
+    parsed = apply_get_parser(
+        {"x": [value, value]},
+        slice_tensor,
+        decoded_args,
+        global_indexes=[0, 1],
+    )
+    assert torch.equal(parsed["x"][0], value[:, :2])
+    assert torch.equal(parsed["x"][1], value[1])
+
+    # Pure int lists stay rejected even after the same wire path.
+    int_list_msg = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA,
+        sender_id="test",
+        body={"parser_args": [[0, 2]]},
+    )
+    int_list_args = ZMQMessage.deserialize(int_list_msg.serialize()).body["parser_args"]
+    with pytest.raises(ValueError, match="does not take a list of indices"):
+        apply_get_parser({"x": [value]}, slice_tensor, int_list_args, global_indexes=[0])
+
+
 def test_apply_get_parser_slice_tensor_keeps_per_key_views():
     field_data = {"input_ids": [torch.arange(4), torch.arange(10, 14)]}
 

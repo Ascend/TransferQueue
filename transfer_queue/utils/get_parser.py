@@ -51,13 +51,36 @@ def select_list_items(value: Sequence[Any], indices: Sequence[int]) -> list[Any]
     return [value[index] for index in indices]
 
 
+def _indexing_tuple_from_list(index: list) -> tuple[Any, ...] | None:
+    """Restore a multi-dim indexing tuple that msgpack decoded as a list, or return None.
+
+    Untyped msgpack turns ``(slice(None), slice(0, 2))`` into ``[slice(None), slice(0, 2)]``.
+    Accept that shape so RPC ``parser_args`` still work; keep rejecting a pure ``list[int]``
+    (that is ``select_list_items`` advanced-index style, not ``value[i, j, ...]``).
+    """
+    if not index:
+        return None
+    has_slice = False
+    for item in index:
+        if isinstance(item, bool):
+            return None
+        if isinstance(item, slice):
+            has_slice = True
+        elif isinstance(item, int) or item is None or item is Ellipsis:
+            continue
+        else:
+            return None
+    return tuple(index) if has_slice else None
+
+
 def slice_tensor(value: torch.Tensor, index: int | slice | tuple[Any, ...]) -> torch.Tensor:
     """Return ``value`` sliced by ``index`` so only that logical content is serialized and sent on get.
 
     ``index`` is an ``int`` dim-0 prefix length (``value[:index]``), a ``slice``, or an indexing
     ``tuple`` applied as ``value[index]``. It is not a list of indices like ``select_list_items``;
-    pass ``[0, 2]`` and you get ``TypeError``, not advanced indexing. Wire size follows the sliced
-    logical content in all cases.
+    pass ``[0, 2]`` and you get ``TypeError``, not advanced indexing. After RPC, msgpack may
+    deliver an indexing tuple as a list that still contains at least one ``slice``; that form is
+    restored to a tuple. Wire size follows the sliced logical content in all cases.
 
     Encode without ``.contiguous()`` materialization only when the sliced result ``is_contiguous()``
     (typical: dim-0 prefix ``[:n]`` of a C-contiguous tensor). Non-contiguous slices such as
@@ -76,13 +99,17 @@ def slice_tensor(value: torch.Tensor, index: int | slice | tuple[Any, ...]) -> t
         if not 0 <= index <= value.size(0):
             raise IndexError(f"prefix length {index} is out of range for dim 0 of size {value.size(0)}")
         return value[:index]
+    if isinstance(index, list):
+        # msgpack loses tuple vs list; only lists with a slice are treated as indexing tuples.
+        restored = _indexing_tuple_from_list(index)
+        if restored is None:
+            raise TypeError(
+                "slice_tensor does not take a list of indices (use select_list_items for that); "
+                "pass an int stop, a slice, or a tuple of slices/ints"
+            )
+        index = restored
     if isinstance(index, slice | tuple):
         return value[index]
-    if isinstance(index, list):
-        raise TypeError(
-            "slice_tensor does not take a list of indices (use select_list_items for that); "
-            "pass an int stop, a slice, or a tuple of slices/ints"
-        )
     raise TypeError(
         f"slice_tensor index must be an int stop, a slice, or a tuple of slices/ints, got {type(index).__name__}"
     )

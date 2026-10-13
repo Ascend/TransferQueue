@@ -36,7 +36,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
-from transfer_queue.utils.get_parser import GetParser
+from transfer_queue.utils.get_parser import GetParser, validate_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -844,6 +844,7 @@ class KVStorageManager(StorageManager):
         Fetches tensors using the provided metadata, reconstructs them with the
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
+        validate_get_parser(parser, parser_args, metadata.size)
         if parser is not None:
             raise NotImplementedError(
                 f"{type(self).__name__} does not support kv_batch_get parsers: KV backends return whole (key, field) "

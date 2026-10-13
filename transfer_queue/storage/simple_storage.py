@@ -1150,17 +1150,39 @@ class SimpleStorageUnit:
                 },
             )
 
-        response_frames = response_msg.serialize()
-        if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-            # This end serializes the get response, so its frames give the true wire size.
-            log_heavy_operation(
-                self.storage_unit_id,
-                "get",
-                time.perf_counter() - started,
-                sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                f"samples={len(request_msg.body.get('global_indexes', []))} "
-                f"fields={list(request_msg.body.get('fields', []))}",
+        # Serialize is outside the handler try: a success body can still fail encode
+        # (e.g. get parser returns a generator). Contain that here so the sole worker lives.
+        try:
+            response_frames = response_msg.serialize()
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_unit_id}]: failed to serialize response for {operation} "
+                f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
             )
+            error_type = (
+                ZMQRequestType.GET_ERROR
+                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
+                else ZMQRequestType.PUT_GET_ERROR
+            )
+            response_frames = ZMQMessage.create(
+                request_type=error_type,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={
+                    "message": f"{self.storage_unit_id}: failed to serialize response "
+                    f"for {operation}: {type(e).__name__}: {e}"
+                },
+            ).serialize()
+        else:
+            if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+                # This end serializes the get response, so its frames give the true wire size.
+                log_heavy_operation(
+                    self.storage_unit_id,
+                    "get",
+                    time.perf_counter() - started,
+                    sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                    f"samples={len(request_msg.body.get('global_indexes', []))} "
+                    f"fields={list(request_msg.body.get('fields', []))}",
+                )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:

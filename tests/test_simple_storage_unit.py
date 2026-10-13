@@ -81,11 +81,16 @@ class MockStorageClient:
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
-    def send_get(self, client_id, global_indexes, fields):
+    def send_get(self, client_id, global_indexes, fields, parser=None, parser_args=None):
+        body = {"global_indexes": global_indexes, "fields": fields}
+        if parser is not None:
+            body["parser"] = parser
+        if parser_args is not None:
+            body["parser_args"] = parser_args
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
-            body={"global_indexes": global_indexes, "fields": fields},
+            body=body,
         )
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
@@ -1169,4 +1174,25 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
 
     response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    client.close()
+
+
+def test_unserializable_get_response_answered_and_worker_survives(storage_setup):
+    """A get parser that returns a non-encodable value must not kill the sole worker."""
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
+
+    response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+
+    def generator_parser(value, parser_arg):
+        return (x for x in [1, 2, 3])
+
+    response = client.send_get(0, [0], ["val"], parser=generator_parser)
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "failed to serialize response" in response.body["message"]
+
+    response = client.send_get(0, [0], ["val"])
+    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
+    torch.testing.assert_close(response.body["data"]["val"][0], torch.tensor([1.0]))
     client.close()

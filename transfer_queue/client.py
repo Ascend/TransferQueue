@@ -570,7 +570,12 @@ class AsyncTransferQueueClient:
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_get_data"
         ):
-            results = await self.storage_manager.get_data(metadata, parser=parser, parser_args=parser_args)
+            # Only pass parser kwargs when a parser is used so old custom managers
+            # with get_data(self, metadata) keep working for plain gets.
+            if parser is not None:
+                results = await self.storage_manager.get_data(metadata, parser=parser, parser_args=parser_args)
+            else:
+                results = await self.storage_manager.get_data(metadata)
 
         logger.debug(f"[{self.client_id}]: get_data with {metadata.size} samples successfully.")
 
