@@ -1505,7 +1505,7 @@ class SimpleStorageUnit:
 
     def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
         """Seek to assigned records and merge them into local storage at current indexes."""
-        updates = []
+        updates: list[dict[str, Any]] = []
         bytes_read = 0
         try:
             with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS):
