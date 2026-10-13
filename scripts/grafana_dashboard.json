@@ -380,15 +380,15 @@
     },
     {
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
-      "description": "Arrivals count logical PUT, GET, and CLEAR operations when they start. NIXL PREPARE is counted once; COMMIT continues that operation. A sustained gap can indicate started operations that did not reach the measured completion path. Neither series identifies an individual request.",
+      "description": "Arrivals count decoded requests, including GET_METRICS and checkpoint operations. NIXL PREPARE counts as PUT_DATA/GET_DATA; COMMIT/CANCEL are not counted again. Measured requests count entry into PUT/GET/CLEAR handlers, at COMMIT for NIXL, not completion or success. Unmeasured operations and failed or cancelled PREPAREs, including concurrent-clear key misses, can leave a gap. A gap alone does not prove request loss or unfinished requests. Neither series identifies an individual request.",
       "fieldConfig": { "defaults": { "color": { "mode": "palette-classic" }, "custom": { "fillOpacity": 10, "lineWidth": 2 } } },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 87 },
       "id": 40,
       "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
-      "title": "Arrived vs Completed (per second)",
+      "title": "Arrived vs Measured Requests (per second)",
       "targets": [
         { "expr": "sum by (op_type) (rate(tq_storage_arrivals_by_op{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "arrived {{ op_type }}" },
-        { "expr": "sum by (op_type) (rate(tq_storage_request_ops{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "completed {{ op_type }}" }
+        { "expr": "sum by (op_type) (rate(tq_storage_request_ops{op_type=~\"$op_type\"}[$__rate_interval]))", "legendFormat": "measured {{ op_type }}" }
       ],
       "type": "timeseries"
     },

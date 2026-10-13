@@ -48,6 +48,7 @@ import torch
 import zmq
 
 from transfer_queue.storage.payload_transfer import PayloadTransfer, create_payload_transfer
+from transfer_queue.storage.payload_transfer.base import KEY_NOT_FOUND_MARKER
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -72,14 +73,18 @@ logger = get_logger(__name__)
 
 
 def _storage_arrival_op_type(operation: ZMQRequestType) -> str | None:
-    """Map a tracked logical storage operation's first message to its metric label."""
+    """Count decoded operations while treating NIXL continuations as the same request."""
+    if operation in (
+        ZMQRequestType.PUT_DATA_COMMIT,
+        ZMQRequestType.GET_DATA_COMMIT,
+        ZMQRequestType.PUT_DATA_CANCEL,
+        ZMQRequestType.GET_DATA_CANCEL,
+    ):
+        return None
     return {
-        ZMQRequestType.PUT_DATA: "PUT_DATA",
-        ZMQRequestType.GET_DATA: "GET_DATA",
-        ZMQRequestType.CLEAR_DATA: "CLEAR_DATA",
         ZMQRequestType.PUT_DATA_PREPARE: "PUT_DATA",
         ZMQRequestType.GET_DATA_PREPARE: "GET_DATA",
-    }.get(operation)
+    }.get(operation, operation.name)
 
 
 TQ_STORAGE_POLLER_TIMEOUT = int(os.environ.get("TQ_STORAGE_POLLER_TIMEOUT", 5))  # in seconds
@@ -112,9 +117,6 @@ class _SSDValueRef:
     dtype: str | np.dtype[Any] | None = None
     shape: tuple[int, ...] | None = None
 
-
-# Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
-KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
 # Accept-queue depth for the client-facing ROUTER. A full queue loses connections silently.
 TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
@@ -540,6 +542,15 @@ class HybridStorageUnitData(StorageUnitData):
                 ssd_samples.append(encoded)
                 prepared_values.append(None)
             else:
+                # Small views must not retain a shared receive buffer after SSD offload.
+                # Encoding failures may be large and retain their existing fallback behavior.
+                if encoded is not None:
+                    if encoded.codec == "pickle":
+                        value = pickle.loads(encoded.payload)
+                    elif isinstance(value, torch.Tensor):
+                        value = value.clone()
+                    elif isinstance(value, np.ndarray):
+                        value = value.copy()
                 prepared_values.append(value)
                 if encoded is None:
                     fallback_values += 1
@@ -1171,7 +1182,7 @@ class SimpleStorageUnit:
             "ssd_active_values": self.storage_data.ssd_active_values,
             "ssd_active_bytes": self.storage_data.ssd_active_bytes,
             "ssd_fallback_values_total": self.storage_data.ssd_fallback_values_total,
-            # Counted on arrival; op_stats below only advances on completion.
+            # Keep arrivals independent of whether a request has a measured handler.
             "requests_arrived": self._requests_arrived,
             "arrivals_by_op": dict(self._arrivals_by_op),
         }

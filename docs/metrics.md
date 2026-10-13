@@ -141,23 +141,29 @@ Steps:
 | `tq_storage_ssd_active_values` | Gauge | `storage_unit_id` | Active field values stored on SSD |
 | `tq_storage_ssd_active_bytes` | Gauge | `storage_unit_id` | Logical bytes held by active SSD-backed values |
 | `tq_storage_ssd_fallback_values_total` | Gauge | `storage_unit_id` | Cumulative values retained in memory because SSD encoding was unavailable |
-| `tq_storage_request_ops` | Gauge | `storage_unit_id`, `op_type` | Total requests processed by storage unit |
+| `tq_storage_request_ops` | Gauge | `storage_unit_id`, `op_type` | Cumulative entries into measured PUT, GET, and CLEAR handlers |
 | `tq_storage_request_latency_avg` | Gauge | `storage_unit_id`, `op_type` | Average request latency (seconds) |
 | `tq_storage_request_latency_p50` | Gauge | `storage_unit_id`, `op_type` | P50 request latency (seconds) |
 | `tq_storage_request_latency_p99` | Gauge | `storage_unit_id`, `op_type` | P99 request latency (seconds) |
 
 ### Storage Request-Loss Diagnostics (collected via ZMQ, exposed on controller)
 
-Arrivals count logical PUT, GET, and CLEAR operations when they start. For NIXL PUT/GET, the
-worker counts PREPARE once and treats COMMIT as continuation of that operation. Completion
-metrics advance when the operation reaches its measured completion path, so a sustained gap
-can indicate started operations that did not complete. These cumulative per-operation counters
-carry no request identity and characterise a unit, not any individual request.
+Arrivals count decoded worker requests, including GET_METRICS and checkpoint operations.
+For NIXL PUT/GET, PREPARE counts as a PUT_DATA/GET_DATA arrival; COMMIT and CANCEL are
+continuations and are not counted again.
+
+`tq_storage_request_ops` counts entry into measured PUT, GET, and CLEAR handlers, not their
+completion or success. For NIXL PUT/GET, that entry occurs at COMMIT. A failed or cancelled
+PREPARE, including a key miss under a concurrent clear, therefore leaves an arrival without
+a measured handler entry. GET_METRICS and checkpoint operations also have arrivals without
+corresponding measured handler counts. A sustained gap alone does not prove request loss or
+an unfinished request. These cumulative per-operation counters carry no request identity and
+characterise a unit, not any individual request.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `tq_storage_requests_arrived` | Gauge | `storage_unit_id` | Logical PUT, GET, and CLEAR operations started by the worker |
-| `tq_storage_arrivals_by_op` | Gauge | `storage_unit_id`, `op_type` | Same, broken down by logical operation type |
+| `tq_storage_requests_arrived` | Gauge | `storage_unit_id` | Decoded worker requests, excluding NIXL COMMIT/CANCEL continuations |
+| `tq_storage_arrivals_by_op` | Gauge | `storage_unit_id`, `op_type` | Same, by operation; NIXL PREPARE maps to PUT_DATA/GET_DATA |
 
 The accept-queue series below exist only when the unit runs with `TQ_ACCEPT_PROBE_INTERVAL`
 set; the series are removed rather than reported as zero when the probe is off, so a missing

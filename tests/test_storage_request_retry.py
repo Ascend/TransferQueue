@@ -27,9 +27,15 @@ from tensordict import TensorDict
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
+from transfer_queue.storage.payload_transfer import (
+    PayloadTransferError,
+    PayloadTransferTimeout,
+    create_payload_transfer,
+)
+from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import NixlError
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
-from transfer_queue.utils.zmq_utils import ZMQServerInfo
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
 def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
@@ -87,6 +93,159 @@ async def test_lost_request_recovers_without_diagnosis():
     assert result == "payload"
     assert request.await_count == 2
     diagnose.assert_not_awaited()
+
+
+class _ReplySocket:
+    def __init__(self, reply, timeout_on=None):
+        self.reply = reply
+        self.timeout_on = timeout_on
+
+    async def send_multipart(self, *args, **kwargs):
+        if self.timeout_on == "send":
+            raise zmq.Again()
+
+    async def recv_multipart(self, *args, **kwargs):
+        if self.timeout_on == "receive":
+            raise zmq.Again()
+        return self.reply.serialize()
+
+
+async def _payload_request(manager, operation, socket):
+    if operation == "put":
+        return await manager._put_to_single_storage_unit.__wrapped__(
+            manager, [0], {"value": [42]}, "unit_a", socket=socket
+        )
+    return await manager._get_from_single_storage_unit.__wrapped__(manager, [0], ["value"], "unit_a", socket=socket)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["put", "get"])
+@pytest.mark.parametrize("timeout_on", ["send", "receive"])
+async def test_zmq_timeout_retry_recovers_without_error_log(operation, timeout_on, caplog):
+    manager = _manager()
+    manager.payload_transfer = create_payload_transfer(None)
+    response = ZMQMessage.create(
+        request_type=ZMQRequestType[f"{operation.upper()}_DATA_RESPONSE"],
+        sender_id="unit_a",
+        body={"data": {"value": [42]}},
+    )
+    sockets = iter([_ReplySocket(None, timeout_on), _ReplySocket(response)])
+
+    async def attempt():
+        return await _payload_request(manager, operation, next(sockets))
+
+    with patch.object(manager, "_diagnose_storage_unit") as diagnose, caplog.at_level(logging.WARNING):
+        result = await manager._request_with_retry(operation, "unit_a", "samples=1", attempt, max_attempts=2)
+
+    assert result == (None if operation == "put" else (["value"], {"value": [42]}))
+    diagnose.assert_not_awaited()
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    assert sum("retry 2/2" in record.getMessage() for record in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["put", "get"])
+@pytest.mark.parametrize("timeout_on", ["send", "receive"])
+async def test_zmq_exhausted_timeout_logs_once_and_preserves_cause(operation, timeout_on, caplog):
+    manager = _manager()
+    manager.payload_transfer = create_payload_transfer(None)
+    attempts = 0
+
+    async def attempt():
+        nonlocal attempts
+        attempts += 1
+        return await _payload_request(manager, operation, _ReplySocket(None, timeout_on))
+
+    with (
+        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis") as diagnose,
+        caplog.at_level(logging.WARNING),
+        pytest.raises(StorageUnitTimeout) as raised,
+    ):
+        await manager._request_with_retry(operation, "unit_a", "samples=1", attempt, max_attempts=2)
+
+    assert attempts == 2
+    diagnose.assert_awaited_once()
+    cause = raised.value.__cause__
+    assert isinstance(cause, PayloadTransferTimeout)
+    assert isinstance(cause.__cause__, zmq.Again)
+    assert (cause.wire_bytes > 0) == (operation == "put")
+    errors = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 1
+    assert "failed after 2 attempts" in errors[0].getMessage()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["put", "get"])
+async def test_zmq_peer_error_is_logged_once_without_retry(operation, caplog):
+    manager = _manager()
+    manager.payload_transfer = create_payload_transfer(None)
+    response = ZMQMessage.create(
+        request_type=ZMQRequestType[f"{operation.upper()}_ERROR"],
+        sender_id="unit_a",
+        body={"message": "disk full"},
+    )
+    attempts = 0
+
+    async def attempt():
+        nonlocal attempts
+        attempts += 1
+        return await _payload_request(manager, operation, _ReplySocket(response))
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="disk full") as raised:
+        await manager._request_with_retry(operation, "unit_a", "samples=1", attempt, max_attempts=2)
+
+    assert attempts == 1
+    assert len([record for record in caplog.records if record.levelno >= logging.ERROR]) == 1
+    assert str(raised.value).count("Error in put to storage unit") == (1 if operation == "put" else 0)
+    assert str(raised.value).count("Error getting data from storage unit") == (1 if operation == "get" else 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["put", "get"])
+async def test_zmq_socket_error_keeps_runtime_error_contract(operation, caplog):
+    manager = _manager()
+    manager.payload_transfer = create_payload_transfer(None)
+    error = zmq.ZMQError("connection failed")
+    socket = MagicMock()
+    socket.send_multipart = AsyncMock(side_effect=error)
+    socket.recv_multipart = AsyncMock()
+
+    with caplog.at_level(logging.ERROR), pytest.raises(RuntimeError, match="connection failed") as raised:
+        await _payload_request(manager, operation, socket)
+
+    assert raised.value.__cause__ is error
+    socket.send_multipart.assert_awaited_once()
+    socket.recv_multipart.assert_not_awaited()
+    assert len([record for record in caplog.records if record.levelno >= logging.ERROR]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["put", "get"])
+@pytest.mark.parametrize("error_type", [PayloadTransferError, NixlError])
+async def test_payload_error_is_wrapped_once_without_retry(operation, error_type, caplog):
+    manager = _manager()
+    cause = zmq.ZMQError("connection failed")
+    error = error_type("transfer failed")
+    error.__cause__ = cause
+    manager.payload_transfer = MagicMock()
+    transfer_request = AsyncMock(side_effect=error)
+    setattr(manager.payload_transfer, operation, transfer_request)
+
+    with (
+        patch.object(manager, "_diagnose_storage_unit") as diagnose,
+        caplog.at_level(logging.ERROR),
+        pytest.raises(RuntimeError, match="transfer failed") as raised,
+    ):
+        await manager._request_with_retry(
+            operation, "unit_a", "samples=1", lambda: _payload_request(manager, operation, None), max_attempts=2
+        )
+
+    assert type(raised.value) is RuntimeError
+    assert raised.value.__cause__ is error
+    assert raised.value.__cause__.__cause__ is cause
+    transfer_request.assert_awaited_once()
+    diagnose.assert_not_awaited()
+    assert len([record for record in caplog.records if record.levelno >= logging.ERROR]) == 1
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,10 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.payload_transfer import PayloadTransferTimeout, create_payload_transfer
+from transfer_queue.storage.payload_transfer import (
+    PayloadTransferTimeout,
+    create_payload_transfer,
+)
 from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
@@ -665,13 +668,16 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
             ) from e
-        except StorageKeyNotFoundError:
-            # Already logged at debug by the storage unit; propagate for the caller to classify.
-            raise
         except Exception as exc:
             if KEY_NOT_FOUND_MARKER in str(exc):
                 raise StorageKeyNotFoundError(str(exc)) from exc
-            raise
+            logger.error(
+                f"[{self.storage_manager_id}]: Unexpected error from storage unit "
+                f"{target_storage_unit}: {type(exc).__name__}: {exc}"
+            )
+            raise RuntimeError(
+                f"Error getting data from storage unit {target_storage_unit}: {type(exc).__name__}: {exc}"
+            ) from exc
         return fields, data
 
     async def clear_data(self, metadata: BatchMeta) -> None:

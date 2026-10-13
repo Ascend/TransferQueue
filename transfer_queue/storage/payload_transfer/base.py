@@ -24,6 +24,10 @@ if TYPE_CHECKING:
     from transfer_queue.utils.zmq_utils import ZMQMessage
 
 
+# Marks a GET error reply as an expected missing key so callers can distinguish it from a fault.
+KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+
 class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
 

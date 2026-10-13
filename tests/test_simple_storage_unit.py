@@ -28,8 +28,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import pickle
 import time
+import weakref
 from pathlib import Path
 from uuid import uuid4
 
@@ -47,6 +49,7 @@ from transfer_queue.storage.simple_storage import (
     StorageKeyNotFoundError,
     _SSDValueRef,
 )
+from transfer_queue.utils.serial_utils import calc_packed_size, decode, encode, pack_into, unpack_from
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -525,6 +528,7 @@ def test_hybrid_storage_routes_each_sample_by_payload_size_and_clears(tmp_path):
         assert storage.ssd_active_values == 1
         assert storage.ssd_active_bytes == 100
         assert storage.ssd_fallback_values_total == 1
+        assert storage.get_data(["unsupported"], [1])["unsupported"][0] is large_sparse
 
         storage.clear([1])
         assert storage.active_key_count == 1
@@ -542,6 +546,69 @@ def test_hybrid_storage_routes_each_sample_by_payload_size_and_clears(tmp_path):
         storage.close()
 
     assert not (tmp_path / "transfer_queue_ssd_offload" / "test-run").exists()
+
+
+@pytest.mark.parametrize("kind", ["tensor", "numpy"])
+@pytest.mark.parametrize("layout", ["packed", "frame-native"])
+@pytest.mark.parametrize("nested", [False, True])
+def test_hybrid_small_values_release_shared_receive_buffer(tmp_path, kind, layout, nested):
+    storage = HybridStorageUnitData(None, str(tmp_path), "test-run", "test-unit", threshold_bytes=1024)
+    large = np.arange(1024, dtype=np.float32).reshape(2, 512)
+    small = np.arange(4, dtype=np.float32).reshape(2, 2)
+    data = {"large": large, "small": small}
+    if kind == "tensor":
+        data = {field: torch.from_numpy(value) for field, value in data.items()}
+    if nested:
+        data["small"] = [{"value": [value]} for value in data["small"]]
+    encoded = encode(data)
+    if layout == "packed":
+        owner = np.empty(calc_packed_size(encoded), dtype=np.uint8)
+        pack_into(owner, encoded)
+        frames = unpack_from(owner)
+    else:
+        owner = np.concatenate([np.frombuffer(frame, dtype=np.uint8) for frame in encoded])
+        frames = []
+        offset = 0
+        for frame in encoded:
+            size = memoryview(frame).nbytes
+            frames.append(memoryview(owner)[offset : offset + size])
+            offset += size
+    owner_ref = weakref.ref(owner)
+    try:
+        storage.put_data(decode(frames), [0, 1])
+        del frames, owner
+        gc.collect()
+
+        assert storage.ssd_active_values == 2
+        assert owner_ref() is None
+        result = storage.get_data(["large", "small"], [0, 1])
+        for field in data:
+            for position, value in enumerate(result[field]):
+                expected = data[field][position]
+                if nested and field == "small":
+                    value = value["value"][0]
+                    expected = expected["value"][0]
+                if kind == "tensor":
+                    torch.testing.assert_close(value, expected)
+                else:
+                    np.testing.assert_array_equal(value, expected)
+        storage.clear([0, 1])
+        assert storage.ssd_active_values == 0
+    finally:
+        storage.close()
+
+
+def test_hybrid_encoding_fallback_keeps_large_tensor_without_cloning(tmp_path, monkeypatch):
+    storage = HybridStorageUnitData(None, str(tmp_path), "test-run", "test-unit", threshold_bytes=64)
+    value = torch.arange(128, dtype=torch.float32)
+    monkeypatch.setattr(storage, "_sample_from_value", lambda sample: None)
+    try:
+        storage.put_data({"value": [value]}, [0])
+        assert storage.get_data(["value"], [0])["value"][0] is value
+        assert storage.ssd_fallback_values_total == 1
+        assert storage.ssd_active_values == 0
+    finally:
+        storage.close()
 
 
 def test_hybrid_storage_cleans_completed_ssd_writes_after_batch_failure(tmp_path, monkeypatch):

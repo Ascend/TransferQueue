@@ -225,17 +225,17 @@ class TQMetricsExporter:
         )
 
         # ---- Storage-unit request-loss diagnostics ----
-        # Read against tq_storage_request_ops, which advances only on completion: a gap
-        # between the two is tracked operations starting and not reaching completion.
+        # Arrival labels also include unmeasured operations and NIXL PREPARE failures,
+        # so a gap against measured handler entries alone cannot prove request loss.
         self.storage_requests_arrived = Gauge(
             "tq_storage_requests_arrived",
-            "Logical PUT, GET, and CLEAR operations started by the storage unit worker",
+            "Decoded storage worker requests, excluding NIXL COMMIT/CANCEL continuations",
             ["storage_unit_id"],
             registry=r,
         )
         self.storage_arrivals_by_op = Gauge(
             "tq_storage_arrivals_by_op",
-            "Logical PUT, GET, and CLEAR operations started by the worker, by operation",
+            "Decoded storage worker requests by operation; NIXL PREPARE maps to PUT_DATA/GET_DATA",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
@@ -286,7 +286,7 @@ class TQMetricsExporter:
         # conflict with Prometheus reserved suffixes and label semantics).
         self.storage_request_ops = Gauge(
             "tq_storage_request_ops",
-            "Total requests processed by storage unit",
+            "Cumulative entries into measured PUT, GET, and CLEAR handlers",
             ["storage_unit_id", "op_type"],
             registry=r,
         )
