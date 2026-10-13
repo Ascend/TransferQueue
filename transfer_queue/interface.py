@@ -695,8 +695,9 @@ def kv_batch_update(
 ) -> KVBatchMeta:
     """Merge batched values into the fields of keys, adding keys or fields if missing.
 
-    See ``kv_update``. A timeout has an unknown outcome because a unit may commit
-    after the caller stops waiting. Do not blindly retry a merge.
+    See ``kv_update``. ``keys`` must be unique; a repeated key raises ``ValueError``
+    before anything is registered or written. A timeout has an unknown outcome because
+    a unit may commit after the caller stops waiting. Do not blindly retry a merge.
     """
     tq_client = _maybe_create_tq_client()
     return tq_client._run_coroutine(
@@ -1175,6 +1176,11 @@ async def async_kv_batch_update(
     """Asynchronously merge or add batched fields of keys. See ``kv_update``."""
     if not isinstance(keys, list) or not keys or not all(isinstance(key, str) for key in keys):
         raise TypeError("keys must be a non-empty list of strings")
+    # A repeated missing key would get one row per occurrence, orphaning all but the last;
+    # a repeated existing key would merge twice from the same old value, losing one.
+    if len(set(keys)) != len(keys):
+        duplicates = sorted({key for key in keys if keys.count(key) > 1})
+        raise ValueError(f"keys must be unique in one kv_batch_update; duplicated: {duplicates}")
     if not isinstance(fields, TensorDict) or not fields.keys():
         raise TypeError("fields must be a non-empty TensorDict")
     if fields.batch_size != torch.Size([len(keys)]):

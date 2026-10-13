@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import errno
 from unittest.mock import MagicMock, patch
 
@@ -21,7 +22,7 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from transfer_queue.interface import _single_update_batch
+from transfer_queue.interface import _single_update_batch, async_kv_batch_update
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.mooncake_manager import MooncakeStorageManager
@@ -47,6 +48,14 @@ def test_single_update_batch_wraps_tensor_and_python_values():
 def test_single_update_batch_rejects_invalid_fields(fields):
     with pytest.raises(TypeError):
         _single_update_batch(fields)
+
+
+@patch("transfer_queue.interface._maybe_create_tq_client", side_effect=AssertionError("must fail before any RPC"))
+def test_batch_update_rejects_duplicate_keys_before_registering(_client):
+    fields = TensorDict({"tokens": torch.tensor([[1], [2], [3]])}, batch_size=3)
+
+    with pytest.raises(ValueError, match=r"duplicated: \['k'\]"):
+        asyncio.run(async_kv_batch_update(["k", "other", "k"], "p", fields, _concat))
 
 
 def test_apply_update_concatenates_and_keeps_field_name():
