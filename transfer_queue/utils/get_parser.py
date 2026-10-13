@@ -92,17 +92,13 @@ def _coerce_int_like(arg: Any, label: str) -> int:
     """Turn a 0-d / single-element integer tensor or numpy scalar into a Python ``int``."""
     if isinstance(arg, torch.Tensor):
         if arg.dim() > 1 or arg.numel() != 1:
-            raise ValueError(
-                f"{label} must be a 0-d or single-element integer tensor, got shape {tuple(arg.shape)}"
-            )
+            raise ValueError(f"{label} must be a 0-d or single-element integer tensor, got shape {tuple(arg.shape)}")
         if arg.dtype == torch.bool or torch.is_floating_point(arg) or torch.is_complex(arg):
             raise TypeError(f"{label} must be an integer tensor, got dtype {arg.dtype}")
         return int(arg.item())
     if isinstance(arg, np.ndarray):
         if arg.ndim > 1 or arg.size != 1:
-            raise ValueError(
-                f"{label} must be a 0-d or single-element integer array, got shape {tuple(arg.shape)}"
-            )
+            raise ValueError(f"{label} must be a 0-d or single-element integer array, got shape {tuple(arg.shape)}")
         if not np.issubdtype(arg.dtype, np.integer):
             raise TypeError(f"{label} must be an integer array, got dtype {arg.dtype}")
         return int(arg.item())
@@ -130,7 +126,7 @@ def _coerce_parser_args(parser_args: Any, num_keys: int) -> Sequence[Any]:
             )
         return [_coerce_int_like(item, f"parser_args[{i}]") for i, item in enumerate(parser_args)]
 
-    if not isinstance(parser_args, Sequence) or isinstance(parser_args, (str, bytes)):
+    if not isinstance(parser_args, Sequence) or isinstance(parser_args, str | bytes):
         raise TypeError(
             f"parser_args must be a sequence of per-key args (or a 1-d integer tensor/array), "
             f"got {type(parser_args).__name__}"
@@ -199,10 +195,11 @@ def apply_get_parser(
     parser_args: Sequence[Any] | None,
     global_indexes: Sequence[int],
 ) -> dict[str, list[Any]]:
-    """Replace every already-loaded value by ``parser(value, parser_arg)`` of its key; values arrive unwrapped from NonTensor*.
+    """Replace every already-loaded value by ``parser(value, parser_arg)`` of its key.
 
-    Call this only after the storage unit has decoded the stored value (including any SSD read).
-    The reply then serializes the parsed subset; disk I/O for the full blob is unchanged.
+    Values arrive unwrapped from NonTensor*. Call this only after the storage unit has decoded
+    the stored value (including any SSD read). The reply then serializes the parsed subset;
+    disk I/O for the full blob is unchanged.
     Parser errors raise ``ValueError`` (field, global index, arg); kv_batch_get callers get ``RuntimeError``."""
     if parser_args is None:
         parser_args = [None] * len(global_indexes)
