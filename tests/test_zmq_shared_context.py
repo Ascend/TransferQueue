@@ -17,11 +17,13 @@
 
 with_zmq_socket used to create and term() a context per RPC call, which churned libzmq
 signaler file descriptors and crashed the process under concurrency (Bad file descriptor
--> SIGABRT). It now reuses the owner's context and only creates the socket per call, so
+-> SIGABRT). It now reuses the owner's context and leases sockets from a shared pool, so
 these tests assert every concurrent call sees the SAME context, alive until close().
+Pool-specific behavior is covered in test_zmq_socket_pool.py.
 """
 
 import asyncio
+from contextlib import contextmanager
 from threading import Thread
 from unittest.mock import patch
 
@@ -138,8 +140,10 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
     assert len(results) == num_calls
     assert all(isinstance(meta, BatchMeta) for meta in results)
 
-    # Every call must have used the SAME context, and it must be the client's context.
-    assert len(seen_contexts) == num_calls
+    # Every socket must come from the SAME context, and it must be the client's. The count
+    # is bounded by the pool's cap rather than by the call count, since concurrency past it
+    # waits for a socket instead of opening one.
+    assert seen_contexts, "no socket was created at all"
     assert all(ctx is client.zmq_context for ctx in seen_contexts)
     # The shared context must NOT have been terminated by any call.
     assert not client.zmq_context.closed
@@ -168,6 +172,83 @@ def test_client_rejects_invalid_context_pool_size(echo_controller):
         )
 
 
+@contextmanager
+def _no_context_left_open():
+    """Assert every ZMQ context built inside the block is closed by the time it exits.
+
+    __init__ arms the finalizer only on success, so an invalid argument must either be
+    rejected before the context is built or destroy it on the way out -- otherwise the
+    context and its native I/O threads leak for the process lifetime.
+    """
+    created = []
+    real_context = zmq.asyncio.Context
+
+    def _spy(*args, **kwargs):
+        ctx = real_context(*args, **kwargs)
+        created.append(ctx)
+        return ctx
+
+    with patch("zmq.asyncio.Context", side_effect=_spy):
+        try:
+            yield created
+        finally:
+            leaked = [ctx for ctx in created if not ctx.closed]
+            for ctx in leaked:
+                ctx.destroy(linger=0)
+            assert not leaked, f"{len(leaked)} ZMQ context(s) left open on the failure path"
+
+
+def test_client_rejects_invalid_socket_pool_size(echo_controller):
+    """A bad TQ_SOCKET_POOL_SIZE must name the variable, not silently disable reuse.
+
+    Below 1 nothing is ever parked, so every request pays a fresh connect while the client
+    still looks pooled.
+    """
+    for bad in (-1, 0):
+        with patch("transfer_queue.client.TQ_SOCKET_POOL_SIZE", bad):
+            with _no_context_left_open() as created:
+                with pytest.raises(ValueError, match="TQ_SOCKET_POOL_SIZE must be at least 1"):
+                    AsyncTransferQueueClient(
+                        client_id="client_invalid_socket_pool",
+                        controller_info=echo_controller.zmq_server_info,
+                    )
+                assert created == [], "checkable without a context, so none should be built"
+
+
+def test_invalid_max_sockets_does_not_leak_a_context(echo_controller):
+    """No invalid max-sockets input may leave the context or its I/O threads behind."""
+    # Rejectable without a live context.
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", "not-a-number"):
+        with _no_context_left_open() as created:
+            with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer"):
+                AsyncTransferQueueClient(
+                    client_id="client_garbage_max_sockets",
+                    controller_info=echo_controller.zmq_server_info,
+                )
+            assert created == [], "parsing needs no context, so none should be built"
+
+    for bad in (0, -5):
+        with _no_context_left_open() as created:
+            with pytest.raises(ValueError, match="at least 1"):
+                AsyncTransferQueueClient(
+                    client_id="client_low_max_sockets",
+                    controller_info=echo_controller.zmq_server_info,
+                    zmq_max_sockets=bad,
+                )
+            assert created == [], "the lower bound needs no context, so none should be built"
+
+    # Above ZMQ_SOCKET_LIMIT: this one genuinely needs a live context, so it must be
+    # destroyed rather than hoisted.
+    with _no_context_left_open() as created:
+        with pytest.raises(ValueError, match="ZMQ_SOCKET_LIMIT"):
+            AsyncTransferQueueClient(
+                client_id="client_huge_max_sockets",
+                controller_info=echo_controller.zmq_server_info,
+                zmq_max_sockets=10**9,
+            )
+        assert len(created) == 1, "the limit check requires a built context"
+
+
 def test_simple_storage_borrows_client_context(echo_controller):
     client = AsyncTransferQueueClient(
         client_id="client_simple_storage_context",
@@ -186,6 +267,105 @@ def test_simple_storage_borrows_client_context(echo_controller):
     )
 
     client.close()
+
+
+def test_each_scenario_gets_its_own_pool(echo_controller):
+    """Controller RPC, storage RPC and notify must each hold a separate pool.
+
+    They share one context but never one pool: each dials a different peer or socket name,
+    so a shared pool reused nothing while letting one scenario's sockets be swept by
+    another's. Separate pools keep each scenario's failures to itself.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_scenario_pools",
+        controller_info=echo_controller.zmq_server_info,
+    )
+
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            zmq_context=client.zmq_context,
+        )
+
+    pools = [client.controller_rpc_pool, manager.storage_rpc_pool, manager.notify_pool]
+    assert len({id(pool) for pool in pools}) == 3, "scenarios must not share a pool"
+
+    manager.close()
+    client.close()
+
+
+@pytest.mark.parametrize(
+    "pool_size, units, warns",
+    [
+        (8, 4, False),  # 32 idle sockets against a 64-socket budget
+        (8, 32, True),  # 256 would exceed it
+    ],
+)
+def test_warns_when_pool_size_times_units_exceeds_the_context(echo_controller, caplog, pool_size, units, warns):
+    """The per-address cap multiplies by storage-unit count; the context ceiling does not.
+
+    At a few thousand units the product passes ZMQ_MAX_SOCKETS, where opening a socket
+    fails outright, so the mismatch is worth naming at construction rather than at a lease.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_pool_budget",
+        controller_info=echo_controller.zmq_server_info,
+        zmq_max_sockets=64,
+    )
+    zmq_info = {
+        f"storage_{i}": ZMQServerInfo(
+            role=Role.STORAGE,
+            id=f"storage_{i}",
+            ip="127.0.0.1",
+            ports={"put_get_socket": 5600 + i},
+        )
+        for i in range(units)
+    }
+
+    with (
+        patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"),
+        patch("transfer_queue.storage.managers.simple_storage_manager.TQ_SOCKET_POOL_SIZE", pool_size),
+        caplog.at_level("WARNING"),
+    ):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": zmq_info},
+            zmq_context=client.zmq_context,
+        )
+
+    assert ("above this context's ZMQ_MAX_SOCKETS" in caplog.text) is warns
+
+    manager.close()
+    client.close()
+
+
+def test_close_after_failed_handshake_still_releases_the_context(echo_controller):
+    """A manager whose base constructor raised must still tear down on close().
+
+    storage_rpc_pool is assigned after super().__init__(), so a handshake timeout leaves it
+    unset while the context and its native I/O threads are already allocated. __del__ calls
+    close() regardless, so dereferencing the pool there aborts the base teardown and leaks
+    the context.
+    """
+    built = []
+
+    def _fail(self):
+        built.append(self)
+        raise TimeoutError("handshake failed")
+
+    with patch.object(StorageManager, "_connect_to_controller", _fail):
+        with pytest.raises(TimeoutError):
+            AsyncSimpleStorageManager(
+                echo_controller.zmq_server_info,
+                {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            )
+
+    manager = built[0]
+    assert not hasattr(manager, "storage_rpc_pool"), "the test no longer exercises the partial-build path"
+
+    manager.close()
+    assert manager.zmq_context.closed, "the context outlived a failed construction"
 
 
 def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
@@ -266,8 +446,11 @@ def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
     context.destroy(linger=0)
 
 
-def _make_borrowing_manager(zmq_context):
-    """A minimal manager that borrows a caller's context, like SimpleStorage does."""
+def _make_borrowing_manager(client=None):
+    """A minimal manager borrowing *client*'s context, like SimpleStorage does.
+
+    With no client it creates its own context. Either way it builds its own notify pool.
+    """
 
     class Borrower(StorageManager):
         def _connect_to_controller(self):
@@ -282,7 +465,7 @@ def _make_borrowing_manager(zmq_context):
         async def clear_data(self, *args, **kwargs):
             return None
 
-    return Borrower(None, {}, zmq_context=zmq_context)
+    return Borrower(None, {}) if client is None else Borrower(None, {}, zmq_context=client.zmq_context)
 
 
 def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller):
@@ -295,7 +478,7 @@ def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller)
         client_id="client_notify_thread_veto",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+    client.storage_manager = _make_borrowing_manager(client)
     context = client.zmq_context
 
     with patch.object(client.storage_manager._notify_thread, "is_alive", return_value=True):
@@ -314,7 +497,7 @@ def test_healthy_notify_thread_does_not_block_destroy(echo_controller):
         client_id="client_notify_thread_clean",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+    client.storage_manager = _make_borrowing_manager(client)
 
     client.close()
     assert client.zmq_context.closed
@@ -326,7 +509,7 @@ def test_manager_with_own_context_does_not_veto(echo_controller):
         client_id="client_independent_manager",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(None)  # creates its own context
+    client.storage_manager = _make_borrowing_manager()  # creates its own context
     assert client.storage_manager.zmq_context is not client.zmq_context
 
     # Even a stuck notify thread on an unrelated context must not block the client.

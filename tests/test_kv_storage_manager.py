@@ -23,6 +23,28 @@ from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import KVStorageManager
 
 
+def test_close_is_quiet_when_config_is_rejected_before_super_init():
+    """A config rejected before super().__init__() leaves nothing for close() to release.
+
+    Every KV manager validates its config first, so none of the base attributes close()
+    reaches for exist yet. __del__ calls close() regardless, and an AttributeError there
+    buries the real ValueError under a spurious teardown error.
+    """
+    built = []
+
+    class Probe(KVStorageManager):
+        def __init__(self, *args, **kwargs):
+            built.append(self)
+            super().__init__(*args, **kwargs)
+
+    with pytest.raises(ValueError, match="Missing client_name"):
+        Probe(None, {})
+
+    manager = built[0]
+    assert not hasattr(manager, "notify_pool"), "the test no longer exercises the pre-super path"
+    manager.close()
+
+
 def get_meta(data, global_indexes=None):
     if not global_indexes:
         global_indexes = list(range(data.batch_size[0]))

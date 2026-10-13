@@ -24,8 +24,25 @@ if TYPE_CHECKING:
     from transfer_queue.utils.zmq_utils import ZMQMessage
 
 
+# Marks a GET error reply as an expected missing key so callers can distinguish it from a fault.
+KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+
 class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
+
+
+class PayloadTransferTimeout(RuntimeError):
+    """A payload transfer control message was not answered within the timeout.
+
+    Distinct from an error the peer reported: only a missing answer is worth retrying on a
+    new connection. Carries the request's payload bytes so the caller can report the wire
+    size of the attempt that timed out.
+    """
+
+    def __init__(self, message: str, *, wire_bytes: int = 0):
+        super().__init__(message)
+        self.wire_bytes = wire_bytes
 
 
 class PayloadTransfer(ABC):
@@ -41,8 +58,12 @@ class PayloadTransfer(ABC):
         global_indexes: list[int],
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
-    ) -> None:
-        """Put decoded storage data through this strategy."""
+    ) -> int:
+        """Put decoded storage data through this strategy.
+
+        Returns the payload bytes moved, so callers can report transfer sizes without
+        knowing the wire protocol.
+        """
 
     @abstractmethod
     async def get(

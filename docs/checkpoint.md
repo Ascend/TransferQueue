@@ -77,7 +77,9 @@ checkpoint_dir/
 └── simple_storage/
     ├── storage_unit_info.json           # Position-to-ID manifest
     ├── su_0_<id>.pkl                    # StorageUnit at position 0
+    ├── su_0_<id>.pkl.blobs/             # Its SSD values, when offload is enabled
     ├── su_1_<id>.pkl                    # StorageUnit at position 1
+    ├── su_1_<id>.pkl.blobs/             # Its SSD values, when offload is enabled
     └── ...
 ```
 
@@ -123,7 +125,7 @@ tq.save_checkpoint / tq.load_checkpoint
                               └── ...
 ```
 
-Both the controller and each storage unit write their data directly to disk from within their own processes. The ZMQ RPC carries only the target file path and an ACK, not the payload — this avoids routing large tensors through the Ray object store.
+Both the controller and each storage unit write their data directly to disk from within their own processes. The ZMQ RPC carries only the target file path and an ACK, not the payload — this avoids routing large tensors through the Ray object store. With SSD offload enabled, each `su_*.pkl` stores in-memory values plus an `ssd_index` of plain metadata dictionaries; SSD-backed values are copied unchanged into the adjacent `.blobs` directory. Save and load therefore do not materialize the full SSD tier in host memory.
 
 ## Save Order and Consistency
 

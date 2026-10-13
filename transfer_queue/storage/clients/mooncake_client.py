@@ -33,6 +33,34 @@ from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes
 
 logger = get_logger(__name__)
 
+try:
+    import torch_npu  # noqa: F401
+
+    NPU_IMPORTED: bool = True
+except Exception:  # pragma: no cover - accelerator optional
+    NPU_IMPORTED = False
+
+
+def _resolve_npu_device() -> int | None:
+    """Return the NPU device this process is bound to, or ``None`` if it uses no NPU.
+
+    Ascend ACL contexts are thread-local, so this must run on the thread that owns
+    the device (``__init__``). Resolving it on a context-less pool worker would
+    always report device 0. Gating on ``is_initialized()`` (rather than
+    ``is_available()``) keeps a process that never touches the NPU from allocating
+    device memory and contending for device 0.
+    """
+    if not NPU_IMPORTED:
+        return None
+    try:
+        if not torch.npu.is_initialized():
+            return None
+        return int(torch.npu.current_device())
+    except Exception:
+        logger.warning("Failed to resolve the current NPU device.", exc_info=True)
+        return None
+
+
 MOONCAKE_STORE_IMPORTED: bool = True
 try:
     from mooncake.store import MooncakeDistributedStore, ReplicateConfig
@@ -40,11 +68,69 @@ try:
 except ImportError:
     MOONCAKE_STORE_IMPORTED = False
 
+MOONCAKE_BUFFER_POOL_IMPORTED: bool = True
+try:
+    from mooncake.store import BufferPool
+except ImportError:
+    # Older mooncake builds have no lease API; those fall back to registering per transfer.
+    MOONCAKE_BUFFER_POOL_IMPORTED = False
+
 BATCH_SIZE_LIMIT: int = 400
 MAX_BATCH_WORKER_THREADS = 4
 MAX_SERIAL_WORKER_THREADS = 4
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+
+
+def _copy_buffer_content_into_tensors(lease, targets: list[Tensor], offsets: list[int]) -> None:
+    """Copy each staged region out of the pooled buffer into the caller's tensors.
+
+    Views are dropped even when a copy raises: the pool refuses to return a buffer while an
+    exported view of it is alive, and an exception would otherwise keep it in its frame.
+    """
+    # torch.frombuffer rejects count=0, and an empty tensor has nothing to copy.
+    staged = [(t, off) for t, off in zip(targets, offsets, strict=True) if t.numel()]
+    if not staged:
+        return
+    targets = [t for t, _ in staged]
+    offsets = [off for _, off in staged]
+
+    t0 = targets[0]
+    numel = t0.numel()
+    # A uniform, tightly packed group copies in one strided pass; ragged groups copy per tensor.
+    uniform = len(targets) > 1
+    if uniform:
+        base_off = t0.storage_offset()
+        base_ptr = t0.untyped_storage().data_ptr()
+        for j, t in enumerate(targets):
+            if (
+                t.dtype != t0.dtype
+                or t.shape != t0.shape
+                or not t.is_contiguous()
+                or t.storage_offset() != base_off + j * numel
+                or t.untyped_storage().data_ptr() != base_ptr
+            ):
+                uniform = False
+                break
+
+    if uniform:
+        k = len(targets)
+        stride_elems = (offsets[1] - offsets[0]) // t0.element_size()
+        src = torch.frombuffer(lease.buffer, dtype=t0.dtype, count=(k - 1) * stride_elems + numel).as_strided(
+            (k, numel), (stride_elems, 1)
+        )
+        try:
+            t0.as_strided((k, numel), (numel, 1), t0.storage_offset()).copy_(src)
+        finally:
+            del src
+        return
+
+    for target, off in zip(targets, offsets, strict=True):
+        staged = torch.frombuffer(lease.buffer, dtype=target.dtype, count=target.numel(), offset=off)
+        try:
+            target.copy_(staged.view(target.shape))
+        finally:
+            del staged
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
@@ -121,6 +207,9 @@ class MooncakeStoreClient(StorageKVClient):
             hard_pin = not offload_enabled
         self.replica_config.with_hard_pin = bool(hard_pin)
 
+        # Capture on the owning thread; pool workers reuse it via _bind_npu_device.
+        self._npu_device = _resolve_npu_device()
+
         self._store = MooncakeDistributedStore()
         ret = self._store.setup(
             self.local_hostname,
@@ -133,6 +222,39 @@ class MooncakeStoreClient(StorageKVClient):
         )
         if ret != 0:
             raise RuntimeError(f"Mooncake store setup failed with error code: {ret}")
+
+        # Only RDMA reads pay for register_buffer (a kernel op far slower than the transfer it
+        # enables); TCP reads would pay the extra copy-out for no gain, so leave them unpooled.
+        # See https://github.com/Ascend/TransferQueue/issues/169
+        use_pool = MOONCAKE_BUFFER_POOL_IMPORTED and self.protocol == "rdma"
+        self._buffer_pool = (
+            BufferPool(self._store, max_bytes=self.local_buffer_size, max_regions=MAX_BATCH_WORKER_THREADS)
+            if use_pool
+            else None
+        )
+        self._pool_fallback_warned = False
+        if not MOONCAKE_BUFFER_POOL_IMPORTED and self.protocol == "rdma" and self._gdr_staging is None:
+            logger.warning(
+                "mooncake.store.BufferPool is unavailable, so every tensor read registers and "
+                "unregisters its own receive buffer. Upgrade to mooncake-transfer-engine >= 0.3.12 "
+                "to lease pre-registered buffers instead."
+            )
+        # Claim at most half the registered buffer: mooncake stages its own reads from the
+        # same region, so splitting all of it across the reader threads would starve those reads.
+        self._pool_share_bytes = self.local_buffer_size // (2 * MAX_BATCH_WORKER_THREADS)
+
+    def _bind_npu_device(self) -> None:
+        """``ThreadPoolExecutor`` initializer: bind a worker to ``self._npu_device``."""
+        if self._npu_device is None:
+            return
+        try:
+            torch.npu.set_device(self._npu_device)
+        except Exception:
+            logger.warning(
+                f"Failed to bind NPU device {self._npu_device} on a worker thread; "
+                "Mooncake buffer register/unregister may fail.",
+                exc_info=True,
+            )
 
     def put(self, keys: list[str], values: list[Any]) -> list[dict | None]:
         """Stores multiple key-value pairs to MooncakeStore.
@@ -173,7 +295,10 @@ class MooncakeStoreClient(StorageKVClient):
 
         tensor_futures: list[Future[None]] = []
         bytes_futures: list[Future[list[int]]] = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=self._bind_npu_device,
+        ) as executor:
             if not use_gdr_path:
                 for i in range(0, len(tensor_keys), BATCH_SIZE_LIMIT):
                     batch_keys = tensor_keys[i : i + BATCH_SIZE_LIMIT]
@@ -373,7 +498,10 @@ class MooncakeStoreClient(StorageKVClient):
                 results[idx] = val
 
         futures = []
-        with ThreadPoolExecutor(max_workers=MAX_BATCH_WORKER_THREADS) as executor:
+        with ThreadPoolExecutor(
+            max_workers=MAX_BATCH_WORKER_THREADS,
+            initializer=self._bind_npu_device,
+        ) as executor:
             for i in range(0, len(cpu_tensor_indices), BATCH_SIZE_LIMIT):
                 batch_keys = cpu_tensor_keys[i : i + BATCH_SIZE_LIMIT]
                 batch_shapes = cpu_tensor_shapes[i : i + BATCH_SIZE_LIMIT]
@@ -404,17 +532,90 @@ class MooncakeStoreClient(StorageKVClient):
         self, batch_keys: list[str], batch_shapes: list[tuple], batch_dtypes: list[torch.dtype], indexes: list[int]
     ) -> tuple[list[Tensor], list[int]]:
         batch_nbytes = get_nbytes(batch_dtypes, batch_shapes)
-        batch_buffer_tensors, batch_buffer_ptrs, region_ptrs, region_sizes = allocate_empty_tensors(
-            batch_dtypes, batch_shapes
-        )
+        batch_buffer_tensors, batch_buffer_ptrs, _, _ = allocate_empty_tensors(batch_dtypes, batch_shapes)
 
+        if self._buffer_pool is None:
+            self._read_into_registered_tensors(batch_keys, batch_buffer_ptrs, batch_nbytes)
+            return batch_buffer_tensors, indexes
+
+        # Read what the pool can serve; register the rest in one pass after the loop, so
+        # oversized tensors and pool exhaustion keep the pre-pool cost (one register + one
+        # transfer) instead of paying it per group.
+        fallback: list[int] = []
+        for group in split_by_bytes(batch_nbytes, self._pool_share_bytes):
+            fallback += self._read_via_buffer_pool(
+                group, batch_keys, batch_buffer_ptrs, batch_nbytes, batch_buffer_tensors
+            )
+        if fallback:
+            self._read_into_registered_tensors(
+                [batch_keys[i] for i in fallback],
+                [batch_buffer_ptrs[i] for i in fallback],
+                [batch_nbytes[i] for i in fallback],
+            )
+
+        return batch_buffer_tensors, indexes
+
+    def _read_into_registered_tensors(self, keys: list[str], ptrs: list[int], nbytes: list[int]) -> None:
+        """Register the receive regions for one transfer, read into them, then unregister."""
+        region_ptrs, region_sizes = merge_contiguous_memory(ptrs, nbytes)
         self._register_all_buffers(region_ptrs, region_sizes)
         try:
-            self._batch_get_into_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes)
+            self._batch_get_into_with_retry(keys, ptrs, nbytes)
         finally:
             self._unregister_all_buffers(region_ptrs)
 
-        return batch_buffer_tensors, indexes
+    def _read_via_buffer_pool(
+        self,
+        group: list[int],
+        batch_keys: list[str],
+        batch_ptrs: list[int],
+        batch_nbytes: list[int],
+        batch_tensors: list[Tensor],
+    ) -> list[int]:
+        """Read one group into a pooled buffer and copy into the caller's tensors.
+
+        Returns the group unread when the pool cannot serve it, so the caller can register
+        those keys in one batch. A group larger than one reader's share is never leased:
+        that headroom belongs to the other readers and to mooncake's own staging.
+        """
+        nbytes = [batch_nbytes[i] for i in group]
+        offsets, total = _aligned_offsets(nbytes)
+        lease = self._acquire_buffer(total) if total <= self._pool_share_bytes else None
+        if lease is None:
+            return group
+
+        keys = [batch_keys[i] for i in group]
+        try:
+            self._batch_get_into_with_retry(keys, [lease.ptr + off for off in offsets], nbytes)
+            _copy_buffer_content_into_tensors(lease, [batch_tensors[i] for i in group], offsets)
+        except Exception:
+            # A failed read can leave the buffer unreturnable; keep the original cause.
+            try:
+                lease.release()
+            except Exception as release_error:
+                logger.warning(f"Returning the pooled receive buffer failed: {release_error}")
+            raise
+        lease.release()
+        return []
+
+    def _acquire_buffer(self, nbytes: int):
+        """Lease ``nbytes`` of pre-registered memory, or None when the pool cannot serve it.
+
+        Never block: a busy pool means registering a receive buffer beats waiting. mooncake
+        reports both the per-reader cap and an over-capacity request as an exception.
+        """
+        assert self._buffer_pool is not None
+        try:
+            return self._buffer_pool.acquire(nbytes, block=False)
+        except Exception as e:
+            logger.debug(f"Leasing {nbytes} B of pre-registered memory failed ({e}); registering own buffer.")
+            if not self._pool_fallback_warned:
+                self._pool_fallback_warned = True
+                logger.warning(
+                    f"Falling back to registering receive buffers per read ({e}). Raise local_buffer_size "
+                    "or lower read concurrency to keep reads on the pre-registered fast path."
+                )
+            return None
 
     def _get_tensors_gdr(
         self,
@@ -534,7 +735,14 @@ class MooncakeStoreClient(StorageKVClient):
                 logger.error(f"remove failed for key `{actual_keys[i]}` with error code: {ret}")
 
     def close(self):
-        """Closes MooncakeStore."""
+        """Closes MooncakeStore.
+
+        Callers must have finished their reads first: the pool refuses to close while a
+        buffer is still leased, and the store owns the memory those buffers point into.
+        """
+        if self._buffer_pool is not None:
+            self._buffer_pool.close()
+            self._buffer_pool = None
         if self._gdr_staging is not None:
             self._gdr_staging.close(self._store)
             self._gdr_staging = None

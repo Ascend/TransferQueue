@@ -29,9 +29,11 @@ from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    TQ_SOCKET_POOL_SIZE,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    ZMQSocketPool,
     with_zmq_socket,
 )
 
@@ -49,10 +51,8 @@ DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
-    "request_handle_socket",
-    get_identity=lambda self: self.client_id,
     get_peer=lambda self, target: self._controller,
-    get_context=lambda self: self.zmq_context,
+    get_pool=lambda self: self.controller_rpc_pool,
 )
 
 
@@ -61,6 +61,11 @@ class AsyncTransferQueueClient:
 
     This client provides async methods for data transfer operations including getting metadata,
     reading data from storage, writing data to storage, and clearing data.
+
+    Await these methods from one long-lived event loop, as the examples below do. Pooled
+    sockets are keyed by their owning loop, so a fresh ``asyncio.run()`` per call gets a
+    fresh socket every time and pays a connect handshake it cannot amortize. Callers with
+    no loop of their own should use ``TransferQueueClient``, which keeps one internally.
     """
 
     def __init__(
@@ -91,12 +96,17 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # One long-lived context per client; sockets stay per-request because ZMQ sockets
-        # are not thread-safe.
+        # Check everything that does not need the context first: the finalizer is not armed
+        # until __init__ returns, so raising after allocation leaks it and its I/O threads.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
-        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
+        if TQ_SOCKET_POOL_SIZE < 1:
+            # Name the variable: the pool's own error cannot say which knob supplied the value.
+            raise ValueError(
+                f"TQ_SOCKET_POOL_SIZE must be at least 1, got {TQ_SOCKET_POOL_SIZE}. "
+                f"The pool always reuses at least one socket per endpoint; it cannot be disabled."
+            )
 
         max_sockets = zmq_max_sockets
         explicitly_requested = max_sockets is not None
@@ -109,26 +119,44 @@ class AsyncTransferQueueClient:
                     f"TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer, got {TQ_CLIENT_ZMQ_MAX_SOCKETS!r}"
                 ) from e
             explicitly_requested = True
+        if max_sockets is not None and max_sockets < 1:
+            # The upper bound needs ZMQ_SOCKET_LIMIT, hence a live context, but the lower one
+            # does not -- so reject it before allocating anything.
+            raise ValueError(f"Client ZMQ max sockets must be at least 1, got {max_sockets}")
         if max_sockets is None:
             max_sockets = DEFAULT_CLIENT_ZMQ_MAX_SOCKETS
 
-        socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
-        if explicitly_requested:
-            # A value the caller asked for must not be silently reinterpreted.
-            if not 1 <= max_sockets <= socket_limit:
-                raise ValueError(
-                    f"Client ZMQ max sockets must be between 1 and this build's "
-                    f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
+        try:
+            # ZMQ_SOCKET_LIMIT is a property of the built context, so this last check cannot
+            # be hoisted above it; destroy the context rather than leak it on failure.
+            socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
+            if explicitly_requested:
+                # A value the caller asked for must not be silently reinterpreted.
+                if max_sockets > socket_limit:
+                    raise ValueError(
+                        f"Client ZMQ max sockets must be between 1 and this build's "
+                        f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+                    )
+            elif max_sockets > socket_limit:
+                # Nobody asked for the default, so clamp instead of failing to construct on a
+                # build whose ZMQ_SOCKET_LIMIT is below it.
+                logger.debug(
+                    f"[{client_id}]: Clamping default ZMQ max sockets {max_sockets} to this "
+                    f"build's ZMQ_SOCKET_LIMIT ({socket_limit})."
                 )
-        elif max_sockets > socket_limit:
-            # Nobody asked for the default, so clamp instead of failing to construct on a
-            # build whose ZMQ_SOCKET_LIMIT is below it.
-            logger.debug(
-                f"[{client_id}]: Clamping default ZMQ max sockets {max_sockets} to this "
-                f"build's ZMQ_SOCKET_LIMIT ({socket_limit})."
-            )
-            max_sockets = socket_limit
-        self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+                max_sockets = socket_limit
+            self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+        except BaseException:
+            self.zmq_context.destroy(linger=0)
+            raise
+        # Reused across requests, so the socket budget above is consumed by the concurrency
+        # high-water mark rather than by request count.
+        self.controller_rpc_pool = ZMQSocketPool(
+            self.zmq_context,
+            client_id,
+            "request_handle_socket",
+        )
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
         # not leak for the process lifetime. finalize() (not __del__) also runs at
@@ -159,7 +187,8 @@ class AsyncTransferQueueClient:
 
         The client's long-lived ZMQ context is offered to every backend uniformly; each
         registered manager decides whether to borrow it or keep its own, so the client
-        needs no knowledge of specific backend names.
+        needs no knowledge of specific backend names. Managers build their own pools over
+        whichever context they end up with, one per request scenario.
 
         Args:
             manager_type: Type of storage manager to create. Supported types include:
@@ -236,33 +265,35 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> # Example 1: Basic fetch metadata
-            >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences"
-            ... ))
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
-            >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=8,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ... ))
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
-            >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     partition_id="train_0",   # optional
-            ...     mode="force_fetch",
-            ... ))
-            >>> print(batch_meta.is_ready)  # May be False if some samples not ready
+            >>> async def main():
+            ...     # Example 1: Basic fetch metadata
+            ...     batch_meta = await client.async_get_meta(
+            ...         data_fields=["input_ids", "attention_mask"],
+            ...         batch_size=4,
+            ...         partition_id="train_0",
+            ...         mode="fetch",
+            ...         task_name="generate_sequences"
+            ...     )
+            ...     print(batch_meta.is_ready)  # True if all samples ready
+            ...
+            ...     # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
+            ...     batch_meta = await client.async_get_meta(
+            ...         data_fields=["input_ids", "attention_mask"],
+            ...         batch_size=8,
+            ...         partition_id="train_0",
+            ...         mode="fetch",
+            ...         task_name="generate_sequences",
+            ...     )
+            ...     print(batch_meta.is_ready)  # True if all samples ready
+            ...
+            ...     # Example 3: Force fetch metadata (bypass production status check and Sampler,
+            ...     # so may include unready and already-consumed samples. No filtering by
+            ...     # consumption status is applied.)
+            ...     batch_meta = await client.async_get_meta(
+            ...         partition_id="train_0",   # optional
+            ...         mode="force_fetch",
+            ...     )
+            ...     print(batch_meta.is_ready)  # May be False if some samples not ready
         """
         response_msg = await self._request_controller(
             socket=socket,
@@ -302,10 +333,11 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> # Create batch with custom metadata
-            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=4, ...)
-            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
-            >>> asyncio.run(client.async_set_custom_meta(batch_meta))
+            >>> async def main():
+            ...     # Create batch with custom metadata
+            ...     batch_meta = await client.async_get_meta(data_fields=["input_ids"], batch_size=4, ...)
+            ...     batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
+            ...     await client.async_set_custom_meta(batch_meta)
         """
         assert socket is not None
 
@@ -387,30 +419,34 @@ class AsyncTransferQueueClient:
             >>> batch_size = 4
             >>> seq_len = 16
             >>> current_partition_id = "train_0"
-            >>> # Example 1: Normal usage with existing metadata
-            >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     data_fields=["prompts", "attention_mask"],
-            ...     batch_size=batch_size,
-            ...     partition_id=current_partition_id,
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ... ))
-            >>> batch = asyncio.run(client.async_get_data(batch_meta))
-            >>> output = TensorDict({"response": torch.randn(batch_size, seq_len)})
-            >>> asyncio.run(client.async_put(data=output, metadata=batch_meta))
-            >>>
-            >>> # Example 2: Initial data insertion without pre-existing metadata
-            >>> # BE CAREFUL: this usage may overwrite any unconsumed data in the given partition_id!
-            >>> # Please make sure the corresponding partition_id is empty before calling the async_put()
-            >>> # without metadata.
-            >>> # Now we only support put all the data of the corresponding partition id in once. You should repeat with
-            >>> # interleave the initial data if n_sample > 1 before calling the async_put().
-            >>> original_prompts = torch.randn(batch_size, seq_len)
-            >>> n_samples = 4
-            >>> prompts_repeated = torch.repeat_interleave(original_prompts, n_samples, dim=0)
-            >>> prompts_repeated_batch = TensorDict({"prompts": prompts_repeated})
-            >>> # This will create metadata in "insert" mode internally.
-            >>> metadata = asyncio.run(client.async_put(data=prompts_repeated_batch, partition_id=current_partition_id))
+            >>> async def main():
+            ...     # Example 1: Normal usage with existing metadata
+            ...     batch_meta = await client.async_get_meta(
+            ...         data_fields=["prompts", "attention_mask"],
+            ...         batch_size=batch_size,
+            ...         partition_id=current_partition_id,
+            ...         mode="fetch",
+            ...         task_name="generate_sequences",
+            ...     )
+            ...     batch = await client.async_get_data(batch_meta)
+            ...     output = TensorDict({"response": torch.randn(batch_size, seq_len)})
+            ...     await client.async_put(data=output, metadata=batch_meta)
+            ...
+            ...     # Example 2: Initial data insertion without pre-existing metadata
+            ...     # BE CAREFUL: this usage may overwrite any unconsumed data in the given
+            ...     # partition_id! Please make sure the corresponding partition_id is empty
+            ...     # before calling the async_put() without metadata.
+            ...     # Now we only support put all the data of the corresponding partition id in
+            ...     # once. You should repeat with interleave the initial data if n_sample > 1
+            ...     # before calling the async_put().
+            ...     original_prompts = torch.randn(batch_size, seq_len)
+            ...     n_samples = 4
+            ...     prompts_repeated = torch.repeat_interleave(original_prompts, n_samples, dim=0)
+            ...     prompts_repeated_batch = TensorDict({"prompts": prompts_repeated})
+            ...     # This will create metadata in "insert" mode internally.
+            ...     metadata = await client.async_put(
+            ...         data=prompts_repeated_batch, partition_id=current_partition_id
+            ...     )
         """
 
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
@@ -467,16 +503,18 @@ class AsyncTransferQueueClient:
                 - Requested data fields (e.g., "prompts", "attention_mask")
 
         Example:
-            >>> batch_meta = asyncio.run(client.async_get_meta(
-            ...     data_fields=["prompts", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ... ))
-            >>> batch = asyncio.run(client.async_get_data(batch_meta))
-            >>> print(batch)
-            >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
+            >>> async def main():
+            ...     batch_meta = await client.async_get_meta(
+            ...         data_fields=["prompts", "attention_mask"],
+            ...         batch_size=4,
+            ...         partition_id="train_0",
+            ...         mode="fetch",
+            ...         task_name="generate_sequences",
+            ...     )
+            ...     batch = await client.async_get_data(batch_meta)
+            ...     print(batch)
+            ...     # TensorDict with fields "prompts", "attention_mask", and sample order
+            ...     # matching metadata global_indexes
         """
 
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
@@ -678,10 +716,10 @@ class AsyncTransferQueueClient:
 
         Example:
             >>> # Get consumption status
-            >>> global_index, consumption_status = asyncio.run(client.async_get_consumption_status(
+            >>> global_index, consumption_status = await client.async_get_consumption_status(
             ...     task_name="generate_sequences",
             ...     partition_id="train_0"
-            ... ))
+            ... )
             >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
         """
 
@@ -725,10 +763,10 @@ class AsyncTransferQueueClient:
 
         Example:
             >>> # Get production status
-            >>> global_index, production_status = asyncio.run(client.async_get_production_status(
+            >>> global_index, production_status = await client.async_get_production_status(
             ...     data_fields=["input_ids", "attention_mask"],
             ...     partition_id="train_0"
-            ... ))
+            ... )
             >>> print(f"Global index: {global_index}, Production status: {production_status}")
         """
         try:
@@ -766,10 +804,10 @@ class AsyncTransferQueueClient:
 
         Example:
             >>> # Check if all samples have been consumed
-            >>> is_consumed = asyncio.run(client.async_check_consumption_status(
+            >>> is_consumed = await client.async_check_consumption_status(
             ...     task_name="generate_sequences",
             ...     partition_id="train_0"
-            ... ))
+            ... )
             >>> print(f"All samples consumed: {is_consumed}")
         """
 
@@ -802,10 +840,10 @@ class AsyncTransferQueueClient:
 
         Example:
             >>> # Check if all samples are ready for consumption
-            >>> is_ready = asyncio.run(client.async_check_production_status(
+            >>> is_ready = await client.async_check_production_status(
             ...     data_fields=["input_ids", "attention_mask"],
             ...     partition_id="train_0"
-            ... ))
+            ... )
             >>> print(f"All samples ready: {is_ready}")
         """
         _, production_status = await self.async_get_production_status(
@@ -842,10 +880,10 @@ class AsyncTransferQueueClient:
 
         Example:
             >>> # Reset consumption for train task to re-train on same data
-            >>> success = asyncio.run(client.async_reset_consumption(
+            >>> success = await client.async_reset_consumption(
             ...     partition_id="train_0",
             ...     task_name="train"
-            ... ))
+            ... )
             >>> print(f"Reset successful: {success}")
         """
         body = {"partition_id": partition_id}
@@ -879,7 +917,7 @@ class AsyncTransferQueueClient:
             list[str]: List of partition ids managed by the controller
 
         Example:
-            >>> partition_ids = asyncio.run(client.get_partition_list())
+            >>> partition_ids = await client.get_partition_list()
             >>> print(f"Available partitions: {partition_ids}")
         """
         try:
@@ -1053,6 +1091,8 @@ class AsyncTransferQueueClient:
             )
             return
         try:
+            # Close pooled sockets before the context that owns them.
+            self.controller_rpc_pool.close()
             if hasattr(self, "zmq_context") and self.zmq_context is not None:
                 self.zmq_context.destroy(linger=0)
         except Exception as e:

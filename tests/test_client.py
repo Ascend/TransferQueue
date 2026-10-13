@@ -68,6 +68,7 @@ class MockController:
         )
 
         self.running = True
+        self.caller_identities: set[bytes] = set()
         self.request_thread = Thread(target=self._handle_requests, daemon=True)
         self.request_thread.start()
 
@@ -85,6 +86,9 @@ class MockController:
                 if self.request_socket in socks:
                     messages = self.request_socket.recv_multipart(copy=False)
                     identity = messages.pop(0)
+                    # Each pooled socket dials with its own identity, so this records how
+                    # many distinct connections the client opened.
+                    self.caller_identities.add(bytes(identity))
                     serialized_msg = messages
                     request_msg = ZMQMessage.deserialize(serialized_msg)
 
@@ -1328,6 +1332,26 @@ class TestClientKVInterface:
                 global_indexes=[0, "invalid"],
                 partition_id="test_partition",
             )
+
+
+# =====================================================
+# Controller RPC Socket Pool Tests
+# =====================================================
+
+
+def test_controller_rpc_reuses_one_socket(client_setup):
+    """Repeated calls must share a single connection to the controller.
+
+    This is the client-side payoff of the socket pool: TransferQueueClient runs every call
+    on the one event loop it builds in __init__, so all of them land in the same pool
+    bucket. Counted from the controller, which sees one ZMQ identity per socket dialled.
+    """
+    client, mock_controller, _ = client_setup
+
+    for _ in range(5):
+        assert client.get_partition_list() == ["partition_0", "partition_1", "test_partition"]
+
+    assert len(mock_controller.caller_identities) == 1, "each request opened its own socket"
 
 
 # =====================================================

@@ -20,6 +20,8 @@ import logging
 import pytest
 import torch
 
+from transfer_queue.storage.managers import simple_storage_manager as manager_module
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
@@ -90,3 +92,42 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
     assert reply.request_type == ZMQRequestType.GET_ERROR
     assert KEY_NOT_FOUND_MARKER in reply.body["message"]
     assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+
+
+@pytest.mark.asyncio
+async def test_key_not_found_reply_is_not_logged_as_error_by_caller(caplog):
+    manager = object.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "TQ_STORAGE_test"
+    manager.storage_unit_infos = {}
+    manager.payload_transfer = manager_module.create_payload_transfer(None)
+
+    class GetErrorSocket:
+        async def send_multipart(self, *args, **kwargs):
+            pass
+
+        async def recv_multipart(self, **kwargs):
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.GET_ERROR,
+                sender_id="su0",
+                body={
+                    "message": f"Failed to get data from storage unit id #su0, detail error message: "
+                    f"{KEY_NOT_FOUND_MARKER}: key 1 not found"
+                },
+            ).serialize()
+
+    with caplog.at_level(logging.DEBUG, logger="transfer_queue"):
+        with pytest.raises(StorageKeyNotFoundError):
+            await AsyncSimpleStorageManager._get_from_single_storage_unit.__wrapped__(
+                manager,
+                [1],
+                ["log_probs"],
+                target_storage_unit="su0",
+                socket=GetErrorSocket(),
+            )
+
+    errors = [
+        record
+        for record in caplog.records
+        if record.name.startswith("transfer_queue") and record.levelno >= logging.ERROR
+    ]
+    assert errors == [], [record.getMessage() for record in errors]
