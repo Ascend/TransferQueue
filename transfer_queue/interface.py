@@ -649,8 +649,9 @@ def kv_update(
 ) -> KVBatchMeta:
     """Merge new values into the fields of one key, adding the key or fields if missing.
 
-    A superset of ``kv_put``: a missing key is created and a field the controller does
-    not record for the key yet is stored as given, without calling ``merge_fn``.
+    A missing key is created and a field the controller does not record for the key
+    yet is stored as given, without calling ``merge_fn``. Unlike ``kv_put``, it takes
+    no ``tags`` or ``data_parser``.
 
     Args:
         key: User-specified key. Created if missing.

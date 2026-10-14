@@ -116,7 +116,7 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
 - **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
-- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into fields with `merge_fn(old, new)`; a superset of put that adds missing keys and fields. SimpleStorage only.
+- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into fields with `merge_fn(old, new)`, adding missing keys and fields. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_describe**: Show each key's stored fields, including those `kv_update(finalize=False)` keeps hidden.
 - **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
