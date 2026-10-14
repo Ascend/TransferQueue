@@ -727,6 +727,18 @@ class TestKVGetE2E:
             # Or it might raise an error about keys not found
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 
+    def test_kv_batch_get_raises_when_some_keys_are_missing(self, controller, tq_api):
+        """A partial miss must not return fewer rows than keys."""
+        partition_id = "test_partition"
+        keys = ["partial_0", "partial_1"]
+        fields = TensorDict({"x": torch.tensor([[1], [2]])}, batch_size=2)
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields)
+
+        with pytest.raises(ValueError, match=r"1 of 3 keys were not found in partition 'test_partition': \['absent'\]"):
+            tq_api.kv_batch_get(keys=["partial_0", "absent", "partial_1"], partition_id=partition_id)
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
     def test_kv_batch_get_data_parser_parses_each_field_with_per_key_args(self, tq_api, backend_name):
         if backend_name != "SimpleStorage":
             pytest.skip("kv_batch_get data_parser is implemented only for SimpleStorage")
@@ -756,7 +768,7 @@ class TestKVGetE2E:
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, data_parser=parse, parser_args=[2, 3])
         with pytest.raises(ValueError, match="requires data_parser"):
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, parser_args=[2, 3, 1])
-        with pytest.raises(ValueError, match="parser_args needs every key"):
+        with pytest.raises(ValueError, match="1 of 2 keys were not found"):
             tq_api.kv_batch_get(
                 keys=["parse_0", "absent"], partition_id=partition_id, data_parser=parse, parser_args=[1, 1]
             )

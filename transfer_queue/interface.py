@@ -502,7 +502,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | Non
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
         ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
@@ -557,17 +557,17 @@ def kv_batch_get(
 
             Only supported by SimpleStorage; KV backends raise ``NotImplementedError``.
         parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
-            Requires ``data_parser``, and every key must exist. They are serialized like
-            request data, so tuples arrive as lists.
+            Requires ``data_parser``. They are serialized like request data, so tuples
+            arrive as lists.
 
     Returns:
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
-        ValueError: If ``parser_args`` is given without ``data_parser``, does not match the
-            number of keys, or some keys are missing
+        ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
+            number of keys
         RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
 
     Example:
@@ -947,7 +947,7 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str]
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
         ValueError: If any field in select_fields doesn't exist in KVBatchMeta.fields
 
@@ -1008,10 +1008,10 @@ async def async_kv_batch_get(
         TensorDict with the requested data
 
     Raises:
-        ValueError: If keys or partition are not found
+        ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
-        ValueError: If ``parser_args`` is given without ``data_parser``, does not match the
-            number of keys, or some keys are missing
+        ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
+            number of keys
         RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
 
     Example:
@@ -1032,10 +1032,14 @@ async def async_kv_batch_get(
 
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
-    # Missing keys are dropped from the meta, which would shift parser_args onto other keys.
-    num_keys = 1 if isinstance(keys, str) else len(keys)
-    if parser_args is not None and batch_meta.size != num_keys:
-        raise ValueError(f"only {batch_meta.size} of {num_keys} keys were found; parser_args needs every key")
+    # The controller drops missing keys from the meta, so the rows would no longer line up with keys.
+    requested = [keys] if isinstance(keys, str) else keys
+    if batch_meta.size != len(requested):
+        found = set(await tq_client.async_kv_retrieve_keys(batch_meta.global_indexes, partition_id))
+        missing = [key for key in requested if key not in found]
+        raise ValueError(
+            f"{len(missing)} of {len(requested)} keys were not found in partition {partition_id!r}: {missing[:20]}"
+        )
 
     if select_fields is not None:
         if isinstance(select_fields, str):
