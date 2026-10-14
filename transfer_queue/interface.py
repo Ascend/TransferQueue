@@ -659,9 +659,10 @@ def kv_update(
         merge_fn: ``merge_fn(old, new) -> stored`` for fields the key already holds,
             hidden ones included. SimpleStorage runs it once per field on the unit
             that owns the sample.
-        finalize: If False, the updated fields become (or stay) hidden from consumers,
-            so readers never see an intermediate value. Pass True (the default) on the
-            last update to make them ready.
+        finalize: If False, the updated fields stay hidden from consumers until an update
+            with True (the default), so a field built over several updates never shows an
+            intermediate value. Hiding a field that is already ready is not guaranteed:
+            readers that already hold its metadata can still see the new value.
 
     Returns:
         Metadata for the updated sample.

@@ -1279,12 +1279,6 @@ class TestKVUpdateE2E:
         assert tq_api.kv_describe(keys=key, partition_id=partition_id)[key]["unfinalized"] == []
         data = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
         assert_tensor_equal(data["tokens"][0], torch.tensor([1, 2, 3]))
-
-        # A non-final update hides a field that was already ready.
-        tq_api.kv_update(
-            key=key, partition_id=partition_id, fields={"tokens": torch.tensor([4])}, merge_fn=concat, finalize=False
-        )
-        assert not tokens_ready()
         tq_api.kv_clear(keys=key, partition_id=partition_id)
 
     def test_creates_missing_key_and_field_and_rejects_incompatible_result(self, tq_api, backend_name):

@@ -134,7 +134,8 @@ transaction.
 To build a field over several updates without exposing intermediate values, pass
 `finalize=False` to every `kv_update` except the last one, which uses the default
 `finalize=True`. Until then the field is stored but not ready, so samplers, the
-dataloader and `kv_batch_get` do not see it.
+dataloader and `kv_batch_get` do not see it. Updates to one key must come from
+one writer at a time; use `kv_global_lock` if several processes write the same key.
 
 **Key Features**
 
