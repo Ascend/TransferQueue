@@ -121,12 +121,15 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 - **(async_)kv_describe**: Show each key's stored fields, including those `kv_update(finalize=False)` keeps hidden.
 - **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
 
-`kv_update` stores a field the key does not hold yet as given, without calling
-`merge_fn`; a merge must preserve the stored value's tensor/non-tensor type and
-tensor dtype. A timeout has an unknown outcome because a storage unit may commit
-after the caller stops waiting, so non-idempotent merge operations must not be
-retried blindly. Updates are atomic within one storage-unit request; a batch
-spanning multiple units is not a distributed transaction.
+`kv_update` merges only the rows the controller records as holding the field
+(including hidden ones); every other row takes the new value as given, without
+calling `merge_fn`, and overwrites anything a storage unit kept after a failed
+clear. Every stored value must keep the field's tensor/non-tensor type and
+tensor dtype in the partition. A timeout has an unknown outcome because a
+storage unit may commit after the caller stops waiting, so non-idempotent merge
+operations must not be retried blindly. Updates are atomic within one
+storage-unit request; a batch spanning multiple units is not a distributed
+transaction.
 
 To build a field over several updates without exposing intermediate values, pass
 `finalize=False` to every `kv_update` except the last one, which uses the default

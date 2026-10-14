@@ -649,15 +649,16 @@ def kv_update(
 ) -> KVBatchMeta:
     """Merge new values into the fields of one key, adding the key or fields if missing.
 
-    A superset of ``kv_put``: a missing key is created and a field the key does not
-    hold yet is stored as given, without calling ``merge_fn``.
+    A superset of ``kv_put``: a missing key is created and a field the controller does
+    not record for the key yet is stored as given, without calling ``merge_fn``.
 
     Args:
         key: User-specified key. Created if missing.
         partition_id: Partition that holds the key.
         fields: New values keyed by field name.
-        merge_fn: ``merge_fn(old, new) -> stored`` for fields the key already holds.
-            SimpleStorage runs it once per field on the unit that owns the sample.
+        merge_fn: ``merge_fn(old, new) -> stored`` for fields the key already holds,
+            hidden ones included. SimpleStorage runs it once per field on the unit
+            that owns the sample.
         finalize: If False, the updated fields become (or stay) hidden from consumers,
             so readers never see an intermediate value. Pass True (the default) on the
             last update to make them ready.
@@ -666,8 +667,9 @@ def kv_update(
         Metadata for the updated sample.
 
     Raises:
-        TypeError: If ``fields`` is not a non-empty dict, ``merge_fn`` is not callable,
-            or a merge result changes the stored value's type or dtype.
+        TypeError: If ``fields`` is not a non-empty dict or ``merge_fn`` is not callable.
+        RuntimeError: If ``merge_fn`` fails or a stored value would change the field's
+            tensor/non-tensor type or dtype; the failing storage unit writes nothing.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Note:
