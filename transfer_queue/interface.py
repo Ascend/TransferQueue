@@ -1078,8 +1078,8 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
         partition_id: Partition containing the keys.
 
     Returns:
-        ``{key: {"global_index", "fields", "unfinalized", "tag"}}``. ``fields`` lists every
-        stored field of the key and ``unfinalized`` the subset still hidden from consumers.
+        ``{key: {"fields", "unfinalized"}}``. ``fields`` lists every stored field of the
+        key and ``unfinalized`` the subset that is not ready yet.
 
     Raises:
         RuntimeError: If the partition or any key does not exist.
@@ -1093,7 +1093,9 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
     keys = [keys] if isinstance(keys, str) else keys
     tq_client = _maybe_create_tq_client()
     description = await tq_client.async_kv_describe(list(dict.fromkeys(keys)), partition_id)
-    return description["rows"]
+    return {
+        key: {"fields": row["fields"], "unfinalized": row["unfinalized"]} for key, row in description["rows"].items()
+    }
 
 
 async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
