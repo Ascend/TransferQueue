@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections import Counter
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -456,6 +457,7 @@ def kv_batch_put(
         ValueError: When both ``fields`` and ``tags`` are empty.
         ValueError: When ``fields`` batch size mismatches key count.
         ValueError: When ``tags`` length mismatches key count.
+        ValueError: When ``keys`` contains duplicates.
         RuntimeError: When retrieved metadata size mismatches input key count.
 
     Example:
@@ -832,6 +834,13 @@ async def async_kv_put(
     )
 
 
+def _check_unique_keys(keys: list[str]) -> None:
+    # KVBatchMeta rejects duplicates only after the write has landed, so reject them before any RPC.
+    duplicates = sorted(key for key, count in Counter(keys).items() if count > 1)
+    if duplicates:
+        raise ValueError(f"keys must be unique, got duplicates: {duplicates[:20]}")
+
+
 async def async_kv_batch_put(
     keys: list[str],
     partition_id: str,
@@ -869,6 +878,7 @@ async def async_kv_batch_put(
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
         ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
+        ValueError: If `keys` contains duplicates
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
 
     Example:
@@ -892,6 +902,7 @@ async def async_kv_batch_put(
             f"`keys` with length {len(keys)} does not match the `fields` TensorDict with "
             f"batch_size {fields.batch_size[0]}"
         )
+    _check_unique_keys(keys)
 
     tq_client = _maybe_create_tq_client()
 
@@ -1182,6 +1193,7 @@ async def async_kv_batch_update(
         raise ValueError(f"fields batch size {fields.batch_size} does not match {len(keys)} keys")
     if not callable(merge_fn):
         raise TypeError("merge_fn must be callable")
+    _check_unique_keys(keys)
     tq_client = _maybe_create_tq_client()
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 

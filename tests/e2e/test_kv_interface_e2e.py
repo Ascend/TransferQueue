@@ -602,6 +602,15 @@ class TestKVBatchPutE2E:
 
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
+    def test_kv_batch_put_rejects_duplicate_keys_before_writing(self, controller, tq_api):
+        partition_id = "test_partition"
+        fields = TensorDict({"x": torch.tensor([[1], [2]])}, batch_size=2)
+
+        with pytest.raises(ValueError, match=r"keys must be unique, got duplicates: \['dup_put'\]"):
+            tq_api.kv_batch_put(keys=["dup_put", "dup_put"], partition_id=partition_id, fields=fields)
+
+        assert "dup_put" not in tq_api.kv_list(partition_id=partition_id).get(partition_id, {})
+
 
 class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
@@ -1188,6 +1197,25 @@ class TestKVE2ECornerCases:
 
 class TestKVUpdateE2E:
     """SimpleStorage merge behavior through sync and async public APIs."""
+
+    def test_batch_update_rejects_duplicate_keys_before_merging(self, controller, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        key = "dup_update"
+        tq_api.kv_batch_put(keys=[key], partition_id=partition_id, fields=TensorDict({"x": torch.tensor([[1]])}, 1))
+
+        with pytest.raises(ValueError, match=r"keys must be unique, got duplicates: \['dup_update'\]"):
+            tq_api.kv_batch_update(
+                keys=[key, key],
+                partition_id=partition_id,
+                fields=TensorDict({"x": torch.tensor([[10], [20]])}, batch_size=2),
+                merge_fn=lambda old, new: old + new,
+            )
+
+        assert_tensor_equal(tq_api.kv_batch_get(keys=key, partition_id=partition_id)["x"], torch.tensor([[1]]))
+        tq_api.kv_clear(keys=key, partition_id=partition_id)
 
     def test_update_then_clear_field_keeps_partition_field_metadata(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":
