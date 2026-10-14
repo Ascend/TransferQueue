@@ -728,75 +728,161 @@ class TestKVGetE2E:
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 
 
-class TestKVBatchGetSelectItemsE2E:
-    """kv_batch_get with select_items applied on the SimpleStorage units."""
+class TestKVBatchGetParserE2E:
+    """End-to-end tests for kv_batch_get with a parser applied on the SimpleStorage units."""
 
     @pytest.fixture(autouse=True)
     def require_simple_storage(self, backend_name):
         if backend_name != "SimpleStorage":
-            pytest.skip("select_items runs on SimpleStorage units only")
+            pytest.skip("get parsers only run on SimpleStorage units")
 
     @staticmethod
-    def put_rows(tq_api, keys):
-        images = [[torch.full((2, k + i + 1), float(10 * k + i)) for i in range(k + 2)] for k in range(len(keys))]
+    def put_image_lists(tq_api, partition_id, keys):
+        image_lists = [
+            [torch.full((3, 2, k + i + 1), float(10 * k + i)) for i in range(k + 2)] for k in range(len(keys))
+        ]
         fields = TensorDict(
-            {"images": NonTensorStack(*images), "input_ids": torch.arange(len(keys) * 4).view(len(keys), 4)},
+            {"images": NonTensorStack(*image_lists), "input_ids": torch.arange(len(keys) * 4).view(len(keys), 4)},
             batch_size=len(keys),
         )
-        meta = tq_api.kv_batch_put(keys=keys, partition_id="test_partition", fields=fields, tags=[{} for _ in keys])
-        return images, meta
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{} for _ in keys])
+        return image_lists
 
-    @pytest.mark.parametrize(
-        "select_items",
-        [[[4, 0], [1], [3, 3, 1]], [[], [], []], [slice(1, 3), slice(0, 1), slice(None)]],
-        ids=["indices", "empty", "slices"],
-    )
-    def test_selects_list_items_per_key(self, tq_api, select_items):
-        images, _ = self.put_rows(tq_api, ["items_0", "items_1", "items_2", "items_3"])
+    def test_kv_batch_get_parser_selects_list_items_per_key(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_0", "parser_1", "parser_2", "parser_3"]
+        image_lists = self.put_image_lists(tq_api, partition_id, keys)
 
         retrieved = tq_api.kv_batch_get(
-            keys=["items_3", "items_0", "items_2"],
-            partition_id="test_partition",
+            keys=["parser_3", "parser_0", "parser_2"],
+            partition_id=partition_id,
             select_fields="images",
-            select_items=select_items,
+            parser=tq.select_list_items,
+            parser_args=[[4, 0], [1], [3, 3, 1]],
         )
 
         assert list(retrieved.keys()) == ["images"]
-        for got, row, items in zip(
-            list(retrieved["images"]), [images[3], images[0], images[2]], select_items, strict=False
-        ):
-            expected = row[items] if isinstance(items, slice) else [row[i] for i in items]
-            assert len(got) == len(expected)
-            for got_item, expected_item in zip(got, expected, strict=True):
-                assert_tensor_equal(got_item, expected_item)
-        full = tq_api.kv_batch_get(keys="items_3", partition_id="test_partition", select_fields="images")
-        assert len(full["images"][0]) == len(images[3])
+        expected = [[image_lists[3][4], image_lists[3][0]], [image_lists[0][1]], [image_lists[2][i] for i in (3, 3, 1)]]
+        for got_row, expected_row in zip(list(retrieved["images"]), expected, strict=True):
+            assert len(got_row) == len(expected_row)
+            for got, want in zip(got_row, expected_row, strict=True):
+                assert_tensor_equal(got, want)
 
-    def test_trims_tensor_field_to_per_key_lengths(self, tq_api):
-        _, meta = self.put_rows(tq_api, ["trim_0", "trim_1", "trim_2"])
-        select_items = [slice(0, n) for n in torch.tensor([1, 3, 2]).tolist()]
-        expected = [torch.tensor([0]), torch.tensor([4, 5, 6]), torch.tensor([8, 9])]
+        full = tq_api.kv_batch_get(keys="parser_3", partition_id=partition_id, select_fields="images")
+        assert len(full["images"][0]) == len(image_lists[3])
+
+    def test_kv_batch_get_parser_selects_video_frames_mixed_with_images(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_video_0", "parser_video_1"]
+        # Each row is image, three same-shaped video frames, image, as a VLM row stores them.
+        rows = [
+            [torch.full((3, 4, 8), float(10 * k))]
+            + [torch.full((3, 4, 4), float(10 * k + f + 1)) for f in range(3)]
+            + [torch.full((3, 8, 4), float(10 * k + 9))]
+            for k in range(len(keys))
+        ]
+        fields = TensorDict({"images": NonTensorStack(*rows)}, batch_size=len(keys))
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{} for _ in keys])
+
+        for parser_args in ([[1], [2]], [[1, 2, 3], [3, 1, 2]], [[0, 2, 4], [1, 3]]):
+            retrieved = tq_api.kv_batch_get(
+                keys=keys,
+                partition_id=partition_id,
+                select_fields="images",
+                parser=tq.select_list_items,
+                parser_args=parser_args,
+            )
+            got_rows = list(retrieved["images"])
+            assert len(got_rows) == len(rows)
+            for got_row, row, item_indices in zip(got_rows, rows, parser_args, strict=True):
+                assert isinstance(got_row, list) and len(got_row) == len(item_indices)
+                for got, item_idx in zip(got_row, item_indices, strict=True):
+                    assert_tensor_equal(got, row[item_idx])
+
+    def test_kv_batch_get_parser_empty_selection(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_empty_0", "parser_empty_1"]
+        self.put_image_lists(tq_api, partition_id, keys)
 
         retrieved = tq_api.kv_batch_get(
-            keys=meta.keys, partition_id="test_partition", select_fields="input_ids", select_items=select_items
+            keys=keys,
+            partition_id=partition_id,
+            select_fields="images",
+            parser=tq.select_list_items,
+            parser_args=[[], []],
         )
-        assert_nested_tensor_equal(retrieved["input_ids"], expected)
-        by_meta = tq_api.kv_batch_get_by_meta(meta, select_fields="input_ids", select_items=select_items)
-        assert_nested_tensor_equal(by_meta["input_ids"], expected)
 
-    def test_rejects_bad_requests(self, tq_api):
-        keys = ["bad_0", "bad_1"]
-        self.put_rows(tq_api, keys)
+        assert list(retrieved["images"]) == [[], []]
 
-        with pytest.raises(RuntimeError, match="out of range"):
+    def test_kv_batch_get_parser_trims_tensor_field_to_variable_lengths(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_tensor_0", "parser_tensor_1", "parser_tensor_2"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        retrieved = tq_api.kv_batch_get(
+            keys=keys,
+            partition_id=partition_id,
+            select_fields="input_ids",
+            parser=tq.slice_tensor,
+            parser_args=[1, 3, 2],
+        )
+
+        assert_nested_tensor_equal(
+            retrieved["input_ids"], [torch.tensor([0]), torch.tensor([4, 5, 6]), torch.tensor([8, 9])]
+        )
+
+    def test_kv_batch_get_parser_out_of_range_index_raises(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_oob_0", "parser_oob_1"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        with pytest.raises(RuntimeError, match=r"failed on field 'images'.*indices \[7\] are out of range"):
             tq_api.kv_batch_get(
-                keys=keys, partition_id="test_partition", select_fields="images", select_items=[[0], [7]]
+                keys=keys,
+                partition_id=partition_id,
+                select_fields="images",
+                parser=tq.select_list_items,
+                parser_args=[[0], [7]],
             )
-        with pytest.raises(ValueError, match="needs select_fields"):
-            tq_api.kv_batch_get(keys=keys, partition_id="test_partition", select_items=[[0], [0]])
-        with pytest.raises(ValueError, match="only 2 of 3 keys were found"):
+
+    def test_kv_batch_get_parser_exception_reaches_caller(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_raise_0"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        with pytest.raises(RuntimeError, match="ZeroDivisionError"):
             tq_api.kv_batch_get(
-                keys=keys + ["absent"], partition_id="test_partition", select_fields="images", select_items=[[0]] * 3
+                keys=keys,
+                partition_id=partition_id,
+                select_fields="images",
+                parser=lambda value, arg: 1 / 0,
+            )
+
+    def test_kv_batch_get_parser_requires_select_fields_for_multi_field(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_multi_0"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        with pytest.raises(ValueError, match="omits select_fields but the keys have multiple fields"):
+            tq_api.kv_batch_get(
+                keys=keys,
+                partition_id=partition_id,
+                parser=tq.select_list_items,
+                parser_args=[[0]],
+            )
+
+    def test_kv_batch_get_parser_missing_key_raises(self, controller, tq_api):
+        partition_id = "test_partition"
+        keys = ["parser_missing_0"]
+        self.put_image_lists(tq_api, partition_id, keys)
+
+        with pytest.raises(ValueError, match="only 1 of 2 keys were found"):
+            tq_api.kv_batch_get(
+                keys=["parser_missing_0", "parser_missing_absent"],
+                partition_id=partition_id,
+                select_fields="images",
+                parser=tq.select_list_items,
+                parser_args=[[0], [0]],
             )
 
 

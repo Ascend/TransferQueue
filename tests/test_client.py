@@ -435,7 +435,7 @@ def client_setup(mock_controller, mock_storage):
         async def mock_put_data(data, metadata, data_parser=None):
             pass  # Just pretend to store the data
 
-        async def mock_get_data(metadata):
+        async def mock_get_data(metadata, **kwargs):
             # Return the test data when requested
             return TEST_DATA
 
@@ -528,7 +528,7 @@ def test_single_controller_multiple_storages():
             async def mock_put_data(data, metadata, data_parser=None):
                 pass  # Just pretend to store the data
 
-            async def mock_get_data(metadata):
+            async def mock_get_data(metadata, **kwargs):
                 # Return some test data when requested
                 return TensorDict({"tokens": torch.randint(0, 100, (5, 128))}, batch_size=5)
 
@@ -1476,15 +1476,15 @@ class TestClientCheckpointInterface:
 
 
 @pytest.mark.asyncio
-async def test_async_get_data_passes_select_items_only_when_set():
-    """Custom managers written as get_data(self, metadata) keep serving plain gets."""
+async def test_async_get_data_omits_parser_kwargs_for_old_managers():
+    """Plain gets omit parser kwargs so old get_data(self, metadata) managers still work."""
 
     class OldStyleManager:
         async def get_data(self, metadata):
             return TensorDict({"x": torch.zeros(metadata.size)}, batch_size=[metadata.size])
 
     client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
-    client.client_id = "old_manager_client"
+    client.client_id = "old_mgr_client"
     client.storage_manager = OldStyleManager()
     metadata = BatchMeta(
         global_indexes=[0],
@@ -1492,6 +1492,8 @@ async def test_async_get_data_passes_select_items_only_when_set():
         field_schema={"x": {"dtype": torch.float32, "shape": (1,), "is_nested": False, "is_non_tensor": False}},
     )
 
-    assert "x" in await client.async_get_data(metadata)
+    result = await client.async_get_data(metadata)
+    assert "x" in result
+
     with pytest.raises(TypeError):
-        await client.async_get_data(metadata, select_items=[slice(0, 1)])
+        await client.async_get_data(metadata, parser=lambda value, arg: value)
