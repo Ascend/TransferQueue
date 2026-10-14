@@ -564,6 +564,11 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0 or len(metadata.field_names) == 0:
             logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to get_data. Returning empty TensorDict.")
             return TensorDict({}, batch_size=0)
+        if parser_args is not None:
+            if data_parser is None:
+                raise ValueError("parser_args requires data_parser")
+            if len(parser_args) != metadata.size:
+                raise ValueError(f"parser_args has {len(parser_args)} entries for {metadata.size} samples")
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_get_data"

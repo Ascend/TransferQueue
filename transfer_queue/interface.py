@@ -1026,12 +1026,6 @@ async def async_kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
-    keys = [keys] if isinstance(keys, str) else keys
-    if parser_args is not None:
-        if data_parser is None:
-            raise ValueError("parser_args requires data_parser")
-        if len(parser_args) != len(keys):
-            raise ValueError(f"parser_args has {len(parser_args)} entries for {len(keys)} keys")
     tq_client = _maybe_create_tq_client()
 
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
@@ -1039,8 +1033,9 @@ async def async_kv_batch_get(
     if batch_meta.size == 0:
         raise ValueError("keys or partition were not found!")
     # Missing keys are dropped from the meta, which would shift parser_args onto other keys.
-    if parser_args is not None and batch_meta.size != len(keys):
-        raise ValueError(f"only {batch_meta.size} of {len(keys)} keys were found; parser_args needs every key")
+    num_keys = 1 if isinstance(keys, str) else len(keys)
+    if parser_args is not None and batch_meta.size != num_keys:
+        raise ValueError(f"only {batch_meta.size} of {num_keys} keys were found; parser_args needs every key")
 
     if select_fields is not None:
         if isinstance(select_fields, str):

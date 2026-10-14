@@ -46,8 +46,10 @@ from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     SSDFileStore,
     StorageKeyNotFoundError,
+    _apply_data_parser,
     _SSDValueRef,
 )
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -1004,6 +1006,16 @@ def test_storage_unit_get_data_parser_parses_each_field_without_changing_stored_
     torch.testing.assert_close(response.body["data"]["tokens"], [tokens[0]])
 
     client.close()
+
+
+def test_get_data_parser_view_sends_only_the_parsed_bytes():
+    value = torch.arange(12, dtype=torch.int64).view(3, 4)
+    parsed = _apply_data_parser({"x": [value]}, lambda data, _args: {"x": [v[:2] for v in data["x"]]}, None)
+
+    buffers = MsgpackEncoder().encode(parsed)
+    assert parsed["x"][0].data_ptr() == value.data_ptr()
+    assert buffers[1].nbytes == value[:2].nbytes < value.nbytes
+    assert torch.equal(MsgpackDecoder().decode(buffers)["x"][0], value[:2])
 
 
 def test_storage_unit_data_parser_validation(storage_setup):

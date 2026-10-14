@@ -1495,3 +1495,5 @@ async def test_async_get_data_passes_data_parser_only_when_set():
     assert "x" in await client.async_get_data(metadata)
     with pytest.raises(TypeError):
         await client.async_get_data(metadata, data_parser=lambda data, args: data)
+    with pytest.raises(ValueError, match="parser_args requires data_parser"):
+        await client.async_get_data(metadata, parser_args=[1])

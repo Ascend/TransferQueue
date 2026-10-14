@@ -752,7 +752,7 @@ class TestKVGetE2E:
         assert_tensor_equal(retrieved["input_ids"], input_ids)
         assert_tensor_equal(retrieved["scores"], scores)
 
-        with pytest.raises(ValueError, match="2 entries for 3 keys"):
+        with pytest.raises(ValueError, match="2 entries for 3 samples"):
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, data_parser=parse, parser_args=[2, 3])
         with pytest.raises(ValueError, match="requires data_parser"):
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, parser_args=[2, 3, 1])
