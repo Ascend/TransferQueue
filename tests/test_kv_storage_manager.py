@@ -519,23 +519,11 @@ def test_put_data_custom_backend_meta_length_mismatch_raises_error(test_data_for
 
 
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
-def test_get_data_with_parser_raises_not_implemented(test_data_for_put_data):
+def test_get_data_with_select_items_raises_before_fetching(test_data_for_put_data):
     mock_storage_client = MagicMock()
     with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
         manager = KVStorageManager(controller_info=MagicMock(), config={"client_name": "MockClient"})
 
-    with pytest.raises(NotImplementedError, match="does not support kv_batch_get parsers"):
-        asyncio.run(manager.get_data(test_data_for_put_data["metadata"], parser=lambda value, arg: value))
-    mock_storage_client.get.assert_not_called()
-
-
-@patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
-def test_get_data_parser_args_without_parser_raises(test_data_for_put_data):
-    """KV backends must not silently ignore parser_args when parser is None."""
-    mock_storage_client = MagicMock()
-    with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
-        manager = KVStorageManager(controller_info=MagicMock(), config={"client_name": "MockClient"})
-
-    with pytest.raises(ValueError, match="parser_args was given without a parser"):
-        asyncio.run(manager.get_data(test_data_for_put_data["metadata"], parser_args=[[0]]))
+    with pytest.raises(NotImplementedError, match="does not support select_items"):
+        asyncio.run(manager.get_data(test_data_for_put_data["metadata"], select_items=[slice(0, 1)]))
     mock_storage_client.get.assert_not_called()

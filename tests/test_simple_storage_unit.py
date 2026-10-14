@@ -46,8 +46,10 @@ from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     SSDFileStore,
     StorageKeyNotFoundError,
+    _select_items,
     _SSDValueRef,
 )
+from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -81,12 +83,10 @@ class MockStorageClient:
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
-    def send_get(self, client_id, global_indexes, fields, parser=None, parser_args=None):
+    def send_get(self, client_id, global_indexes, fields, select_items=None):
         body = {"global_indexes": global_indexes, "fields": fields}
-        if parser is not None:
-            body["parser"] = parser
-        if parser_args is not None:
-            body["parser_args"] = parser_args
+        if select_items is not None:
+            body["select_items"] = select_items
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
@@ -1177,22 +1177,35 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     client.close()
 
 
-def test_unserializable_get_response_answered_and_worker_survives(storage_setup):
-    """A get parser that returns a non-encodable value must not kill the sole worker."""
+def test_get_select_items_returns_selected_items_and_keeps_stored_values(storage_setup):
     _, put_get_address, storage_ip = storage_setup
     client = MockStorageClient(put_get_address, storage_ip)
+    tokens = [torch.arange(4), torch.arange(10, 16)]
+    images = [["a0", "a1", "a2"], ["b0", "b1"]]
+    client.send_put(0, [0, 1], {"tokens": tokens, "images": images})
 
-    response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
-    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    response = client.send_get(0, [0, 1], ["tokens", "images"], select_items=[slice(0, 2), [1, 0, 1]])
 
-    def generator_parser(value, parser_arg):
-        return (x for x in [1, 2, 3])
-
-    response = client.send_get(0, [0], ["val"], parser=generator_parser)
-    assert response.request_type == ZMQRequestType.GET_ERROR
-    assert "failed to serialize response" in response.body["message"]
-
-    response = client.send_get(0, [0], ["val"])
     assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
-    torch.testing.assert_close(response.body["data"]["val"][0], torch.tensor([1.0]))
+    data = response.body["data"]
+    torch.testing.assert_close(data["tokens"][0], torch.tensor([0, 1]))
+    torch.testing.assert_close(data["tokens"][1], torch.tensor([11, 10, 11]))
+    assert data["images"] == [["a0", "a1"], ["b1", "b0", "b1"]]
+    full = client.send_get(0, [0, 1], ["tokens", "images"]).body["data"]
+    torch.testing.assert_close(full["tokens"][1], tokens[1])
+    assert full["images"] == images
+
+    response = client.send_get(0, [0, 1], ["images"], select_items=[[0], [5]])
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "out of range" in response.body["message"]
     client.close()
+
+
+def test_select_items_slice_sends_only_the_selected_bytes():
+    value = torch.arange(12, dtype=torch.int64).view(3, 4)
+    selected = _select_items(value, slice(0, 2))
+
+    buffers = MsgpackEncoder().encode(selected)
+    assert selected.data_ptr() == value.data_ptr()
+    assert buffers[1].nbytes == selected.nbytes < value.nbytes
+    assert torch.equal(MsgpackDecoder().decode(buffers), value[:2])

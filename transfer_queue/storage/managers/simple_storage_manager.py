@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import operator
 import os
 import time
 import warnings
@@ -24,6 +25,7 @@ from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+import numpy as np
 import torch
 import zmq
 from omegaconf import DictConfig
@@ -36,7 +38,6 @@ from transfer_queue.storage.simple_storage import (
     StorageKeyNotFoundError,
 )
 from transfer_queue.utils.common import log_heavy_operation
-from transfer_queue.utils.get_parser import GetParser, validate_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     TQ_SOCKET_POOL_SIZE,
@@ -156,6 +157,28 @@ with_storage_unit_dump_socket = with_zmq_socket(
     get_pool=lambda self: self.storage_dump_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
+
+
+def _normalize_select_items(select_items: Sequence[Any], num_samples: int) -> list[slice | list[int]]:
+    """Turn per-sample selections into plain slices and int lists that round-trip to the units."""
+    if isinstance(select_items, torch.Tensor | np.ndarray):
+        select_items = select_items.tolist()
+    if not isinstance(select_items, Sequence) or isinstance(select_items, str | bytes):
+        raise TypeError(f"select_items must be a sequence with one entry per key, got {type(select_items).__name__}")
+    if len(select_items) != num_samples:
+        raise ValueError(f"select_items has {len(select_items)} entries for {num_samples} keys; give one per key")
+    normalized: list[slice | list[int]] = []
+    for item in select_items:
+        if isinstance(item, torch.Tensor | np.ndarray):
+            item = item.tolist()
+        if isinstance(item, slice):
+            bounds = (item.start, item.stop, item.step)
+            normalized.append(slice(*(None if b is None else operator.index(b) for b in bounds)))
+        elif isinstance(item, Sequence) and not isinstance(item, str | bytes):
+            normalized.append([operator.index(i) for i in item])
+        else:
+            raise TypeError(f"each select_items entry must be a slice or a list of indices, got {type(item).__name__}")
+    return normalized
 
 
 class RoutingGroup(NamedTuple):
@@ -780,12 +803,7 @@ class AsyncSimpleStorageManager(StorageManager):
             # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
         return NonTensorStack(*values)
 
-    async def get_data(
-        self,
-        metadata: BatchMeta,
-        parser: GetParser | None = None,
-        parser_args: Sequence[Any] | None = None,
-    ) -> TensorDict:
+    async def get_data(self, metadata: BatchMeta, select_items: Sequence[Any] | None = None) -> TensorDict:
         """
         Retrieve data from remote StorageUnit based on metadata.
 
@@ -793,9 +811,8 @@ class AsyncSimpleStorageManager(StorageManager):
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
-            parser: Optional ``parser(value, parser_arg)`` each SU applies after load/decode; only the parsed
-                subset is serialized on the wire (Hybrid/SSD may still read the full blob first).
-            parser_args: Optional per-sample parser arguments, aligned with ``metadata.global_indexes``.
+            select_items: Optional per-sample selection along dim 0 of each value, aligned with
+                ``metadata.global_indexes``; each unit applies it before replying.
 
         Returns:
             TensorDict containing the retrieved data.
@@ -805,7 +822,8 @@ class AsyncSimpleStorageManager(StorageManager):
 
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
-        parser_args = validate_get_parser(parser, parser_args, metadata.size)
+        if select_items is not None:
+            select_items = _normalize_select_items(select_items, metadata.size)
 
         routing = self._group_by_hash(metadata.global_indexes)
 
@@ -819,8 +837,7 @@ class AsyncSimpleStorageManager(StorageManager):
                     group.global_indexes,
                     metadata.field_names,
                     target_storage_unit=su_id,
-                    parser=parser,
-                    parser_args=None if parser_args is None else [parser_args[pos] for pos in group.batch_positions],
+                    select_items=None if select_items is None else [select_items[p] for p in group.batch_positions],
                 ),
             )
             for su_id, group in routing.items()
@@ -859,14 +876,13 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
-        parser: GetParser | None = None,
-        parser_args: list[Any] | None = None,
+        select_items: list[slice | list[int]] | None = None,
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
-        body = {"global_indexes": global_indexes, "fields": fields}
-        if parser is not None:
-            body.update(parser=parser, parser_args=parser_args)
+        body: dict[str, Any] = {"global_indexes": global_indexes, "fields": fields}
+        if select_items is not None:
+            body["select_items"] = select_items
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
@@ -879,11 +895,6 @@ class AsyncSimpleStorageManager(StorageManager):
             response_msg = ZMQMessage.deserialize(messages)
 
             if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
-                if parser is not None and not response_msg.body.get("parsed", False):
-                    raise RuntimeError(
-                        f"storage unit {target_storage_unit} replied without applying the kv_batch_get parser; it "
-                        "runs a TransferQueue older than get parsers, so restart the storage units on this version"
-                    )
                 storage_unit_data = response_msg.body["data"]
                 return fields, storage_unit_data
             else:

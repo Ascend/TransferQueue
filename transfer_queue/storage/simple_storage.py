@@ -51,7 +51,6 @@ import zmq
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
-from transfer_queue.utils.get_parser import apply_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
@@ -111,6 +110,16 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+
+def _select_items(value: Any, items: slice | list[int]) -> Any:
+    """Select along dim 0 without modifying the stored value.
+
+    A slice of a tensor is a view, an index list of a tensor is a copy, and a list value yields a new list.
+    """
+    if isinstance(items, slice) or isinstance(value, torch.Tensor):
+        return value[items]
+    return [value[i] for i in items]
 
 
 def _describe_stored_values(values: list) -> dict[str, Any]:
@@ -1150,39 +1159,17 @@ class SimpleStorageUnit:
                 },
             )
 
-        # Serialize is outside the handler try: a success body can still fail encode
-        # (e.g. get parser returns a generator). Contain that here so the sole worker lives.
-        try:
-            response_frames = response_msg.serialize()
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_unit_id}]: failed to serialize response for {operation} "
-                f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
+        response_frames = response_msg.serialize()
+        if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+            # This end serializes the get response, so its frames give the true wire size.
+            log_heavy_operation(
+                self.storage_unit_id,
+                "get",
+                time.perf_counter() - started,
+                sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                f"samples={len(request_msg.body.get('global_indexes', []))} "
+                f"fields={list(request_msg.body.get('fields', []))}",
             )
-            error_type = (
-                ZMQRequestType.GET_ERROR
-                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
-                else ZMQRequestType.PUT_GET_ERROR
-            )
-            response_frames = ZMQMessage.create(
-                request_type=error_type,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
-                    "message": f"{self.storage_unit_id}: failed to serialize response "
-                    f"for {operation}: {type(e).__name__}: {e}"
-                },
-            ).serialize()
-        else:
-            if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                # This end serializes the get response, so its frames give the true wire size.
-                log_heavy_operation(
-                    self.storage_unit_id,
-                    "get",
-                    time.perf_counter() - started,
-                    sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                    f"samples={len(request_msg.body.get('global_indexes', []))} "
-                    f"fields={list(request_msg.body.get('fields', []))}",
-                )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
@@ -1312,26 +1299,24 @@ class SimpleStorageUnit:
         try:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
-            parser = data_parts.body.get("parser")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
-                # get_data may read/decode the full SSD-backed blob; the parser only shrinks the reply wire size.
                 result_data = self.storage_data.get_data(fields, global_indexes)
-                if parser is not None:
-                    result_data = apply_get_parser(
-                        result_data, parser, data_parts.body.get("parser_args"), global_indexes
-                    )
+                select_items = data_parts.body.get("select_items")
+                if select_items is not None:
+                    result_data = {
+                        field: [_select_items(value, items) for value, items in zip(values, select_items, strict=True)]
+                        for field, values in result_data.items()
+                    }
 
-            response_body: dict[str, Any] = {"data": result_data}
-            if parser is not None:
-                # NOTE(neowywang): lets the manager tell a parsed reply from an older unit that ignored the parser.
-                response_body["parsed"] = True
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
-                body=response_body,
+                body={
+                    "data": result_data,
+                },
             )
         except Exception as e:
             key_not_found = isinstance(e, StorageKeyNotFoundError)
