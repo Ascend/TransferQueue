@@ -523,6 +523,13 @@ class DataPartitionStatus:
             True if update was successful, False on error
         """
         try:
+            # Same dtype check as FieldMeta.update, run first so a conflicting write changes nothing.
+            for name, incoming in field_schema.items():
+                existing = self.field_metadata.get(name)
+                dtype = incoming.get("dtype")
+                if existing is not None and None not in (existing.dtype, dtype) and existing.dtype != dtype:
+                    raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
+
             # Derive field_names from field_schema to guarantee consistency
             field_names = list(field_schema.keys())
 
