@@ -51,7 +51,6 @@ import zmq
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
-from transfer_queue.utils.get_parser import apply_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
@@ -833,6 +832,38 @@ def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: 
     return selected
 
 
+def _element_count(value: Any) -> int | None:
+    if hasattr(value, "shape") and isinstance(value.shape, tuple | list) and len(value.shape) > 0:
+        return value.shape[0]
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., Any], *args: Any) -> dict[str, Any]:
+    """Run a user ``data_parser(field_data, *args)`` and check it kept every key and element count."""
+    if not callable(data_parser):
+        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
+
+    original_lengths = {k: _element_count(v) for k, v in field_data.items()}
+    parsed = data_parser(field_data, *args)
+
+    if not isinstance(parsed, dict):
+        raise TypeError(f"data_parser must return a dict, got {type(parsed).__name__}")
+    if set(parsed) != set(original_lengths):
+        raise ValueError(
+            f"data_parser must not change dict keys. Original keys: {sorted(original_lengths)}, got: {sorted(parsed)}"
+        )
+    for k, v in parsed.items():
+        orig_len, new_len = original_lengths[k], _element_count(v)
+        if orig_len is not None and new_len is not None and orig_len != new_len:
+            raise ValueError(
+                f"data_parser changed the number of elements for key '{k}': expected {orig_len}, got {new_len}"
+            )
+    return parsed
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -1150,8 +1181,7 @@ class SimpleStorageUnit:
                 },
             )
 
-        # Serialize is outside the handler try: a success body can still fail encode
-        # (e.g. get parser returns a generator). Contain that here so the sole worker lives.
+        # A get data_parser can return a value that fails to encode; reply with an error so the sole worker lives.
         try:
             response_frames = response_msg.serialize()
         except Exception as e:
@@ -1159,18 +1189,12 @@ class SimpleStorageUnit:
                 f"[{self.storage_unit_id}]: failed to serialize response for {operation} "
                 f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
             )
-            error_type = (
-                ZMQRequestType.GET_ERROR
-                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
-                else ZMQRequestType.PUT_GET_ERROR
-            )
             response_frames = ZMQMessage.create(
-                request_type=error_type,  # type: ignore[arg-type]
+                request_type=ZMQRequestType.GET_ERROR  # type: ignore[arg-type]
+                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
+                else ZMQRequestType.PUT_GET_ERROR,
                 sender_id=self.storage_unit_id,
-                body={
-                    "message": f"{self.storage_unit_id}: failed to serialize response "
-                    f"for {operation}: {type(e).__name__}: {e}"
-                },
+                body={"message": f"{self.storage_unit_id}: failed to serialize response: {type(e).__name__}: {e}"},
             ).serialize()
         else:
             if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
@@ -1204,47 +1228,7 @@ class SimpleStorageUnit:
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
                 if data_parser is not None:
-                    if not callable(data_parser):
-                        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
-
-                    original_keys = set(field_data.keys())
-                    original_lengths = {}
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            original_lengths[k] = v.shape[0]
-                        else:
-                            try:
-                                original_lengths[k] = len(v)
-                            except Exception:
-                                original_lengths[k] = None
-
-                    field_data = data_parser(field_data)
-
-                    if not isinstance(field_data, dict):
-                        raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
-
-                    new_keys = set(field_data.keys())
-                    if new_keys != original_keys:
-                        raise ValueError(
-                            f"data_parser must not change dict keys. "
-                            f"Original keys: {sorted(original_keys)}, got: {sorted(new_keys)}"
-                        )
-
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            new_len = v.shape[0]
-                        else:
-                            try:
-                                new_len = len(v)
-                            except Exception:
-                                new_len = None
-
-                        orig_len = original_lengths[k]
-                        if orig_len is not None and new_len is not None and orig_len != new_len:
-                            raise ValueError(
-                                f"data_parser changed the number of elements for key '{k}': "
-                                f"expected {orig_len}, got {new_len}"
-                            )
+                    field_data = _apply_data_parser(field_data, data_parser)
                 self.storage_data.put_data(field_data, global_indexes)
 
             # After put operation finish, send a message to the client
@@ -1312,26 +1296,21 @@ class SimpleStorageUnit:
         try:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
-            parser = data_parts.body.get("parser")
+            data_parser = data_parts.body.get("data_parser")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
-                # get_data may read/decode the full SSD-backed blob; the parser only shrinks the reply wire size.
                 result_data = self.storage_data.get_data(fields, global_indexes)
-                if parser is not None:
-                    result_data = apply_get_parser(
-                        result_data, parser, data_parts.body.get("parser_args"), global_indexes
-                    )
+                if data_parser is not None:
+                    result_data = _apply_data_parser(result_data, data_parser, data_parts.body.get("parser_args"))
 
-            response_body: dict[str, Any] = {"data": result_data}
-            if parser is not None:
-                # NOTE(neowywang): lets the manager tell a parsed reply from an older unit that ignored the parser.
-                response_body["parsed"] = True
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
-                body=response_body,
+                body={
+                    "data": result_data,
+                },
             )
         except Exception as e:
             key_not_found = isinstance(e, StorageKeyNotFoundError)

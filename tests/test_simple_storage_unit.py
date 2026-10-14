@@ -81,12 +81,10 @@ class MockStorageClient:
         self.socket.send_multipart(msg.serialize())
         return ZMQMessage.deserialize(self.socket.recv_multipart(copy=False))
 
-    def send_get(self, client_id, global_indexes, fields, parser=None, parser_args=None):
+    def send_get(self, client_id, global_indexes, fields, data_parser=None, parser_args=None):
         body = {"global_indexes": global_indexes, "fields": fields}
-        if parser is not None:
-            body["parser"] = parser
-        if parser_args is not None:
-            body["parser_args"] = parser_args
+        if data_parser is not None:
+            body.update(data_parser=data_parser, parser_args=parser_args)
         msg = ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
             sender_id=f"mock_client_{client_id}",
@@ -965,6 +963,49 @@ def test_storage_unit_data_parser_callable_types(storage_setup):
     client.close()
 
 
+def test_storage_unit_get_data_parser_parses_each_field_without_changing_stored_values(storage_setup):
+    _, put_get_address, storage_ip = storage_setup
+    client = MockStorageClient(put_get_address, storage_ip)
+    tokens = torch.arange(8).reshape(2, 4)
+    images = [["i0", "i1", "i2"], ["j0", "j1"]]
+    response = client.send_put(0, [0, 1], {"tokens": tokens, "images": images})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE, response.body
+
+    def pick(data, args):
+        data["tokens"] = [value[:n] for value, (n, _) in zip(data["tokens"], args, strict=True)]
+        data["images"] = [[value[i] for i in idx] for value, (_, idx) in zip(data["images"], args, strict=True)]
+        return data
+
+    response = client.send_get(0, [1, 0], ["tokens", "images"], data_parser=pick, parser_args=[(1, [1]), (3, [2, 0])])
+    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE, response.body
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[1, :1], tokens[0, :3]])
+    assert response.body["data"]["images"] == [["j1"], ["i2", "i0"]]
+
+    response = client.send_get(0, [0, 1], ["tokens", "images"])
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[0], tokens[1]])
+    assert response.body["data"]["images"] == images
+
+    def drop_one(data, _args):
+        data["tokens"] = data["tokens"][:-1]
+        return data
+
+    response = client.send_get(0, [0, 1], ["tokens"], data_parser=drop_one)
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "data_parser changed the number of elements" in response.body["message"]
+
+    def unencodable(data, _args):
+        data["tokens"] = [(x for x in ()) for _ in data["tokens"]]
+        return data
+
+    response = client.send_get(0, [0, 1], ["tokens"], data_parser=unencodable)
+    assert response.request_type == ZMQRequestType.GET_ERROR
+    assert "failed to serialize response" in response.body["message"]
+    response = client.send_get(0, [0], ["tokens"])
+    torch.testing.assert_close(response.body["data"]["tokens"], [tokens[0]])
+
+    client.close()
+
+
 def test_storage_unit_data_parser_validation(storage_setup):
     """Test that invalid data_parser inputs produce clear error messages."""
     _, put_get_address, storage_ip = storage_setup
@@ -1174,25 +1215,4 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
 
     response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
-    client.close()
-
-
-def test_unserializable_get_response_answered_and_worker_survives(storage_setup):
-    """A get parser that returns a non-encodable value must not kill the sole worker."""
-    _, put_get_address, storage_ip = storage_setup
-    client = MockStorageClient(put_get_address, storage_ip)
-
-    response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
-    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
-
-    def generator_parser(value, parser_arg):
-        return (x for x in [1, 2, 3])
-
-    response = client.send_get(0, [0], ["val"], parser=generator_parser)
-    assert response.request_type == ZMQRequestType.GET_ERROR
-    assert "failed to serialize response" in response.body["message"]
-
-    response = client.send_get(0, [0], ["val"])
-    assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
-    torch.testing.assert_close(response.body["data"]["val"][0], torch.tensor([1.0]))
     client.close()

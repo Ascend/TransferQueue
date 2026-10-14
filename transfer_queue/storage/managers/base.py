@@ -21,7 +21,6 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable
 from uuid import uuid4
@@ -36,7 +35,6 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
-from transfer_queue.utils.get_parser import GetParser, validate_get_parser
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -339,16 +337,18 @@ class StorageManager(ABC):
     async def get_data(
         self,
         metadata: BatchMeta,
-        parser: GetParser | None = None,
-        parser_args: Sequence[Any] | None = None,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
     ) -> TensorDict:
         """
         Get data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be retrieved from the storage.
-            parser: Optional get parser applied to every requested value where it is stored, before sending.
-            parser_args: Optional per-sample parser arguments, aligned with ``metadata.global_indexes``.
+            data_parser: Optional ``data_parser(data, args)`` applied where the data is stored,
+                before it is sent. See ``transfer_queue.kv_batch_get``. Only supported by
+                SimpleStorage backend.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing the data retrieved from the storage.
@@ -835,8 +835,8 @@ class KVStorageManager(StorageManager):
     async def get_data(
         self,
         metadata: BatchMeta,
-        parser: GetParser | None = None,
-        parser_args: Sequence[Any] | None = None,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
     ) -> TensorDict:
         """
         Retrieve tensor data from the backend storage.
@@ -844,12 +844,9 @@ class KVStorageManager(StorageManager):
         Fetches tensors using the provided metadata, reconstructs them with the
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
-        validate_get_parser(parser, parser_args, metadata.size)
-        if parser is not None:
+        if data_parser is not None:
             raise NotImplementedError(
-                f"{type(self).__name__} does not support kv_batch_get parsers: KV backends return whole (key, field) "
-                "values and cannot run a parser where the data is stored. Use the SimpleStorage backend, or fetch "
-                "without parser= and select the needed part on the caller side"
+                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
             )
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")

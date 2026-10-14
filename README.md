@@ -73,7 +73,7 @@ In the data plane, we utilize a pluggable design, enabling TransferQueue to inte
 Specifically, we provide a `StorageManager` abstraction class that defines the core APIs as follows:
 
 - `async def put_data(self, data: TensorDict, metadata: BatchMeta, data_parser=None) -> None`
-- `async def get_data(self, metadata: BatchMeta, select_items=None) -> TensorDict`
+- `async def get_data(self, metadata: BatchMeta, data_parser=None, parser_args=None) -> TensorDict`
 - `async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None`
 
 This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.
@@ -115,7 +115,7 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
-- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields) and, on SimpleStorage, per-key item selection inside each value (`select_items`).
+- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields) and, on SimpleStorage, an optional `data_parser` run on the storage units.
 - **(async_)kv_update / (async_)kv_batch_update**: Merge new values into already-produced fields with `merge_fn(old, new)`. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
@@ -125,6 +125,18 @@ timeout has an unknown outcome because a storage unit may commit after the
 caller stops waiting, so non-idempotent merge operations must not be retried
 blindly. Updates are atomic within one storage-unit request; a batch spanning
 multiple units is not a distributed transaction.
+
+**Advanced: parsing on get.** Like `kv_batch_put`, `kv_batch_get` takes a
+`data_parser`, here run by each SimpleStorage unit before it replies, so only the
+parsed values cross the network (e.g. trimming padding or picking a few frames).
+It is called as `data_parser(data, args)`: `data` maps each selected field to the
+unit's stored values, one per sample, and `args` holds the matching entries of the
+optional per-key `parser_args`. Each field may be parsed differently, but the
+result must keep the keys and the number and order of values. `data` holds the
+stored objects themselves, so never modify them in place; build new values
+instead. As with put, a get with a parser is not retried on a storage-unit
+timeout; the call raises, and retrying it yourself may run the parser again, so
+keep it free of side effects. See the `kv_batch_get` docstring for details.
 
 **Key Features**
 
