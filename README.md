@@ -72,9 +72,8 @@ In the data plane, we utilize a pluggable design, enabling TransferQueue to inte
 
 Specifically, we provide a `StorageManager` abstraction class that defines the core APIs as follows:
 
-- `async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None`
-- `async def get_data(self, metadata: BatchMeta, parser=None, parser_args=None) -> TensorDict`
-  (`parser` / `parser_args` are optional kwargs for managers that support get parsers, e.g. SimpleStorage; custom managers may keep `get_data(self, metadata)` and still work for plain gets without a parser)
+- `async def put_data(self, data: TensorDict, metadata: BatchMeta, data_parser=None) -> None`
+- `async def get_data(self, metadata: BatchMeta, select_items=None) -> TensorDict`
 - `async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None`
 
 This class encapsulates the core interaction logic within the TransferQueue system. You only need to write a simple subclass to integrate your custom storage backend. Refer to the [Customize](#customize) section for details.
@@ -116,7 +115,7 @@ To simplify the usage of TransferQueue, we provide a Redis-style high-level API 
 
 - **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
 - **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
-- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields).
+- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields) and, on SimpleStorage, per-key item selection inside each value (`select_items`).
 - **(async_)kv_update / (async_)kv_batch_update**: Merge new values into already-produced fields with `merge_fn(old, new)`. SimpleStorage only.
 - **(async_)kv_list**: List keys and tags (metadata) in a partition.
 - **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
