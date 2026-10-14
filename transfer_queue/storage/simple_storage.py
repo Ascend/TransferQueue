@@ -245,11 +245,11 @@ class StorageUnitData:
         global_indexes: list[int],
         new_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
         """Merge into held values, store the other rows as is, validate, then write once.
 
-        ``columns[field]["held"]`` comes from the controller, not from this unit: a local
+        ``merge_plan[field]["held"]`` comes from the controller, not from this unit: a local
         value the controller no longer tracks (e.g. after a failed clear) is overwritten,
         never merged. Every final value must match the field's known column type. All
         merges and checks finish before one ``put_data`` call, so a merge error, an
@@ -260,7 +260,7 @@ class StorageUnitData:
         """
         computed: dict[str, list] = {}
         for field, new_values in new_data.items():
-            column = columns[field]
+            column = merge_plan[field]
             present = [i for i, held in enumerate(column["held"]) if held]
             old_values = self.get_data([field], [global_indexes[i] for i in present])[field] if present else []
             values = list(new_values)
@@ -1253,7 +1253,7 @@ class SimpleStorageUnit:
             global_indexes = data_parts.body["global_indexes"]
             merge_fn = data_parts.body.get("merge_fn")
             new_data = data_parts.body.get("data")
-            columns = data_parts.body.get("columns")
+            merge_plan = data_parts.body.get("merge_plan")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
@@ -1262,9 +1262,9 @@ class SimpleStorageUnit:
                     raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
                 if not isinstance(new_data, dict) or not new_data:
                     raise TypeError("update data must be a non-empty dict")
-                if not isinstance(columns, dict) or set(columns) != set(new_data):
-                    raise ValueError("columns must describe every update field")
-                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, columns)
+                if not isinstance(merge_plan, dict) or set(merge_plan) != set(new_data):
+                    raise ValueError("merge_plan must describe every update field")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, merge_plan)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]

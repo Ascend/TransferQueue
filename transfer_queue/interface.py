@@ -1200,7 +1200,7 @@ async def async_kv_batch_update(
             f"kv_update is not supported by {type(tq_client.storage_manager).__name__}; "
             "it requires the SimpleStorage backend"
         )
-    batch_meta, columns = await tq_client.async_kv_prepare_update(
+    batch_meta, merge_plan = await tq_client.async_kv_prepare_update(
         keys=keys, partition_id=partition_id, fields=list(fields.keys())
     )
 
@@ -1208,7 +1208,7 @@ async def async_kv_batch_update(
         raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match {len(keys)} keys")
 
     batch_meta = await tq_client.async_update(
-        metadata=batch_meta, values=fields, merge_fn=merge_fn, columns=columns, finalize=finalize
+        metadata=batch_meta, values=fields, merge_fn=merge_fn, merge_plan=merge_plan, finalize=finalize
     )
 
     return KVBatchMeta(

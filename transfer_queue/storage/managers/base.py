@@ -365,7 +365,7 @@ class StorageManager(ABC):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """Merge new values on the unit that holds each sample, or store them if absent.
@@ -374,7 +374,7 @@ class StorageManager(ABC):
             metadata: Samples to update.
             values: New values as a TensorDict aligned with ``metadata``.
             merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
-            columns: ``{field: {"dtype", "is_non_tensor", "held"}}`` from the controller;
+            merge_plan: ``{field: {"dtype", "is_non_tensor", "held"}}`` from the controller;
                 ``held`` is aligned with ``metadata`` and decides which rows merge.
             finalize: If False, keep the updated fields hidden from consumers.
 

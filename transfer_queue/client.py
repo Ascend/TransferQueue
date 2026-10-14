@@ -497,7 +497,7 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
         """Merge new values into fields on SimpleStorage units, storing them where absent.
@@ -506,7 +506,7 @@ class AsyncTransferQueueClient:
             metadata: Samples to update, already registered with the controller.
             values: New values aligned with ``metadata``.
             merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
-            columns: Per-field column type and held rows, from ``async_kv_prepare_update``.
+            merge_plan: Per-field column type and held rows, from ``async_kv_prepare_update``.
             finalize: If False, keep the updated fields hidden from consumers.
 
         Returns:
@@ -523,7 +523,7 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
-        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, columns, finalize=finalize)
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, merge_plan, finalize=finalize)
         if not finalize:
             metadata.production_status[:] = 0
         return metadata.apply_field_schema(field_schema, set_all_ready=finalize)
@@ -1023,7 +1023,7 @@ class AsyncTransferQueueClient:
         """Register missing keys and get, per field, its column type and which rows hold it.
 
         Returns:
-            The keys' BatchMeta and the ``columns`` that ``async_update`` takes.
+            The keys' BatchMeta and the ``merge_plan`` that ``async_update`` takes.
         """
         response_msg = await self._request_controller(
             socket=socket,
@@ -1031,7 +1031,7 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
-        return response_msg.body["metadata"], response_msg.body["columns"]
+        return response_msg.body["metadata"], response_msg.body["merge_plan"]
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
         """Clear fields of existing keys while keeping the keys, tags and consumption status.
@@ -1662,14 +1662,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
         """Synchronously merge or add values on SimpleStorage units.
 
         See ``async_update``.
         """
-        return self._update(metadata, values, merge_fn, columns, finalize=finalize)
+        return self._update(metadata, values, merge_fn, merge_plan, finalize=finalize)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
@@ -1888,7 +1888,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def kv_prepare_update(
         self, keys: list[str], partition_id: str, fields: list[str]
     ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
-        """Synchronously register missing keys and get the ``columns`` for ``update``.
+        """Synchronously register missing keys and get the ``merge_plan`` for ``update``.
 
         See ``async_kv_prepare_update``.
         """

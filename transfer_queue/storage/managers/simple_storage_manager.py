@@ -544,7 +544,7 @@ class AsyncSimpleStorageManager(StorageManager):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> dict[str, dict[str, Any]]:
         """Merge or add values on each owner unit and notify the controller.
@@ -567,7 +567,8 @@ class AsyncSimpleStorageManager(StorageManager):
         for su_id, group in routing.items():
             storage_data = {f: self._select_by_positions(values[f], group.batch_positions) for f in field_names}
             unit_columns = {
-                f: {**columns[f], "held": [columns[f]["held"][p] for p in group.batch_positions]} for f in field_names
+                f: {**merge_plan[f], "held": [merge_plan[f]["held"][p] for p in group.batch_positions]}
+                for f in field_names
             }
             tasks.append(
                 self._request_with_retry(
@@ -680,7 +681,7 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         storage_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
-        columns: dict[str, dict[str, Any]],
+        merge_plan: dict[str, dict[str, Any]],
         target_storage_unit: str,
         socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
@@ -689,7 +690,7 @@ class AsyncSimpleStorageManager(StorageManager):
             "global_indexes": global_indexes,
             "data": storage_data,
             "merge_fn": merge_fn,
-            "columns": columns,
+            "merge_plan": merge_plan,
         }
 
         request_msg = ZMQMessage.create(

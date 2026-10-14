@@ -1204,13 +1204,13 @@ class TestTransferQueueControllerKvInterface:
         ray.get(tq_controller.update_production_status.remote(partition_id, [s0], response, ready=False))
         ray.get(tq_controller.update_production_status.remote(partition_id, [s1], prompt))
 
-        metadata, columns = ray.get(
+        metadata, merge_plan = ray.get(
             tq_controller.kv_prepare_update.remote(["s0", "s1", "s2"], partition_id, ["response", "fresh"])
         )
 
         assert metadata.global_indexes[:2] == [s0, s1]
-        assert columns["response"] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
-        assert columns["fresh"] == {"dtype": None, "is_non_tensor": None, "held": [False, False, False]}
+        assert merge_plan["response"] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
+        assert merge_plan["fresh"] == {"dtype": None, "is_non_tensor": None, "held": [False, False, False]}
 
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
