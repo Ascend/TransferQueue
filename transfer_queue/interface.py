@@ -548,7 +548,9 @@ def kv_batch_get(
             Required with ``select_items``.
         select_items: Optional per-key selection along dim 0 of every selected value,
             aligned with ``keys``: a ``slice`` (a view for tensors) or a list of indices
-            (reorder and repeats allowed; a copy for tensors). The storage units apply it
+            (reorder and repeats allowed; a copy for tensors). A slice follows Python
+            semantics and is silently clipped to the value's length (``slice(0, 10)`` on
+            4 items returns 4), while an out-of-range index raises. The storage units apply it
             before replying, so only the selected items cross the network; SSD-offloaded
             values are still read in full. SimpleStorage only; KV backends raise
             ``NotImplementedError``.
