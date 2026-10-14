@@ -29,11 +29,15 @@ from transfer_queue.storage.managers.mooncake_manager import MooncakeStorageMana
 from transfer_queue.storage.managers.ray_storage_manager import RayStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import _build_update_field_schema
 from transfer_queue.storage.managers.yuanrong_manager import YuanrongStorageManager
-from transfer_queue.storage.simple_storage import HybridStorageUnitData, StorageUnitData
+from transfer_queue.storage.simple_storage import HybridStorageUnitData, StorageKeyNotFoundError, StorageUnitData
 
 
 def _concat(old, new):
     return torch.cat([old, new])
+
+
+def _column(*held, dtype=torch.int64, is_non_tensor=False):
+    return {"dtype": dtype, "is_non_tensor": is_non_tensor, "held": list(held)}
 
 
 def test_single_update_batch_wraps_tensor_and_python_values():
@@ -62,7 +66,9 @@ def test_apply_update_concatenates_and_keeps_field_name():
     data = StorageUnitData()
     data.put_data({"sequence_ids": [torch.tensor([10, 11, 12])]}, [0])
 
-    described = data.apply_update([0], {"sequence_ids": [torch.tensor([20, 21])]}, _concat, {})
+    described = data.apply_update(
+        [0], {"sequence_ids": [torch.tensor([20, 21])]}, _concat, {"sequence_ids": _column(True)}
+    )
 
     assert described["sequence_ids"] == {"dtype": torch.int64, "shapes": [(5,)]}
     assert torch.equal(data.field_data["sequence_ids"][0], torch.tensor([10, 11, 12, 20, 21]))
@@ -78,7 +84,7 @@ def test_apply_update_is_atomic_on_merge_error():
         raise RuntimeError("merge failed")
 
     with pytest.raises(RuntimeError, match="merge failed"):
-        data.apply_update([7], {"tokens": [torch.tensor([9])]}, fail, {})
+        data.apply_update([7], {"tokens": [torch.tensor([9])]}, fail, {"tokens": _column(True)})
     assert torch.equal(data.field_data["tokens"][7], original)
 
 
@@ -92,7 +98,10 @@ def test_apply_update_stores_missing_values_without_merging():
         return torch.cat([old, new])
 
     described = data.apply_update(
-        [3, 4], {"tokens": [torch.tensor([2]), torch.tensor([5])], "fresh": [{"a": 1}, {"a": 2}]}, concat, {}
+        [3, 4],
+        {"tokens": [torch.tensor([2]), torch.tensor([5])], "fresh": [{"a": 1}, {"a": 2}]},
+        concat,
+        {"tokens": _column(True, False), "fresh": _column(False, False, dtype=None, is_non_tensor=None)},
     )
 
     assert len(merged) == 1
@@ -115,7 +124,7 @@ def test_apply_update_rejects_incompatible_tensor_results_before_writing(merge_f
     data.put_data({"tokens": [original.clone()]}, [0])
 
     with pytest.raises(TypeError, match=error):
-        data.apply_update([0], {"tokens": [torch.tensor([3])]}, merge_fn, {})
+        data.apply_update([0], {"tokens": [torch.tensor([3])]}, merge_fn, {"tokens": _column(True)})
     assert torch.equal(data.field_data["tokens"][0], original)
 
 
@@ -124,16 +133,21 @@ def test_apply_update_rejects_tensor_result_for_non_tensor_field():
     data.put_data({"meta": [{"step": 1}]}, [0])
 
     with pytest.raises(TypeError, match="must remain non-tensor"):
-        data.apply_update([0], {"meta": [{"step": 2}]}, lambda _old, _new: torch.tensor([2]), {})
+        data.apply_update(
+            [0],
+            {"meta": [{"step": 2}]},
+            lambda _old, _new: torch.tensor([2]),
+            {"meta": _column(True, dtype=None, is_non_tensor=True)},
+        )
     assert data.field_data["meta"][0] == {"step": 1}
 
 
 @pytest.mark.parametrize(
     "column, value, error",
     [
-        ({"dtype": torch.float32, "is_non_tensor": False}, torch.tensor([1]), "keep dtype"),
-        ({"dtype": torch.float32, "is_non_tensor": False}, {"not": "a tensor"}, "keep dtype"),
-        ({"dtype": None, "is_non_tensor": True}, torch.tensor([1.0]), "must remain non-tensor"),
+        (_column(True, False, dtype=torch.float32), torch.tensor([1]), "keep dtype"),
+        (_column(True, False, dtype=torch.float32), {"not": "a tensor"}, "keep dtype"),
+        (_column(False, False, dtype=None, is_non_tensor=True), torch.tensor([1.0]), "must remain non-tensor"),
     ],
 )
 def test_apply_update_checks_new_rows_against_column_type_before_writing(column, value, error):
@@ -146,6 +160,30 @@ def test_apply_update_checks_new_rows_against_column_type_before_writing(column,
     assert torch.equal(data.field_data["score"][0], torch.tensor([0.5]))
 
 
+def test_apply_update_overwrites_a_local_value_the_controller_does_not_hold():
+    data = StorageUnitData()
+    data.put_data({"response": [torch.tensor([100, 101])]}, [0])
+
+    def must_not_merge(_old, _new):
+        raise AssertionError("a value the controller does not hold must not be merged")
+
+    data.apply_update([0], {"response": [torch.tensor([1])]}, must_not_merge, {"response": _column(False)})
+
+    assert torch.equal(data.field_data["response"][0], torch.tensor([1]))
+
+
+def test_apply_update_rejects_held_row_missing_locally_before_writing():
+    data = StorageUnitData()
+    data.put_data({"tokens": [torch.tensor([1])]}, [0])
+
+    with pytest.raises(StorageKeyNotFoundError):
+        data.apply_update(
+            [0, 1], {"tokens": [torch.tensor([2]), torch.tensor([3])]}, _concat, {"tokens": _column(True, True)}
+        )
+    assert set(data.field_data["tokens"]) == {0}
+    assert torch.equal(data.field_data["tokens"][0], torch.tensor([1]))
+
+
 def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
     data = HybridStorageUnitData(
         storage_size=4, threshold_bytes=64, ssd_path=str(tmp_path), run_id="run", unit_id="unit"
@@ -154,7 +192,7 @@ def test_apply_update_decodes_ssd_offloaded_old_value(tmp_path):
     data.put_data({"tokens": [prompt]}, [0])
     assert data.ssd_active_values == 1
 
-    data.apply_update([0], {"tokens": [torch.tensor([99])]}, _concat, {})
+    data.apply_update([0], {"tokens": [torch.tensor([99])]}, _concat, {"tokens": _column(True)})
 
     assert torch.equal(data.get_data(["tokens"], [0])["tokens"][0], torch.cat([prompt, torch.tensor([99])]))
     assert data.ssd_active_values == 1
@@ -180,7 +218,7 @@ def test_apply_update_is_atomic_when_a_later_field_fails_to_reach_ssd(tmp_path, 
         monkeypatch.setattr(data._ssd_store, "write_values", fail_second_field)
         new_data = {"tokens": [torch.tensor([99])], "mask": [torch.tensor([1])]}
         with pytest.raises(OSError, match="No space left"):
-            data.apply_update([0], new_data, _concat, {})
+            data.apply_update([0], new_data, _concat, {"tokens": _column(True), "mask": _column(True)})
 
         stored = data.get_data(["tokens", "mask"], [0])
         assert torch.equal(stored["tokens"][0], prompt)
@@ -244,4 +282,4 @@ async def test_kv_backends_reject_update(mock_create, manager_cls):
     values = TensorDict({"x": torch.ones(1, 1, dtype=torch.int64)}, batch_size=1)
 
     with pytest.raises(NotImplementedError, match=f"not supported by {manager_cls.__name__}"):
-        await manager.update_data(meta, values, lambda _old, new: new)
+        await manager.update_data(meta, values, lambda _old, new: new, {"x": _column(True)})

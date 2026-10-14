@@ -497,6 +497,7 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
+        columns: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
         """Merge new values into fields on SimpleStorage units, storing them where absent.
@@ -504,7 +505,8 @@ class AsyncTransferQueueClient:
         Args:
             metadata: Samples to update, already registered with the controller.
             values: New values aligned with ``metadata``.
-            merge_fn: Called per sample per field as ``merge_fn(old, new)`` when a value exists.
+            merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
+            columns: Per-field column type and held rows, from ``async_kv_prepare_update``.
             finalize: If False, keep the updated fields hidden from consumers.
 
         Returns:
@@ -521,7 +523,7 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
-        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, finalize=finalize)
+        field_schema = await self.storage_manager.update_data(metadata, values, merge_fn, columns, finalize=finalize)
         if not finalize:
             metadata.production_status[:] = 0
         return metadata.apply_field_schema(field_schema, set_all_ready=finalize)
@@ -972,7 +974,6 @@ class AsyncTransferQueueClient:
         keys: list[str] | str,
         partition_id: str,
         create: bool = False,
-        include_fields: list[str] | None = None,
         socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously retrieve BatchMeta by user-defined keys.
@@ -984,7 +985,6 @@ class AsyncTransferQueueClient:
             keys: List of keys to retrieve.
             partition_id: The ID of the logical partition to search for keys.
             create:  If True, automatically create entries for missing keys.
-            include_fields: Known fields to include even if not every key holds them ready.
             socket: ZMQ socket injected by @with_controller_socket.
 
         Returns:
@@ -1010,12 +1010,28 @@ class AsyncTransferQueueClient:
                     "keys": keys,
                     "partition_id": partition_id,
                     "create": create,
-                    "include_fields": include_fields,
                 },
             )
             return response_msg.body.get("metadata", BatchMeta.empty())
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}] Failed in async_kv_retrieve_meta: {e}") from e
+
+    @with_controller_socket
+    async def async_kv_prepare_update(
+        self, keys: list[str], partition_id: str, fields: list[str], socket=None
+    ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
+        """Register missing keys and get, per field, its column type and which rows hold it.
+
+        Returns:
+            The keys' BatchMeta and the ``columns`` that ``async_update`` takes.
+        """
+        response_msg = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_PREPARE_UPDATE,
+            response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "fields": fields},
+        )
+        return response_msg.body["metadata"], response_msg.body["columns"]
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
         """Clear fields of existing keys while keeping the keys, tags and consumption status.
@@ -1462,6 +1478,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
         self._reset_consumption = _make_sync(self.async_reset_consumption)
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
+        self._kv_prepare_update = _make_sync(self.async_kv_prepare_update)
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
         self._kv_describe = _make_sync(self.async_kv_describe)
@@ -1645,13 +1662,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
         metadata: BatchMeta,
         values: TensorDict,
         merge_fn: Callable[[Any, Any], Any],
+        columns: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
         """Synchronously merge or add values on SimpleStorage units.
 
         See ``async_update``.
         """
-        return self._update(metadata, values, merge_fn, finalize=finalize)
+        return self._update(metadata, values, merge_fn, columns, finalize=finalize)
 
     def get_data(self, metadata: BatchMeta) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
@@ -1866,6 +1884,15 @@ class TransferQueueClient(AsyncTransferQueueClient):
             TypeError: If `keys` is not a list of string or a string
         """
         return self._kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
+
+    def kv_prepare_update(
+        self, keys: list[str], partition_id: str, fields: list[str]
+    ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
+        """Synchronously register missing keys and get the ``columns`` for ``update``.
+
+        See ``async_kv_prepare_update``.
+        """
+        return self._kv_prepare_update(keys, partition_id, fields)
 
     def kv_retrieve_keys(
         self,

@@ -1652,7 +1652,6 @@ class TransferQueueController:
         keys: list[str],
         partition_id: str,
         create: bool = False,
-        include_fields: list[str] | None = None,
     ) -> BatchMeta:
         """
         Retrieve BatchMeta from the controller using a list of keys.
@@ -1662,8 +1661,6 @@ class TransferQueueController:
             keys: List of keys to retrieve from the controller
             partition_id: Partition id to retrieve from the controller
             create: Whether to register new keys if not found.
-            include_fields: Fields whose column schema to include even if not every key holds
-                them ready, so kv_update can type-check the values it adds to them.
 
         Returns:
             metadata: BatchMeta of the requested keys
@@ -1724,11 +1721,34 @@ class TransferQueueController:
         for field_name, col_idx in partition.field_name_mapping.items():
             if col_idx < len(col_mask) and col_mask[col_idx]:
                 data_fields.append(field_name)
-        for field_name in include_fields or []:
-            if field_name in partition.field_metadata and field_name not in data_fields:
-                data_fields.append(field_name)
 
         return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+
+    def kv_prepare_update(
+        self, keys: list[str], partition_id: str, fields: list[str]
+    ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
+        """Register missing keys and tell kv_update, per field, which rows to merge into.
+
+        Storage units may keep values the controller no longer tracks (e.g. after a failed
+        clear), so ``held`` comes from ``FieldMeta.global_indexes``, which covers hidden cells.
+
+        Returns:
+            The keys' BatchMeta and ``{field: {"dtype", "is_non_tensor", "held"}}``, where
+            ``held`` is aligned with the BatchMeta rows. The types are None for a new field.
+        """
+        metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
+        partition = self._get_partition(partition_id)
+        assert partition is not None
+        columns = {}
+        for name in fields:
+            meta = partition.field_metadata.get(name)
+            held = meta.global_indexes if meta is not None else set()
+            columns[name] = {
+                "dtype": meta.dtype if meta is not None else None,
+                "is_non_tensor": meta.is_non_tensor if meta is not None else None,
+                "held": [idx in held for idx in metadata.global_indexes],
+            }
+        return metadata, columns
 
     def kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> BatchMeta:
         """Clear fields of existing keys and return the cleared cells' metadata for storage deletion.
@@ -2062,6 +2082,7 @@ class TransferQueueController:
             ZMQRequestType.KV_RETRIEVE_KEYS: self._handle_kv_retrieve_keys_request,
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
             ZMQRequestType.KV_DESCRIBE: self._handle_kv_describe_request,
+            ZMQRequestType.KV_PREPARE_UPDATE: self._handle_kv_prepare_update_request,
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
@@ -2247,7 +2268,6 @@ class TransferQueueController:
             keys=params["keys"],
             partition_id=params["partition_id"],
             create=params["create"],
-            include_fields=params.get("include_fields"),
         )
         return self._make_response(
             request_msg,
@@ -2267,6 +2287,13 @@ class TransferQueueController:
         params = request_msg.body
         description = self.kv_describe(params["keys"], params["partition_id"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
+
+    def _handle_kv_prepare_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        metadata, columns = self.kv_prepare_update(params["keys"], params["partition_id"], params["fields"])
+        return self._make_response(
+            request_msg, ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE, {"metadata": metadata, "columns": columns}
+        )
 
     def _handle_kv_clear_fields_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body

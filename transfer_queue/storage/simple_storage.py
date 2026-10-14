@@ -245,34 +245,30 @@ class StorageUnitData:
         global_indexes: list[int],
         new_data: dict[str, Any],
         merge_fn: Callable[[Any, Any], Any],
-        column_types: dict[str, dict[str, Any]],
+        columns: dict[str, dict[str, Any]],
     ) -> dict[str, dict[str, Any]]:
-        """Merge into stored values, store new ones as is, validate, then write once.
+        """Merge into held values, store the other rows as is, validate, then write once.
 
-        A row that has no value for a field takes ``new`` without calling ``merge_fn``,
-        as a put would. A merge result must keep the old value's tensor/non-tensor kind
-        and tensor dtype; a new row must match ``column_types``, the controller's column
-        type for fields it already knows. All merges and checks finish before one
-        ``put_data`` call, so a merge error or incompatible value leaves storage unchanged.
+        ``columns[field]["held"]`` comes from the controller, not from this unit: a local
+        value the controller no longer tracks (e.g. after a failed clear) is overwritten,
+        never merged. Every final value must match the field's known column type. All
+        merges and checks finish before one ``put_data`` call, so a merge error, an
+        incompatible value or a held row missing here leaves storage unchanged.
 
         Returns:
             Per-sample description of the stored values, keyed by field name.
         """
         computed: dict[str, list] = {}
         for field, new_values in new_data.items():
-            stored = self.field_data.get(field, {})
-            present = [i for i, idx in enumerate(global_indexes) if idx in stored]
+            column = columns[field]
+            present = [i for i, held in enumerate(column["held"]) if held]
             old_values = self.get_data([field], [global_indexes[i] for i in present])[field] if present else []
             values = list(new_values)
             for i, old in zip(present, old_values, strict=True):
                 values[i] = merge_fn(old, new_values[i])
-                _check_value_type(field, values[i], isinstance(old, torch.Tensor), getattr(old, "dtype", None))
-            column = column_types.get(field)
-            if column is not None:
-                merged = set(present)
-                for i, value in enumerate(values):
-                    if i not in merged:
-                        _check_value_type(field, value, not column["is_non_tensor"], column["dtype"])
+            if column["is_non_tensor"] is not None:
+                for value in values:
+                    _check_value_type(field, value, not column["is_non_tensor"], column["dtype"])
             computed[field] = values
         self.put_data(computed, global_indexes)
         return {field: _describe_stored_values(values) for field, values in computed.items()}
@@ -1257,7 +1253,7 @@ class SimpleStorageUnit:
             global_indexes = data_parts.body["global_indexes"]
             merge_fn = data_parts.body.get("merge_fn")
             new_data = data_parts.body.get("data")
-            column_types = data_parts.body.get("column_types")
+            columns = data_parts.body.get("columns")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
@@ -1266,9 +1262,9 @@ class SimpleStorageUnit:
                     raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
                 if not isinstance(new_data, dict) or not new_data:
                     raise TypeError("update data must be a non-empty dict")
-                if not isinstance(column_types, dict):
-                    raise TypeError("update request must carry column_types")
-                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, column_types)
+                if not isinstance(columns, dict) or set(columns) != set(new_data):
+                    raise ValueError("columns must describe every update field")
+                stored_shapes = self.storage_data.apply_update(global_indexes, new_data, merge_fn, columns)
 
             return ZMQMessage.create(
                 request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]

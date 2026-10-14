@@ -107,6 +107,9 @@ async def test_put_retries_only_without_a_parser(data_parser, expected_attempts)
     manager.notify_data_update.assert_not_awaited()
 
 
+_HELD_INPUT_IDS = {"input_ids": {"dtype": torch.int64, "is_non_tensor": False, "held": [True]}}
+
+
 @pytest.mark.asyncio
 async def test_update_reports_controller_rejection_after_storage_commit():
     manager = _manager()
@@ -117,7 +120,7 @@ async def test_update_reports_controller_rejection_after_storage_commit():
     values, metadata = _single_sample_batch()
 
     with pytest.raises(RuntimeError, match="Storage update committed.*do not retry"):
-        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]))
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
 
     manager._update_to_single_storage_unit.assert_awaited_once()
     manager.notify_data_update.assert_awaited_once()
@@ -131,7 +134,7 @@ async def test_update_timeout_is_not_retried_or_published():
     values, metadata = _single_sample_batch()
 
     with patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"), pytest.raises(StorageUnitTimeout):
-        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]))
+        await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
 
     manager._update_to_single_storage_unit.assert_awaited_once()
     manager.notify_data_update.assert_not_awaited()

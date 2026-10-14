@@ -1337,6 +1337,41 @@ class TestKVUpdateE2E:
         assert_tensor_equal(data["reward"][0], torch.tensor([0.25]))
         tq_api.kv_clear(keys=["k1", "k2"], partition_id=partition_id)
 
+    def test_storage_values_the_controller_does_not_hold_are_overwritten(self, tq_api, backend_name, monkeypatch):
+        if backend_name != "SimpleStorage":
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
+
+        from transfer_queue import interface
+
+        def concat(old, new):
+            return torch.cat([old, new])
+
+        async def fail_clear(*_args, **_kwargs):
+            raise RuntimeError("simulated storage unit timeout")
+
+        async def reject_notify(*_args, **_kwargs):
+            return False
+
+        partition_id = "test_partition"
+        manager = interface._maybe_create_tq_client().storage_manager
+        fields = {"response": torch.tensor([100, 101]), "prompt": torch.tensor([7])}
+        tq_api.kv_put(key="k", partition_id=partition_id, fields=fields)
+        with monkeypatch.context() as patched:
+            patched.setattr(manager, "_clear_single_storage_unit", fail_clear)
+            tq_api.kv_clear(keys="k", partition_id=partition_id, fields="response")
+        tq_api.kv_update(key="k", partition_id=partition_id, fields={"response": torch.tensor([1])}, merge_fn=concat)
+        data = tq_api.kv_batch_get(keys="k", partition_id=partition_id, select_fields="response")
+        assert_tensor_equal(data["response"][0], torch.tensor([1]))
+
+        # A first chunk the controller never recorded is rewritten on retry, not merged twice.
+        with monkeypatch.context() as patched, pytest.raises(RuntimeError, match="did not accept"):
+            patched.setattr(manager, "notify_data_update", reject_notify)
+            tq_api.kv_update(key="r", partition_id=partition_id, fields={"tokens": torch.tensor([5])}, merge_fn=concat)
+        tq_api.kv_update(key="r", partition_id=partition_id, fields={"tokens": torch.tensor([5])}, merge_fn=concat)
+        data = tq_api.kv_batch_get(keys="r", partition_id=partition_id, select_fields="tokens")
+        assert_tensor_equal(data["tokens"][0], torch.tensor([5]))
+        tq_api.kv_clear(keys=["k", "r"], partition_id=partition_id)
+
     def test_kv_backend_rejects(self, tq_api, backend_name):
         if backend_name == "SimpleStorage":
             pytest.skip("rejection is the KV-backend contract")
