@@ -470,6 +470,23 @@ class TestKVPutE2E:
 
         tq_api.kv_clear(keys=key, partition_id=partition_id)
 
+    def test_kv_put_raises_when_the_controller_rejects_its_dtype(self, tq_api):
+        partition_id = "test_partition"
+        tq_api.kv_put(key="float_x", partition_id=partition_id, fields={"x": torch.tensor([1.0, 2.0])})
+
+        with pytest.raises(RuntimeError, match=r"Field 'x' dtype mismatch: torch.float32 != torch.int64"):
+            tq_api.kv_put(key="int_x", partition_id=partition_id, fields={"x": torch.tensor([3, 4])})
+
+        stored = tq_api.kv_batch_get(keys="float_x", partition_id=partition_id, select_fields="x")
+        assert_tensor_equal(stored["x"][0], torch.tensor([1.0, 2.0]))
+        tq_api.kv_clear(keys=["float_x", "int_x"], partition_id=partition_id)
+
+    def test_notify_for_a_cleared_partition_warns_instead_of_raising(self, tq_system):
+        # A writer that finishes after its partition was cleared must not fail.
+        manager = tq.get_client().storage_manager
+        schema = {"x": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}}
+        assert asyncio.run(manager.notify_data_update("no_such_partition", [0], schema)) is False
+
 
 class TestKVBatchPutE2E:
     """End-to-end tests for kv_batch_put functionality."""

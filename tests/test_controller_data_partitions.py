@@ -1363,12 +1363,15 @@ class TestFieldMetaIntegration:
         assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
 
     def test_dtype_conflict_leaves_readiness_unchanged(self):
+        import pytest
+
         partition = self._make_partition()
         f32 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
         i64 = {**f32, "dtype": "torch.int64"}
         partition.update_production_status([0, 1], ["pv"], {"pv": f32})
 
-        assert not partition.update_production_status([1], ["pv"], {"pv": i64}, ready=False)
+        with pytest.raises(ValueError, match="dtype mismatch"):
+            partition.update_production_status([1], ["pv"], {"pv": i64}, ready=False)
         assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
         assert partition.field_metadata["pv"].dtype == "torch.float32"
 

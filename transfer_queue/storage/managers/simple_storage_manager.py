@@ -605,12 +605,15 @@ class AsyncSimpleStorageManager(StorageManager):
             metadata.global_indexes, list(zip([g.global_indexes for g in routing.values()], described, strict=True))
         )
 
-        published = await self.notify_data_update(
-            metadata.partition_ids[0],
-            metadata.global_indexes,
-            field_schema,
-            ready=finalize,
-        )
+        try:
+            published = await self.notify_data_update(
+                metadata.partition_ids[0],
+                metadata.global_indexes,
+                field_schema,
+                ready=finalize,
+            )
+        except RuntimeError as e:
+            raise RuntimeError(f"Storage update committed, but {e}; do not retry this merge blindly") from e
         if not published:
             raise RuntimeError(
                 "Storage update committed, but the controller did not accept its metadata; "
