@@ -613,7 +613,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 ready=finalize,
             )
         except RuntimeError as e:
-            raise RuntimeError(f"Storage update committed, but {e}; do not retry this merge blindly") from e
+            raise RuntimeError(
+                f"Storage update committed, but controller notification failed: {e}; do not retry this merge blindly"
+            ) from e
         if not published:
             raise RuntimeError(
                 "Storage update committed, but the controller did not accept its metadata; "

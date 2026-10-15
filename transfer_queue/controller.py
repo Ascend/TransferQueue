@@ -523,9 +523,10 @@ class DataPartitionStatus:
             True if update was successful, False on error
 
         Raises:
-            ValueError: If a field's dtype conflicts with the partition's; nothing is changed.
+            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
-        # Same dtype check as FieldMeta.update, run first so a conflicting write changes nothing.
+        # A dtype conflict must leave controller metadata and readiness unchanged.
+        # Payloads are already stored, so this check cannot roll back the write.
         for name, incoming in field_schema.items():
             existing = self.field_metadata.get(name)
             dtype = incoming.get("dtype")
@@ -1160,7 +1161,7 @@ class TransferQueueController:
             True if update was successful, False otherwise
 
         Raises:
-            ValueError: If a field's dtype conflicts with the partition's; nothing is changed.
+            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
         field_names = list(field_schema.keys())
         partition = self._get_partition(partition_id)
@@ -2143,41 +2144,24 @@ class TransferQueueController:
 
     def _handle_notify_data_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
-        partition_id = params.get("partition_id")
+        partition_id = params["partition_id"]
         global_indexes = params.get("global_indexes", [])
-        # A rejected write makes the writer raise. A partition cleared while its data was in flight
-        # only makes the writer warn: that data is no longer wanted.
-        partition_exists = self._get_partition(cast(str, partition_id)) is not None
-        success, error = False, None
-        if partition_exists:
-            try:
-                success = self.update_production_status(
-                    partition_id=cast(str, partition_id),
-                    global_indexes=global_indexes,
-                    field_schema=params.get("field_schema", {}),
-                    custom_backend_meta=params.get("custom_backend_meta", {}),
-                    ready=params.get("ready", True),
-                )
-            except ValueError as e:
-                error = str(e)
-            if not success and error is None:
-                error = "the controller failed to record it; see the controller log"
-        if success:
-            if self._metrics is not None:
-                self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
-            logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
+        if self._get_partition(partition_id) is None:
+            return self._make_response(request_msg, ZMQRequestType.NOTIFY_DATA_UPDATE_ACK, {"success": False})
 
-        return self._make_response(
-            request_msg,
-            ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
-            {
-                "controller_id": self.controller_id,
-                "partition_id": partition_id,
-                "success": success,
-                "partition_exists": partition_exists,
-                "error": error,
-            },
-        )
+        if not self.update_production_status(
+            partition_id=partition_id,
+            global_indexes=global_indexes,
+            field_schema=params.get("field_schema", {}),
+            custom_backend_meta=params.get("custom_backend_meta", {}),
+            ready=params.get("ready", True),
+        ):
+            raise RuntimeError(f"Failed to record data for partition {partition_id!r}; see the controller log")
+        if self._metrics is not None:
+            self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
+        logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
+
+        return self._make_response(request_msg, ZMQRequestType.NOTIFY_DATA_UPDATE_ACK, {"success": True})
 
     def _handle_get_partition_meta_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         partition_id = request_msg.body["partition_id"]

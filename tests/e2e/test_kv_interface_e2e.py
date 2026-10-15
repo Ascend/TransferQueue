@@ -21,6 +21,7 @@ This test module validates the KV interface functionality by:
 """
 
 import asyncio
+import logging
 import os
 
 import pytest
@@ -470,7 +471,7 @@ class TestKVPutE2E:
 
         tq_api.kv_clear(keys=key, partition_id=partition_id)
 
-    def test_kv_put_raises_when_the_controller_rejects_its_dtype(self, tq_api):
+    def test_kv_put_can_retry_after_dtype_rejection(self, tq_api):
         partition_id = "test_partition"
         tq_api.kv_put(key="float_x", partition_id=partition_id, fields={"x": torch.tensor([1.0, 2.0])})
 
@@ -479,13 +480,38 @@ class TestKVPutE2E:
 
         stored = tq_api.kv_batch_get(keys="float_x", partition_id=partition_id, select_fields="x")
         assert_tensor_equal(stored["x"][0], torch.tensor([1.0, 2.0]))
+
+        tq_api.kv_put(key="int_x", partition_id=partition_id, fields={"x": torch.tensor([3.0, 4.0])})
+        stored = tq_api.kv_batch_get(keys="int_x", partition_id=partition_id, select_fields="x")
+        assert_tensor_equal(stored["x"][0], torch.tensor([3.0, 4.0]))
         tq_api.kv_clear(keys=["float_x", "int_x"], partition_id=partition_id)
 
-    def test_notify_for_a_cleared_partition_warns_instead_of_raising(self, tq_system):
+    def test_rejected_overwrite_stays_readable_until_corrected(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("Reading the overwritten value with stale dtype metadata depends on the backend")
+
+        partition_id = "test_partition"
+        tq_api.kv_put(key="a", partition_id=partition_id, fields={"x": torch.tensor([1.0, 2.0])})
+        with pytest.raises(RuntimeError, match="dtype mismatch"):
+            tq_api.kv_put(key="a", partition_id=partition_id, fields={"x": torch.tensor([3, 4])})
+
+        stored = tq_api.kv_batch_get(keys="a", partition_id=partition_id, select_fields="x")
+        assert stored["x"][0].dtype == torch.int64
+        assert_tensor_equal(stored["x"][0], torch.tensor([3, 4]))
+
+        tq_api.kv_put(key="a", partition_id=partition_id, fields={"x": torch.tensor([5.0, 6.0])})
+        stored = tq_api.kv_batch_get(keys="a", partition_id=partition_id, select_fields="x")
+        assert stored["x"][0].dtype == torch.float32
+        assert_tensor_equal(stored["x"][0], torch.tensor([5.0, 6.0]))
+        tq_api.kv_clear(keys="a", partition_id=partition_id)
+
+    def test_notify_for_a_cleared_partition_warns_instead_of_raising(self, tq_system, caplog):
         # A writer that finishes after its partition was cleared must not fail.
         manager = tq.get_client().storage_manager
         schema = {"x": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}}
-        assert asyncio.run(manager.notify_data_update("no_such_partition", [0], schema)) is False
+        with caplog.at_level(logging.WARNING):
+            assert asyncio.run(manager.notify_data_update("no_such_partition", [0], schema)) is False
+        assert "no longer exists" in caplog.text
 
 
 class TestKVBatchPutE2E:

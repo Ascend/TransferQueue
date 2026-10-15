@@ -71,7 +71,7 @@ class _SocketLease:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("accepted", [False, True])
-async def test_controller_notification_returns_ack_body(accepted):
+async def test_controller_notification_returns_ack_status(accepted):
     manager = _manager()
     manager.controller_info = MagicMock(id="controller")
     socket = MagicMock()
@@ -86,19 +86,19 @@ async def test_controller_notification_returns_ack_body(accepted):
     manager.notify_pool = MagicMock()
     manager.notify_pool.alease.return_value = _SocketLease(socket)
 
-    assert await manager._notify_and_wait([b"request"]) == {"success": accepted}
+    assert await manager._notify_and_wait([b"request"]) is accepted
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "ack, published",
+    "ack, published, warns",
     [
-        ({"success": True, "partition_exists": True, "error": None}, True),
-        (None, False),  # no ACK in time: the outcome is unknown, so the put is not failed
-        ({"success": False, "partition_exists": False, "error": None}, False),
+        (True, True, False),
+        (None, False, False),  # no ACK in time: the outcome is unknown, so the put is not failed
+        (False, False, True),
     ],
 )
-async def test_notify_publishes_or_tolerates_ack(ack, published, caplog):
+async def test_notify_publishes_or_tolerates_ack(ack, published, warns, caplog):
     manager = _manager()
     manager.controller_info = MagicMock(id="controller")
     manager._notify_loop = asyncio.get_running_loop()
@@ -106,19 +106,29 @@ async def test_notify_publishes_or_tolerates_ack(ack, published, caplog):
 
     with caplog.at_level(logging.WARNING):
         assert await manager.notify_data_update("p", [0, 1], {}) is published
-    assert ("no longer exists" in caplog.text) is (ack is not None and not ack["partition_exists"])
+    assert ("no longer exists" in caplog.text) is warns
 
 
 @pytest.mark.asyncio
-async def test_notify_raises_when_the_controller_rejects_the_data():
+async def test_notify_raises_on_request_error_without_waiting_for_timeout():
     manager = _manager()
     manager.controller_info = MagicMock(id="controller")
     manager._notify_loop = asyncio.get_running_loop()
-    rejected = {"success": False, "partition_exists": True, "error": "Field 'x' dtype mismatch"}
-    manager._notify_and_wait = AsyncMock(return_value=rejected)
+    socket = MagicMock()
+    socket.send_multipart = AsyncMock()
+    error = ZMQMessage.create(
+        request_type=ZMQRequestType.REQUEST_ERROR,
+        sender_id="controller",
+        body={"success": False, "message": "Field 'x' dtype mismatch"},
+    )
+    socket.recv_multipart = AsyncMock(side_effect=[error.serialize(), TimeoutError("no further reply")])
+    manager.notify_pool = MagicMock()
+    manager.notify_pool.alease.return_value = _SocketLease(socket)
 
-    with pytest.raises(RuntimeError, match=r"rejected the data for partition 'p': Field 'x' dtype mismatch"):
+    with pytest.raises(RuntimeError, match="Field 'x' dtype mismatch"):
         await manager.notify_data_update("p", [0], {})
+    socket.recv_multipart.assert_awaited_once()
+    socket.close.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -175,8 +185,8 @@ async def test_update_reports_controller_rejection_after_storage_commit():
     manager._update_to_single_storage_unit.assert_awaited_once()
     manager.notify_data_update.assert_awaited_once()
 
-    manager.notify_data_update = AsyncMock(side_effect=RuntimeError("the controller rejected the data: dtype"))
-    with pytest.raises(RuntimeError, match="Storage update committed, but the controller rejected.*do not retry"):
+    manager.notify_data_update = AsyncMock(side_effect=RuntimeError("Controller failed to record written data: dtype"))
+    with pytest.raises(RuntimeError, match="Storage update committed.*notification failed.*dtype.*do not retry"):
         await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
 
 

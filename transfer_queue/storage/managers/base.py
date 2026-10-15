@@ -243,7 +243,7 @@ class StorageManager(ABC):
             unknown) or the partition no longer exists (the data is dropped, with a warning).
 
         Raises:
-            RuntimeError: If the controller rejected the data, e.g. on a dtype conflict.
+            RuntimeError: If the controller failed to record the data, e.g. on a dtype conflict.
         """
 
         if not self.controller_info:
@@ -281,21 +281,16 @@ class StorageManager(ABC):
             self._notify_and_wait(request_msg),
             self._notify_loop,
         )
-        ack = await asyncio.wrap_future(thread_future)
-        if ack is None:
-            return False
-        if ack.get("success"):
-            return True
-        if not ack.get("partition_exists", True):
+        accepted = await asyncio.wrap_future(thread_future)
+        if accepted is False:
             logger.warning(
                 f"[{self.storage_manager_id}]: Partition {partition_id!r} no longer exists; "
                 f"the controller dropped {len(global_indexes)} written samples"
             )
-            return False
-        raise RuntimeError(f"the controller rejected the data for partition {partition_id!r}: {ack.get('error')}")
+        return accepted is True
 
-    async def _notify_and_wait(self, request_msg: list) -> dict[str, Any] | None:
-        """Send a data status notification to the controller and return its ACK body, or None if none arrived."""
+    async def _notify_and_wait(self, request_msg: list) -> bool | None:
+        """Return ACK success, or None if no reply arrived; raise on REQUEST_ERROR."""
         # Acquiring the lease sits outside the handler below: a missing socket name or a dead
         # context is a configuration/lifecycle fault the caller must see, not a slow ACK.
         async with self.notify_pool.alease(self.controller_info) as sock:
@@ -318,18 +313,25 @@ class StorageManager(ABC):
                     messages = await asyncio.wait_for(sock.recv_multipart(copy=False), timeout=remaining)
                     response_msg = ZMQMessage.deserialize(messages)
 
-                    if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        logger.debug(
-                            f"[{self.storage_manager_id}]: Received data status update ACK "
-                            f"from controller id #{response_msg.sender_id}: {response_msg.body}."
-                        )
-                        return response_msg.body
+                    if response_msg.request_type in (
+                        ZMQRequestType.NOTIFY_DATA_UPDATE_ACK,
+                        ZMQRequestType.REQUEST_ERROR,
+                    ):
+                        break
             except Exception as e:
                 # Logged rather than raised, so a slow controller does not fail the put. Close
                 # the socket: a late ACK would otherwise be read as the next lessee's reply.
                 logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
                 sock.close(linger=0)
                 return None
+
+        logger.debug(
+            f"[{self.storage_manager_id}]: Received data status update response "
+            f"from controller id #{response_msg.sender_id}: {response_msg.body}."
+        )
+        if response_msg.request_type == ZMQRequestType.REQUEST_ERROR:
+            raise RuntimeError(f"Controller failed to record written data: {response_msg.body['message']}")
+        return bool(response_msg.body["success"])
 
     @abstractmethod
     async def put_data(

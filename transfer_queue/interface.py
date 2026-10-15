@@ -399,8 +399,8 @@ def kv_put(
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
-        RuntimeError: If the controller rejects the data, e.g. a field's dtype conflicts with
-            earlier writes to it. The value may already be stored but is never made ready.
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -461,8 +461,8 @@ def kv_batch_put(
         ValueError: When ``tags`` length mismatches key count.
         ValueError: When ``keys`` contains duplicates.
         RuntimeError: When retrieved metadata size mismatches input key count.
-        RuntimeError: When the controller rejects the data, e.g. a field's dtype conflicts with
-            earlier writes to it. The values may already be stored but are never made ready.
+        RuntimeError: When the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -805,8 +805,8 @@ async def async_kv_put(
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
-        RuntimeError: If the controller rejects the data, e.g. a field's dtype conflicts with
-            earlier writes to it. The value may already be stored but is never made ready.
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
@@ -916,8 +916,8 @@ async def async_kv_batch_put(
         ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
         ValueError: If `keys` contains duplicates
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
-        RuntimeError: If the controller rejects the data, e.g. a field's dtype conflicts with
-            earlier writes to it. The values may already be stored but are never made ready.
+        RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
+            Storage changes are not rolled back; overwrites of ready fields may remain visible.
 
     Example:
         >>> import transfer_queue as tq
