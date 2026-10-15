@@ -602,6 +602,15 @@ class TestKVBatchPutE2E:
 
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
+    def test_kv_batch_put_rejects_duplicate_keys_before_writing(self, controller, tq_api):
+        partition_id = "test_partition"
+        fields = TensorDict({"x": torch.tensor([[1], [2]])}, batch_size=2)
+
+        with pytest.raises(ValueError, match=r"keys must be unique, got duplicates: \['dup_put'\]"):
+            tq_api.kv_batch_put(keys=["dup_put", "dup_put"], partition_id=partition_id, fields=fields)
+
+        assert "dup_put" not in tq_api.kv_list(partition_id=partition_id).get(partition_id, {})
+
 
 class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
@@ -727,6 +736,18 @@ class TestKVGetE2E:
             # Or it might raise an error about keys not found
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 
+    def test_kv_batch_get_raises_when_some_keys_are_missing(self, controller, tq_api):
+        """A partial miss must not return fewer rows than keys."""
+        partition_id = "test_partition"
+        keys = ["partial_0", "partial_1"]
+        fields = TensorDict({"x": torch.tensor([[1], [2]])}, batch_size=2)
+        tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields)
+
+        with pytest.raises(ValueError, match=r"1 of 3 keys were not found in partition 'test_partition': \['absent'\]"):
+            tq_api.kv_batch_get(keys=["partial_0", "absent", "partial_1"], partition_id=partition_id)
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
     def test_kv_batch_get_data_parser_parses_each_field_with_per_key_args(self, tq_api, backend_name):
         if backend_name != "SimpleStorage":
             pytest.skip("kv_batch_get data_parser is implemented only for SimpleStorage")
@@ -756,7 +777,7 @@ class TestKVGetE2E:
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, data_parser=parse, parser_args=[2, 3])
         with pytest.raises(ValueError, match="requires data_parser"):
             tq_api.kv_batch_get(keys=keys, partition_id=partition_id, parser_args=[2, 3, 1])
-        with pytest.raises(ValueError, match="parser_args needs every key"):
+        with pytest.raises(ValueError, match="1 of 2 keys were not found"):
             tq_api.kv_batch_get(
                 keys=["parse_0", "absent"], partition_id=partition_id, data_parser=parse, parser_args=[1, 1]
             )
@@ -1176,6 +1197,25 @@ class TestKVE2ECornerCases:
 
 class TestKVUpdateE2E:
     """SimpleStorage merge behavior through sync and async public APIs."""
+
+    def test_batch_update_rejects_duplicate_keys_before_merging(self, controller, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("merge-backed kv_update is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        key = "dup_update"
+        tq_api.kv_batch_put(keys=[key], partition_id=partition_id, fields=TensorDict({"x": torch.tensor([[1]])}, 1))
+
+        with pytest.raises(ValueError, match=r"keys must be unique, got duplicates: \['dup_update'\]"):
+            tq_api.kv_batch_update(
+                keys=[key, key],
+                partition_id=partition_id,
+                fields=TensorDict({"x": torch.tensor([[10], [20]])}, batch_size=2),
+                merge_fn=lambda old, new: old + new,
+            )
+
+        assert_tensor_equal(tq_api.kv_batch_get(keys=key, partition_id=partition_id)["x"], torch.tensor([[1]]))
+        tq_api.kv_clear(keys=key, partition_id=partition_id)
 
     def test_update_then_clear_field_keeps_partition_field_metadata(self, controller, tq_api, backend_name):
         if backend_name != "SimpleStorage":

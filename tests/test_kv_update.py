@@ -58,7 +58,7 @@ def test_single_update_batch_rejects_invalid_fields(fields):
 def test_batch_update_rejects_duplicate_keys_before_registering(_client):
     fields = TensorDict({"tokens": torch.tensor([[1], [2], [3]])}, batch_size=3)
 
-    with pytest.raises(ValueError, match=r"duplicated: \['k'\]"):
+    with pytest.raises(ValueError, match=r"duplicates: \['k'\]"):
         asyncio.run(async_kv_batch_update(["k", "other", "k"], "p", fields, _concat))
 
 
