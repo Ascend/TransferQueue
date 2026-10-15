@@ -337,12 +337,21 @@ class StorageManager(ABC):
         raise NotImplementedError("Subclasses must implement put_data")
 
     @abstractmethod
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Get data from the storage backend.
 
         Args:
             metadata: BatchMeta of the data to be retrieved from the storage.
+            data_parser: Optional ``data_parser(data, args)`` applied where the data is stored,
+                before it is sent. See ``transfer_queue.kv_batch_get``. Only supported by
+                SimpleStorage backend.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing the data retrieved from the storage.
@@ -831,13 +840,22 @@ class KVStorageManager(StorageManager):
             per_field_custom_backend_meta,
         )
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Retrieve tensor data from the backend storage.
 
         Fetches tensors using the provided metadata, reconstructs them with the
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
+        if data_parser is not None:
+            raise NotImplementedError(
+                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
+            )
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))

@@ -111,6 +111,23 @@ _HELD_INPUT_IDS = {"input_ids": {"dtype": torch.int64, "is_non_tensor": False, "
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data, args: data, 1)])
+async def test_get_retries_only_without_a_parser(data_parser, expected_attempts):
+    manager = _manager()
+    manager._get_from_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("no answer"))
+    _, metadata = _single_sample_batch()
+
+    with (
+        patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
+        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
+        pytest.raises(StorageUnitTimeout),
+    ):
+        await manager.get_data(metadata, data_parser=data_parser)
+
+    assert manager._get_from_single_storage_unit.await_count == expected_attempts
+
+
+@pytest.mark.asyncio
 async def test_update_reports_controller_rejection_after_storage_commit():
     manager = _manager()
     manager._update_to_single_storage_unit = AsyncMock(

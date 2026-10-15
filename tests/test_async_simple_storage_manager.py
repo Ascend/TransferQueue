@@ -287,6 +287,36 @@ async def test_get_data_routes_from_hash():
 
 
 @pytest.mark.asyncio
+async def test_get_data_sends_each_unit_the_parser_args_of_its_samples():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test_get_parser"
+    manager.storage_unit_infos = {
+        su: ZMQServerInfo(role=Role.STORAGE, id=su, ip="127.0.0.1", ports={"put_get_socket": port})
+        for su, port in (("storage_0", 19012), ("storage_1", 19013))
+    }
+    batch_meta = BatchMeta(
+        global_indexes=[3, 0, 1, 2],
+        partition_ids=["p0"] * 4,
+        field_schema={"f": {"dtype": torch.float32, "shape": (2,), "is_nested": False, "is_non_tensor": False}},
+        production_status=np.ones(4, dtype=np.int8),
+    )
+    called_with: dict[str, tuple] = {}
+
+    async def fake_get(global_indexes, fields, target_storage_unit=None, data_parser=None, parser_args=None, **_):
+        called_with[target_storage_unit] = (list(global_indexes), data_parser, parser_args)
+        return fields, {"f": [torch.zeros(2) for _ in global_indexes]}
+
+    manager._get_from_single_storage_unit = fake_get
+
+    def parser(data, args):
+        return data
+
+    await manager.get_data(batch_meta, data_parser=parser, parser_args=["a", "b", "c", "d"])
+
+    assert called_with == {"storage_0": ([0, 2], parser, ["b", "d"]), "storage_1": ([3, 1], parser, ["a", "c"])}
+
+
+@pytest.mark.asyncio
 async def test_clear_data_routes_from_hash():
     """clear_data should route using global_idx % num_su (hash routing)."""
     storage_unit_infos = {

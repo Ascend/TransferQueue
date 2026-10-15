@@ -786,7 +786,12 @@ class AsyncSimpleStorageManager(StorageManager):
             # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
         return NonTensorStack(*values)
 
-    async def get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """
         Retrieve data from remote StorageUnit based on metadata.
 
@@ -794,6 +799,10 @@ class AsyncSimpleStorageManager(StorageManager):
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
+            data_parser: Optional ``data_parser(data, args)`` each SU applies to its part of the
+                batch before replying. See ``transfer_queue.kv_batch_get``.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``;
+                each SU receives the slice for its samples as ``args``.
 
         Returns:
             TensorDict containing the retrieved data.
@@ -805,6 +814,8 @@ class AsyncSimpleStorageManager(StorageManager):
             return TensorDict({}, batch_size=0)
 
         routing = self._group_by_hash(metadata.global_indexes)
+        # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
+        max_attempts = 1 if data_parser is not None else None
 
         tasks = [
             self._request_with_retry(
@@ -816,7 +827,10 @@ class AsyncSimpleStorageManager(StorageManager):
                     group.global_indexes,
                     metadata.field_names,
                     target_storage_unit=su_id,
+                    data_parser=data_parser,
+                    parser_args=None if parser_args is None else [parser_args[p] for p in group.batch_positions],
                 ),
+                max_attempts=max_attempts,
             )
             for su_id, group in routing.items()
         ]
@@ -854,6 +868,8 @@ class AsyncSimpleStorageManager(StorageManager):
         global_indexes: list[int],
         fields: list[str],
         target_storage_unit: str,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
         socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
@@ -861,7 +877,12 @@ class AsyncSimpleStorageManager(StorageManager):
             request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "fields": fields},
+            body={
+                "global_indexes": global_indexes,
+                "fields": fields,
+                "data_parser": data_parser,
+                "parser_args": parser_args,
+            },
         )
         try:
             await socket.send_multipart(request_msg.serialize())

@@ -727,6 +727,42 @@ class TestKVGetE2E:
             # Or it might raise an error about keys not found
             assert "not found" in str(e).lower() or "empty" in str(e).lower()
 
+    def test_kv_batch_get_data_parser_parses_each_field_with_per_key_args(self, tq_api, backend_name):
+        if backend_name != "SimpleStorage":
+            pytest.skip("kv_batch_get data_parser is implemented only for SimpleStorage")
+
+        partition_id = "test_partition"
+        keys = ["parse_0", "parse_1", "parse_2"]
+        input_ids = torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0], [6, 0, 0, 0]])
+        scores = torch.tensor([1.0, 2.0, 3.0])
+        tq_api.kv_batch_put(
+            keys=keys, partition_id=partition_id, fields=TensorDict({"input_ids": input_ids, "scores": scores}, 3)
+        )
+
+        def parse(data, args):
+            data["input_ids"] = [ids[:n] for ids, n in zip(data["input_ids"], args, strict=True)]
+            data["scores"] = [score * 10 for score in data["scores"]]
+            return data
+
+        retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id, data_parser=parse, parser_args=[2, 3, 1])
+        assert_nested_tensor_equal(retrieved["input_ids"], [input_ids[0, :2], input_ids[1, :3], input_ids[2, :1]])
+        assert_tensor_equal(retrieved["scores"], scores * 10)
+
+        retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
+        assert_tensor_equal(retrieved["input_ids"], input_ids)
+        assert_tensor_equal(retrieved["scores"], scores)
+
+        with pytest.raises(ValueError, match="2 entries for 3 samples"):
+            tq_api.kv_batch_get(keys=keys, partition_id=partition_id, data_parser=parse, parser_args=[2, 3])
+        with pytest.raises(ValueError, match="requires data_parser"):
+            tq_api.kv_batch_get(keys=keys, partition_id=partition_id, parser_args=[2, 3, 1])
+        with pytest.raises(ValueError, match="parser_args needs every key"):
+            tq_api.kv_batch_get(
+                keys=["parse_0", "absent"], partition_id=partition_id, data_parser=parse, parser_args=[1, 1]
+            )
+
+        tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
 
 class TestKVBatchGetByMetaE2E:
     """End-to-end tests for kv_batch_get_by_meta functionality."""

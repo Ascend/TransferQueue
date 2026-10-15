@@ -528,11 +528,19 @@ class AsyncTransferQueueClient:
             metadata.production_status[:] = 0
         return metadata.apply_field_schema(field_schema, set_all_ready=finalize)
 
-    async def async_get_data(self, metadata: BatchMeta) -> TensorDict:
+    async def async_get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """Asynchronously fetch data from storage units and organize into TensorDict.
 
         Args:
             metadata: Batch metadata containing data location information and global indexes
+            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
+                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing:
@@ -562,11 +570,22 @@ class AsyncTransferQueueClient:
         if not metadata or metadata.size == 0 or len(metadata.field_names) == 0:
             logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to get_data. Returning empty TensorDict.")
             return TensorDict({}, batch_size=0)
+        if parser_args is not None:
+            if data_parser is None:
+                raise ValueError("parser_args requires data_parser")
+            if len(parser_args) != metadata.size:
+                raise ValueError(f"parser_args has {len(parser_args)} entries for {metadata.size} samples")
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_get_data"
         ):
-            results = await self.storage_manager.get_data(metadata)
+            # Passed only when set, so custom managers with get_data(self, metadata) keep working.
+            if data_parser is None:
+                results = await self.storage_manager.get_data(metadata)
+            else:
+                results = await self.storage_manager.get_data(
+                    metadata, data_parser=data_parser, parser_args=parser_args
+                )
 
         logger.debug(f"[{self.client_id}]: get_data with {metadata.size} samples successfully.")
 
@@ -1671,11 +1690,19 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._update(metadata, values, merge_fn, merge_plan, finalize=finalize)
 
-    def get_data(self, metadata: BatchMeta) -> TensorDict:
+    def get_data(
+        self,
+        metadata: BatchMeta,
+        data_parser: Callable[[Any, Any], Any] | None = None,
+        parser_args: list | None = None,
+    ) -> TensorDict:
         """Synchronously fetch data from storage units and organize into TensorDict.
 
         Args:
             metadata: Batch metadata containing data location information and global indexes
+            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
+                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
+            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
 
         Returns:
             TensorDict containing:
@@ -1693,7 +1720,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> print(batch)
             >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
         """
-        return self._get_data(metadata=metadata)
+        return self._get_data(metadata=metadata, data_parser=data_parser, parser_args=parser_args)
 
     def clear_partition(self, partition_id: str):
         """Synchronously clear the whole partition from all storage units and the controller.

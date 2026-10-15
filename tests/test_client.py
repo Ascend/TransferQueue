@@ -23,6 +23,7 @@ import zmq
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue import TransferQueueClient
+from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import (
@@ -1472,3 +1473,27 @@ class TestClientCheckpointInterface:
 
         with pytest.raises(RuntimeError, match="Storage manager not initialized"):
             client.load_storage_checkpoint(ckpt_dir)
+
+
+@pytest.mark.asyncio
+async def test_async_get_data_passes_data_parser_only_when_set():
+    """Custom managers written as get_data(self, metadata) keep serving plain gets."""
+
+    class OldStyleManager:
+        async def get_data(self, metadata):
+            return TensorDict({"x": torch.zeros(metadata.size)}, batch_size=[metadata.size])
+
+    client = AsyncTransferQueueClient.__new__(AsyncTransferQueueClient)
+    client.client_id = "old_manager_client"
+    client.storage_manager = OldStyleManager()
+    metadata = BatchMeta(
+        global_indexes=[0],
+        partition_ids=["0"],
+        field_schema={"x": {"dtype": torch.float32, "shape": (1,), "is_nested": False, "is_non_tensor": False}},
+    )
+
+    assert "x" in await client.async_get_data(metadata)
+    with pytest.raises(TypeError):
+        await client.async_get_data(metadata, data_parser=lambda data, args: data)
+    with pytest.raises(ValueError, match="parser_args requires data_parser"):
+        await client.async_get_data(metadata, parser_args=[1])

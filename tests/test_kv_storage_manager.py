@@ -516,3 +516,15 @@ def test_put_data_custom_backend_meta_length_mismatch_raises_error(test_data_for
         asyncio.run(manager.put_data(test_data_for_put_data["data"], test_data_for_put_data["metadata"]))
 
     assert "does not match" in str(exc_info.value)
+
+
+@patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
+def test_get_data_rejects_data_parser(test_data_for_put_data):
+    mock_storage_client = MagicMock()
+    config = {"controller_info": MagicMock(), "client_name": "MockClient"}
+    with patch(f"{STORAGE_CLIENT_FACTORY_PATH}.create", return_value=mock_storage_client):
+        manager = KVStorageManager(controller_info=MagicMock(), config=config)
+
+    with pytest.raises(NotImplementedError, match="data_parser is not supported"):
+        asyncio.run(manager.get_data(test_data_for_put_data["metadata"], data_parser=lambda data, args: data))
+    mock_storage_client.get.assert_not_called()

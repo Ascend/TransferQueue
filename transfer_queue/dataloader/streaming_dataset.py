@@ -331,7 +331,6 @@ def chunk_batch_fn(td, batch_meta, micro_batch_size=1):
     # Calculate number of splits (handles uneven division)
     num_splits = (total_size + micro_batch_size - 1) // micro_batch_size
     splits = []
-    batch_meta_list = batch_meta.chunk(num_splits)
 
     # Pre-process: separate nested tensors so that native ``td[start:end]`` works.
     # TensorDict delegates slice to each field; nested tensors do not support
@@ -360,6 +359,6 @@ def chunk_batch_fn(td, batch_meta, micro_batch_size=1):
         for key, (tensors, layout) in nested_fields.items():
             chunk_td[key] = torch.nested.as_nested_tensor(tensors[start:end], layout=layout)
 
-        splits.append((chunk_td, batch_meta_list[i]))
+        splits.append((chunk_td, batch_meta[start:end]))
 
     return splits

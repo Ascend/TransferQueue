@@ -837,6 +837,38 @@ def select_dump_schema(schema: dict, source_indexes: list[int], target_indexes: 
     return selected
 
 
+def _element_count(value: Any) -> int | None:
+    if hasattr(value, "shape") and isinstance(value.shape, tuple | list) and len(value.shape) > 0:
+        return value.shape[0]
+    try:
+        return len(value)
+    except Exception:
+        return None
+
+
+def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., Any], *args: Any) -> dict[str, Any]:
+    """Run a user ``data_parser(field_data, *args)`` and check it kept every key and element count."""
+    if not callable(data_parser):
+        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
+
+    original_lengths = {k: _element_count(v) for k, v in field_data.items()}
+    parsed = data_parser(field_data, *args)
+
+    if not isinstance(parsed, dict):
+        raise TypeError(f"data_parser must return a dict, got {type(parsed).__name__}")
+    if set(parsed) != set(original_lengths):
+        raise ValueError(
+            f"data_parser must not change dict keys. Original keys: {sorted(original_lengths)}, got: {sorted(parsed)}"
+        )
+    for k, v in parsed.items():
+        orig_len, new_len = original_lengths[k], _element_count(v)
+        if orig_len is not None and new_len is not None and orig_len != new_len:
+            raise ValueError(
+                f"data_parser changed the number of elements for key '{k}': expected {orig_len}, got {new_len}"
+            )
+    return parsed
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -1154,17 +1186,32 @@ class SimpleStorageUnit:
                 },
             )
 
-        response_frames = response_msg.serialize()
-        if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-            # This end serializes the get response, so its frames give the true wire size.
-            log_heavy_operation(
-                self.storage_unit_id,
-                "get",
-                time.perf_counter() - started,
-                sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                f"samples={len(request_msg.body.get('global_indexes', []))} "
-                f"fields={list(request_msg.body.get('fields', []))}",
+        # A get data_parser can return a value that fails to encode; reply with an error so the sole worker lives.
+        try:
+            response_frames = response_msg.serialize()
+        except Exception as e:
+            logger.error(
+                f"[{self.storage_unit_id}]: failed to serialize response for {operation} "
+                f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
             )
+            response_frames = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_ERROR  # type: ignore[arg-type]
+                if operation == ZMQRequestType.GET_DATA  # type: ignore[arg-type]
+                else ZMQRequestType.PUT_GET_ERROR,
+                sender_id=self.storage_unit_id,
+                body={"message": f"{self.storage_unit_id}: failed to serialize response: {type(e).__name__}: {e}"},
+            ).serialize()
+        else:
+            if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+                # This end serializes the get response, so its frames give the true wire size.
+                log_heavy_operation(
+                    self.storage_unit_id,
+                    "get",
+                    time.perf_counter() - started,
+                    sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                    f"samples={len(request_msg.body.get('global_indexes', []))} "
+                    f"fields={list(request_msg.body.get('fields', []))}",
+                )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
@@ -1186,47 +1233,7 @@ class SimpleStorageUnit:
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_put"
             ):
                 if data_parser is not None:
-                    if not callable(data_parser):
-                        raise TypeError(f"data_parser must be callable, got {type(data_parser).__name__}")
-
-                    original_keys = set(field_data.keys())
-                    original_lengths = {}
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            original_lengths[k] = v.shape[0]
-                        else:
-                            try:
-                                original_lengths[k] = len(v)
-                            except Exception:
-                                original_lengths[k] = None
-
-                    field_data = data_parser(field_data)
-
-                    if not isinstance(field_data, dict):
-                        raise TypeError(f"data_parser must return a dict, got {type(field_data).__name__}")
-
-                    new_keys = set(field_data.keys())
-                    if new_keys != original_keys:
-                        raise ValueError(
-                            f"data_parser must not change dict keys. "
-                            f"Original keys: {sorted(original_keys)}, got: {sorted(new_keys)}"
-                        )
-
-                    for k, v in field_data.items():
-                        if hasattr(v, "shape") and isinstance(v.shape, tuple | list) and len(v.shape) > 0:
-                            new_len = v.shape[0]
-                        else:
-                            try:
-                                new_len = len(v)
-                            except Exception:
-                                new_len = None
-
-                        orig_len = original_lengths[k]
-                        if orig_len is not None and new_len is not None and orig_len != new_len:
-                            raise ValueError(
-                                f"data_parser changed the number of elements for key '{k}': "
-                                f"expected {orig_len}, got {new_len}"
-                            )
+                    field_data = _apply_data_parser(field_data, data_parser)
                 self.storage_data.put_data(field_data, global_indexes)
 
             # After put operation finish, send a message to the client
@@ -1294,11 +1301,14 @@ class SimpleStorageUnit:
         try:
             fields = data_parts.body["fields"]
             global_indexes = data_parts.body["global_indexes"]
+            data_parser = data_parts.body.get("data_parser")
 
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_get"
             ):
                 result_data = self.storage_data.get_data(fields, global_indexes)
+                if data_parser is not None:
+                    result_data = _apply_data_parser(result_data, data_parser, data_parts.body.get("parser_args"))
 
             response_msg = ZMQMessage.create(
                 request_type=ZMQRequestType.GET_DATA_RESPONSE,  # type: ignore[arg-type]
@@ -1402,13 +1412,14 @@ class SimpleStorageUnit:
             for op_type in ("PUT_DATA", "UPDATE_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
-                    counter = self._metrics.request_total.labels(op_type=op_type)
                     duration_sum = hist._sum.get()
                     # Build cumulative counts once, reuse for total and quantiles
                     cumulative_counts = self._cumulative_bucket_counts(hist)
                     duration_count = cumulative_counts[-1] if cumulative_counts else 0
                     op_stats[op_type] = {
-                        "request_count": counter._value.get(),
+                        # Observed when the handler returns or raises. request_total counts entry and
+                        # agrees only because this worker answers GET_METRICS after each handler.
+                        "request_count": duration_count,
                         "latency_avg": duration_sum / duration_count if duration_count > 0 else 0,
                         "latency_p50": self._quantile_from_cumulative(hist, cumulative_counts, 0.50),
                         "latency_p99": self._quantile_from_cumulative(hist, cumulative_counts, 0.99),
