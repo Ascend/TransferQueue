@@ -67,7 +67,7 @@ def demonstrate_kv_api():
 
     # Define the data content (The "Value")
     input_ids = torch.tensor([[1, 2, 3]])
-    attention_mask = torch.ones(input_ids.size())
+    attention_mask = torch.ones_like(input_ids)
 
     single_sample = TensorDict(
         {
