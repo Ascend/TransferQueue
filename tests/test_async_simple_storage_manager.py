@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -317,7 +318,7 @@ async def test_get_data_sends_each_unit_the_parser_args_of_its_samples():
 
 
 @pytest.mark.asyncio
-async def test_clear_data_routes_from_hash():
+async def test_clear_data_routes_from_hash(caplog):
     """clear_data should route using global_idx % num_su (hash routing)."""
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
@@ -360,6 +361,23 @@ async def test_clear_data_routes_from_hash():
 
     assert set(called_with.get("storage_0", [])) == {0, 2}
     assert set(called_with.get("storage_1", [])) == {1, 3}
+
+    # A failed unit is logged, not raised, and the other units are still cleared.
+    called_with.clear()
+
+    async def fail_on_storage_1(global_indexes, target_storage_unit=None, **kwargs):
+        called_with[target_storage_unit] = list(global_indexes)
+        if target_storage_unit == "storage_1":
+            raise RuntimeError("unit timeout")
+
+    manager._clear_single_storage_unit = fail_on_storage_1
+    with caplog.at_level(logging.ERROR):
+        await manager.clear_data(batch_meta)
+
+    assert set(called_with) == {"storage_0", "storage_1"}
+    failures = [record.message for record in caplog.records if "Failed to clear" in record.message]
+    assert len(failures) == 1
+    assert "2 samples" in failures[0] and "storage_1" in failures[0] and "unit timeout" in failures[0]
 
 
 @pytest.mark.asyncio

@@ -937,33 +937,33 @@ class AsyncSimpleStorageManager(StorageManager):
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for i, result in enumerate(results):
+        # Logged rather than raised: the caller no longer wants this data, and failing its cleanup
+        # would stop the job. The unit keeps the payloads until their indexes are reused and cleared.
+        for (su_id, group), result in zip(routing.items(), results, strict=True):
             if isinstance(result, Exception):
-                logger.error(f"[{self.storage_manager_id}]: Error in clear operation task {i}: {result}")
+                logger.error(
+                    f"[{self.storage_manager_id}]: Failed to clear {len(group.global_indexes)} samples "
+                    f"(fields={fields or 'all'}) on storage unit {su_id}; they stay in its memory: "
+                    f"{type(result).__name__}: {result}"
+                )
 
     @with_storage_unit_socket
     async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
-        try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA,
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"global_indexes": global_indexes, "fields": fields},
+        request_msg = ZMQMessage.create(
+            request_type=ZMQRequestType.CLEAR_DATA,
+            sender_id=self.storage_manager_id,
+            receiver_id=target_storage_unit,
+            body={"global_indexes": global_indexes, "fields": fields},
+        )
+
+        await socket.send_multipart(request_msg.serialize())
+        messages = await socket.recv_multipart(copy=False)
+        response_msg = ZMQMessage.deserialize(messages)
+
+        if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
+            raise RuntimeError(
+                f"Failed to clear storage {target_storage_unit}: {response_msg.body.get('message', 'Unknown error')}"
             )
-
-            await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to clear storage {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-
-        except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Error clearing storage unit {target_storage_unit}: {str(e)}")
-            raise
 
     def get_zmq_server_info(self) -> dict[str, ZMQServerInfo]:
         """Get ZMQ server information for all storage units.
