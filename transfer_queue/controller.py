@@ -369,6 +369,7 @@ class DataPartitionStatus:
 
     # Linked fields hold no payload of their own and read the source row's instead
     links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: source global_idx}
+    linked_by: dict[int, set[int]] = field(default_factory=dict)  # source global_idx -> global_idxs linking to it
 
     # Dynamic configuration - these are computed from the current state
     @property
@@ -947,10 +948,10 @@ class DataPartitionStatus:
                 # only clear empty fields
                 for field_name in empty_fields:
                     self.field_metadata.pop(field_name)
+            self._drop_links(indexes_to_release)
             for idx in indexes_to_release:
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)
-                self.links.pop(idx, None)
 
                 if idx in self.revert_keys_mapping:
                     self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
@@ -1002,16 +1003,17 @@ class DataPartitionStatus:
             row_links = self.links.setdefault(idx, {})
             for name in field_names:
                 row_links[name] = source_links.get(name, source)
+                self.linked_by.setdefault(row_links[name], set()).add(idx)
 
     def check_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
         """Refuse to clear payloads that rows outside this clear still read through links."""
         clearing = set(global_indexes)
         sources = {
             source
-            for idx, row_links in self.links.items()
+            for source in clearing
+            for idx in self.linked_by.get(source, ())
             if idx not in clearing
-            for name, source in row_links.items()
-            if source in clearing and (field_names is None or name in field_names)
+            and any(s == source and (field_names is None or n in field_names) for n, s in self.links[idx].items())
         }
         if sources:
             keys = sorted(str(self.revert_keys_mapping.get(idx, idx)) for idx in sources)
@@ -1020,15 +1022,18 @@ class DataPartitionStatus:
                 "clear the linked keys first or in the same call"
             )
 
-    def _drop_links(self, global_indexes: list[int], field_names: list[str]) -> None:
-        if not self.links:
-            return
+    def _drop_links(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
+        """Drop the links of these rows on ``field_names`` (all fields if None)."""
         for idx in global_indexes:
             row_links = self.links.get(idx)
             if row_links is None:
                 continue
-            for name in field_names:
-                row_links.pop(name, None)
+            for name in list(row_links) if field_names is None else field_names:
+                source = row_links.pop(name, None)
+                if source is not None and source not in row_links.values():
+                    self.linked_by[source].discard(idx)
+                    if not self.linked_by[source]:
+                        del self.linked_by[source]
             if not row_links:
                 del self.links[idx]
 

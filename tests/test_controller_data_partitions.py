@@ -1492,3 +1492,32 @@ class TestFieldMetaIntegration:
         schema = field_meta.to_batch_schema([0, 1])
 
         assert schema["per_sample_shapes"] == [(3,), None]
+
+
+class TestFieldLinks:
+    """Rows linking to a source row through DataPartitionStatus.link_fields."""
+
+    SCHEMA = {"x": {"dtype": "torch.int64", "shape": (3,), "is_nested": False, "is_non_tensor": False}}
+
+    def _linked_partition(self):
+        """Source row 0 holds ``x``; rows 1 and 2 link to it."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="links")
+        assert partition.update_production_status([0], ["x"], field_schema=self.SCHEMA)
+        partition.link_fields([1, 2], 0, ["x"])
+        return partition
+
+    def test_source_index_follows_put_and_clear(self):
+        import pytest
+
+        partition = self._linked_partition()
+        assert partition.linked_by == {0: {1, 2}}
+        with pytest.raises(ValueError, match="linked by other keys"):
+            partition.check_not_linked([0, 1])
+
+        assert partition.update_production_status([1], ["x"], field_schema=self.SCHEMA)
+        partition.clear_data([2])
+
+        assert partition.links == {} and partition.linked_by == {}
+        partition.check_not_linked([0])
