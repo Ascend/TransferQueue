@@ -50,6 +50,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
+            checkpoint_uint8_fields=conf.backend.SimpleStorage.get("checkpoint_uint8_fields", []),
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
         logger.info(

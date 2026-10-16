@@ -32,6 +32,9 @@ backend:
     num_data_storage_units: 2
     # Optional Ray custom resource required on storage nodes. null keeps all alive nodes eligible.
     required_node_resource: null
+    # Opt-in checkpoint encoding for CPU int16 tensors with values in [0, 255].
+    # Loads restore int16; other tensors and fields are unchanged.
+    checkpoint_uint8_fields: []
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
 
