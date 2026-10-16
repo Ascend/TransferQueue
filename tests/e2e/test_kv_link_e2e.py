@@ -137,6 +137,21 @@ def test_put_replaces_the_link(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(7).tolist()] + [_prompt(0).tolist()] * 2
 
 
+def test_update_refuses_a_linked_field(tq_system):
+    keys = _put_group(0)
+
+    with pytest.raises(RuntimeError, match="cannot merge into fields linked"):
+        tq.kv_batch_update(
+            ["new", keys[0]],
+            PARTITION,
+            TensorDict({"prompt": torch.stack([_prompt(5)] * 2)}, batch_size=2),
+            merge_fn=lambda old, new: new,
+        )
+
+    assert "new" not in tq.kv_list(PARTITION)[PARTITION]
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
+
+
 def test_unfinalized_source_update_is_hidden_from_linked_keys(tq_system):
     keys = _put_group(0)
 

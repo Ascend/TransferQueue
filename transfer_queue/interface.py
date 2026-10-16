@@ -753,7 +753,8 @@ def kv_update(
     Raises:
         TypeError: If ``fields`` is not a non-empty dict or ``merge_fn`` is not callable.
         RuntimeError: If ``merge_fn`` fails or a stored value would change the field's
-            tensor/non-tensor type or dtype; the failing storage unit writes nothing.
+            tensor/non-tensor type or dtype; the failing storage unit writes nothing. Also
+            if a field is linked by ``kv_link``, before anything is registered or written.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Note:

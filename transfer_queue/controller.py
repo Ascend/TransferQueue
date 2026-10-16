@@ -1840,7 +1840,23 @@ class TransferQueueController:
         Returns:
             The keys' BatchMeta and ``{field: {"dtype", "is_non_tensor", "held"}}``, where
             ``held`` is aligned with the BatchMeta rows. The types are None for a new field.
+
+        Raises:
+            ValueError: A key links one of ``fields`` by kv_link; nothing is registered.
         """
+        partition = self._get_partition(partition_id)
+        if partition is not None:
+            # A unit merges into the old value on the sample's own row; a linked value lives on the source's.
+            linked = [
+                key
+                for key, idx in zip(keys, partition.kv_retrieve_indexes(keys), strict=True)
+                if idx is not None and any(name in partition.links.get(idx, {}) for name in fields)
+            ]
+            if linked:
+                raise ValueError(
+                    f"kv_update cannot merge into fields linked by kv_link on keys {linked}; "
+                    "kv_put a value to replace the link first"
+                )
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
         partition = self._get_partition(partition_id)
         assert partition is not None
