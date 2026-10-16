@@ -34,6 +34,10 @@ class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
 
 
+class PayloadTransferFatalError(PayloadTransferError):
+    """The owning worker/job must stop or restart before another payload request."""
+
+
 class PayloadTransferTimeout(PayloadTransferError):
     """A payload transfer control message was not answered within the timeout.
 

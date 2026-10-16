@@ -30,7 +30,7 @@ from uuid import uuid4
 
 import numpy as np
 
-from transfer_queue.storage.payload_transfer.base import PayloadTransferError
+from transfer_queue.storage.payload_transfer.base import PayloadTransferError, PayloadTransferFatalError
 from transfer_queue.utils.logging_utils import get_logger
 
 if TYPE_CHECKING:
@@ -50,8 +50,16 @@ class NixlError(PayloadTransferError):
     """A NIXL runtime operation failed."""
 
 
+class NixlFatalError(NixlError, PayloadTransferFatalError):
+    """A native sender failure made this payload transfer unusable."""
+
+
 class NixlWriteNotStarted(NixlError):
     """The failed send never exposed the remote receive buffer to a WRITE."""
+
+
+class NixlWriteCompletedCleanupFailed(NixlFatalError):
+    """The WRITE finished, but sender resources could not be cleaned up."""
 
 
 @dataclass
@@ -186,6 +194,7 @@ class NixlRuntime:
         self._registered_sources: dict[int, _FrameSource] = {}
         self._remote_metadata: dict[str, bytes] = {}
         self._failed_peers: set[str] = set()
+        self._terminal_error: str | None = None
         self._peer_senders: dict[str, _PeerSender] = {}
         self._lock = threading.RLock()
         self._closing = threading.Event()
@@ -230,6 +239,7 @@ class NixlRuntime:
                 "outstanding_sends": sum(sender.outstanding for sender in self._peer_senders.values()),
                 "sender_executors": len(self._peer_senders),
                 "failed_send_peers": len(self._failed_peers),
+                "terminal_send_failure": int(self._terminal_error is not None),
                 "data_transfer_seconds": self._data_transfer_seconds,
                 "total_seconds": self._total_seconds,
                 "registered_bytes": self._registered_bytes,
@@ -249,6 +259,11 @@ class NixlRuntime:
                 "receive_buffer_reuses": self._receive_buffer_reuses,
                 "receive_buffer_evictions": self._receive_buffer_evictions,
             }
+
+    @property
+    def terminal_error(self) -> str | None:
+        with self._lock:
+            return self._terminal_error
 
     def prepare_receive(self, descriptor: PayloadDescriptor) -> dict[str, Any]:
         """Publish frame descriptors and metadata for this receive MR only."""
@@ -615,9 +630,9 @@ class NixlRuntime:
                     if failed_sources:
                         self._retained_resources.append((None, failed_sources))
                     if peer_state_uncertain or failed_sources:
-                        self._failed_peers.add(remote_name)
+                        self._fail_sender(remote_name, error_message)
                 else:
-                    self._failed_peers.add(remote_name)
+                    self._fail_sender(remote_name, error_message)
                     self._retained_resources.append((handle, sources))
                 self._total_seconds += time.monotonic() - submitted_at
             handle = None
@@ -644,8 +659,19 @@ class NixlRuntime:
                     self._retained_resources.append((None, failed_sources))
                 cleanup_failed = bool(failed_sources)
             if cleanup_failed:
-                self._failed_peers.add(remote_name)
+                self._fail_sender(remote_name, "NIXL WRITE completed but sender cleanup failed")
             self._total_seconds += time.monotonic() - submitted_at
+        if cleanup_failed:
+            raise NixlWriteCompletedCleanupFailed(self._terminal_error)
+
+    def _fail_sender(self, remote_name: str, reason: str) -> None:
+        """Poison this runtime after an unsafe send; callers must restart its owner."""
+        self._failed_peers.add(remote_name)
+        if self._terminal_error is None:
+            self._terminal_error = (
+                f"NIXL sender entered a terminal state after {remote_name!r}: {reason}; "
+                "stop or restart the owning worker/job"
+            )
 
     def _check_send_deadline(self, deadline: float) -> None:
         if time.monotonic() >= deadline:
@@ -691,6 +717,8 @@ class NixlRuntime:
     def _ensure_open(self) -> None:
         if self._closed:
             raise NixlError("NIXL runtime is closed")
+        if self._terminal_error is not None:
+            raise NixlFatalError(self._terminal_error)
 
     @staticmethod
     def _validate_send_metadata(

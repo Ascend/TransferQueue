@@ -24,7 +24,12 @@ import torch
 import zmq
 
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
-from transfer_queue.storage.payload_transfer import DeferredResponse, PayloadTransferError, create_payload_transfer
+from transfer_queue.storage.payload_transfer import (
+    DeferredResponse,
+    PayloadTransferError,
+    PayloadTransferFatalError,
+    create_payload_transfer,
+)
 from transfer_queue.storage.payload_transfer.nixl import (
     NixlPayloadTransfer,
     PayloadDescriptor,
@@ -35,6 +40,7 @@ from transfer_queue.storage.payload_transfer.nixl import (
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     NixlError,
     NixlRuntime,
+    NixlWriteCompletedCleanupFailed,
     NixlWriteNotStarted,
     _frame_regions,
     _FrameSource,
@@ -508,7 +514,7 @@ def test_same_peer_serializes_while_different_peer_runs_concurrently(runtime, mo
     assert starts.count("peer-a") == 2
 
 
-def test_completed_write_cleanup_failure_keeps_success_and_fails_peer(runtime):
+def test_completed_write_cleanup_failure_fails_runtime(runtime):
     instance, agent = runtime
     descriptor = _descriptor("cleanup", 1)
     agent.metadata_names[b"metadata"] = "peer"
@@ -516,9 +522,11 @@ def test_completed_write_cleanup_failure_keeps_success_and_fails_peer(runtime):
 
     completed = instance.send({}, _token("peer", b"metadata", descriptor), descriptor, (bytearray(b"x"),))
 
-    assert completed.result(timeout=1) is None
+    with pytest.raises(NixlError, match="cleanup failed"):
+        completed.result(timeout=1)
     assert instance._retained_resources
-    with pytest.raises(NixlError, match="has failed"):
+    assert instance.terminal_error is not None
+    with pytest.raises(NixlError, match="terminal state"):
         instance.send({}, _token("peer", b"metadata", descriptor), descriptor, (bytearray(b"y"),))
 
 
@@ -688,11 +696,12 @@ def test_metadata_failure_still_fails_peer_before_handle_creation(runtime):
     token = _token("peer", b"unknown-metadata", descriptor)
     with pytest.raises(NixlWriteNotStarted):
         instance.send({}, token, descriptor, (b"x",)).result(timeout=1)
-    with pytest.raises(NixlError, match="has failed"):
+    assert instance.terminal_error is not None
+    with pytest.raises(NixlError, match="terminal state"):
         instance.send({}, token, descriptor, (b"x",))
 
 
-def test_failed_write_retains_resources_and_other_peer_still_works(runtime):
+def test_failed_write_retains_resources_and_stops_entire_runtime(runtime):
     instance, agent = runtime
     descriptor = _descriptor("failure", 1)
     agent.metadata_names.update({b"bad": "bad-peer", b"good": "good-peer"})
@@ -702,7 +711,12 @@ def test_failed_write_retains_resources_and_other_peer_still_works(runtime):
         instance.send({}, _token("bad-peer", b"bad", descriptor), descriptor, (bytearray(b"x"),)).result()
 
     assert instance._retained_resources
-    assert instance.send({}, _token("good-peer", b"good", descriptor), descriptor, (bytearray(b"y"),)).result() is None
+    assert instance.terminal_error is not None
+    with pytest.raises(PayloadTransferFatalError, match="terminal state"):
+        instance.send({}, _token("good-peer", b"good", descriptor), descriptor, (bytearray(b"y"),))
+    with pytest.raises(NixlError, match="terminal state"):
+        instance.prepare_receive(_descriptor("later-get", 1))
+    assert len(agent.transfer_calls) == 1
 
 
 def test_failed_future_does_not_retain_handle_or_sources(runtime):
@@ -930,6 +944,87 @@ class _LoopbackSocket:
         return response.serialize()
 
 
+def test_failed_storage_get_write_makes_client_terminal(runtime):
+    storage = NixlPayloadTransfer(receive_buffer_cache_mb=0)
+    client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_mb=0)
+    fresh_client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_mb=0)
+    storage._runtime._agent.add_remote_agent = lambda metadata: client._runtime.agent_name
+    storage._runtime._agent.status_by_remote[client._runtime.agent_name] = "ERR"
+
+    async def exercise():
+        with pytest.raises(PayloadTransferFatalError, match="terminal state"):
+            await client.get(
+                control_socket=_LoopbackSocket(storage),
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        assert storage._runtime.terminal_error is not None
+        assert client._terminal_remote_error is not None
+        assert client.diagnostics["quarantined_bytes"] > 0
+
+        # Fail before a new request reaches the storage unit, even for another target.
+        with pytest.raises(PayloadTransferFatalError, match="terminal"):
+            await client.get(
+                control_socket=None,
+                sender_id="manager",
+                target_id="other-storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        with pytest.raises(PayloadTransferFatalError, match="terminal state"):
+            await fresh_client.get(
+                control_socket=_LoopbackSocket(storage),
+                sender_id="another-manager",
+                target_id="storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        assert fresh_client._terminal_remote_error is not None
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        client.close()
+        fresh_client.close()
+        storage.close()
+
+
+def test_failed_client_put_write_stops_later_requests(runtime):
+    storage = NixlPayloadTransfer(receive_buffer_cache_mb=0)
+    client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_mb=0)
+    client._runtime._agent.add_remote_agent = lambda metadata: storage._runtime.agent_name
+    client._runtime._agent.status_by_remote[storage._runtime.agent_name] = "ERR"
+
+    async def exercise():
+        with pytest.raises(PayloadTransferFatalError, match="terminal state"):
+            await client.put(
+                control_socket=_LoopbackSocket(storage),
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                data={"value": [torch.arange(8)]},
+                data_parser=None,
+            )
+        assert client._runtime.terminal_error is not None
+        with pytest.raises(PayloadTransferFatalError, match="terminal state"):
+            await client.put(
+                control_socket=None,
+                sender_id="manager",
+                target_id="other-storage",
+                global_indexes=[2],
+                data={"value": [torch.arange(8)]},
+                data_parser=None,
+            )
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        client.close()
+        storage.close()
+
+
 def test_get_recovers_after_missing_commit_response_with_fresh_receive(runtime):
     storage = NixlPayloadTransfer(receive_buffer_cache_mb=0)
     client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_mb=0)
@@ -1063,8 +1158,8 @@ def test_put_commit_releases_receive_when_view_creation_fails(runtime, monkeypat
         storage.close()
 
 
-@pytest.mark.parametrize("error_type", [NixlError, NixlWriteNotStarted])
-def test_put_only_cancels_failed_send_when_write_never_started(error_type):
+@pytest.mark.parametrize("error_type", [NixlError, NixlWriteNotStarted, NixlWriteCompletedCleanupFailed])
+def test_put_cancels_only_when_write_never_started_or_completed(error_type):
     transfer = object.__new__(NixlPayloadTransfer)
     failed_send: Future[None] = Future()
     failed_send.set_exception(error_type("write failed"))
@@ -1088,7 +1183,7 @@ def test_put_only_cancels_failed_send_when_write_never_started(error_type):
             )
         )
 
-    assert bool(cancellations) == (error_type is NixlWriteNotStarted)
+    assert bool(cancellations) == (error_type in (NixlWriteNotStarted, NixlWriteCompletedCleanupFailed))
 
 
 @pytest.mark.parametrize("failure_stage", ["ready", "endpoint", "submit"])
@@ -1438,6 +1533,40 @@ def test_control_socket_errors_keep_runtime_error_contract(operation, failure_st
         )
     assert isinstance(raised.value, RuntimeError)
     assert raised.value.__cause__ is socket_error
+
+
+@pytest.mark.parametrize("operation", ["put", "get"])
+def test_manager_propagates_terminal_payload_failure_without_retry(operation):
+    manager = object.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "manager"
+    manager.storage_unit_infos = {}
+    calls = 0
+
+    async def fail(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise PayloadTransferFatalError("sender terminal; stop job")
+
+    transfer = MagicMock()
+    transfer.put = fail
+    transfer.get = fail
+    manager.payload_transfer = transfer
+
+    async def attempt():
+        if operation == "put":
+            return await manager._put_to_single_storage_unit.__wrapped__(
+                manager, [1], {"value": [1]}, "storage", socket=object()
+            )
+        return await manager._get_from_single_storage_unit.__wrapped__(
+            manager, [1], ["value"], "storage", socket=object()
+        )
+
+    async def exercise():
+        with pytest.raises(PayloadTransferFatalError, match="stop job"):
+            await manager._request_with_retry(operation, "storage", "samples=1", attempt, max_attempts=3)
+
+    asyncio.run(exercise())
+    assert calls == 1
 
 
 @pytest.mark.parametrize("operation", ["put", "get"])

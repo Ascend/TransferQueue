@@ -133,9 +133,15 @@ validation only confirm that the NIXL-UCX path is usable; to confirm RDMA, also 
 
 ### A NIXL Session Has Failed
 
-An uncertain WRITE retains its buffers until teardown and stops the affected peer session.
-Recreate the runtime through the owning worker's error handling. Confirmed pre-WRITE failures
-and local decode errors after completion do not fail the GET session.
+An uncertain WRITE retains its buffers until teardown. The owning NIXL payload transfer enters
+a terminal state: the failed request raises, and all later PUT/GET requests through that transfer
+fail immediately, including requests to other peers. A storage unit sends a terminal error to
+the requesting client so its payload transfer also stops. Stop or restart the owning worker/job;
+TQ does not automatically rebuild a native agent after an uncertain WRITE. Confirmed safe
+pre-WRITE failures and local decode errors after completion do not poison the session. A
+completed WRITE with failed sender cleanup is terminal as well.
+The manager propagates `PayloadTransferFatalError` without retrying or wrapping it, so the job
+can distinguish this terminal failure from an ordinary request error.
 
 PUT cancellation waits for its running send. GET cancellation after COMMIT waits within the
 remaining timeout: a matching completion or pre-WRITE error releases the receiver; an unknown
@@ -144,7 +150,7 @@ Once the quarantine limit is reached, new receives fail explicitly until the pay
 is recreated. Cancellation still propagates to the caller.
 
 With metrics enabled, `tq_storage_payload_*` reports cache, leased and quarantined bytes,
-queue wait and sender resources.
+queue wait, sender resources, and `terminal_send_failure` (0 or 1).
 
 ### RDMA Devices Are Ready, but NIXL-UCX Fails to Start
 

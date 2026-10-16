@@ -296,6 +296,7 @@ class TQMetricsExporter:
                 "outstanding_sends": "Queued and running payload sends",
                 "sender_executors": "Retained sender executors",
                 "failed_send_peers": "Failed native sender sessions",
+                "terminal_send_failure": "Payload transfer stopped after an unsafe native send",
                 "queue_wait_seconds": "Cumulative queue wait for started sends in seconds",
                 "registration_seconds": "Cumulative memory registration time in seconds",
                 "data_transfer_seconds": "Cumulative native time for writes reaching a terminal status, in seconds",

@@ -32,13 +32,16 @@ from transfer_queue.storage.payload_transfer.base import (
     DeferredResponse,
     PayloadTransfer,
     PayloadTransferError,
+    PayloadTransferFatalError,
     PayloadTransferTimeout,
 )
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
     DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
     NixlError,
+    NixlFatalError,
     NixlRuntime,
+    NixlWriteCompletedCleanupFailed,
     NixlWriteNotStarted,
 )
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
@@ -167,6 +170,7 @@ class NixlPayloadTransfer(PayloadTransfer):
             raise NixlError(f"failed to create NIXL runtime: {exc}") from exc
         self._pending_puts: dict[str, _PendingPut] = {}
         self._pending_gets: dict[str, _PendingGet] = {}
+        self._terminal_remote_error: str | None = None
 
     @property
     def diagnostics(self) -> dict[str, float | int]:
@@ -188,6 +192,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         data: dict[str, Any],
         data_parser: Callable[[Any], Any] | None,
     ) -> int:
+        self._ensure_operational()
         frames = tuple(encode(data))
         frame_sizes = tuple(memoryview(frame).nbytes for frame in frames)
         descriptor = PayloadDescriptor(transfer_id=uuid4().hex, payload_bytes=sum(frame_sizes), frame_sizes=frame_sizes)
@@ -235,7 +240,7 @@ class NixlPayloadTransfer(PayloadTransfer):
                     # Keep the transaction socket alive until a running WRITE finishes.
                     try:
                         await asyncio.wrap_future(send_future)
-                    except NixlWriteNotStarted:
+                    except (NixlWriteNotStarted, NixlWriteCompletedCleanupFailed):
                         pass
                     except Exception:
                         safe_to_cancel = False
@@ -261,6 +266,10 @@ class NixlPayloadTransfer(PayloadTransfer):
                 raise PayloadTransferError(
                     f"Error in put to storage unit {target_id}: {type(exc).__name__}: {exc}"
                 ) from exc
+            runtime = getattr(self, "_runtime", None)
+            terminal_error = getattr(runtime, "terminal_error", None)
+            if terminal_error is not None and isinstance(exc, NixlError):
+                raise NixlFatalError(terminal_error) from exc
             raise
 
     async def get(
@@ -272,6 +281,7 @@ class NixlPayloadTransfer(PayloadTransfer):
         global_indexes: list[int],
         fields: list[str],
     ) -> dict[str, Any]:
+        self._ensure_operational()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
         transfer_id = uuid4().hex
@@ -377,6 +387,15 @@ class NixlPayloadTransfer(PayloadTransfer):
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
     ) -> ZMQMessage | DeferredResponse | None:
+        runtime = getattr(self, "_runtime", None)
+        terminal_error = getattr(runtime, "terminal_error", None)
+        if terminal_error is not None and request.request_type in (
+            ZMQRequestType.PUT_DATA_PREPARE,
+            ZMQRequestType.PUT_DATA_COMMIT,
+            ZMQRequestType.GET_DATA_PREPARE,
+            ZMQRequestType.GET_DATA_COMMIT,
+        ):
+            return self._error(storage_id, "payload transfer", NixlFatalError(terminal_error), terminal_failure=True)
         if request.request_type == ZMQRequestType.PUT_DATA_PREPARE:
             return self._handle_put_prepare(request, storage_id)
         if request.request_type == ZMQRequestType.PUT_DATA_COMMIT:
@@ -514,20 +533,28 @@ class NixlPayloadTransfer(PayloadTransfer):
                         body={"transfer_id": transfer_id},
                     )
                 except Exception as exc:
+                    runtime = getattr(self, "_runtime", None)
                     response = self._error(
                         storage_id,
                         "GET commit",
                         exc,
                         transfer_id=transfer_id,
                         write_not_started=completed.cancelled() or isinstance(exc, NixlWriteNotStarted),
+                        terminal_failure=getattr(runtime, "terminal_error", None) is not None,
                     )
                 response_future.set_result(response)
 
             send_future.add_done_callback(complete_response)
             return DeferredResponse(response_future)
         except Exception as exc:
+            runtime = getattr(self, "_runtime", None)
             return self._error(
-                storage_id, "GET commit", exc, transfer_id=transfer_id, write_not_started=write_not_started
+                storage_id,
+                "GET commit",
+                exc,
+                transfer_id=transfer_id,
+                write_not_started=write_not_started,
+                terminal_failure=getattr(runtime, "terminal_error", None) is not None,
             )
 
     def _handle_get_cancel(self, request: ZMQMessage, storage_id: str) -> ZMQMessage:
@@ -625,10 +652,15 @@ class NixlPayloadTransfer(PayloadTransfer):
             logger.warning("failed to cancel %s transfer %s at %s: %s", request_type.value, transfer_id, target_id, exc)
             return False
 
-    @staticmethod
-    def _expect(response: ZMQMessage, expected: ZMQRequestType, target_id: str) -> None:
+    def _expect(self, response: ZMQMessage, expected: ZMQRequestType, target_id: str) -> None:
         if response.sender_id != target_id:
             raise PayloadTransferError(f"expected response from storage unit {target_id}, got {response.sender_id}")
+        if response.body.get("terminal_failure") is True:
+            self._terminal_remote_error = str(response.body.get("message", "remote NIXL sender failed"))
+            raise PayloadTransferFatalError(
+                f"NIXL payload transfer entered a terminal state at storage unit {target_id}: "
+                f"{self._terminal_remote_error}; stop or restart the owning worker/job"
+            )
         if response.request_type != expected:
             raise RuntimeError(
                 f"storage unit {target_id} returned {response.request_type}: "
@@ -643,8 +675,11 @@ class NixlPayloadTransfer(PayloadTransfer):
         *,
         transfer_id: str | None = None,
         write_not_started: bool = False,
+        terminal_failure: bool = False,
     ) -> ZMQMessage:
         body: dict[str, Any] = {"message": f"{operation} failed in storage unit {storage_id}: {error}"}
+        if terminal_failure:
+            body["terminal_failure"] = True
         if transfer_id is not None:
             body.update(transfer_id=transfer_id, write_not_started=write_not_started)
         return ZMQMessage.create(
@@ -652,3 +687,15 @@ class NixlPayloadTransfer(PayloadTransfer):
             sender_id=storage_id,
             body=body,
         )
+
+    def _ensure_operational(self) -> None:
+        remote_error = getattr(self, "_terminal_remote_error", None)
+        if remote_error is not None:
+            raise PayloadTransferFatalError(
+                f"NIXL payload transfer is terminal after a remote sender failure: {remote_error}; "
+                "stop or restart the owning worker/job"
+            )
+        runtime = getattr(self, "_runtime", None)
+        terminal_error = getattr(runtime, "terminal_error", None)
+        if terminal_error is not None:
+            raise NixlFatalError(terminal_error)

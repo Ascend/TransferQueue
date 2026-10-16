@@ -462,7 +462,7 @@ class TestStorageMetricsCollection:
         exporter._storage_unit_infos = {"storage": MagicMock()}
         snapshot = {
             "storage_unit_id": "storage",
-            "payload_transfer": {"idle_receive_bytes": 128, "queue_wait_seconds": 2.5},
+            "payload_transfer": {"idle_receive_bytes": 128, "queue_wait_seconds": 2.5, "terminal_send_failure": 1},
         }
         exporter._query_storage_unit = MagicMock(return_value=snapshot)
 
@@ -474,6 +474,10 @@ class TestStorageMetricsCollection:
         assert (
             exporter.registry.get_sample_value("tq_storage_payload_queue_wait_seconds", {"storage_unit_id": "storage"})
             == 2.5
+        )
+        assert (
+            exporter.registry.get_sample_value("tq_storage_payload_terminal_send_failure", {"storage_unit_id": "storage"})
+            == 1
         )
 
         snapshot.pop("payload_transfer")
@@ -657,6 +661,7 @@ class TestStorageWorkerArrivals:
         transfer._pending_puts = {}
         transfer._pending_gets = {}
         transfer._runtime = MagicMock()
+        transfer._runtime.terminal_error = None
         unit.payload_transfer = transfer
         frames = encode({"value": [42]})
         frame_sizes = tuple(memoryview(frame).nbytes for frame in frames)

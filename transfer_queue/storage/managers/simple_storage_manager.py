@@ -33,6 +33,7 @@ from tensordict import NonTensorStack, TensorDict
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.payload_transfer import (
+    PayloadTransferFatalError,
     PayloadTransferTimeout,
     create_payload_transfer,
 )
@@ -527,6 +528,8 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
                 f"serialized_mb={e.wire_bytes / 2**20:.1f}"
             ) from e
+        except PayloadTransferFatalError:
+            raise
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: Unexpected error during put to storage unit "
@@ -668,6 +671,8 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
                 f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
             ) from e
+        except PayloadTransferFatalError:
+            raise
         except Exception as exc:
             if KEY_NOT_FOUND_MARKER in str(exc):
                 raise StorageKeyNotFoundError(str(exc)) from exc
