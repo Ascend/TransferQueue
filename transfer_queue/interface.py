@@ -701,9 +701,13 @@ def kv_link(keys: list[str] | str, partition_id: str, source_key: str, fields: l
 
     For example, the n responses of a GRPO prompt can link the prompt's fields instead
     of putting the prompt n times. Missing ``keys`` are created, and linked fields read
-    as produced. Putting a linked field stores a private value in place of the link;
+    the source's current value and are ready whenever the source's are. Putting a linked
+    field stores a private value in place of the link, and ``kv_update`` refuses it;
     clearing a linked key or field drops only the link. ``source_key`` cannot be cleared
     while other keys link to it, unless they are cleared in the same call.
+
+    ``source_key`` stays an ordinary sample: ``get_meta`` and dataloaders that ask only
+    for linked fields also return it, so give consumers a field the source lacks.
 
     Args:
         keys: Single key or list of keys that will read the linked fields.
