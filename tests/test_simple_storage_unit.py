@@ -32,7 +32,10 @@ import gc
 import pickle
 import time
 import weakref
+from concurrent.futures import Future
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import numpy as np
@@ -42,6 +45,8 @@ import tensordict
 import torch
 import zmq
 
+from transfer_queue.storage import simple_storage
+from transfer_queue.storage.payload_transfer import DeferredResponse
 from transfer_queue.storage.simple_storage import (
     HybridStorageUnitData,
     SimpleStorageUnit,
@@ -152,6 +157,131 @@ def storage_setup(ray_setup):
 
     # Cleanup
     ray.kill(storage_actor)
+
+
+def test_zmq_get_response_is_serialized_once(monkeypatch):
+    request = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA,
+        sender_id="manager",
+        body={"global_indexes": [0], "fields": ["value"]},
+    )
+    response = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA_RESPONSE,
+        sender_id="unit",
+        body={"data": {"value": [torch.arange(4)]}},
+    )
+    request_frames = request.serialize()
+    unit = SimpleNamespace(
+        storage_unit_id="unit",
+        payload_transfer=SimpleNamespace(handle_request=lambda *args, **kwargs: response),
+        _load_data=lambda *args: {},
+        _put_decoded_data=lambda *args: None,
+        _requests_arrived=0,
+        _arrivals_by_op={},
+    )
+    worker_socket = SimpleNamespace(recv_multipart=lambda copy=False: [b"manager", *request_frames])
+    monitor = SimpleNamespace(measure=lambda **kwargs: nullcontext())
+    original_serialize = ZMQMessage.serialize
+    serialized_responses = 0
+
+    def count_response_serialize(message):
+        nonlocal serialized_responses
+        if message is response:
+            serialized_responses += 1
+        return original_serialize(message)
+
+    monkeypatch.setattr(ZMQMessage, "serialize", count_response_serialize)
+    identity, frames = SimpleStorageUnit.__ray_actor_class__._process_one_worker_request(
+        unit, worker_socket, monitor, {}
+    )
+
+    assert identity == b"manager"
+    assert serialized_responses == 1
+    assert isinstance(frames, list)
+    decoded = ZMQMessage.deserialize(frames)
+    torch.testing.assert_close(decoded.body["data"]["value"][0], torch.arange(4))
+
+
+def test_deferred_send_failure_fails_pending_and_later_requests(monkeypatch):
+    class DeferredTransfer:
+        handled = 0
+
+        def __init__(self):
+            self.future = Future()
+
+        def expire_prepared(self):
+            pass
+
+        def handle_request(self, request, **kwargs):
+            self.handled += 1
+            if self.handled == 1:
+                return DeferredResponse(self.future)
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_RESPONSE,
+                sender_id=kwargs["storage_id"],
+                body={"data": {}},
+            )
+
+        def close(self):
+            pass
+
+    transfer = DeferredTransfer()
+    monkeypatch.setattr(simple_storage, "create_payload_transfer", lambda _: transfer)
+    drain = simple_storage._drain_deferred_responses
+
+    class FailedSend:
+        def send_multipart(self, *_args, **_kwargs):
+            raise zmq.ZMQError("injected deferred send failure")
+
+    def fail_deferred_send(completions, worker_socket, storage_id, measurements):
+        drain(completions, FailedSend(), storage_id, measurements)
+
+    monkeypatch.setattr(simple_storage, "_drain_deferred_responses", fail_deferred_send)
+    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = unit_class(config={"total_storage_size": 8, "num_data_storage_units": 1})
+    address = unit.get_zmq_server_info().to_addr("put_get_socket")
+    client = MockStorageClient(address, unit.zmq_server_info.ip)
+    other_client = MockStorageClient(address, unit.zmq_server_info.ip)
+    try:
+        request = ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA,
+            sender_id="mock_client_0",
+            body={"global_indexes": [0], "fields": ["value"]},
+        )
+        client.socket.send_multipart(request.serialize())
+        deadline = time.monotonic() + 2
+        while transfer.handled == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert transfer.handled == 1
+        assert other_client.send_get(1, [0], ["value"]).request_type == ZMQRequestType.GET_DATA_RESPONSE
+        assert unit.get_worker_health()["healthy"] is True
+
+        transfer.future.set_result(
+            ZMQMessage.create(
+                request_type=ZMQRequestType.GET_DATA_RESPONSE,
+                sender_id=unit.storage_unit_id,
+                body={"data": {}},
+            )
+        )
+        first = ZMQMessage.deserialize(client.socket.recv_multipart(copy=False))
+        assert first.request_type == ZMQRequestType.PUT_GET_ERROR
+        assert first.body["terminal_failure"] is True
+        assert "deferred response send failed" in first.body["message"]
+        assert unit.get_worker_health()["healthy"] is False
+        assert unit.worker_thread is not None
+        unit.worker_thread.join(timeout=2)
+        assert not unit.worker_thread.is_alive()
+
+        started = time.monotonic()
+        second = client.send_get(0, [0], ["value"])
+        assert time.monotonic() - started < 2
+        assert second.request_type == ZMQRequestType.PUT_GET_ERROR
+        assert second.body["terminal_failure"] is True
+        assert transfer.handled == 2
+    finally:
+        client.close()
+        other_client.close()
+        unit.shutdown()
 
 
 def test_put_get_single_client(storage_setup):

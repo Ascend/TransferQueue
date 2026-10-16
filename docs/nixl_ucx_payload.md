@@ -76,6 +76,31 @@ or GID, add the corresponding variables to `ucx_env_vars`.
 If NIXL initialization or a transfer fails, TQ reports the error directly and does not fall back to ZMQ.
 If the transport is not restricted, or if `UCX_TLS` includes `tcp`, UCX may use TCP.
 
+### Receive Buffer Cache
+
+Set `payload_transfer.receive_buffer_cache_mb` to limit idle registered buffers **per runtime**,
+in MB (1024² bytes). The default is `256`; `0` disables caching. Larger payloads still transfer,
+but their buffers are released when no longer referenced. A storage-side PUT copies received
+frames into ordinary memory before storing decoded values, so stored values do not hold the
+registered receive buffer. Client GET views, in-flight transfers and fault-retained memory
+are outside the idle cache limit. A smaller cache saves idle memory at the cost of
+more registrations; account for all runtimes on a node when increasing it.
+
+Set `payload_transfer.quarantine_limit_mb` to stop preparing new NIXL receives after
+uncertain GETs have retained at least this many bytes per runtime. The default is `1024` MB.
+An already exposed receive buffer is never freed to satisfy the limit; it remains registered
+until the payload transfer closes. One in-flight receive can therefore take the retained total
+above the configured threshold. Increase the limit if normal payloads need more headroom.
+
+Set `payload_transfer.prepare_timeout_seconds` to expire abandoned PUT/GET PREPARE state.
+The default is twice the larger of the control-plane timeout and 180 seconds (normally
+400 seconds). The storage worker checks once per second. Expired GET frames are released
+and a late COMMIT is rejected. An expired PUT is removed from pending state, but its
+receive buffer must be quarantined until runtime teardown because the peer may still
+hold a READY token and perform a late WRITE. Quarantined bytes count against
+`quarantine_limit_mb`; do not deregister an exposed PUT buffer solely on elapsed time.
+If abandoned PUTs exhaust that limit, stop or restart the owning worker/job.
+
 ### Common UCX Configuration
 
 | Variable | Purpose | Reference value |
@@ -116,6 +141,27 @@ validation only confirm that the NIXL-UCX path is usable; to confirm RDMA, also 
 `rc_*` indicates RDMA, while a TCP lane indicates that TCP is being used.
 
 ## Common Issues
+
+### A NIXL Session Has Failed
+
+An uncertain WRITE retains its buffers until teardown. The owning NIXL payload transfer enters
+a terminal state: the failed request raises, and all later PUT/GET requests through that transfer
+fail immediately, including requests to other peers. A storage unit sends a terminal error to
+the requesting client so its payload transfer also stops. Stop or restart the owning worker/job;
+TQ does not automatically rebuild a native agent after an uncertain WRITE. Confirmed safe
+pre-WRITE failures and local decode errors after completion do not poison the session. A
+completed WRITE with failed sender cleanup is terminal as well.
+The manager propagates `PayloadTransferFatalError` without retrying or wrapping it, so the job
+can distinguish this terminal failure from an ordinary request error.
+
+PUT cancellation waits for its running send. GET cancellation after COMMIT waits within the
+remaining timeout: a matching completion or pre-WRITE error releases the receiver; an unknown
+result quarantines only that receive buffer. A later GET uses a new transfer ID and buffer.
+Once the quarantine limit is reached, new receives fail explicitly until the payload transfer
+is recreated. Cancellation still propagates to the caller.
+
+With metrics enabled, `tq_storage_payload_*` reports cache, leased and quarantined bytes,
+queue wait, sender resources, and `terminal_send_failure` (0 or 1).
 
 ### RDMA Devices Are Ready, but NIXL-UCX Fails to Start
 

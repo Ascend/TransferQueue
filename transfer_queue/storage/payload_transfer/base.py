@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from concurrent.futures import Future
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -32,7 +34,11 @@ class PayloadTransferError(RuntimeError):
     """A payload transfer could not be completed safely."""
 
 
-class PayloadTransferTimeout(RuntimeError):
+class PayloadTransferFatalError(PayloadTransferError):
+    """The owning worker/job must stop or restart before another payload request."""
+
+
+class PayloadTransferTimeout(PayloadTransferError):
     """A payload transfer control message was not answered within the timeout.
 
     Distinct from an error the peer reported: only a missing answer is worth retrying on a
@@ -45,8 +51,23 @@ class PayloadTransferTimeout(RuntimeError):
         self.wire_bytes = wire_bytes
 
 
+@dataclass(frozen=True)
+class DeferredResponse:
+    """A response that the SimpleStorage worker must send after completion."""
+
+    future: Future[ZMQMessage]
+
+
 class PayloadTransfer(ABC):
     """Complete SimpleStorage payload strategy, including its wire protocol."""
+
+    @property
+    def diagnostics(self) -> dict[str, float | int]:
+        """Return backend metrics for the storage metrics response."""
+        return {}
+
+    def expire_prepared(self) -> None:
+        """Reap abandoned PREPARE requests on the storage worker thread."""
 
     @abstractmethod
     async def put(
@@ -85,7 +106,7 @@ class PayloadTransfer(ABC):
         storage_id: str,
         load_data: Callable[..., dict[str, Any]],
         store_data: Callable[..., None],
-    ) -> ZMQMessage | None:
+    ) -> ZMQMessage | DeferredResponse | None:
         """Handle a strategy-owned request on a SimpleStorageUnit."""
 
     def bootstrap_info(self) -> dict[str, Any] | None:
