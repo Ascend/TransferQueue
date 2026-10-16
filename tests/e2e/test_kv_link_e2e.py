@@ -97,6 +97,9 @@ def test_link_requires_a_produced_source_field(tq_system):
         tq.kv_link("r", PARTITION, "missing", "prompt")
     with pytest.raises(RuntimeError, match="must have produced"):
         tq.kv_link("r", PARTITION, "p0", "image")
+    with pytest.raises(ValueError, match="duplicates"):
+        tq.kv_link(["r", "r"], PARTITION, "p0", "prompt")
+    assert tq.kv_list(PARTITION)[PARTITION].keys() == {"p0"}
 
 
 def test_link_refuses_a_source_being_cleared(tq_system):

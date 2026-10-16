@@ -711,6 +711,7 @@ def kv_link(keys: list[str] | str, partition_id: str, source_key: str, fields: l
 
     Raises:
         RuntimeError: If ``source_key`` does not exist or has not produced all of ``fields``.
+        ValueError: If ``keys`` contains duplicates.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Example:
@@ -1256,8 +1257,10 @@ async def async_kv_link(keys: list[str] | str, partition_id: str, source_key: st
     # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
     if not isinstance(tq_client.storage_manager, AsyncSimpleStorageManager):
         raise NotImplementedError(f"{type(tq_client.storage_manager).__name__} does not support kv_link")
+    keys = [keys] if isinstance(keys, str) else keys
+    _check_unique_keys(keys)
     await tq_client.async_kv_link(
-        [keys] if isinstance(keys, str) else keys,
+        keys,
         partition_id,
         source_key,
         [fields] if isinstance(fields, str) else fields,
