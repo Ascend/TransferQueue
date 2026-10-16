@@ -134,12 +134,13 @@ def _queue_deferred_response(
     completions: SimpleQueue[tuple[bytes, Future[ZMQMessage]]],
     wakeup: socket.socket,
     shutdown_event: Event,
+    worker_failed: Event | None = None,
 ) -> None:
     """Wake the owning worker when an asynchronous response becomes ready."""
     routing_identity = bytes(identity)
 
     def ready(future: Future[ZMQMessage]) -> None:
-        if shutdown_event.is_set():
+        if shutdown_event.is_set() or (worker_failed is not None and worker_failed.is_set()):
             return
         completions.put((routing_identity, future))
         try:
@@ -859,6 +860,8 @@ class SimpleStorageUnit:
 
         # Shutdown event for graceful termination
         self._shutdown_event = Event()
+        self._worker_failed = Event()
+        self._worker_failure: str | None = None
 
         # Placeholder for zmq_context, proxy_thread and worker_threads
         self.zmq_context: zmq.Context | None = None
@@ -965,6 +968,7 @@ class SimpleStorageUnit:
         poller = zmq.Poller()
         poller.register(front, zmq.POLLIN)
         poller.register(back, zmq.POLLIN)
+        pending_requests: dict[bytes, int] = {}
         try:
             # Forwarding by hand rather than via zmq.proxy() so a non-TransferQueue peer on
             # this exposed TCP port cannot reach the worker and terminate its request loop.
@@ -980,13 +984,32 @@ class SimpleStorageUnit:
                                 self.storage_unit_id,
                             )
                             continue
-                        back.send_multipart(messages, copy=False)
+                        if self._worker_failed.is_set():
+                            front.send_multipart([identity] + self._worker_failure_response().serialize(), copy=False)
+                        else:
+                            back.send_multipart(messages, copy=False)
+                            pending_requests[identity] = pending_requests.get(identity, 0) + 1
                     finally:
                         # This thread outlives each request, so drop forwarded payload frames while idle.
                         del messages
 
                 if back in events:
-                    front.send_multipart(back.recv_multipart(copy=False), copy=False)
+                    response = back.recv_multipart(copy=False)
+                    identity = bytes(response[0])
+                    outstanding = pending_requests.get(identity, 0)
+                    if outstanding == 1:
+                        del pending_requests[identity]
+                    elif outstanding > 1:
+                        pending_requests[identity] = outstanding - 1
+                    else:
+                        logger.warning("[%s]: response for unknown client identity", self.storage_unit_id)
+                    front.send_multipart(response, copy=False)
+
+                if self._worker_failed.is_set() and pending_requests:
+                    for identity, count in pending_requests.items():
+                        for _ in range(count):
+                            front.send_multipart([identity] + self._worker_failure_response().serialize(), copy=False)
+                    pending_requests.clear()
         except zmq.ContextTerminated:
             logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy stopped gracefully (Context Terminated)")
         except Exception as e:
@@ -1043,8 +1066,10 @@ class SimpleStorageUnit:
                     _drain_deferred_responses(
                         deferred_completions, worker_socket, self.storage_unit_id, deferred_measurements
                     )
-                except zmq.ZMQError as exc:
-                    logger.warning(f"[{self.storage_unit_id}]: deferred response send failed: {exc}")
+                except Exception as exc:
+                    self._worker_failure = f"deferred response send failed: {type(exc).__name__}: {exc}"
+                    self._worker_failed.set()
+                    logger.exception("[%s]: %s", self.storage_unit_id, self._worker_failure)
                     break
 
             if worker_socket in socks:
@@ -1058,6 +1083,7 @@ class SimpleStorageUnit:
                         deferred_completions,
                         wakeup_writer,
                         self._shutdown_event,
+                        self._worker_failed,
                     )
                 else:
                     worker_socket.send_multipart([identity] + response, copy=False)
@@ -1070,6 +1096,20 @@ class SimpleStorageUnit:
         wakeup_reader.close()
         wakeup_writer.close()
         worker_socket.close(linger=0)
+
+    def _worker_failure_response(self) -> ZMQMessage:
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_GET_ERROR,
+            sender_id=self.storage_unit_id,
+            body={
+                "message": f"{self.storage_unit_id}, storage worker unavailable: {self._worker_failure}",
+                "terminal_failure": True,
+            },
+        )
+
+    def get_worker_health(self) -> dict[str, str | bool | None]:
+        """Expose a stopped worker to the owning actor and diagnostics."""
+        return {"healthy": not self._worker_failed.is_set(), "error": self._worker_failure}
 
     def _put_decoded_data(self, global_indexes: list[int], field_data: dict[str, Any], data_parser: Any) -> None:
         """Validate parsed data and store it."""
