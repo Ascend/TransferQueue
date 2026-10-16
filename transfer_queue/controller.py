@@ -371,6 +371,10 @@ class DataPartitionStatus:
     links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: source global_idx}
     linked_by: dict[int, set[int]] = field(default_factory=dict)  # source global_idx -> global_idxs linking to it
 
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        # Controller checkpoints pickle partitions; ones saved before kv_link have no links.
+        self.__dict__.update({"links": {}, "linked_by": {}, **state})
+
     # Dynamic configuration - these are computed from the current state
     @property
     def total_samples_num(self) -> int:

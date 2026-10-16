@@ -1522,6 +1522,19 @@ class TestFieldLinks:
         assert partition.links == {} and partition.linked_by == {}
         partition.check_not_linked([0])
 
+    def test_checkpoint_saved_before_links_still_loads(self):
+        import pickle
+
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="old")
+        del partition.links, partition.linked_by
+        partition = pickle.loads(pickle.dumps(partition))
+
+        assert partition.update_production_status([0], ["x"], field_schema=self.SCHEMA)
+        partition.link_fields([1], 0, ["x"])
+        assert partition.linked_by == {0: {1}}
+
     def test_linked_rows_follow_source_readiness_and_shape(self):
         partition = self._linked_partition()
         wider = {"x": {**self.SCHEMA["x"], "shape": (5,)}}
