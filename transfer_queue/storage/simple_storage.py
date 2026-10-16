@@ -1048,17 +1048,17 @@ class SimpleStorageUnit:
             if worker_socket in socks:
                 # Keep request handling in a separate scope so payload references are
                 # released before the worker waits for the next request.
-                identity, response_msg = self._process_one_worker_request(worker_socket, monitor, deferred_measurements)
-                if isinstance(response_msg, DeferredResponse):
+                identity, response = self._process_one_worker_request(worker_socket, monitor, deferred_measurements)
+                if isinstance(response, DeferredResponse):
                     _queue_deferred_response(
                         identity,
-                        response_msg,
+                        response,
                         deferred_completions,
                         wakeup_writer,
                         self._shutdown_event,
                     )
                 else:
-                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                    worker_socket.send_multipart([identity] + response, copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
         for measurement in deferred_measurements.values():
@@ -1099,8 +1099,8 @@ class SimpleStorageUnit:
         worker_socket: zmq.Socket,
         monitor: Any,
         deferred_measurements: dict[Future[ZMQMessage], ExitStack],
-    ) -> tuple[bytes | zmq.Frame, ZMQMessage | DeferredResponse]:
-        """Process one storage request and return its response for the worker socket."""
+    ) -> tuple[bytes | zmq.Frame, list | DeferredResponse]:
+        """Process one storage request and return serialized frames or a deferred response."""
         # Messages received from proxy: [identity, serialized_msg_frame1, ...]
         messages = worker_socket.recv_multipart(copy=False)
         identity = messages[0]
@@ -1120,7 +1120,7 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"undecodable request: {type(e).__name__}: {e}"},
             )
-            return identity, error_msg
+            return identity, error_msg.serialize()
 
         operation = request_msg.request_type
         started = time.perf_counter()
@@ -1206,7 +1206,7 @@ class SimpleStorageUnit:
                 f"samples={len(request_msg.body.get('global_indexes', []))} "
                 f"fields={list(request_msg.body.get('fields', []))}",
             )
-        return identity, response_msg
+        return identity, response_frames
 
     @staticmethod
     def _field_length(value: Any) -> int | None:

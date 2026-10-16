@@ -32,7 +32,9 @@ import gc
 import pickle
 import time
 import weakref
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 import numpy as np
@@ -152,6 +154,49 @@ def storage_setup(ray_setup):
 
     # Cleanup
     ray.kill(storage_actor)
+
+
+def test_zmq_get_response_is_serialized_once(monkeypatch):
+    request = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA,
+        sender_id="manager",
+        body={"global_indexes": [0], "fields": ["value"]},
+    )
+    response = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA_RESPONSE,
+        sender_id="unit",
+        body={"data": {"value": [torch.arange(4)]}},
+    )
+    request_frames = request.serialize()
+    unit = SimpleNamespace(
+        storage_unit_id="unit",
+        payload_transfer=SimpleNamespace(handle_request=lambda *args, **kwargs: response),
+        _load_data=lambda *args: {},
+        _put_decoded_data=lambda *args: None,
+        _requests_arrived=0,
+        _arrivals_by_op={},
+    )
+    worker_socket = SimpleNamespace(recv_multipart=lambda copy=False: [b"manager", *request_frames])
+    monitor = SimpleNamespace(measure=lambda **kwargs: nullcontext())
+    original_serialize = ZMQMessage.serialize
+    serialized_responses = 0
+
+    def count_response_serialize(message):
+        nonlocal serialized_responses
+        if message is response:
+            serialized_responses += 1
+        return original_serialize(message)
+
+    monkeypatch.setattr(ZMQMessage, "serialize", count_response_serialize)
+    identity, frames = SimpleStorageUnit.__ray_actor_class__._process_one_worker_request(
+        unit, worker_socket, monitor, {}
+    )
+
+    assert identity == b"manager"
+    assert serialized_responses == 1
+    assert isinstance(frames, list)
+    decoded = ZMQMessage.deserialize(frames)
+    torch.testing.assert_close(decoded.body["data"]["value"][0], torch.arange(4))
 
 
 def test_put_get_single_client(storage_setup):
