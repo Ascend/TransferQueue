@@ -88,7 +88,7 @@ def test_native_checkpoint_preserves_finished_and_pending_rows(tmp_path, compact
         after = tq.kv_batch_get(keys=keys, partition_id="train")
         for field in fields.keys():
             if field in ("raw_prompt", "tools_kwargs"):
-                assert after[field].tolist() == before[field].tolist()
+                assert list(after[field]) == list(before[field])
             else:
                 assert after[field].dtype == before[field].dtype
                 if after[field].is_nested:
