@@ -99,6 +99,16 @@ def test_link_requires_a_produced_source_field(tq_system):
         tq.kv_link("r", PARTITION, "p0", "image")
 
 
+def test_link_refuses_a_source_being_cleared(tq_system):
+    tq.kv_put(key="p0", partition_id=PARTITION, fields={"prompt": _prompt(0)})
+    source = tq.get_client().kv_describe(["p0"], PARTITION)["rows"]["p0"]["global_index"]
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    ray.get(controller.mark_clearing.remote([source], [PARTITION]))
+
+    with pytest.raises(RuntimeError, match="must have produced"):
+        tq.kv_link("r", PARTITION, "p0", "prompt")
+
+
 def test_source_cannot_be_cleared_while_linked(tq_system):
     keys = _put_group(0)
 

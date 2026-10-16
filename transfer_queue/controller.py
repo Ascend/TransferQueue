@@ -1964,10 +1964,12 @@ class TransferQueueController:
         if partition is None or source_key not in partition.keys_mapping:
             raise KeyError(f"source key {source_key!r} not found in partition {partition_id!r}")
         source = partition.keys_mapping[source_key]
+        # Production status, not field metadata: mark_clearing zeroes it before storage deletes the payload.
         missing = [
             name
             for name in fields
-            if name not in partition.field_metadata or source not in partition.field_metadata[name].global_indexes
+            if name not in partition.field_name_mapping
+            or partition.production_status[source, partition.field_name_mapping[name]] != 1
         ]
         if not fields or missing:
             raise ValueError(f"source key {source_key!r} must have produced fields {missing or fields}")
