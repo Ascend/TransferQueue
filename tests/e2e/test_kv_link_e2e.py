@@ -99,7 +99,20 @@ def test_link_requires_a_produced_source_field(tq_system):
         tq.kv_link("r", PARTITION, "p0", "image")
     with pytest.raises(ValueError, match="duplicates"):
         tq.kv_link(["r", "r"], PARTITION, "p0", "prompt")
+    with pytest.raises(RuntimeError, match="cannot link to itself"):
+        tq.kv_link(["r", "p0"], PARTITION, "p0", "prompt")
     assert tq.kv_list(PARTITION)[PARTITION].keys() == {"p0"}
+
+
+def test_link_refuses_to_relink_a_source(tq_system):
+    keys = _put_group(0)
+    tq.kv_put(key="q0", partition_id=PARTITION, fields={"prompt": _prompt(9)})
+
+    with pytest.raises(RuntimeError, match="linked by other keys"):
+        tq.kv_link("p0", PARTITION, "q0", "prompt")
+
+    assert _links("p0") == {}
+    assert _rows(tq.kv_batch_get(["p0", *keys], PARTITION)["prompt"]) == [_prompt(0).tolist()] * (N + 1)
 
 
 def test_link_refuses_a_source_being_cleared(tq_system):

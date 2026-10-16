@@ -1990,7 +1990,8 @@ class TransferQueueController:
 
         Raises:
             KeyError: The partition or ``source_key`` does not exist.
-            ValueError: ``fields`` is empty or ``source_key`` has not produced all of them.
+            ValueError: ``fields`` is empty, ``source_key`` has not produced all of them, or
+                ``keys`` include ``source_key`` or a key other keys link these fields to.
         """
         partition = self._get_partition(partition_id)
         if partition is None or source_key not in partition.keys_mapping:
@@ -2005,6 +2006,11 @@ class TransferQueueController:
         ]
         if not fields or missing:
             raise ValueError(f"source key {source_key!r} must have produced fields {missing or fields}")
+        existing = [idx for idx in partition.kv_retrieve_indexes(keys) if idx is not None]
+        if source in existing:
+            raise ValueError(f"source key {source_key!r} cannot link to itself")
+        # Keys linking to a relinked key would keep reading its old payload, not the new source.
+        partition.check_not_linked(existing, fields)
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
         partition.link_fields(metadata.global_indexes, source, fields)
 

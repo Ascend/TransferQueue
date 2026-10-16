@@ -710,7 +710,8 @@ def kv_link(keys: list[str] | str, partition_id: str, source_key: str, fields: l
         fields: Single field name or list of field names to link.
 
     Raises:
-        RuntimeError: If ``source_key`` does not exist or has not produced all of ``fields``.
+        RuntimeError: If ``source_key`` does not exist or has not produced all of ``fields``,
+            or ``keys`` include ``source_key`` or a key that other keys link these fields to.
         ValueError: If ``keys`` contains duplicates.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
