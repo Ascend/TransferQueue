@@ -267,6 +267,14 @@ class TestBatchMetaColumnar:
 
         assert batch._links == [{"field_b": 7}, {}]
 
+    def test_union_takes_links_with_the_overriding_fields(self):
+        linked = self._make_batch(batch_size=1)
+        linked._links = [{"field_a": 7, "field_b": 7}]
+        private = self._make_batch(batch_size=1, field_names=["field_a"])
+
+        assert linked.union(private)._links == [{"field_b": 7}]
+        assert private.union(linked)._links == [{"field_a": 7, "field_b": 7}]
+
     def test_shallow_copy_isolation_global_indexes(self):
         """Modifying the original global_indexes list does not affect BatchMeta."""
         original_indexes = [0, 1, 2]

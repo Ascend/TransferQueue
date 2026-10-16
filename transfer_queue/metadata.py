@@ -717,7 +717,10 @@ class BatchMeta:
             extra_info=merged_extra_info,
             custom_meta=merged_custom_meta,
             _custom_backend_meta=merged_custom_backend_meta,
-            _links=[{**mine, **theirs} for mine, theirs in zip(self._links, other._links, strict=True)],
+            _links=[
+                {**{f: s for f, s in mine.items() if f not in other.field_schema}, **theirs}
+                for mine, theirs in zip(self._links, other._links, strict=True)
+            ],
         )
 
     @classmethod
