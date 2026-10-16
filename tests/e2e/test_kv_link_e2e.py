@@ -90,6 +90,19 @@ def test_linked_keys_read_the_source_payload(tq_system):
     assert _rows(data["response"]) == [[i] for i in range(len(keys))]
 
 
+def test_data_parser_refuses_linked_fields(tq_system):
+    keys = _put_group(0)
+    tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
+
+    def identity(data, args):
+        return data
+
+    with pytest.raises(NotImplementedError, match="kv_link"):
+        tq.kv_batch_get(keys, PARTITION, data_parser=identity)
+    data = tq.kv_batch_get(keys, PARTITION, select_fields="response", data_parser=identity)
+    assert _rows(data["response"]) == [[i] for i in range(N)]
+
+
 def test_link_requires_a_produced_source_field(tq_system):
     tq.kv_put(key="p0", partition_id=PARTITION, fields={"prompt": _prompt(0)})
 
