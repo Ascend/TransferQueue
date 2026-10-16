@@ -800,7 +800,8 @@ class AsyncSimpleStorageManager(StorageManager):
         """
         Retrieve data from remote StorageUnit based on metadata.
 
-        Routes to each SU using global_idx % num_su (hash routing).
+        Routes to each SU using global_idx % num_su (hash routing). A linked field is read
+        from its source row, once however many samples link to it.
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
@@ -818,26 +819,44 @@ class AsyncSimpleStorageManager(StorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        routing = self._group_by_hash(metadata.global_indexes)
+        # A parser sees every selected field of each sample on one unit; a linked field lives on another row.
+        if data_parser is not None and any(metadata._links):
+            raise NotImplementedError("data_parser does not support samples with fields linked by kv_link")
         # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
         max_attempts = 1 if data_parser is not None else None
+
+        # A unit request reads the same fields for every row in it, and a row stores only its
+        # unlinked fields, so rows are grouped by the field set they physically hold. Without
+        # links this is one group in batch order, so batch_positions index parser_args.
+        fields_by_row: dict[int, set[str]] = defaultdict(set)
+        for global_index, links in zip(metadata.global_indexes, metadata._links, strict=True):
+            for field in metadata.field_names:
+                fields_by_row[links.get(field, global_index)].add(field)
+        rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        for global_index, fields in fields_by_row.items():
+            rows_by_fields[tuple(sorted(fields))].append(global_index)
+        requests = [
+            (su_id, list(fields), group)
+            for fields, rows in rows_by_fields.items()
+            for su_id, group in self._group_by_hash(rows).items()
+        ]
 
         tasks = [
             self._request_with_retry(
                 "get",
                 su_id,
-                f"samples={len(group.global_indexes)} fields={list(metadata.field_names)}",
+                f"samples={len(group.global_indexes)} fields={fields}",
                 partial(
                     self._get_from_single_storage_unit,
                     group.global_indexes,
-                    metadata.field_names,
+                    fields,
                     target_storage_unit=su_id,
                     data_parser=data_parser,
                     parser_args=None if parser_args is None else [parser_args[p] for p in group.batch_positions],
                 ),
                 max_attempts=max_attempts,
             )
-            for su_id, group in routing.items()
+            for su_id, fields, group in requests
         ]
         try:
             results = await asyncio.gather(*tasks)
@@ -849,19 +868,23 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: get_data failed. "
                 f"partition_id={metadata.partition_ids[0]}, "
                 f"num_samples={metadata.size}, "
-                f"num_storage_units={len(routing)}, "
+                f"num_requests={len(requests)}, "
                 f"error={type(e).__name__}: {e}"
             )
             raise
 
-        # Scatter results directly to batch positions — no intermediate per-sample dict
-        n = len(metadata.global_indexes)
-        ordered_data: dict[str, list] = {field: [None] * n for field in metadata.field_names}
-
-        for (su_id, group), (fields, su_data) in zip(routing.items(), results, strict=True):
+        values: dict[tuple[int, str], Any] = {}
+        for (_, _, group), (fields, su_data) in zip(requests, results, strict=True):
             for field in fields:
-                for i, pos in enumerate(group.batch_positions):
-                    ordered_data[field][pos] = su_data[field][i]
+                for i, global_index in enumerate(group.global_indexes):
+                    values[global_index, field] = su_data[field][i]
+        ordered_data = {
+            field: [
+                values[links.get(field, global_index), field]
+                for global_index, links in zip(metadata.global_indexes, metadata._links, strict=True)
+            ]
+            for field in metadata.field_names
+        }
 
         tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
 

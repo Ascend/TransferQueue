@@ -1186,6 +1186,23 @@ class AsyncTransferQueueClient:
         )
         return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
 
+    @with_controller_socket
+    async def async_kv_link(
+        self,
+        keys: list[str],
+        partition_id: str,
+        source_key: str,
+        fields: list[str],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Asynchronously make ``fields`` of ``keys`` read the payload of ``source_key``; see ``kv_link``."""
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_LINK,
+            response_type=ZMQRequestType.KV_LINK_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "source_key": source_key, "fields": fields},
+        )
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1501,6 +1518,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
         self._kv_describe = _make_sync(self.async_kv_describe)
+        self._kv_link = _make_sync(self.async_kv_link)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
@@ -1977,6 +1995,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
         See ``async_kv_describe``.
         """
         return self._kv_describe(keys, partition_id)
+
+    def kv_link(self, keys: list[str], partition_id: str, source_key: str, fields: list[str]) -> None:
+        """Synchronously make ``fields`` of ``keys`` read the payload of ``source_key``; see ``kv_link``."""
+        return self._kv_link(keys, partition_id, source_key, fields)
 
     # ==================== Selective Data Dump API ====================
 

@@ -367,6 +367,9 @@ class DataPartitionStatus:
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
     revert_keys_mapping: dict[int, str] = field(default_factory=dict)  # global_idx -> key
 
+    # Linked fields hold no payload of their own and read the source row's instead
+    links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: source global_idx}
+
     # Dynamic configuration - these are computed from the current state
     @property
     def total_samples_num(self) -> int:
@@ -564,6 +567,9 @@ class DataPartitionStatus:
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
+
+            # A written value replaces the link it lands on
+            self._drop_links(global_indices, field_names)
 
             return True
 
@@ -944,6 +950,7 @@ class DataPartitionStatus:
             for idx in indexes_to_release:
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)
+                self.links.pop(idx, None)
 
                 if idx in self.revert_keys_mapping:
                     self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
@@ -970,6 +977,60 @@ class DataPartitionStatus:
             backend_meta = self.field_custom_backend_meta.get(idx, {})
             for field_name in field_names:
                 backend_meta.pop(field_name, None)
+        self._drop_links(global_indexes, field_names)
+
+    # ==================== Field Links ====================
+    def link_fields(self, global_indexes: list[int], source: int, field_names: list[str]) -> None:
+        """Mark ``field_names`` produced on these rows, read from the payload of row ``source``."""
+        schema = {}
+        for name in field_names:
+            meta = self.field_metadata[name]
+            schema[name] = {
+                "dtype": meta.dtype,
+                "shape": meta.shape,
+                "is_nested": meta.is_nested,
+                "is_non_tensor": meta.is_non_tensor,
+            }
+            if meta.is_nested:
+                schema[name]["per_sample_shapes"] = {idx: meta.per_sample_shapes[source] for idx in global_indexes}
+        # Before recording links: update_production_status drops links on the cells it marks.
+        if not self.update_production_status(global_indexes, field_names, schema):
+            raise RuntimeError(f"failed to link fields {field_names} in partition {self.partition_id}")
+        # Point at the row holding the payload, so a chain of links is one hop.
+        source_links = self.links.get(source, {})
+        for idx in global_indexes:
+            row_links = self.links.setdefault(idx, {})
+            for name in field_names:
+                row_links[name] = source_links.get(name, source)
+
+    def check_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
+        """Refuse to clear payloads that rows outside this clear still read through links."""
+        clearing = set(global_indexes)
+        sources = {
+            source
+            for idx, row_links in self.links.items()
+            if idx not in clearing
+            for name, source in row_links.items()
+            if source in clearing and (field_names is None or name in field_names)
+        }
+        if sources:
+            keys = sorted(str(self.revert_keys_mapping.get(idx, idx)) for idx in sources)
+            raise ValueError(
+                f"keys {keys} in partition {self.partition_id!r} are linked by other keys; "
+                "clear the linked keys first or in the same call"
+            )
+
+    def _drop_links(self, global_indexes: list[int], field_names: list[str]) -> None:
+        if not self.links:
+            return
+        for idx in global_indexes:
+            row_links = self.links.get(idx)
+            if row_links is None:
+                continue
+            for name in field_names:
+                row_links.pop(name, None)
+            if not row_links:
+                del self.links[idx]
 
     def kv_retrieve_indexes(self, keys: list[str]) -> list[int | None]:
         """Translate the user-specified keys to global_indexes"""
@@ -1507,6 +1568,13 @@ class TransferQueueController:
         # Convert controller dict[int, dict] → BatchMeta list[dict] (aligned with batch_global_indexes)
         custom_meta_list = [custom_meta_dict.get(global_index, {}) for global_index in batch_global_indexes]
         custom_backend_meta_list = [custom_backend_meta.get(global_index, {}) for global_index in batch_global_indexes]
+        links_list = None
+        if partition.links:
+            wanted = set(data_fields)
+            links_list = [
+                {name: source for name, source in partition.links.get(global_index, {}).items() if name in wanted}
+                for global_index in batch_global_indexes
+            ]
 
         batch_meta = BatchMeta(
             global_indexes=batch_global_indexes,
@@ -1515,6 +1583,7 @@ class TransferQueueController:
             production_status=production_status,
             custom_meta=custom_meta_list,
             _custom_backend_meta=custom_backend_meta_list,
+            _links=links_list,
         )
         return batch_meta
 
@@ -1539,6 +1608,12 @@ class TransferQueueController:
 
         combined = list(zip(partition_ids, global_indexes, strict=True))
         combined.sort(key=itemgetter(0))
+
+        # Validate every partition first so a refused clear marks nothing.
+        for partition_id, group in groupby(combined, key=itemgetter(0)):
+            partition = self._get_partition(partition_id)
+            if partition:
+                partition.check_not_linked([idx for _, idx in group])
 
         for partition_id, group in groupby(combined, key=itemgetter(0)):
             partition = self._get_partition(partition_id)
@@ -1777,6 +1852,7 @@ class TransferQueueController:
         fields = [f for f in fields if f in partition.field_metadata]
         if not global_indexes or not fields:
             return BatchMeta.empty()
+        partition.check_not_linked(global_indexes, fields)
 
         metadata = self.generate_batch_meta(partition_id, global_indexes, fields, mode="force_fetch")
         partition.clear_fields(global_indexes, fields)
@@ -1830,10 +1906,11 @@ class TransferQueueController:
             partition_id: Partition that owns ``keys``.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "unfinalized", "tag"}}, "field_schema":
-            {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` is empty for a row with no
-            produced field yet; ``unfinalized`` lists the stored fields not yet ready (written
-            by ``kv_update(finalize=False)``); ``field_schema`` covers the described rows' fields.
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
+            {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` lists the row's stored fields and is
+            empty for a row with no produced field yet; ``unfinalized`` lists the stored fields not yet
+            ready (written by ``kv_update(finalize=False)``); ``links`` maps each linked field to its
+            source key; ``field_schema`` covers the described rows' stored fields.
 
         Raises:
             KeyError: The partition or any key does not exist.
@@ -1849,10 +1926,11 @@ class TransferQueueController:
 
         rows: dict[str, dict[str, Any]] = {}
         for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True):
+            links = partition.links.get(global_index, {})
             fields = sorted(
                 field_name
                 for field_name, field_meta in partition.field_metadata.items()
-                if global_index in field_meta.global_indexes
+                if global_index in field_meta.global_indexes and field_name not in links
             )
             rows[key] = {
                 "global_index": global_index,
@@ -1862,6 +1940,7 @@ class TransferQueueController:
                     for name in fields
                     if not partition.production_status[global_index, partition.field_name_mapping[name]]
                 ],
+                "links": {name: partition.revert_keys_mapping[source] for name, source in links.items()},
                 "tag": partition.custom_meta.get(global_index, {}),
             }
         # Only the declared types: row dtypes and shapes live with the storage units.
@@ -1871,6 +1950,29 @@ class TransferQueueController:
             if any(name in row["fields"] for row in rows.values())
         }
         return {"rows": rows, "field_schema": field_schema}
+
+    def kv_link(self, keys: list[str], partition_id: str, source_key: str, fields: list[str]) -> None:
+        """Make ``fields`` of ``keys`` read the payload of ``source_key`` without copying it.
+
+        Missing ``keys`` are created. The source must already have produced ``fields``.
+
+        Raises:
+            KeyError: The partition or ``source_key`` does not exist.
+            ValueError: ``fields`` is empty or ``source_key`` has not produced all of them.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None or source_key not in partition.keys_mapping:
+            raise KeyError(f"source key {source_key!r} not found in partition {partition_id!r}")
+        source = partition.keys_mapping[source_key]
+        missing = [
+            name
+            for name in fields
+            if name not in partition.field_metadata or source not in partition.field_metadata[name].global_indexes
+        ]
+        if not fields or missing:
+            raise ValueError(f"source key {source_key!r} must have produced fields {missing or fields}")
+        metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
+        partition.link_fields(metadata.global_indexes, source, fields)
 
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
@@ -2099,6 +2201,7 @@ class TransferQueueController:
             ZMQRequestType.KV_PREPARE_UPDATE: self._handle_kv_prepare_update_request,
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
+            ZMQRequestType.KV_LINK: self._handle_kv_link_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2303,6 +2406,11 @@ class TransferQueueController:
         return self._make_response(
             request_msg, ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE, {"metadata": metadata, "merge_plan": merge_plan}
         )
+
+    def _handle_kv_link_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        self.kv_link(params["keys"], params["partition_id"], params["source_key"], params["fields"])
+        return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
 
     def _handle_kv_clear_fields_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body

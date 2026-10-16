@@ -318,6 +318,46 @@ async def test_get_data_sends_each_unit_the_parser_args_of_its_samples():
 
 
 @pytest.mark.asyncio
+async def test_get_data_reads_linked_field_once_from_source():
+    """Rows 0 and 1 link ``prompt`` to row 2: it is read once from row 2, never from 0 or 1."""
+    storage_unit_infos = {
+        f"storage_{i}": ZMQServerInfo(
+            role=Role.STORAGE, id=f"storage_{i}", ip="127.0.0.1", ports={"put_get_socket": 19012 + i}
+        )
+        for i in range(2)
+    }
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
+        manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+        manager.storage_manager_id = "test_get_links"
+        manager.storage_unit_infos = storage_unit_infos
+        manager.controller_info = None
+        manager.controller_handshake_socket = None
+        manager.zmq_context = None
+
+    schema = {"dtype": torch.float32, "shape": (1,), "is_nested": False, "is_non_tensor": False}
+    batch_meta = BatchMeta(
+        global_indexes=[0, 1],
+        partition_ids=["p0"] * 2,
+        field_schema={"prompt": schema, "response": schema},
+        production_status=np.ones(2, dtype=np.int8),
+        _links=[{"prompt": 2}, {"prompt": 2}],
+    )
+    calls = []
+
+    async def fake_get(global_indexes, fields, target_storage_unit=None, **kwargs):
+        calls.append((list(global_indexes), list(fields)))
+        return fields, {f: [torch.tensor([gi * 10.0 + (f == "response")]) for gi in global_indexes] for f in fields}
+
+    manager._get_from_single_storage_unit = fake_get
+
+    result = await manager.get_data(batch_meta)
+
+    assert sorted(calls) == [([0], ["response"]), ([1], ["response"]), ([2], ["prompt"])]
+    assert [row.tolist() for row in result["prompt"].unbind()] == [[20.0], [20.0]]
+    assert [row.tolist() for row in result["response"].unbind()] == [[1.0], [11.0]]
+
+
+@pytest.mark.asyncio
 async def test_clear_data_routes_from_hash(caplog):
     """clear_data should route using global_idx % num_su (hash routing)."""
     storage_unit_infos = {

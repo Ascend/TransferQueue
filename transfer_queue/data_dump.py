@@ -23,7 +23,7 @@ Layout::
 
     <dump_dir>/
         dump_info.json                # version, partition, counts
-        row_index.pt                  # key -> {global_index, fields, unfinalized, tag}
+        row_index.pt                  # key -> {global_index, fields, unfinalized, links, tag}
         shards/
             shard_info.json           # file, unit, row count, source index -> [offset, length]
             shard_<N>_<su_id>.pkl      # independent {global_index, fields} records
