@@ -66,6 +66,9 @@ class PayloadTransfer(ABC):
         """Return backend metrics for the storage metrics response."""
         return {}
 
+    def expire_prepared(self) -> None:
+        """Reap abandoned PREPARE requests on the storage worker thread."""
+
     @abstractmethod
     async def put(
         self,

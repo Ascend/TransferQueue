@@ -1163,6 +1163,64 @@ def test_storage_put_copies_out_of_registered_receive_buffer(runtime):
         storage.close()
 
 
+def test_abandoned_get_prepare_releases_frames_and_rejects_late_commit(runtime):
+    storage = NixlPayloadTransfer(prepare_timeout_seconds=1)
+    prepare = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA_PREPARE,
+        sender_id="manager",
+        body={"transfer_id": "stale-get", "fields": ["value"], "global_indexes": [1]},
+    )
+    commit = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_DATA_COMMIT,
+        sender_id="manager",
+        body={"transfer_id": "stale-get"},
+    )
+    try:
+        assert storage._handle_get_prepare(
+            prepare, "storage", lambda *args: {"value": [torch.arange(8)]}
+        ).request_type == ZMQRequestType.GET_DATA_READY
+        assert storage.diagnostics["pending_get_prepares"] == 1
+        storage._pending_gets["stale-get"].prepared_at -= 2
+        storage.expire_prepared()
+        assert storage._pending_gets == {}
+        assert storage.diagnostics["expired_get_prepares"] == 1
+        assert storage._handle_get_commit(commit, "storage").request_type == ZMQRequestType.PUT_GET_ERROR
+    finally:
+        storage.close()
+
+
+def test_abandoned_put_prepare_quarantines_exposed_buffer(runtime):
+    storage = NixlPayloadTransfer(receive_buffer_cache_mb=0, prepare_timeout_seconds=1)
+    descriptor = _descriptor("stale-put", 16)
+    prepare = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA_PREPARE,
+        sender_id="manager",
+        body={"descriptor": descriptor.to_dict(), "global_indexes": [1]},
+    )
+    commit = ZMQMessage.create(
+        request_type=ZMQRequestType.PUT_DATA_COMMIT,
+        sender_id="manager",
+        body={"transfer_id": descriptor.transfer_id},
+    )
+    try:
+        assert storage._handle_put_prepare(prepare, "storage").request_type == ZMQRequestType.PUT_DATA_READY
+        scratch = storage._runtime._receives[descriptor.transfer_id]
+        assert scratch is not None
+        storage._pending_puts[descriptor.transfer_id].prepared_at -= 2
+        storage.expire_prepared()
+        assert storage._pending_puts == storage._runtime._receives == {}
+        assert storage._runtime._quarantined_receive_buffers == [scratch]
+        assert storage.diagnostics["pending_receive_bytes"] == 0
+        assert storage.diagnostics["quarantined_bytes"] == 16
+        assert storage.diagnostics["expired_put_prepares"] == 1
+        assert storage._handle_put_commit(
+            commit, "storage", lambda *args: pytest.fail("expired PUT must not publish data")
+        ).request_type == ZMQRequestType.PUT_GET_ERROR
+        assert storage._runtime._quarantined_receive_buffers == [scratch]
+    finally:
+        storage.close()
+
+
 @pytest.mark.parametrize("failing_call", ["np.frombuffer", "_frame_views"])
 def test_put_commit_releases_receive_when_view_creation_fails(runtime, monkeypatch, failing_call):
     storage = NixlPayloadTransfer(receive_buffer_cache_mb=0)

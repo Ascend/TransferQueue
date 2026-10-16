@@ -92,6 +92,15 @@ An already exposed receive buffer is never freed to satisfy the limit; it remain
 until the payload transfer closes. One in-flight receive can therefore take the retained total
 above the configured threshold. Increase the limit if normal payloads need more headroom.
 
+Set `payload_transfer.prepare_timeout_seconds` to expire abandoned PUT/GET PREPARE state.
+The default is twice the larger of the control-plane timeout and 180 seconds (normally
+400 seconds). The storage worker checks once per second. Expired GET frames are released
+and a late COMMIT is rejected. An expired PUT is removed from pending state, but its
+receive buffer must be quarantined until runtime teardown because the peer may still
+hold a READY token and perform a late WRITE. Quarantined bytes count against
+`quarantine_limit_mb`; do not deregister an exposed PUT buffer solely on elapsed time.
+If abandoned PUTs exhaust that limit, stop or restart the owning worker/job.
+
 ### Common UCX Configuration
 
 | Variable | Purpose | Reference value |

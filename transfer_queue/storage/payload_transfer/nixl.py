@@ -18,10 +18,12 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
+import time
 from collections.abc import Mapping
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -38,6 +40,7 @@ from transfer_queue.storage.payload_transfer.base import (
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
     DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
+    DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS,
     NixlError,
     NixlFatalError,
     NixlRuntime,
@@ -52,6 +55,9 @@ from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServer
 logger = get_logger(__name__)
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))
+DEFAULT_NIXL_PREPARE_TIMEOUT_SECONDS = 2 * max(
+    TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT, DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
+)
 
 
 @dataclass(frozen=True)
@@ -132,6 +138,7 @@ class _PendingPut:
     sender_id: str
     global_indexes: tuple[int, ...]
     data_parser: Any
+    prepared_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -139,6 +146,7 @@ class _PendingGet:
     descriptor: PayloadDescriptor
     sender_id: str
     frames: tuple[bytes | bytearray | memoryview, ...]
+    prepared_at: float = field(default_factory=time.monotonic)
 
 
 class NixlPayloadTransfer(PayloadTransfer):
@@ -154,7 +162,15 @@ class NixlPayloadTransfer(PayloadTransfer):
         *,
         receive_buffer_cache_mb: int = DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
         quarantine_limit_mb: int = DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
+        prepare_timeout_seconds: int | float = DEFAULT_NIXL_PREPARE_TIMEOUT_SECONDS,
     ):
+        if (
+            isinstance(prepare_timeout_seconds, bool)
+            or not isinstance(prepare_timeout_seconds, (int, float))
+            or not math.isfinite(prepare_timeout_seconds)
+            or prepare_timeout_seconds <= 0
+        ):
+            raise ValueError("prepare_timeout_seconds must be a positive finite number")
         self._peer_infos = dict(peer_infos or {})
         if control_peer_infos and set(control_peer_infos) != set(self._peer_infos):
             raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
@@ -171,10 +187,44 @@ class NixlPayloadTransfer(PayloadTransfer):
         self._pending_puts: dict[str, _PendingPut] = {}
         self._pending_gets: dict[str, _PendingGet] = {}
         self._terminal_remote_error: str | None = None
+        self._prepare_timeout_seconds = float(prepare_timeout_seconds)
+        self._next_prepare_sweep_at = 0.0
+        self._expired_put_prepares = 0
+        self._expired_get_prepares = 0
 
     @property
     def diagnostics(self) -> dict[str, float | int]:
-        return self._runtime.diagnostics
+        return {
+            **self._runtime.diagnostics,
+            "pending_put_prepares": len(self._pending_puts),
+            "pending_get_prepares": len(self._pending_gets),
+            "expired_put_prepares": self._expired_put_prepares,
+            "expired_get_prepares": self._expired_get_prepares,
+        }
+
+    def expire_prepared(self) -> None:
+        """Reap stale READY state; never reuse a PUT buffer exposed to a peer."""
+        now = time.monotonic()
+        if now < self._next_prepare_sweep_at:
+            return
+        self._next_prepare_sweep_at = now + 1.0
+        expired_puts = [
+            transfer_id
+            for transfer_id, pending in self._pending_puts.items()
+            if now - pending.prepared_at >= self._prepare_timeout_seconds
+        ]
+        expired_gets = [
+            transfer_id
+            for transfer_id, pending in self._pending_gets.items()
+            if now - pending.prepared_at >= self._prepare_timeout_seconds
+        ]
+        for transfer_id in expired_puts:
+            self._pending_puts.pop(transfer_id)
+            self.quarantine_receive(transfer_id)
+            self._expired_put_prepares += 1
+        for transfer_id in expired_gets:
+            self._pending_gets.pop(transfer_id)
+            self._expired_get_prepares += 1
 
     def bootstrap_info(self) -> dict[str, Any]:
         return {"endpoint": self.endpoint().to_dict()}

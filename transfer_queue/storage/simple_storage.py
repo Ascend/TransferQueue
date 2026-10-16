@@ -1030,6 +1030,8 @@ class SimpleStorageUnit:
             if self._shutdown_event.is_set():
                 break
 
+            self.payload_transfer.expire_prepared()
+
             if wakeup_fd in socks:
                 # Wakeup bytes only signal work; the queue owns the responses.
                 try:
