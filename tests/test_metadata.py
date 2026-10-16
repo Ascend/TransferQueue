@@ -256,6 +256,17 @@ class TestBatchMetaColumnar:
         restored.add_fields(td)  # Should not raise
         assert restored.is_ready
 
+    def test_add_fields_replaces_links_on_written_fields(self):
+        """A put through this meta stores its own values, so later reads must not follow links."""
+        from tensordict import TensorDict
+
+        batch = self._make_batch(batch_size=2)
+        batch._links = [{"field_a": 7, "field_b": 7}, {"field_a": 7}]
+
+        batch.add_fields(TensorDict({"field_a": torch.randn(2, 2)}, batch_size=2))
+
+        assert batch._links == [{"field_b": 7}, {}]
+
     def test_shallow_copy_isolation_global_indexes(self):
         """Modifying the original global_indexes list does not affect BatchMeta."""
         original_indexes = [0, 1, 2]

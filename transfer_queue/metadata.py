@@ -484,6 +484,10 @@ class BatchMeta:
             set_all_ready (bool): If True, set all production_status to READY_FOR_CONSUME. Default is True.
         """
         self.field_schema.update(field_schema)
+        # The written values replace links on these fields, as they do in the controller.
+        for links in self._links:
+            for name in field_schema:
+                links.pop(name, None)
 
         if set_all_ready:
             self.production_status[:] = 1

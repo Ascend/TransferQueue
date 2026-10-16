@@ -150,6 +150,17 @@ def test_put_replaces_the_link(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(7).tolist()] + [_prompt(0).tolist()] * 2
 
 
+def test_put_through_meta_reads_back_the_written_value(tq_system):
+    keys = _put_group(0)
+    client = tq.get_client()
+    meta = client.kv_retrieve_meta(keys, PARTITION)
+
+    client.put(TensorDict({"prompt": torch.stack([_prompt(7)] * N)}, batch_size=N), metadata=meta)
+
+    assert _rows(client.get_data(meta)["prompt"]) == [_prompt(7).tolist()] * N
+    assert _rows(tq.kv_batch_get("p0", PARTITION)["prompt"]) == [_prompt(0).tolist()]
+
+
 def test_update_refuses_a_linked_field(tq_system):
     keys = _put_group(0)
 
