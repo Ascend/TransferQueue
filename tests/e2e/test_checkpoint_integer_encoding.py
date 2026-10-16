@@ -91,7 +91,13 @@ def test_native_checkpoint_preserves_finished_and_pending_rows(tmp_path, compact
                 assert after[field].tolist() == before[field].tolist()
             else:
                 assert after[field].dtype == before[field].dtype
-                assert torch.equal(after[field], before[field])
+                if after[field].is_nested:
+                    assert torch.equal(after[field].offsets(), before[field].offsets())
+                    for actual, expected in zip(after[field].unbind(), before[field].unbind(), strict=True):
+                        assert actual.shape == expected.shape
+                        assert torch.equal(actual, expected)
+                else:
+                    assert torch.equal(after[field], before[field])
     finally:
         tq.close()
         ray.shutdown()
