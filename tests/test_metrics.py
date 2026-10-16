@@ -610,7 +610,7 @@ class TestStorageWorkerArrivals:
             completions.put((bytes(identity), response.future))
             _drain_deferred_responses(completions, socket, unit.storage_unit_id, measurements)
         else:
-            socket.send_multipart([identity] + response.serialize(), copy=False)
+            socket.send_multipart([identity] + response, copy=False)
         assert measurements == {}
         sent = socket.send_multipart.call_args.args[0]
         assert sent[0] == b"manager"
