@@ -80,8 +80,10 @@ If the transport is not restricted, or if `UCX_TLS` includes `tcp`, UCX may use 
 
 Set `payload_transfer.receive_buffer_cache_mb` to limit idle registered buffers **per runtime**,
 in MB (1024² bytes). The default is `256`; `0` disables caching. Larger payloads still transfer,
-but their buffers are released when no longer referenced. Live data, in-flight transfers and
-fault-retained memory are outside this limit. A smaller cache saves idle memory at the cost of
+but their buffers are released when no longer referenced. A storage-side PUT copies received
+frames into ordinary memory before storing decoded values, so stored values do not hold the
+registered receive buffer. Client GET views, in-flight transfers and fault-retained memory
+are outside the idle cache limit. A smaller cache saves idle memory at the cost of
 more registrations; account for all runtimes on a node when increasing it.
 
 Set `payload_transfer.quarantine_limit_mb` to stop preparing new NIXL receives after

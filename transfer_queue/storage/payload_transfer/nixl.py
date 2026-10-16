@@ -450,10 +450,15 @@ class NixlPayloadTransfer(PayloadTransfer):
             except Exception:
                 self.cancel_receive(transfer_id)
                 raise
+            # Storage values may keep decoded tensor/NumPy views for much longer
+            # than the transfer. Give each frame ordinary owned memory so those
+            # values do not pin the whole registered receive buffer until CLEAR.
+            owned_frames = [bytearray(frame) for frame in frames]
+            del frames
             with limit_pytorch_auto_parallel_threads(
                 target_num_threads=TQ_NUM_THREADS, info=f"[{storage_id}] PUT commit"
             ):
-                store_data(list(pending.global_indexes), decode(list(frames)), pending.data_parser)
+                store_data(list(pending.global_indexes), decode(owned_frames), pending.data_parser)
             return ZMQMessage.create(
                 request_type=ZMQRequestType.PUT_DATA_RESPONSE,
                 sender_id=storage_id,

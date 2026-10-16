@@ -46,7 +46,7 @@ from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
     _FrameSource,
     _RegisteredReceiveBuffer,
 )
-from transfer_queue.storage.simple_storage import _drain_deferred_responses, _queue_deferred_response
+from transfer_queue.storage.simple_storage import StorageUnitData, _drain_deferred_responses, _queue_deferred_response
 from transfer_queue.utils.serial_utils import decode, encode
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -1114,6 +1114,52 @@ def test_prewrite_failure_releases_receiver_across_protocol_and_runtime(runtime,
         asyncio.run(exercise())
     finally:
         client.close()
+        storage.close()
+
+
+def test_storage_put_copies_out_of_registered_receive_buffer(runtime):
+    storage = NixlPayloadTransfer(receive_buffer_cache_mb=1)
+    stored = StorageUnitData()
+
+    def commit(transfer_id: str, index: int, value: torch.Tensor):
+        frames = tuple(encode({"value": [value]}))
+        descriptor = _descriptor(transfer_id, *(memoryview(frame).nbytes for frame in frames))
+        prepare = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_PREPARE,
+            sender_id="manager",
+            body={"descriptor": descriptor.to_dict(), "global_indexes": [index]},
+        )
+        assert storage._handle_put_prepare(prepare, "storage").request_type == ZMQRequestType.PUT_DATA_READY
+        scratch = storage._runtime._receives[transfer_id]
+        assert scratch is not None
+        scratch.buffer[: descriptor.payload_bytes] = b"".join(bytes(frame) for frame in frames)
+        commit_request = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_COMMIT,
+            sender_id="manager",
+            body={"transfer_id": transfer_id},
+        )
+        response = storage._handle_put_commit(
+            commit_request,
+            "storage",
+            lambda indexes, data, parser: stored.put_data(data, indexes),
+        )
+        assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        gc.collect()
+        assert storage.diagnostics["leased_receive_bytes"] == 0
+        return scratch
+
+    try:
+        first_scratch = commit("first", 1, torch.arange(8))
+        assert torch.equal(stored.get_data(["value"], [1])["value"][0], torch.arange(8))
+        second_scratch = commit("second", 2, torch.arange(8) + 100)
+        assert second_scratch is first_scratch
+        assert storage.diagnostics["receive_buffer_registrations"] == 1
+        assert storage.diagnostics["receive_buffer_reuses"] == 1
+        assert torch.equal(stored.get_data(["value"], [1])["value"][0], torch.arange(8))
+        assert torch.equal(stored.get_data(["value"], [2])["value"][0], torch.arange(8) + 100)
+        stored.clear([1])
+        assert storage.diagnostics["leased_receive_bytes"] == 0
+    finally:
         storage.close()
 
 
