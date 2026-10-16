@@ -40,6 +40,7 @@ logger = get_logger(__name__)
 
 DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS = 180
 DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB = 256
+DEFAULT_NIXL_QUARANTINE_LIMIT_MB = 1024
 # Bound the memory held by small payloads when reusing a larger buffer.
 _MAX_RECEIVE_BUFFER_SIZE_RATIO = 2
 _POLL_INTERVAL_SECONDS = 0.0005
@@ -138,6 +139,7 @@ class NixlRuntime:
         ucx_env_vars: dict[str, object] | None = None,
         *,
         receive_buffer_cache_mb: int = DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
+        quarantine_limit_mb: int = DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
     ):
         if (
             isinstance(receive_buffer_cache_mb, bool)
@@ -145,6 +147,8 @@ class NixlRuntime:
             or receive_buffer_cache_mb < 0
         ):
             raise NixlError("receive_buffer_cache_mb must be a non-negative integer (MB)")
+        if isinstance(quarantine_limit_mb, bool) or not isinstance(quarantine_limit_mb, int) or quarantine_limit_mb <= 0:
+            raise NixlError("quarantine_limit_mb must be a positive integer (MB)")
         _configure_ucx_environment(ucx_env_vars)
         try:
             from nixl import nixl_agent, nixl_agent_config
@@ -188,6 +192,7 @@ class NixlRuntime:
         self._closed = False
         self._timeout_seconds = DEFAULT_NIXL_TRANSFER_TIMEOUT_SECONDS
         self._receive_buffer_cache_bytes = receive_buffer_cache_mb * 1024**2
+        self._quarantine_limit_bytes = quarantine_limit_mb * 1024**2
         self._idle_receive_bytes = 0
         self._active_receive_count = 0
         self._active_receive_bytes = 0
@@ -229,6 +234,7 @@ class NixlRuntime:
                 "total_seconds": self._total_seconds,
                 "registered_bytes": self._registered_bytes,
                 "quarantined_bytes": self._quarantined_bytes,
+                "quarantine_limit_bytes": self._quarantine_limit_bytes,
                 "receive_buffer_cache_bytes": self._receive_buffer_cache_bytes,
                 "idle_receive_bytes": self._idle_receive_bytes,
                 "pending_receive_bytes": pending_receive_bytes,
@@ -249,6 +255,8 @@ class NixlRuntime:
         descriptor.validate()
         with self._lock:
             self._ensure_open()
+            if self._quarantined_bytes >= self._quarantine_limit_bytes:
+                raise NixlError("NIXL receive quarantine limit reached; recreate the payload transfer")
             if descriptor.transfer_id in self._receives:
                 raise NixlError(f"duplicate NIXL receive: {descriptor.transfer_id}")
 
@@ -306,7 +314,7 @@ class NixlRuntime:
         with self._lock:
             self._ensure_open()
             if remote_name in self._failed_peers:
-                raise NixlError(f"NIXL peer session {remote_name!r} has failed")
+                raise NixlError(f"NIXL peer session {remote_name!r} has failed; restart the payload transfer")
             if not descriptor.payload_bytes:
                 future: Future[None] = Future()
                 future.set_result(None)
@@ -551,7 +559,7 @@ class NixlRuntime:
                 self._queue_wait_seconds += time.monotonic() - submitted_at
                 self._ensure_open()
                 if remote_name in self._failed_peers:
-                    raise NixlError(f"NIXL peer session {remote_name!r} has failed")
+                    raise NixlError(f"NIXL peer session {remote_name!r} has failed; restart the payload transfer")
 
             for frame in frames:
                 self._check_send_deadline(deadline)
@@ -561,7 +569,7 @@ class NixlRuntime:
             with self._lock:
                 self._ensure_open()
                 if remote_name in self._failed_peers:
-                    raise NixlError(f"NIXL peer session {remote_name!r} has failed")
+                    raise NixlError(f"NIXL peer session {remote_name!r} has failed; restart the payload transfer")
                 local_descs = self._agent.get_xfer_descs(
                     [(source.address, source.size, 0) for source in sources], mem_type="DRAM"
                 )

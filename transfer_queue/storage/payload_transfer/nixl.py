@@ -35,6 +35,7 @@ from transfer_queue.storage.payload_transfer.base import (
     PayloadTransferTimeout,
 )
 from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
+    DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
     DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
     NixlError,
     NixlRuntime,
@@ -149,23 +150,27 @@ class NixlPayloadTransfer(PayloadTransfer):
         control_peer_infos: Mapping[str, ZMQServerInfo] | None = None,
         *,
         receive_buffer_cache_mb: int = DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
+        quarantine_limit_mb: int = DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
     ):
         self._peer_infos = dict(peer_infos or {})
         if control_peer_infos and set(control_peer_infos) != set(self._peer_infos):
             raise RuntimeError("SimpleStorage payload transfer endpoints are missing")
         try:
-            self._runtime = NixlRuntime(ucx_env_vars, receive_buffer_cache_mb=receive_buffer_cache_mb)
+            self._runtime = NixlRuntime(
+                ucx_env_vars,
+                receive_buffer_cache_mb=receive_buffer_cache_mb,
+                quarantine_limit_mb=quarantine_limit_mb,
+            )
         except NixlError:
             raise
         except Exception as exc:
             raise NixlError(f"failed to create NIXL runtime: {exc}") from exc
         self._pending_puts: dict[str, _PendingPut] = {}
         self._pending_gets: dict[str, _PendingGet] = {}
-        self._failed_get_targets: set[str] = set()
 
     @property
     def diagnostics(self) -> dict[str, float | int]:
-        return {**self._runtime.diagnostics, "failed_get_targets": len(self._failed_get_targets)}
+        return self._runtime.diagnostics
 
     def bootstrap_info(self) -> dict[str, Any]:
         return {"endpoint": self.endpoint().to_dict()}
@@ -267,8 +272,6 @@ class NixlPayloadTransfer(PayloadTransfer):
         global_indexes: list[int],
         fields: list[str],
     ) -> dict[str, Any]:
-        if target_id in self._failed_get_targets:
-            raise NixlError(f"NIXL GET session for {target_id!r} has failed; recreate the payload transfer")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
         transfer_id = uuid4().hex
@@ -291,8 +294,6 @@ class NixlPayloadTransfer(PayloadTransfer):
             descriptor = PayloadDescriptor.from_dict(ready.body["descriptor"])
             if descriptor.transfer_id != transfer_id:
                 raise RuntimeError(f"GET descriptor identity changed by storage unit {target_id}")
-            if target_id in self._failed_get_targets:
-                raise NixlError(f"NIXL GET session for {target_id!r} has failed; recreate the payload transfer")
             token = self.prepare_receive(descriptor)
             receive_prepared = True
             commit = ZMQMessage.create(
@@ -343,7 +344,6 @@ class NixlPayloadTransfer(PayloadTransfer):
                 if safe_to_release:
                     self.cancel_receive(transfer_id)
                 else:
-                    self._failed_get_targets.add(target_id)
                     self.quarantine_receive(transfer_id)
             if remote_prepared and not commit_attempted:
                 cancel_confirmed = await self._cancel(

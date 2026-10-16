@@ -42,6 +42,8 @@ backend:
       # ucx_env_vars: {}
       # Unused NIXL receive buffer cache per runtime in MB (1024^2 bytes); 0 disables caching.
       # receive_buffer_cache_mb: 256
+      # Maximum retained bytes after uncertain NIXL writes, in MB; restart the payload transfer when exhausted.
+      # quarantine_limit_mb: 1024
       # See docs/nixl_ucx_payload.md for UCX transport and device configuration.
 
     # SSD offload stores large field values on local SSD to reduce long-lived host-memory use.

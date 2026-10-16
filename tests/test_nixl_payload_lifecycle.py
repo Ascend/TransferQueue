@@ -157,6 +157,14 @@ def test_receive_cache_config_uses_megabytes(runtime, configured, expected_mb):
         transfer.close()
 
 
+def test_quarantine_limit_config_uses_megabytes(runtime):
+    transfer = create_payload_transfer({"backend": "nixl-ucx", "quarantine_limit_mb": 8})
+    try:
+        assert transfer.diagnostics["quarantine_limit_bytes"] == 8 * 1024**2
+    finally:
+        transfer.close()
+
+
 def test_frame_native_layout_preserves_empty_frames_and_large_offsets():
     sizes = (3 * 1024**3, 0, 3 * 1024**3, 2 * 1024**3)
     descriptor = _descriptor("large", *sizes)
@@ -799,6 +807,21 @@ def test_quarantine_never_returns_exposed_receiver_to_pool(runtime):
     assert instance.diagnostics["registered_bytes"] == 40
 
 
+def test_quarantine_budget_stops_new_receives_without_reusing_exposed_memory(runtime):
+    instance, _ = runtime
+    instance._quarantine_limit_bytes = 16
+    instance.prepare_receive(_descriptor("unsafe", 32))
+    scratch = instance._receives["unsafe"]
+    instance.quarantine_receive("unsafe")
+
+    with pytest.raises(NixlError, match="quarantine limit reached"):
+        instance.prepare_receive(_descriptor("next", 8))
+
+    assert instance._quarantined_receive_buffers == [scratch]
+    assert instance.diagnostics["quarantined_bytes"] == 32
+    assert instance._receives == {}
+
+
 @pytest.mark.parametrize("outcome", ["done", "cancelled", "not_started", "failed"])
 def test_get_commit_defers_response_until_send_finishes(outcome):
     transfer = object.__new__(NixlPayloadTransfer)
@@ -907,6 +930,55 @@ class _LoopbackSocket:
         return response.serialize()
 
 
+def test_get_recovers_after_missing_commit_response_with_fresh_receive(runtime):
+    storage = NixlPayloadTransfer(receive_buffer_cache_mb=0)
+    client = NixlPayloadTransfer(peer_infos={"storage": storage.bootstrap_info()}, receive_buffer_cache_mb=0)
+    storage._runtime._agent.add_remote_agent = lambda metadata: client._runtime.agent_name
+
+    def fake_receive(descriptor):
+        # The fake native agent reports DONE without copying bytes.
+        client.cancel_receive(descriptor.transfer_id)
+        return tuple(encode({"value": [torch.arange(8)]}))
+
+    client.receive = fake_receive
+
+    class LostResponseSocket(_LoopbackSocket):
+        async def recv_multipart(self, **kwargs):
+            frames = await super().recv_multipart(**kwargs)
+            if ZMQMessage.deserialize(frames).request_type == ZMQRequestType.GET_DATA_RESPONSE:
+                raise zmq.Again()
+            return frames
+
+    async def exercise():
+        with pytest.raises(PayloadTransferError, match="GET commit outcome is unknown"):
+            await client.get(
+                control_socket=LostResponseSocket(storage),
+                sender_id="manager",
+                target_id="storage",
+                global_indexes=[1],
+                fields=["value"],
+            )
+        assert client.diagnostics["quarantined_bytes"] > 0
+        first_buffer = client._runtime._quarantined_receive_buffers[0]
+
+        result = await client.get(
+            control_socket=_LoopbackSocket(storage),
+            sender_id="manager",
+            target_id="storage",
+            global_indexes=[1],
+            fields=["value"],
+        )
+        assert torch.equal(result["value"][0], torch.arange(8))
+        assert client._runtime._quarantined_receive_buffers == [first_buffer]
+        assert storage._runtime._failed_peers == set()
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        client.close()
+        storage.close()
+
+
 @pytest.mark.parametrize("operation", ["put", "get"])
 @pytest.mark.parametrize("failure_stage", ["prepare", "write"])
 def test_prewrite_failure_releases_receiver_across_protocol_and_runtime(runtime, operation, failure_stage):
@@ -940,7 +1012,6 @@ def test_prewrite_failure_releases_receiver_across_protocol_and_runtime(runtime,
                 assert transfer._runtime._receives == {}
                 assert transfer.diagnostics["registered_bytes"] == 0
                 assert transfer.diagnostics["quarantined_bytes"] == 0
-            assert client._failed_get_targets == set()
         assert sender._runtime._agent.transfer_calls == []
         assert sender._runtime._failed_peers == set()
 
@@ -1182,7 +1253,6 @@ def test_cancel_returns_false_when_ack_is_missing(operation, failure_stage):
 
 def test_get_cancels_remote_source_when_local_receive_prepare_fails():
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = set()
 
     def failed_prepare(descriptor: PayloadDescriptor) -> ReceiveToken:
         raise NixlError("registration failed")
@@ -1210,8 +1280,8 @@ def test_get_cancels_remote_source_when_local_receive_prepare_fails():
 
 def test_get_commit_attempt_failure_quarantines_without_cancel():
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = set()
     transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
+    transfer.receive = lambda descriptor: tuple(encode({"value": [1]}))
     quarantined: list[str] = []
     cancellations: list[Any] = []
     transfer.quarantine_receive = quarantined.append
@@ -1234,20 +1304,21 @@ def test_get_commit_attempt_failure_quarantines_without_cancel():
 
     assert len(quarantined) == 1
     assert cancellations == []
-    assert transfer._failed_get_targets == {"storage"}
 
     retry_socket = _ProtocolSocket()
-    with pytest.raises(NixlError, match="GET session.*has failed"):
-        asyncio.run(
-            transfer.get(
-                control_socket=retry_socket,
-                sender_id="manager",
-                target_id="storage",
-                global_indexes=[1],
-                fields=["value"],
-            )
+    result = asyncio.run(
+        transfer.get(
+            control_socket=retry_socket,
+            sender_id="manager",
+            target_id="storage",
+            global_indexes=[1],
+            fields=["value"],
         )
-    assert retry_socket.last_request is None
+    )
+    assert result == {"value": [1]}
+    assert retry_socket.last_request.request_type == ZMQRequestType.GET_DATA_COMMIT
+    assert retry_socket.last_request.body["transfer_id"] != quarantined[0]
+    assert len(quarantined) == 1
 
 
 @pytest.mark.parametrize("cancel_stage", ["send", "receive"])
@@ -1256,7 +1327,6 @@ def test_get_commit_attempt_failure_quarantines_without_cancel():
 )
 def test_cancelled_get_reclaims_only_after_matching_write_completion(monkeypatch, cancel_stage, outcome):
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = {"unrelated-target"}
     transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
     transfer.receive = lambda descriptor: pytest.fail("cancelled GET must not expose its receive buffer")
     released, quarantined = [], []
@@ -1322,11 +1392,9 @@ def test_cancelled_get_reclaims_only_after_matching_write_completion(monkeypatch
         if outcome in ("done", "not_started"):
             assert released == [transfer_id]
             assert quarantined == []
-            assert transfer._failed_get_targets == {"unrelated-target"}
         else:
             assert released == []
             assert quarantined == [transfer_id]
-            assert transfer._failed_get_targets == {"unrelated-target", "storage"}
 
     asyncio.run(exercise())
 
@@ -1335,7 +1403,6 @@ def test_cancelled_get_reclaims_only_after_matching_write_completion(monkeypatch
 @pytest.mark.parametrize("failure_stage", ["prepare", "commit"])
 def test_control_socket_errors_keep_runtime_error_contract(operation, failure_stage):
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = set()
     transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
     transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
     transfer.quarantine_receive = lambda transfer_id: None
@@ -1383,7 +1450,6 @@ def test_manager_retries_only_confirmed_nixl_prepare_timeouts(
     operation, timeout_on, failure_stage, cancel_confirmed, expected_attempts
 ):
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = set()
     transfer._peer_endpoint = lambda target_id: TransferEndpoint("nixl-ucx", {})
     transfer.prepare_receive = MagicMock(return_value=ReceiveToken({"agent_name": "manager"}))
     transfer.receive = MagicMock(return_value=tuple(encode({"value": [1]})))
@@ -1435,7 +1501,7 @@ def test_manager_retries_only_confirmed_nixl_prepare_timeouts(
             message = "commit outcome is unknown" if failure_stage == "commit" else "without confirmed cancellation"
             with pytest.raises(RuntimeError, match=message) as raised:
                 await manager._request_with_retry(operation, "storage", "samples=1", attempt, max_attempts=3)
-            payload_error = raised.value.__cause__ if operation == "put" else raised.value
+            payload_error = raised.value.__cause__
             assert type(payload_error) is PayloadTransferError
             assert payload_error.__cause__ is timeout
 
@@ -1453,16 +1519,13 @@ def test_manager_retries_only_confirmed_nixl_prepare_timeouts(
     if operation == "get" and failure_stage == "commit":
         transfer.quarantine_receive.assert_called_once()
         transfer.receive.assert_not_called()
-        assert transfer._failed_get_targets == {"storage"}
     else:
         transfer.quarantine_receive.assert_not_called()
-        assert transfer._failed_get_targets == set()
 
 
 @pytest.mark.parametrize("failure_stage", ["receive", "decode"])
 def test_get_local_failure_after_ack_does_not_quarantine_or_fail_target(monkeypatch, failure_stage):
     transfer = object.__new__(NixlPayloadTransfer)
-    transfer._failed_get_targets = {"unrelated-target"}
     transfer.prepare_receive = lambda descriptor: ReceiveToken({"agent_name": "manager"})
     cancellations = []
     transfer.cancel_receive = cancellations.append
@@ -1491,7 +1554,6 @@ def test_get_local_failure_after_ack_does_not_quarantine_or_fail_target(monkeypa
             )
         )
     assert len(cancellations) == 1
-    assert transfer._failed_get_targets == {"unrelated-target"}
 
 
 class _CapturingSocket:

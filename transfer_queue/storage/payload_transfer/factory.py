@@ -53,7 +53,10 @@ def create_payload_transfer(
         return ZmqPayloadTransfer()
     if backend == "nixl-ucx":
         from transfer_queue.storage.payload_transfer.nixl import NixlPayloadTransfer
-        from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB
+        from transfer_queue.storage.payload_transfer.nixl_ucx_runtime import (
+            DEFAULT_NIXL_QUARANTINE_LIMIT_MB,
+            DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB,
+        )
 
         ucx_env_vars = options.get("ucx_env_vars")
         if ucx_env_vars is not None and not isinstance(ucx_env_vars, Mapping):
@@ -65,6 +68,7 @@ def create_payload_transfer(
             receive_buffer_cache_mb=cast(
                 int, options.get("receive_buffer_cache_mb", DEFAULT_NIXL_RECEIVE_BUFFER_CACHE_MB)
             ),
+            quarantine_limit_mb=cast(int, options.get("quarantine_limit_mb", DEFAULT_NIXL_QUARANTINE_LIMIT_MB)),
         )
 
     raise RuntimeError(f"unhandled SimpleStorage payload transfer: {backend!r}")

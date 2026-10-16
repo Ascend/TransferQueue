@@ -84,6 +84,12 @@ but their buffers are released when no longer referenced. Live data, in-flight t
 fault-retained memory are outside this limit. A smaller cache saves idle memory at the cost of
 more registrations; account for all runtimes on a node when increasing it.
 
+Set `payload_transfer.quarantine_limit_mb` to stop preparing new NIXL receives after
+uncertain GETs have retained at least this many bytes per runtime. The default is `1024` MB.
+An already exposed receive buffer is never freed to satisfy the limit; it remains registered
+until the payload transfer closes. One in-flight receive can therefore take the retained total
+above the configured threshold. Increase the limit if normal payloads need more headroom.
+
 ### Common UCX Configuration
 
 | Variable | Purpose | Reference value |
@@ -133,7 +139,9 @@ and local decode errors after completion do not fail the GET session.
 
 PUT cancellation waits for its running send. GET cancellation after COMMIT waits within the
 remaining timeout: a matching completion or pre-WRITE error releases the receiver; an unknown
-result quarantines it and stops that GET target. Cancellation still propagates to the caller.
+result quarantines only that receive buffer. A later GET uses a new transfer ID and buffer.
+Once the quarantine limit is reached, new receives fail explicitly until the payload transfer
+is recreated. Cancellation still propagates to the caller.
 
 With metrics enabled, `tq_storage_payload_*` reports cache, leased and quarantined bytes,
 queue wait and sender resources.
