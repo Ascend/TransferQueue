@@ -207,6 +207,11 @@ def test_dump_and_load_relink(tq_system, dump_test_root):
     with pytest.raises(ValueError, match="must be dumped"):
         tq.dump_data_by_key(dump_dir, keys, PARTITION)
 
+    tq.kv_update("p0", PARTITION, {"prompt": _prompt(0)}, merge_fn=lambda old, new: new, finalize=False)
+    with pytest.raises(ValueError, match="must be finalized"):
+        tq.dump_data_by_key(dump_dir, ["p0", *keys], PARTITION)
+    tq.kv_update("p0", PARTITION, {"prompt": _prompt(0)}, merge_fn=lambda old, new: new)
+
     tq.dump_data_by_key(dump_dir, ["p0", *keys], PARTITION)
     tq.get_client().clear_partition(PARTITION)
     tq.load_data_by_key(dump_dir)

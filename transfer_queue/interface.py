@@ -1543,7 +1543,8 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
 
     Raises:
         FileExistsError: ``dump_dir`` already exists.
-        ValueError: A key links to a source key that is not dumped.
+        ValueError: A key links to a source key that is not dumped, or to a source field
+            that is not finalized.
         RuntimeError: TransferQueue is not initialized, the partition or a key does not
             exist, or a storage unit holds no data for a row it was asked to dump.
         NotImplementedError: The storage backend does not support selective dumps.
@@ -1567,6 +1568,12 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         missing_sources = sorted({source for row in rows.values() for source in row["links"].values()} - rows.keys())
         if missing_sources:
             raise ValueError(f"linked source keys {missing_sources} must be dumped with the keys linking to them")
+        # Load restores unfinalized fields hidden, and kv_link refuses a hidden source field.
+        hidden_sources = sorted(
+            {s for row in rows.values() for name, s in row["links"].items() if name in rows[s]["unfinalized"]}
+        )
+        if hidden_sources:
+            raise ValueError(f"fields that other keys link to on {hidden_sources} must be finalized before dumping")
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.
         fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
