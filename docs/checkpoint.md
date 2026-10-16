@@ -1,5 +1,14 @@
 # Checkpoint: Save and Restore System State
 
+## Optional integer packing for SimpleStorage
+
+Set `backend.SimpleStorage.checkpoint_uint8_fields` to a list of field names
+(for example `[routed_experts]`) to store contiguous CPU int16 tensors as uint8
+when every value lies in `[0, 255]`. This setting defaults to an empty list.
+Other tensors and all remaining fields, including pending prompts, stay intact.
+Loading restores int16 values automatically, independently of the current setting.
+Compact checkpoints require a reader with this codec; older readers reject them.
+
 > Last updated: 07/03/2026
 
 ## Overview

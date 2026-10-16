@@ -25,6 +25,7 @@ import psutil
 import ray
 import zmq
 
+from transfer_queue.storage.checkpoint_codec import dump_checkpoint
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
@@ -154,15 +155,22 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    def __init__(self, storage_unit_size: int | None = None):
+    def __init__(self, storage_unit_size: int | None = None, checkpoint_uint8_fields: list[str] | None = None):
         """Initialize a SimpleStorageUnit with the specified size.
 
         Args:
             storage_unit_size: Maximum number of elements that can be stored in this storage unit.
                 If None, the storage unit has unlimited capacity.
+            checkpoint_uint8_fields: Fields eligible for lossless int16 checkpoint packing.
+                Empty by default; loading always restores the original dtype.
         """
         self.storage_unit_id = f"TQ_STORAGE_UNIT_{uuid4().hex[:8]}"
         self.storage_unit_size = storage_unit_size
+        if isinstance(checkpoint_uint8_fields, str) or any(
+            not isinstance(field, str) or not field for field in (checkpoint_uint8_fields or ())
+        ):
+            raise ValueError("checkpoint_uint8_fields must be a list of nonempty field names")
+        self.checkpoint_uint8_fields = tuple(checkpoint_uint8_fields or ())
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
 
@@ -569,7 +577,7 @@ class SimpleStorageUnit:
                 "active_keys": self.storage_data._active_keys,
             }
             with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                dump_checkpoint(state, f, self.checkpoint_uint8_fields)
             logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
