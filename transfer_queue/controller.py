@@ -572,6 +572,17 @@ class DataPartitionStatus:
             # A written value replaces the link it lands on
             self._drop_links(global_indices, field_names)
 
+            # Rows linking to a written cell read its new payload, so they take on its readiness
+            # (an unfinalized kv_update stays hidden behind links too) and its shape.
+            for source in global_indices:
+                for idx in self.linked_by.get(source, ()):
+                    for name, linked_source in self.links[idx].items():
+                        if linked_source == source and name in field_names:
+                            self.production_status[idx, self.field_name_mapping[name]] = int(ready)
+                            meta = self.field_metadata[name]
+                            if meta.is_nested:
+                                meta.per_sample_shapes[idx] = meta.per_sample_shapes[source]
+
             return True
 
         except Exception as e:

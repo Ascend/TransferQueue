@@ -137,6 +137,17 @@ def test_put_replaces_the_link(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(7).tolist()] + [_prompt(0).tolist()] * 2
 
 
+def test_unfinalized_source_update_is_hidden_from_linked_keys(tq_system):
+    keys = _put_group(0)
+
+    tq.kv_update("p0", PARTITION, {"prompt": _prompt(5)}, merge_fn=lambda old, new: new, finalize=False)
+    with pytest.raises(ValueError, match="not ready"):
+        tq.kv_batch_get(keys, PARTITION, select_fields="prompt")
+
+    tq.kv_update("p0", PARTITION, {"prompt": _prompt(5)}, merge_fn=lambda old, new: new)
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(5).tolist()] * N
+
+
 def test_dump_and_load_relink(tq_system, dump_test_root):
     keys = _put_group(0)
     dump_dir = dump_test_root / "link_dump"

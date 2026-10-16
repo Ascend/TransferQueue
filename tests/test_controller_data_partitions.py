@@ -1521,3 +1521,14 @@ class TestFieldLinks:
 
         assert partition.links == {} and partition.linked_by == {}
         partition.check_not_linked([0])
+
+    def test_linked_rows_follow_source_readiness_and_shape(self):
+        partition = self._linked_partition()
+        wider = {"x": {**self.SCHEMA["x"], "shape": (5,)}}
+
+        assert partition.update_production_status([0], ["x"], field_schema=wider, ready=False)
+        assert partition.production_status[[0, 1, 2], 0].tolist() == [0, 0, 0]
+        assert partition.field_metadata["x"].per_sample_shapes == {0: (5,), 1: (5,), 2: (5,)}
+
+        assert partition.update_production_status([0], ["x"], field_schema=wider)
+        assert partition.production_status[[0, 1, 2], 0].tolist() == [1, 1, 1]
