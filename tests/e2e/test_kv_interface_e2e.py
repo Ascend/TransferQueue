@@ -1389,7 +1389,7 @@ class TestKVUpdateE2E:
         with pytest.raises(ValueError, match="not finalized"):
             tq_api.kv_batch_get_by_meta(meta)
         row = tq_api.kv_describe(keys=key, partition_id=partition_id)[key]
-        assert row == {"fields": ["prompt", "tokens"], "unfinalized": ["tokens"]}
+        assert row == {"fields": ["prompt", "tokens"], "unfinalized": ["tokens"], "links": {}}
         with pytest.raises(RuntimeError, match="not found"):
             tq_api.kv_describe(keys=[key, "absent"], partition_id=partition_id)
 

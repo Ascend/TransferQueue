@@ -68,7 +68,7 @@ def _put_group(p: int) -> list[str]:
 
 
 def _links(key: str) -> dict:
-    return tq.get_client().kv_describe([key], PARTITION)["rows"][key]["links"]
+    return tq.kv_describe(key, PARTITION)[key]["links"]
 
 
 def _rows(field: torch.Tensor) -> list[list]:

@@ -1175,7 +1175,7 @@ class AsyncTransferQueueClient:
         key raises instead of being dropped.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "unfinalized", "tag"}}, "field_schema":
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
             {field: {"is_nested", "is_non_tensor"}}}``.
         """
         response = await self._request_controller(

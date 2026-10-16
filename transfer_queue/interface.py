@@ -1195,8 +1195,9 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
         partition_id: Partition containing the keys.
 
     Returns:
-        ``{key: {"fields", "unfinalized"}}``. ``fields`` lists every stored field of the
-        key and ``unfinalized`` the subset that is not ready yet.
+        ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every stored field of
+        the key and ``unfinalized`` the subset that is not ready yet. ``links`` maps each field
+        linked by ``kv_link`` to its source key; such a field is ready when the source's is.
 
     Raises:
         RuntimeError: If the partition or any key does not exist.
@@ -1211,7 +1212,8 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
     tq_client = _maybe_create_tq_client()
     description = await tq_client.async_kv_describe(list(dict.fromkeys(keys)), partition_id)
     return {
-        key: {"fields": row["fields"], "unfinalized": row["unfinalized"]} for key, row in description["rows"].items()
+        key: {"fields": row["fields"], "unfinalized": row["unfinalized"], "links": row["links"]}
+        for key, row in description["rows"].items()
     }
 
 
