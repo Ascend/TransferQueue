@@ -120,6 +120,15 @@ def test_link_requires_a_produced_public_field(tq_system):
     assert tq.kv_list().get(PARTITION, {}) == {}
 
 
+def test_link_with_conflicting_dtype_creates_no_keys(tq_system):
+    tq.kv_put(key="a", partition_id=PARTITION, fields={"prompt": _prompt(0)})
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0).float()})
+
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        tq.kv_link(["r0", "r1"], PARTITION, "p0", "prompt")
+    assert tq.kv_list(PARTITION)[PARTITION].keys() == {"a"}
+
+
 def test_link_refuses_a_public_key_being_cleared(tq_system):
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
     source = tq.get_client().kv_describe(["p0"], PUBLIC)["rows"]["p0"]["global_index"]

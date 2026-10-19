@@ -2061,6 +2061,13 @@ class TransferQueueController:
         ]
         if not fields or missing:
             raise ValueError(f"public key {public_key!r} must have produced fields {missing or fields}")
+        # Before creating keys, so an incompatible link leaves none behind.
+        partition = self._get_partition(partition_id)
+        if partition is not None:
+            metas = {name: public.field_metadata[name] for name in fields}
+            partition.validate_field_schema(
+                {name: {"dtype": meta.dtype, "is_non_tensor": meta.is_non_tensor} for name, meta in metas.items()}
+            )
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
         partition = self._get_partition(partition_id)
         assert partition is not None
