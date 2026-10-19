@@ -47,7 +47,7 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue import data_dump
 from transfer_queue.client import TransferQueueClient
-from transfer_queue.controller import TransferQueueController
+from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
@@ -696,37 +696,35 @@ def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str |
     tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id, fields=fields))
 
 
-def kv_link(keys: list[str] | str, partition_id: str, source_key: str, fields: list[str] | str) -> None:
-    """Let ``keys`` read ``fields`` from ``source_key`` without storing another copy.
+def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: list[str] | str) -> None:
+    """Let ``keys`` read ``fields`` from ``public_key`` in ``PUBLIC_PARTITION`` without another copy.
 
-    For example, the n responses of a GRPO prompt can link the prompt's fields instead
-    of putting the prompt n times. Missing ``keys`` are created, and linked fields read
-    the source's current value and are ready whenever the source's are. Putting a linked
-    field stores a private value in place of the link, and ``kv_update`` refuses it;
-    clearing a linked key or field drops only the link. ``source_key`` cannot be cleared
-    while other keys link to it, unless they are cleared in the same call.
-
-    ``source_key`` stays an ordinary sample: ``get_meta`` and dataloaders that ask only
-    for linked fields also return it, so give consumers a field the source lacks.
+    Put a payload shared by many keys, e.g. the video of a GRPO prompt read by its n
+    responses, once into ``tq.PUBLIC_PARTITION`` and link the keys to it. Its rows are
+    spread evenly over the storage units, apart from the rows of every other partition.
+    Missing ``keys`` are created, and linked fields read the public key's current value
+    and are ready whenever its fields are. Putting a linked field stores a private value
+    in place of the link, and ``kv_update`` refuses it; clearing a linked key or field
+    drops only the link. ``public_key`` cannot be cleared while keys link to it.
 
     Args:
         keys: Single key or list of keys that will read the linked fields.
-        partition_id: Partition holding both ``keys`` and ``source_key``.
-        source_key: Existing key that has produced ``fields``.
+        partition_id: Partition holding ``keys``; not ``PUBLIC_PARTITION``.
+        public_key: Key in ``PUBLIC_PARTITION`` that has produced ``fields``.
         fields: Single field name or list of field names to link.
 
     Raises:
-        RuntimeError: If ``source_key`` does not exist or has not produced all of ``fields``,
-            or ``keys`` include ``source_key`` or a key that other keys link these fields to.
+        RuntimeError: If ``public_key`` does not exist or has not produced all of ``fields``,
+            or ``partition_id`` is ``PUBLIC_PARTITION``.
         ValueError: If ``keys`` contains duplicates.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Example:
-        >>> tq.kv_put(key="prompt_0", partition_id="train", fields={"input_ids": prompt_ids})
-        >>> tq.kv_link([f"prompt_0_{i}" for i in range(n)], "train", "prompt_0", "input_ids")
+        >>> tq.kv_put(key="prompt_0", partition_id=tq.PUBLIC_PARTITION, fields={"video": video})
+        >>> tq.kv_link([f"prompt_0_{i}" for i in range(n)], "train", "prompt_0", "video")
     """
     tq_client = _maybe_create_tq_client()
-    tq_client._run_coroutine(async_kv_link(keys, partition_id, source_key, fields))
+    tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
 
 
 def kv_update(
@@ -1203,7 +1201,7 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
     Returns:
         ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every stored field of
         the key and ``unfinalized`` the subset that is not ready yet. ``links`` maps each field
-        linked by ``kv_link`` to its source key; such a field is ready when the source's is.
+        linked by ``kv_link`` to its key in ``PUBLIC_PARTITION``, whose readiness it shares.
 
     Raises:
         RuntimeError: If the partition or any key does not exist.
@@ -1261,20 +1259,15 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[
         await tq_client.async_clear_samples(batch_meta)
 
 
-async def async_kv_link(keys: list[str] | str, partition_id: str, source_key: str, fields: list[str] | str) -> None:
-    """Asynchronously let ``keys`` read ``fields`` from ``source_key``. See ``kv_link``."""
+async def async_kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: list[str] | str) -> None:
+    """Asynchronously let ``keys`` read ``fields`` from ``public_key``. See ``kv_link``."""
     tq_client = _maybe_create_tq_client()
     # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
     if not isinstance(tq_client.storage_manager, AsyncSimpleStorageManager):
         raise NotImplementedError(f"{type(tq_client.storage_manager).__name__} does not support kv_link")
     keys = [keys] if isinstance(keys, str) else keys
     _check_unique_keys(keys)
-    await tq_client.async_kv_link(
-        keys,
-        partition_id,
-        source_key,
-        [fields] if isinstance(fields, str) else fields,
-    )
+    await tq_client.async_kv_link(keys, partition_id, public_key, [fields] if isinstance(fields, str) else fields)
 
 
 def _single_update_batch(fields: dict[str, Any]) -> TensorDict:
@@ -1534,8 +1527,9 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
 
     Args:
         dump_dir: Directory to write the dump into.
-        keys: Keys to dump. Duplicates are dropped, first occurrence wins. Must include
-            the source key of every field linked by ``kv_link``.
+        keys: Keys to dump. Duplicates are dropped, first occurrence wins. Fields linked
+            by ``kv_link`` are dumped as links; dump their ``PUBLIC_PARTITION`` keys
+            separately and load that dump first.
         partition_id: Partition that owns ``keys``.
 
     Returns:
@@ -1543,8 +1537,6 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
 
     Raises:
         FileExistsError: ``dump_dir`` already exists.
-        ValueError: A key links to a source key that is not dumped, or to a source field
-            that is not finalized.
         RuntimeError: TransferQueue is not initialized, the partition or a key does not
             exist, or a storage unit holds no data for a row it was asked to dump.
         NotImplementedError: The storage backend does not support selective dumps.
@@ -1565,15 +1557,6 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         description = client.kv_describe(unique_keys, partition_id) if unique_keys else {"rows": {}, "field_schema": {}}
         row_index = {"partition_id": partition_id, **description}
         rows = row_index["rows"]
-        missing_sources = sorted({source for row in rows.values() for source in row["links"].values()} - rows.keys())
-        if missing_sources:
-            raise ValueError(f"linked source keys {missing_sources} must be dumped with the keys linking to them")
-        # Load restores unfinalized fields hidden, and kv_link refuses a hidden source field.
-        hidden_sources = sorted(
-            {s for row in rows.values() for name, s in row["links"].items() if name in rows[s]["unfinalized"]}
-        )
-        if hidden_sources:
-            raise ValueError(f"fields that other keys link to on {hidden_sources} must be finalized before dumping")
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.
         fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
@@ -1614,10 +1597,12 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
         ``{key: tag}`` for every restored key.
 
     Raises:
-        RuntimeError: TransferQueue is not initialized or a storage unit fails.
+        RuntimeError: TransferQueue is not initialized, a storage unit fails, or a key
+            linked to ``PUBLIC_PARTITION`` names a public key that does not exist.
         NotImplementedError: The storage backend is not SimpleStorage.
         FileNotFoundError: The dump is incomplete.
-        ValueError: The manifest or a row disagrees with the row index.
+        ValueError: The manifest or a row disagrees with the row index, or a linked public
+            field is not ready.
     """
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
@@ -1632,14 +1617,28 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
     partition_id = row_index["partition_id"]
     rows = row_index["rows"]
     client.validate_dump_schema(partition_id, row_index["field_schema"])
+    # Checked before loading anything: relinking needs the public fields, restored by their own load.
+    public_keys = sorted({key for row in rows.values() for key in row.get("links", {}).values()})
+    if public_keys:
+        public_rows = client.kv_describe(public_keys, PUBLIC_PARTITION)["rows"]
+        unready = sorted(
+            {
+                key
+                for row in rows.values()
+                for name, key in row.get("links", {}).items()
+                if name not in public_rows[key]["fields"] or name in public_rows[key]["unfinalized"]
+            }
+        )
+        if unready:
+            raise ValueError(f"linked fields of {PUBLIC_PARTITION!r} keys {unready} are not ready; load them first")
     bytes_read = client.load_rows_by_key(partition_id, rows, shards)
-    # Relink once the sources hold their payloads, one call per source and field set.
+    # One kv_link per public key and field set.
     link_groups: dict[tuple[str, tuple[str, ...]], list[str]] = defaultdict(list)
     for key, row in rows.items():
         links = row.get("links", {})
-        for source in set(links.values()):
-            link_groups[source, tuple(sorted(name for name, s in links.items() if s == source))].append(key)
-    for (source, names), keys in link_groups.items():
-        client.kv_link(keys, partition_id, source, list(names))
+        for public_key in set(links.values()):
+            link_groups[public_key, tuple(sorted(name for name, k in links.items() if k == public_key))].append(key)
+    for (public_key, names), keys in link_groups.items():
+        client.kv_link(keys, partition_id, public_key, list(names))
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

@@ -1527,32 +1527,33 @@ def test_index_manager_with_one_unit_reuses_fifo():
 
 
 class TestFieldLinks:
-    """Rows linking to a source row through DataPartitionStatus.link_fields."""
+    """Rows of a partition linking to a public row through DataPartitionStatus.link_fields."""
 
     SCHEMA = {"x": {"dtype": "torch.int64", "shape": (3,), "is_nested": False, "is_non_tensor": False}}
 
-    def _linked_partition(self):
-        """Source row 0 holds ``x``; rows 1 and 2 link to it."""
+    def _public(self):
+        """Public row 0 holds ``x``."""
+        from transfer_queue.controller import PUBLIC_PARTITION, DataPartitionStatus
+
+        public = DataPartitionStatus(partition_id=PUBLIC_PARTITION)
+        assert public.update_production_status([0], ["x"], field_schema=self.SCHEMA)
+        return public
+
+    def test_source_index_follows_link_put_and_clear(self):
         from transfer_queue.controller import DataPartitionStatus
 
-        partition = DataPartitionStatus(partition_id="links")
-        assert partition.update_production_status([0], ["x"], field_schema=self.SCHEMA)
-        partition.link_fields([1, 2], 0, ["x"])
-        return partition
-
-    def test_source_index_follows_put_and_clear(self):
-        import pytest
-
-        partition = self._linked_partition()
+        public = self._public()
+        partition = DataPartitionStatus(partition_id="train")
+        partition.link_fields([1, 2], public, 0, ["x"])
         assert partition.linked_by == {0: {1, 2}}
-        with pytest.raises(ValueError, match="linked by other keys"):
-            partition.check_not_linked([0, 1])
+        assert partition.field_metadata["x"].shape == (3,) and partition.production_status[[1, 2], 0].tolist() == [1, 1]
+        assert partition.linked_sources([0], ["x"]) == {0} and partition.linked_sources([0], ["y"]) == set()
 
         assert partition.update_production_status([1], ["x"], field_schema=self.SCHEMA)
         partition.clear_data([2])
 
         assert partition.links == {} and partition.linked_by == {}
-        partition.check_not_linked([0])
+        assert partition.linked_sources([0]) == set()
 
     def test_checkpoint_saved_before_links_still_loads(self):
         import pickle
@@ -1563,17 +1564,5 @@ class TestFieldLinks:
         del partition.links, partition.linked_by
         partition = pickle.loads(pickle.dumps(partition))
 
-        assert partition.update_production_status([0], ["x"], field_schema=self.SCHEMA)
-        partition.link_fields([1], 0, ["x"])
+        partition.link_fields([1], self._public(), 0, ["x"])
         assert partition.linked_by == {0: {1}}
-
-    def test_linked_rows_follow_source_readiness_and_shape(self):
-        partition = self._linked_partition()
-        wider = {"x": {**self.SCHEMA["x"], "shape": (5,)}}
-
-        assert partition.update_production_status([0], ["x"], field_schema=wider, ready=False)
-        assert partition.production_status[[0, 1, 2], 0].tolist() == [0, 0, 0]
-        assert partition.field_metadata["x"].per_sample_shapes == {0: (5,), 1: (5,), 2: (5,)}
-
-        assert partition.update_production_status([0], ["x"], field_schema=wider)
-        assert partition.production_status[[0, 1, 2], 0].tolist() == [1, 1, 1]

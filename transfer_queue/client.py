@@ -1191,16 +1191,16 @@ class AsyncTransferQueueClient:
         self,
         keys: list[str],
         partition_id: str,
-        source_key: str,
+        public_key: str,
         fields: list[str],
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Asynchronously make ``fields`` of ``keys`` read the payload of ``source_key``; see ``kv_link``."""
+        """Asynchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.KV_LINK,
             response_type=ZMQRequestType.KV_LINK_RESPONSE,
-            body={"keys": keys, "partition_id": partition_id, "source_key": source_key, "fields": fields},
+            body={"keys": keys, "partition_id": partition_id, "public_key": public_key, "fields": fields},
         )
 
     def close(self) -> None:
@@ -1996,9 +1996,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._kv_describe(keys, partition_id)
 
-    def kv_link(self, keys: list[str], partition_id: str, source_key: str, fields: list[str]) -> None:
-        """Synchronously make ``fields`` of ``keys`` read the payload of ``source_key``; see ``kv_link``."""
-        return self._kv_link(keys, partition_id, source_key, fields)
+    def kv_link(self, keys: list[str], partition_id: str, public_key: str, fields: list[str]) -> None:
+        """Synchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
+        return self._kv_link(keys, partition_id, public_key, fields)
 
     # ==================== Selective Data Dump API ====================
 

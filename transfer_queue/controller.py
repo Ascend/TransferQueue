@@ -60,6 +60,10 @@ TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GE
 # storage units, so the budget covers a fleet rather than the two ROUTERs bound here.
 TQ_CONTROLLER_ZMQ_MAX_SOCKETS = int(os.environ.get("TQ_CONTROLLER_ZMQ_MAX_SOCKETS", 4096))
 
+# Holds payloads that keys of other partitions read through kv_link, e.g. a prompt video
+# shared by its n responses. Its rows are balanced over storage units like any partition's.
+PUBLIC_PARTITION = "__public__"
+
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
 # determine consumption status even before producers have generated the samples.
@@ -390,9 +394,9 @@ class DataPartitionStatus:
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
     revert_keys_mapping: dict[int, str] = field(default_factory=dict)  # global_idx -> key
 
-    # Linked fields hold no payload of their own and read the source row's instead
-    links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: source global_idx}
-    linked_by: dict[int, set[int]] = field(default_factory=dict)  # source global_idx -> global_idxs linking to it
+    # Linked fields hold no payload of their own and read a PUBLIC_PARTITION row's instead
+    links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: public global_idx}
+    linked_by: dict[int, set[int]] = field(default_factory=dict)  # public global_idx -> global_idxs linking to it
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Controller checkpoints pickle partitions; ones saved before kv_link have no links.
@@ -598,17 +602,6 @@ class DataPartitionStatus:
 
             # A written value replaces the link it lands on
             self._drop_links(global_indices, field_names)
-
-            # Rows linking to a written cell read its new payload, so they take on its readiness
-            # (an unfinalized kv_update stays hidden behind links too) and its shape.
-            for source in global_indices:
-                for idx in self.linked_by.get(source, ()):
-                    for name, linked_source in self.links[idx].items():
-                        if linked_source == source and name in field_names:
-                            self.production_status[idx, self.field_name_mapping[name]] = int(ready)
-                            meta = self.field_metadata[name]
-                            if meta.is_nested:
-                                meta.per_sample_shapes[idx] = meta.per_sample_shapes[source]
 
             return True
 
@@ -1019,46 +1012,45 @@ class DataPartitionStatus:
         self._drop_links(global_indexes, field_names)
 
     # ==================== Field Links ====================
-    def link_fields(self, global_indexes: list[int], source: int, field_names: list[str]) -> None:
-        """Mark ``field_names`` produced on these rows, read from the payload of row ``source``."""
+    def link_fields(
+        self,
+        global_indexes: list[int],
+        public: "DataPartitionStatus",
+        source: int,
+        field_names: list[str],
+        ready: bool = True,
+    ) -> None:
+        """Mark ``field_names`` of these rows as read from row ``source`` of the public partition.
+
+        The rows take the source row's dtype and shape, and ``ready`` as their readiness.
+        """
         schema = {}
         for name in field_names:
-            meta = self.field_metadata[name]
+            meta = public.field_metadata[name]
+            shape = meta.per_sample_shapes.get(source) if meta.is_nested else meta.shape
             schema[name] = {
                 "dtype": meta.dtype,
-                "shape": meta.shape,
-                "is_nested": meta.is_nested,
+                "shape": shape,
+                "is_nested": False,
                 "is_non_tensor": meta.is_non_tensor,
             }
-            if meta.is_nested:
-                schema[name]["per_sample_shapes"] = {idx: meta.per_sample_shapes[source] for idx in global_indexes}
         # Before recording links: update_production_status drops links on the cells it marks.
-        if not self.update_production_status(global_indexes, field_names, schema):
+        if not self.update_production_status(global_indexes, field_names, schema, ready=ready):
             raise RuntimeError(f"failed to link fields {field_names} in partition {self.partition_id}")
-        # Point at the row holding the payload, so a chain of links is one hop.
-        source_links = self.links.get(source, {})
         for idx in global_indexes:
             row_links = self.links.setdefault(idx, {})
             for name in field_names:
-                row_links[name] = source_links.get(name, source)
-                self.linked_by.setdefault(row_links[name], set()).add(idx)
+                row_links[name] = source
+        self.linked_by.setdefault(source, set()).update(global_indexes)
 
-    def check_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
-        """Refuse to clear payloads that rows outside this clear still read through links."""
-        clearing = set(global_indexes)
-        sources = {
+    def linked_sources(self, sources: list[int], field_names: list[str] | None = None) -> set[int]:
+        """The public rows among ``sources`` that rows here link ``field_names`` (all if None) to."""
+        return {
             source
-            for source in clearing
+            for source in sources
             for idx in self.linked_by.get(source, ())
-            if idx not in clearing
-            and any(s == source and (field_names is None or n in field_names) for n, s in self.links[idx].items())
+            if field_names is None or any(self.links[idx].get(name) == source for name in field_names)
         }
-        if sources:
-            keys = sorted(str(self.revert_keys_mapping.get(idx, idx)) for idx in sources)
-            raise ValueError(
-                f"keys {keys} in partition {self.partition_id!r} are linked by other keys; "
-                "clear the linked keys first or in the same call"
-            )
 
     def _drop_links(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
         """Drop the links of these rows on ``field_names`` (all fields if None)."""
@@ -1276,6 +1268,15 @@ class TransferQueueController:
         success = partition.update_production_status(
             global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
         )
+        if success and partition_id == PUBLIC_PARTITION:
+            # Linking rows read the rewritten payload, so they take on its readiness (an
+            # unfinalized kv_update stays hidden behind links too) and its shape.
+            for other in self.partitions.values():
+                for source in set(global_indexes) & other.linked_by.keys():
+                    for idx in list(other.linked_by[source]):
+                        names = [name for name in field_names if other.links[idx].get(name) == source]
+                        if names:
+                            other.link_fields([idx], partition, source, names, ready=ready)
         if success:
             logger.debug(
                 f"[{self.controller_id}]: Updated production status for partition {partition_id}: "
@@ -1652,11 +1653,8 @@ class TransferQueueController:
         combined = list(zip(partition_ids, global_indexes, strict=True))
         combined.sort(key=itemgetter(0))
 
-        # Validate every partition first so a refused clear marks nothing.
-        for partition_id, group in groupby(combined, key=itemgetter(0)):
-            partition = self._get_partition(partition_id)
-            if partition:
-                partition.check_not_linked([idx for _, idx in group])
+        # Validate first so a refused clear marks nothing.
+        self._check_public_not_linked([idx for partition_id, idx in combined if partition_id == PUBLIC_PARTITION])
 
         for partition_id, group in groupby(combined, key=itemgetter(0)):
             partition = self._get_partition(partition_id)
@@ -1670,6 +1668,17 @@ class TransferQueueController:
             existing = list(set(indexes) & partition.global_indexes)
             if existing and partition.production_status is not None:
                 partition.production_status[existing, :] = 0
+
+    def _check_public_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
+        """Refuse to clear public payloads that keys of other partitions still link to."""
+        linked = set().union(*(p.linked_sources(global_indexes, field_names) for p in self.partitions.values()))
+        if linked:
+            public = self.partitions[PUBLIC_PARTITION]
+            keys = sorted(str(public.revert_keys_mapping.get(idx, idx)) for idx in linked)
+            raise ValueError(
+                f"keys {keys} in partition {PUBLIC_PARTITION!r} are linked by keys of other partitions; "
+                "clear those keys first"
+            )
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
@@ -1911,7 +1920,8 @@ class TransferQueueController:
         fields = [f for f in fields if f in partition.field_metadata]
         if not global_indexes or not fields:
             return BatchMeta.empty()
-        partition.check_not_linked(global_indexes, fields)
+        if partition_id == PUBLIC_PARTITION:
+            self._check_public_not_linked(global_indexes, fields)
 
         metadata = self.generate_batch_meta(partition_id, global_indexes, fields, mode="force_fetch")
         partition.clear_fields(global_indexes, fields)
@@ -1969,7 +1979,7 @@ class TransferQueueController:
             {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` lists the row's stored fields and is
             empty for a row with no produced field yet; ``unfinalized`` lists the stored fields not yet
             ready (written by ``kv_update(finalize=False)``); ``links`` maps each linked field to its
-            source key; ``field_schema`` covers the described rows' stored fields.
+            key in ``PUBLIC_PARTITION``; ``field_schema`` covers the described rows' stored fields.
 
         Raises:
             KeyError: The partition or any key does not exist.
@@ -1983,6 +1993,7 @@ class TransferQueueController:
         if missing_keys:
             raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
 
+        public_keys = self.partitions[PUBLIC_PARTITION].revert_keys_mapping if partition.links else {}
         rows: dict[str, dict[str, Any]] = {}
         for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True):
             links = partition.links.get(global_index, {})
@@ -1999,7 +2010,7 @@ class TransferQueueController:
                     for name in fields
                     if not partition.production_status[global_index, partition.field_name_mapping[name]]
                 ],
-                "links": {name: partition.revert_keys_mapping[source] for name, source in links.items()},
+                "links": {name: public_keys[source] for name, source in links.items()},
                 "tag": partition.custom_meta.get(global_index, {}),
             }
         # Only the declared types: row dtypes and shapes live with the storage units.
@@ -2010,36 +2021,35 @@ class TransferQueueController:
         }
         return {"rows": rows, "field_schema": field_schema}
 
-    def kv_link(self, keys: list[str], partition_id: str, source_key: str, fields: list[str]) -> None:
-        """Make ``fields`` of ``keys`` read the payload of ``source_key`` without copying it.
+    def kv_link(self, keys: list[str], partition_id: str, public_key: str, fields: list[str]) -> None:
+        """Make ``fields`` of ``keys`` read the payload of ``public_key`` in ``PUBLIC_PARTITION``.
 
-        Missing ``keys`` are created. The source must already have produced ``fields``.
+        Missing ``keys`` are created. ``public_key`` must already have produced ``fields``.
 
         Raises:
-            KeyError: The partition or ``source_key`` does not exist.
-            ValueError: ``fields`` is empty, ``source_key`` has not produced all of them, or
-                ``keys`` include ``source_key`` or a key other keys link these fields to.
+            KeyError: ``public_key`` does not exist.
+            ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, or ``fields`` is empty or not
+                all produced by ``public_key``.
         """
-        partition = self._get_partition(partition_id)
-        if partition is None or source_key not in partition.keys_mapping:
-            raise KeyError(f"source key {source_key!r} not found in partition {partition_id!r}")
-        source = partition.keys_mapping[source_key]
+        if partition_id == PUBLIC_PARTITION:
+            raise ValueError(f"keys of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
+        public = self._get_partition(PUBLIC_PARTITION)
+        if public is None or public_key not in public.keys_mapping:
+            raise KeyError(f"key {public_key!r} not found in partition {PUBLIC_PARTITION!r}")
+        source = public.keys_mapping[public_key]
         # Production status, not field metadata: mark_clearing zeroes it before storage deletes the payload.
         missing = [
             name
             for name in fields
-            if name not in partition.field_name_mapping
-            or partition.production_status[source, partition.field_name_mapping[name]] != 1
+            if name not in public.field_name_mapping
+            or public.production_status[source, public.field_name_mapping[name]] != 1
         ]
         if not fields or missing:
-            raise ValueError(f"source key {source_key!r} must have produced fields {missing or fields}")
-        existing = [idx for idx in partition.kv_retrieve_indexes(keys) if idx is not None]
-        if source in existing:
-            raise ValueError(f"source key {source_key!r} cannot link to itself")
-        # Keys linking to a relinked key would keep reading its old payload, not the new source.
-        partition.check_not_linked(existing, fields)
+            raise ValueError(f"public key {public_key!r} must have produced fields {missing or fields}")
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
-        partition.link_fields(metadata.global_indexes, source, fields)
+        partition = self._get_partition(partition_id)
+        assert partition is not None
+        partition.link_fields(metadata.global_indexes, public, source, fields)
 
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
@@ -2476,7 +2486,7 @@ class TransferQueueController:
 
     def _handle_kv_link_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
-        self.kv_link(params["keys"], params["partition_id"], params["source_key"], params["fields"])
+        self.kv_link(params["keys"], params["partition_id"], params["public_key"], params["fields"])
         return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
 
     def _handle_kv_clear_fields_request(self, request_msg: ZMQMessage) -> ZMQMessage:

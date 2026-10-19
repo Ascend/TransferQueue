@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end tests for kv_link: n keys reading one prompt payload without copies."""
+"""End-to-end tests for kv_link: n keys reading one PUBLIC_PARTITION payload without copies."""
 
 import shutil
 
@@ -25,6 +25,7 @@ from tensordict import TensorDict
 
 import transfer_queue as tq
 
+PUBLIC = tq.PUBLIC_PARTITION
 PARTITION = "link"
 N = 3
 
@@ -50,18 +51,20 @@ def tq_system():
 
 
 @pytest.fixture(autouse=True)
-def fresh_partition(tq_system):
+def fresh_partitions(tq_system):
     yield
+    # Linking keys first: a public key cannot be cleared while keys link to it.
     tq.get_client().clear_partition(PARTITION)
+    tq.get_client().clear_partition(PUBLIC)
 
 
-def _prompt(p: int) -> torch.Tensor:
-    return torch.tensor([p, p + 1, p + 2])
+def _prompt(p: int, length: int = 3) -> torch.Tensor:
+    return torch.arange(p, p + length)
 
 
 def _put_group(p: int) -> list[str]:
-    """Put prompt ``p`` once and link its N responses to it; return the response keys."""
-    tq.kv_put(key=f"p{p}", partition_id=PARTITION, fields={"prompt": _prompt(p)})
+    """Put prompt ``p`` once into the public partition and link N response keys to it."""
+    tq.kv_put(key=f"p{p}", partition_id=PUBLIC, fields={"prompt": _prompt(p)})
     keys = [f"p{p}_r{i}" for i in range(N)]
     tq.kv_link(keys, PARTITION, f"p{p}", "prompt")
     return keys
@@ -78,19 +81,17 @@ def _rows(field: torch.Tensor) -> list[list]:
 
 def test_each_partition_spreads_evenly_over_storage_units(tq_system):
     """Two storage units hold global_idx % 2; alternating puts used to send each partition to one."""
-    other = f"{PARTITION}_other"
     for i in range(4):
-        tq.kv_put(key=f"a{i}", partition_id=PARTITION, fields={"prompt": _prompt(i)})
-        tq.kv_put(key=f"b{i}", partition_id=other, fields={"prompt": _prompt(i)})
+        tq.kv_put(key=f"p{i}", partition_id=PUBLIC, fields={"prompt": _prompt(i)})
+        tq.kv_put(key=f"r{i}", partition_id=PARTITION, fields={"response": _prompt(i)})
 
     client = tq.get_client()
-    for partition_id, prefix in ((PARTITION, "a"), (other, "b")):
+    for partition_id, prefix in ((PUBLIC, "p"), (PARTITION, "r")):
         rows = client.kv_describe([f"{prefix}{i}" for i in range(4)], partition_id)["rows"]
         assert sorted(row["global_index"] % 2 for row in rows.values()) == [0, 0, 1, 1]
-    client.clear_partition(other)
 
 
-def test_linked_keys_read_the_source_payload(tq_system):
+def test_linked_keys_read_the_public_payload(tq_system):
     keys = _put_group(0) + _put_group(10)
     tq.kv_batch_put(
         keys=keys,
@@ -102,68 +103,49 @@ def test_linked_keys_read_the_source_payload(tq_system):
 
     assert _rows(data["prompt"]) == [_prompt(0).tolist()] * N + [_prompt(10).tolist()] * N
     assert _rows(data["response"]) == [[i] for i in range(len(keys))]
+    assert _links(keys[0]) == {"prompt": "p0"}
 
 
-def test_data_parser_refuses_linked_fields(tq_system):
-    keys = _put_group(0)
-    tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
-
-    def identity(data, args):
-        return data
-
-    with pytest.raises(NotImplementedError, match="kv_link"):
-        tq.kv_batch_get(keys, PARTITION, data_parser=identity)
-    data = tq.kv_batch_get(keys, PARTITION, select_fields="response", data_parser=identity)
-    assert _rows(data["response"]) == [[i] for i in range(N)]
-
-
-def test_link_requires_a_produced_source_field(tq_system):
-    tq.kv_put(key="p0", partition_id=PARTITION, fields={"prompt": _prompt(0)})
+def test_link_requires_a_produced_public_field(tq_system):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
 
     with pytest.raises(RuntimeError, match="not found"):
         tq.kv_link("r", PARTITION, "missing", "prompt")
     with pytest.raises(RuntimeError, match="must have produced"):
         tq.kv_link("r", PARTITION, "p0", "image")
+    with pytest.raises(RuntimeError, match="cannot link"):
+        tq.kv_link("r", PUBLIC, "p0", "prompt")
     with pytest.raises(ValueError, match="duplicates"):
         tq.kv_link(["r", "r"], PARTITION, "p0", "prompt")
-    with pytest.raises(RuntimeError, match="cannot link to itself"):
-        tq.kv_link(["r", "p0"], PARTITION, "p0", "prompt")
-    assert tq.kv_list(PARTITION)[PARTITION].keys() == {"p0"}
+    assert tq.kv_list().get(PARTITION, {}) == {}
 
 
-def test_link_refuses_to_relink_a_source(tq_system):
-    keys = _put_group(0)
-    tq.kv_put(key="q0", partition_id=PARTITION, fields={"prompt": _prompt(9)})
-
-    with pytest.raises(RuntimeError, match="linked by other keys"):
-        tq.kv_link("p0", PARTITION, "q0", "prompt")
-
-    assert _links("p0") == {}
-    assert _rows(tq.kv_batch_get(["p0", *keys], PARTITION)["prompt"]) == [_prompt(0).tolist()] * (N + 1)
-
-
-def test_link_refuses_a_source_being_cleared(tq_system):
-    tq.kv_put(key="p0", partition_id=PARTITION, fields={"prompt": _prompt(0)})
-    source = tq.get_client().kv_describe(["p0"], PARTITION)["rows"]["p0"]["global_index"]
+def test_link_refuses_a_public_key_being_cleared(tq_system):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    source = tq.get_client().kv_describe(["p0"], PUBLIC)["rows"]["p0"]["global_index"]
     controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
-    ray.get(controller.mark_clearing.remote([source], [PARTITION]))
+    ray.get(controller.mark_clearing.remote([source], [PUBLIC]))
 
     with pytest.raises(RuntimeError, match="must have produced"):
         tq.kv_link("r", PARTITION, "p0", "prompt")
 
 
-def test_source_cannot_be_cleared_while_linked(tq_system):
+def test_public_key_cannot_be_cleared_while_linked(tq_system):
     keys = _put_group(0)
 
-    with pytest.raises(RuntimeError, match="linked by other keys"):
-        tq.kv_clear("p0", PARTITION)
-    with pytest.raises(RuntimeError, match="linked by other keys"):
-        tq.kv_clear("p0", PARTITION, fields="prompt")
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        tq.kv_clear("p0", PUBLIC)
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        tq.kv_clear("p0", PUBLIC, fields="prompt")
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        tq.get_client().clear_partition(PUBLIC)
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
+    tq.kv_clear(keys[0], PARTITION)
     tq.kv_clear(keys[1:], PARTITION, fields="prompt")
-    tq.kv_clear([keys[0], "p0"], PARTITION)
+    tq.kv_clear("p0", PUBLIC)
 
+    assert tq.kv_list().get(PUBLIC, {}) == {}
     assert tq.kv_list(PARTITION)[PARTITION].keys() == set(keys[1:])
     assert all(not _links(key) for key in keys[1:])
 
@@ -185,7 +167,20 @@ def test_put_through_meta_reads_back_the_written_value(tq_system):
     client.put(TensorDict({"prompt": torch.stack([_prompt(7)] * N)}, batch_size=N), metadata=meta)
 
     assert _rows(client.get_data(meta)["prompt"]) == [_prompt(7).tolist()] * N
-    assert _rows(tq.kv_batch_get("p0", PARTITION)["prompt"]) == [_prompt(0).tolist()]
+    assert _rows(tq.kv_batch_get("p0", PUBLIC)["prompt"]) == [_prompt(0).tolist()]
+
+
+def test_data_parser_refuses_linked_fields(tq_system):
+    keys = _put_group(0)
+    tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
+
+    def identity(data, args):
+        return data
+
+    with pytest.raises(NotImplementedError, match="kv_link"):
+        tq.kv_batch_get(keys, PARTITION, data_parser=identity)
+    data = tq.kv_batch_get(keys, PARTITION, select_fields="response", data_parser=identity)
+    assert _rows(data["response"]) == [[i] for i in range(N)]
 
 
 def test_update_refuses_a_linked_field(tq_system):
@@ -203,33 +198,35 @@ def test_update_refuses_a_linked_field(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
 
-def test_unfinalized_source_update_is_hidden_from_linked_keys(tq_system):
+def test_linked_keys_follow_public_readiness_and_shape(tq_system):
     keys = _put_group(0)
 
-    tq.kv_update("p0", PARTITION, {"prompt": _prompt(5)}, merge_fn=lambda old, new: new, finalize=False)
+    tq.kv_update("p0", PUBLIC, {"prompt": _prompt(5, 5)}, merge_fn=lambda old, new: new, finalize=False)
     with pytest.raises(ValueError, match="not ready"):
         tq.kv_batch_get(keys, PARTITION, select_fields="prompt")
 
-    tq.kv_update("p0", PARTITION, {"prompt": _prompt(5)}, merge_fn=lambda old, new: new)
-    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(5).tolist()] * N
+    tq.kv_update("p0", PUBLIC, {"prompt": _prompt(5, 5)}, merge_fn=lambda old, new: new)
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(5, 5).tolist()] * N
+    meta = tq.get_client().kv_retrieve_meta(keys, PARTITION)
+    assert [tuple(shape) for shape in meta.get_shapes("prompt")] == [(5,)] * N
 
 
 def test_dump_and_load_relink(tq_system, dump_test_root):
     keys = _put_group(0)
-    dump_dir = dump_test_root / "link_dump"
-
-    with pytest.raises(ValueError, match="must be dumped"):
-        tq.dump_data_by_key(dump_dir, keys, PARTITION)
-
-    tq.kv_update("p0", PARTITION, {"prompt": _prompt(0)}, merge_fn=lambda old, new: new, finalize=False)
-    with pytest.raises(ValueError, match="must be finalized"):
-        tq.dump_data_by_key(dump_dir, ["p0", *keys], PARTITION)
-    tq.kv_update("p0", PARTITION, {"prompt": _prompt(0)}, merge_fn=lambda old, new: new)
-
-    tq.dump_data_by_key(dump_dir, ["p0", *keys], PARTITION)
+    public_dir, linked_dir = dump_test_root / "public_dump", dump_test_root / "link_dump"
+    tq.dump_data_by_key(public_dir, ["p0"], PUBLIC)
+    tq.dump_data_by_key(linked_dir, keys, PARTITION)
     tq.get_client().clear_partition(PARTITION)
-    tq.load_data_by_key(dump_dir)
-    shutil.rmtree(dump_dir)
+    tq.get_client().clear_partition(PUBLIC)
+
+    with pytest.raises(RuntimeError, match="does not exist|not found"):
+        tq.load_data_by_key(linked_dir)
+    assert tq.kv_list().get(PARTITION, {}) == {}
+
+    tq.load_data_by_key(public_dir)
+    tq.load_data_by_key(linked_dir)
+    shutil.rmtree(public_dir)
+    shutil.rmtree(linked_dir)
 
     assert all(_links(key) == {"prompt": "p0"} for key in keys)
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
