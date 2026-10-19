@@ -130,6 +130,21 @@ def test_link_refuses_a_public_key_being_cleared(tq_system):
         tq.kv_link("r", PARTITION, "p0", "prompt")
 
 
+def test_link_made_while_its_public_key_is_cleared_is_dropped(tq_system):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    source = tq.get_client().kv_describe(["p0"], PUBLIC)["rows"]["p0"]["global_index"]
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    ray.get(controller.mark_clearing.remote([source], [PUBLIC]))
+    # A concurrent put makes p0 ready again, so a link slips in before the clear finishes.
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    tq.kv_link("r", PARTITION, "p0", "prompt")
+
+    ray.get(controller.clear_meta.remote([source], [PUBLIC]))
+
+    assert _links("r") == {}
+    assert "prompt" not in tq.kv_describe("r", PARTITION)["r"]["fields"]
+
+
 def test_public_key_cannot_be_cleared_while_linked(tq_system):
     keys = _put_group(0)
 

@@ -1680,6 +1680,17 @@ class TransferQueueController:
                 "clear those keys first"
             )
 
+    def _unlink_released_public(self, global_indexes: list[int]) -> None:
+        """Mark fields linked to released public rows as never written.
+
+        mark_clearing refuses linked rows, but a put during the clear makes a row ready
+        again and lets kv_link through; such a link would point at a reusable index.
+        """
+        for other in self.partitions.values():
+            for source in set(global_indexes) & other.linked_by.keys():
+                for idx in list(other.linked_by[source]):
+                    other.clear_fields([idx], [name for name, src in other.links[idx].items() if src == source])
+
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
         Clear data for a specific partition (delete the whole partition).
@@ -1700,6 +1711,8 @@ class TransferQueueController:
 
         global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
         partition.clear_data(global_indexes_range, clear_consumption)
+        if partition_id == PUBLIC_PARTITION:
+            self._unlink_released_public(global_indexes_range)
         self.index_manager.release_partition(partition_id)
         self.partitions.pop(partition_id)
         self.sampler.clear_cache(partition_id)
@@ -1784,6 +1797,8 @@ class TransferQueueController:
 
             # Clear data from partition
             partition.clear_data(global_indexes_to_clear, clear_consumption)
+            if partition_id == PUBLIC_PARTITION:
+                self._unlink_released_public(global_indexes_to_clear)
 
             # Release the specific indexes from index manager
             self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
