@@ -2051,6 +2051,26 @@ class TransferQueueController:
         assert partition is not None
         partition.link_fields(metadata.global_indexes, public, source, fields)
 
+    def mark_unlinked_public_clearing(self) -> tuple[BatchMeta, list[str]]:
+        """Mark every ``PUBLIC_PARTITION`` key that no key links to as clearing.
+
+        Selecting and marking in one controller call means a concurrent kv_link cannot link
+        a row this clear deletes: kv_link refuses fields whose production status was zeroed.
+
+        Returns:
+            The marked rows' BatchMeta, for storage deletion and clear_meta, and their keys.
+        """
+        public = self._get_partition(PUBLIC_PARTITION)
+        if public is None:
+            return BatchMeta.empty(), []
+        linked = set().union(*(p.linked_by.keys() for p in self.partitions.values()))
+        keys = sorted(key for key, idx in public.keys_mapping.items() if idx not in linked)
+        if not keys:
+            return BatchMeta.empty(), []
+        metadata = self.kv_retrieve_meta(keys, PUBLIC_PARTITION)
+        self.mark_clearing(metadata.global_indexes, metadata.partition_ids)
+        return metadata, keys
+
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
@@ -2279,6 +2299,7 @@ class TransferQueueController:
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
             ZMQRequestType.KV_LINK: self._handle_kv_link_request,
+            ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING: self._handle_mark_unlinked_public_clearing_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2488,6 +2509,12 @@ class TransferQueueController:
         params = request_msg.body
         self.kv_link(params["keys"], params["partition_id"], params["public_key"], params["fields"])
         return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
+
+    def _handle_mark_unlinked_public_clearing_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        metadata, keys = self.mark_unlinked_public_clearing()
+        return self._make_response(
+            request_msg, ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE, {"metadata": metadata, "keys": keys}
+        )
 
     def _handle_kv_clear_fields_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body

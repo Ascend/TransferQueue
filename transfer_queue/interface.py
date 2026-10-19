@@ -727,6 +727,22 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: l
     tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
 
 
+def kv_clear_unlinked_public() -> list[str]:
+    """Clear every key in ``PUBLIC_PARTITION`` that no key links to, and return those keys.
+
+    For example, after clearing a step's trajectories, this frees the prompt videos no
+    trajectory reads any more. A public key that is put but not linked yet is cleared too,
+    so call it when no writer is between its ``kv_put`` and ``kv_link``. A ``kv_link``
+    that races with it is refused for the keys it clears.
+
+    Example:
+        >>> tq.kv_clear(trajectory_keys, partition_id="train")
+        >>> freed = tq.kv_clear_unlinked_public()
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_clear_unlinked_public())
+
+
 def kv_update(
     key: str,
     partition_id: str,
@@ -1268,6 +1284,12 @@ async def async_kv_link(keys: list[str] | str, partition_id: str, public_key: st
     keys = [keys] if isinstance(keys, str) else keys
     _check_unique_keys(keys)
     await tq_client.async_kv_link(keys, partition_id, public_key, [fields] if isinstance(fields, str) else fields)
+
+
+async def async_kv_clear_unlinked_public() -> list[str]:
+    """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to. See ``kv_clear_unlinked_public``."""
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_clear_unlinked_public()
 
 
 def _single_update_batch(fields: dict[str, Any]) -> TensorDict:

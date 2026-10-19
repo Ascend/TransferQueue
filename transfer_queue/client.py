@@ -1203,6 +1203,28 @@ class AsyncTransferQueueClient:
             body={"keys": keys, "partition_id": partition_id, "public_key": public_key, "fields": fields},
         )
 
+    async def async_clear_unlinked_public(self) -> list[str]:
+        """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to; see ``kv_clear_unlinked_public``.
+
+        Returns:
+            The cleared keys.
+        """
+        metadata, keys = await self._mark_unlinked_public_clearing()
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata)
+            await self._clear_meta_in_controller(metadata)
+        return keys
+
+    @with_controller_socket
+    async def _mark_unlinked_public_clearing(self, socket=None) -> tuple[BatchMeta, list[str]]:
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING,
+            response_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE,
+            body={},
+        )
+        return response.body["metadata"], response.body["keys"]
+
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
@@ -1519,6 +1541,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_list = _make_sync(self.async_kv_list)
         self._kv_describe = _make_sync(self.async_kv_describe)
         self._kv_link = _make_sync(self.async_kv_link)
+        self._clear_unlinked_public = _make_sync(self.async_clear_unlinked_public)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
@@ -1999,6 +2022,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def kv_link(self, keys: list[str], partition_id: str, public_key: str, fields: list[str]) -> None:
         """Synchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
         return self._kv_link(keys, partition_id, public_key, fields)
+
+    def clear_unlinked_public(self) -> list[str]:
+        """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""
+        return self._clear_unlinked_public()
 
     # ==================== Selective Data Dump API ====================
 
