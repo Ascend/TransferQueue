@@ -1494,6 +1494,38 @@ class TestFieldMetaIntegration:
         assert schema["per_sample_shapes"] == [(3,), None]
 
 
+def test_index_manager_balances_each_partition_across_storage_units():
+    """Alternating one-row allocations put every row of a partition on one unit before."""
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    manager.set_num_storage_units(2)
+    for _ in range(4):
+        manager.allocate_indexes("__public__", 1)
+        manager.allocate_indexes("train", 1)
+    for partition_id in ("__public__", "train"):
+        assert sorted(idx % 2 for idx in manager.partition_to_indexes[partition_id]) == [0, 0, 1, 1]
+
+    manager.release_indexes("train", [idx for idx in manager.partition_to_indexes["train"] if idx % 2 == 0])
+    manager.allocate_indexes("val", 3)
+    assert sorted(idx % 2 for idx in manager.partition_to_indexes["val"]) == [0, 0, 1]
+    assert manager.unit_loads["train"] == [0, 2]
+
+    reusable = manager.reusable_indexes
+    manager.set_num_storage_units(2, reusable)
+    assert sorted(manager.reusable_indexes) == sorted(reusable)
+    assert manager.unit_loads == {"__public__": [2, 2], "train": [0, 2], "val": [2, 1]}
+
+
+def test_index_manager_with_one_unit_reuses_fifo():
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    assert manager.allocate_indexes("p", 3) == [0, 1, 2]
+    manager.release_indexes("p", [2, 0])
+    assert manager.allocate_indexes("q", 3) == [2, 0, 3]
+
+
 class TestFieldLinks:
     """Rows linking to a source row through DataPartitionStatus.link_fields."""
 

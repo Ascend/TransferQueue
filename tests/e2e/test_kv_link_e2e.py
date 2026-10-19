@@ -76,6 +76,20 @@ def _rows(field: torch.Tensor) -> list[list]:
     return [row.tolist() for row in field.unbind()]
 
 
+def test_each_partition_spreads_evenly_over_storage_units(tq_system):
+    """Two storage units hold global_idx % 2; alternating puts used to send each partition to one."""
+    other = f"{PARTITION}_other"
+    for i in range(4):
+        tq.kv_put(key=f"a{i}", partition_id=PARTITION, fields={"prompt": _prompt(i)})
+        tq.kv_put(key=f"b{i}", partition_id=other, fields={"prompt": _prompt(i)})
+
+    client = tq.get_client()
+    for partition_id, prefix in ((PARTITION, "a"), (other, "b")):
+        rows = client.kv_describe([f"{prefix}{i}" for i in range(4)], partition_id)["rows"]
+        assert sorted(row["global_index"] % 2 for row in rows.values()) == [0, 0, 1, 1]
+    client.clear_partition(other)
+
+
 def test_linked_keys_read_the_source_payload(tq_system):
     keys = _put_group(0) + _put_group(10)
     tq.kv_batch_put(

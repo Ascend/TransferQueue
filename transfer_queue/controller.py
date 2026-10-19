@@ -17,7 +17,7 @@ import copy
 import os
 import pickle
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
@@ -75,18 +75,38 @@ class PartitionIndexManager:
         # Records the set of global_indexes used by each partition
         self.partition_to_indexes = defaultdict(set)
 
-        # Reusable global_index pool - stored using list
-        self.reusable_indexes = []
-
         # Global index counter for allocating new indexes
         self.global_index_counter = 0
 
         # Track all active indexes
         self.allocated_indexes = set()
 
+        # SimpleStorage stores global_idx on unit global_idx % num_storage_units, so picking the
+        # index picks the unit. Reusable indexes are kept FIFO per unit.
+        self.set_num_storage_units(1, [])
+
+    @property
+    def reusable_indexes(self) -> list[int]:
+        return [idx for pool in self.reusable_by_unit for idx in pool]
+
+    def set_num_storage_units(self, num_storage_units: int, reusable_indexes: list[int] | None = None) -> None:
+        """Regroup the reusable indexes and per-partition unit loads for ``num_storage_units`` units."""
+        reusable = self.reusable_indexes if reusable_indexes is None else reusable_indexes
+        self.num_storage_units = num_storage_units
+        self.reusable_by_unit: list[deque[int]] = [deque() for _ in range(num_storage_units)]
+        for idx in reusable:
+            self.reusable_by_unit[idx % num_storage_units].append(idx)
+        # partition_id -> rows of the partition on each unit
+        self.unit_loads: dict[str, list[int]] = {}
+        for partition_id, indexes in self.partition_to_indexes.items():
+            loads = self.unit_loads[partition_id] = [0] * num_storage_units
+            for idx in indexes:
+                loads[idx % num_storage_units] += 1
+
     def allocate_indexes(self, partition_id, count=1) -> list[int]:
         """
-        Allocate global_indexes for the specified partition.
+        Allocate global_indexes for the specified partition, each on the unit where the
+        partition has the fewest rows, so every partition stays balanced across units.
         Prioritizes obtaining from reusable pool, allocates new indexes when insufficient.
 
         Args:
@@ -98,38 +118,39 @@ class PartitionIndexManager:
         """
         if count <= 0:
             raise ValueError(f"Number of indexes needed must be larger than 0, but got {count}")
+        units = self.num_storage_units
+        loads = self.unit_loads.setdefault(partition_id, [0] * units)
         indexes = []
+        for _ in range(count):
+            # Among the least-loaded units, prefer reusing an index, then the counter's next one.
+            unit = min(
+                range(units),
+                key=lambda u: (loads[u], not self.reusable_by_unit[u], u != self.global_index_counter % units),
+            )
+            if self.reusable_by_unit[unit]:
+                idx = self.reusable_by_unit[unit].popleft()
+            else:
+                # Indexes skipped to reach this unit wait in their own unit's pool.
+                while self.global_index_counter % units != unit:
+                    self.reusable_by_unit[self.global_index_counter % units].append(self.global_index_counter)
+                    self.global_index_counter += 1
+                idx = self.global_index_counter
+                self.global_index_counter += 1
+            loads[unit] += 1
+            indexes.append(idx)
 
-        # Get indexes from reusable pool
-        if self.reusable_indexes:
-            # Calculate number of indexes needed from reusable pool
-            num_reuse = min(count, len(self.reusable_indexes))
-
-            # Use slice operation to get multiple elements at once (FIFO principle)
-            indexes.extend(self.reusable_indexes[:num_reuse])
-            del self.reusable_indexes[:num_reuse]
-
-        # If reusable pool doesn't have enough indexes, allocate new ones
-        if len(indexes) < count:
-            # Ensure newly allocated indexes don't conflict with existing ones
-            needed = count - len(indexes)
-            # Batch allocate consecutive index ranges
-            start_index = self.global_index_counter
-            end_index = start_index + needed
-
-            # Directly generate consecutive index list
-            new_indexes = list(range(start_index, end_index))
-
-            # Batch update status
-            self.allocated_indexes.update(new_indexes)
-            self.global_index_counter = end_index
-
-            indexes.extend(new_indexes)
-
+        self.allocated_indexes.update(indexes)
         # Record partition-index relationship
         self.partition_to_indexes[partition_id].update(indexes)
 
         return indexes
+
+    def _reuse(self, partition_id, indexes) -> None:
+        loads = self.unit_loads.get(partition_id)
+        for idx in indexes:
+            self.reusable_by_unit[idx % self.num_storage_units].append(idx)
+            if loads is not None:
+                loads[idx % self.num_storage_units] -= 1
 
     def release_partition(self, partition_id) -> list[int]:
         """
@@ -145,7 +166,8 @@ class PartitionIndexManager:
             indexes = self.partition_to_indexes.pop(partition_id)
 
             # Add released indexes to reusable pool
-            self.reusable_indexes.extend(indexes)
+            self._reuse(partition_id, indexes)
+            self.unit_loads.pop(partition_id, None)
 
             # Remove these indexes from allocated_indexes
             for idx in indexes:
@@ -171,12 +193,13 @@ class PartitionIndexManager:
             raise ValueError("Some indexes to release do not belong to the specified partition.")
 
         partition_indexes.difference_update(indexes_to_release)
-        self.reusable_indexes.extend(indexes_to_release)
+        self._reuse(partition_id, indexes_to_release)
         self.allocated_indexes.difference_update(indexes_to_release)
 
         # If partition has no more indexes, remove it from the mapping
         if not partition_indexes:
             self.partition_to_indexes.pop(partition_id, None)
+            self.unit_loads.pop(partition_id, None)
 
     def get_indexes_for_partition(self, partition_id) -> list[int]:
         """
@@ -2513,6 +2536,8 @@ class TransferQueueController:
     def store_config(self, conf: DictConfig) -> None:
         """Store the global config of TransferQueue."""
         self.tq_config = conf
+        if conf.backend.storage_backend == "SimpleStorage":
+            self.index_manager.set_num_storage_units(int(conf.backend.SimpleStorage.num_data_storage_units))
 
     def get_config(self) -> DictConfig:
         """Retrieve the global config of TransferQueue."""
@@ -2566,9 +2591,9 @@ class TransferQueueController:
 
             im = state["index_manager"]
             self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
-            self.index_manager.reusable_indexes = im["reusable_indexes"]
             self.index_manager.global_index_counter = im["global_index_counter"]
             self.index_manager.allocated_indexes = im["allocated_indexes"]
+            self.index_manager.set_num_storage_units(self.index_manager.num_storage_units, im["reusable_indexes"])
 
             self.sampler.load_checkpoint(state["sampler"])
 
