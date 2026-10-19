@@ -198,6 +198,22 @@ def test_link_refuses_a_key_marked_by_clear_unlinked_public(tq_system):
         tq.kv_link("r", PARTITION, "p0", "prompt")
 
 
+def test_checkpoint_restores_links_and_their_clear_guard(tq_system, tmp_path):
+    keys = _put_group(0)
+    tq.save_checkpoint(tmp_path / "ck")
+    tq.kv_clear(keys, PARTITION)
+    tq.kv_clear("p0", PUBLIC)
+
+    tq.load_checkpoint(tmp_path / "ck")
+
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
+    assert all(_links(key) == {"prompt": "p0"} for key in keys)
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        tq.kv_clear("p0", PUBLIC)
+    tq.kv_clear(keys, PARTITION)
+    assert tq.kv_clear_unlinked_public() == ["p0"]
+
+
 def test_put_replaces_the_link(tq_system):
     keys = _put_group(0)
 
