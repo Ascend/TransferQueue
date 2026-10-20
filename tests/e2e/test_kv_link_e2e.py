@@ -242,24 +242,35 @@ def test_checkpoint_restores_links_and_their_clear_guard(tq_system, tmp_path):
     assert tq.kv_clear_unlinked_public() == ["p0"]
 
 
-def test_put_replaces_the_link(tq_system):
+def test_put_refuses_a_linked_field(tq_system):
     keys = _put_group(0)
+    tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
 
+    with pytest.raises(ValueError, match="linked by kv_link"):
+        tq.kv_put(key=keys[0], partition_id=PARTITION, fields={"prompt": _prompt(7)})
+    # A read-modify-write of the whole batch would turn every link into a private copy.
+    data = tq.kv_batch_get(keys, PARTITION)
+    data["response"] += 100
+    with pytest.raises(ValueError, match="linked by kv_link"):
+        tq.kv_batch_put(keys, PARTITION, fields=data)
+    assert all(_links(key) == {"prompt": "p0"} for key in keys)
+
+    tq.kv_batch_put(keys, PARTITION, fields=data.select("response"))
+    tq.kv_clear(keys[0], PARTITION, fields="prompt")
     tq.kv_put(key=keys[0], partition_id=PARTITION, fields={"prompt": _prompt(7)})
-
     assert _links(keys[0]) == {}
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(7).tolist()] + [_prompt(0).tolist()] * 2
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["response"]) == [[i + 100] for i in range(N)]
 
 
-def test_put_through_meta_reads_back_the_written_value(tq_system):
+def test_put_through_meta_refuses_a_linked_field(tq_system):
     keys = _put_group(0)
     client = tq.get_client()
     meta = client.kv_retrieve_meta(keys, PARTITION)
 
-    client.put(TensorDict({"prompt": torch.stack([_prompt(7)] * N)}, batch_size=N), metadata=meta)
-
-    assert _rows(client.get_data(meta)["prompt"]) == [_prompt(7).tolist()] * N
-    assert _rows(tq.kv_batch_get("p0", PUBLIC)["prompt"]) == [_prompt(0).tolist()]
+    with pytest.raises(ValueError, match="linked by kv_link"):
+        client.put(TensorDict({"prompt": torch.stack([_prompt(7)] * N)}, batch_size=N), metadata=meta)
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
 
 def test_data_parser_refuses_linked_fields(tq_system):

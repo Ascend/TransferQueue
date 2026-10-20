@@ -413,7 +413,8 @@ class AsyncTransferQueueClient:
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails
 
         Example:
@@ -476,6 +477,13 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        # A read-modify-write would otherwise turn every link into a private copy without notice.
+        linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
+        if linked:
+            raise ValueError(
+                f"fields {linked} are linked by kv_link on some samples; leave them out of the put, "
+                "or kv_clear those fields first to store private values"
+            )
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
@@ -1687,7 +1695,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails
 
         Example:

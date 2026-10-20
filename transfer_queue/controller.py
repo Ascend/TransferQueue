@@ -600,7 +600,7 @@ class DataPartitionStatus:
             # Save these global_indexes
             self.global_indexes.update(global_indices)
 
-            # A written value replaces the link it lands on
+            # A written value replaces the link it lands on; KV puts refuse linked fields up front.
             self._drop_links(global_indices, field_names)
 
             return True
@@ -1910,7 +1910,7 @@ class TransferQueueController:
             if linked:
                 raise ValueError(
                     f"kv_update cannot merge into fields linked by kv_link on keys {linked}; "
-                    "kv_put a value to replace the link first"
+                    "kv_clear those fields first to store private values"
                 )
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
         partition = self._get_partition(partition_id)

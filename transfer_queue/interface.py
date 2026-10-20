@@ -703,9 +703,10 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: l
     responses, once into ``tq.PUBLIC_PARTITION`` and link the keys to it. Its rows are
     spread evenly over the storage units, apart from the rows of every other partition.
     Missing ``keys`` are created, and linked fields read the public key's payload and are
-    ready whenever its fields are. Putting a linked field stores a private value in place
-    of the link, and ``kv_update`` refuses it; clearing a linked key or field drops only
-    the link. ``public_key`` cannot be written or cleared while keys link to it.
+    ready whenever its fields are. ``kv_put`` and ``kv_update`` refuse a linked field, so
+    a read-modify-write must leave it out; clearing a linked key or field drops only the
+    link, after which the field takes a private value. ``public_key`` cannot be written
+    or cleared while keys link to it.
 
     Args:
         keys: Single key or list of keys that will read the linked fields.
