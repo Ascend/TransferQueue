@@ -397,10 +397,13 @@ class DataPartitionStatus:
     # Linked fields hold no payload of their own and read a PUBLIC_PARTITION row's instead
     links: dict[int, dict[str, int]] = field(default_factory=dict)  # global_idx -> {field: public global_idx}
     linked_by: dict[int, set[int]] = field(default_factory=dict)  # public global_idx -> global_idxs linking to it
+    # Public rows some key has linked to; kv_clear_unlinked_public frees only these, so a
+    # payload put but not linked yet is safe from it.
+    ever_linked: set[int] = field(default_factory=set)
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         # Controller checkpoints pickle partitions; ones saved before kv_link have no links.
-        self.__dict__.update({"links": {}, "linked_by": {}, **state})
+        self.__dict__.update({"links": {}, "linked_by": {}, "ever_linked": set(), **state})
 
     # Dynamic configuration - these are computed from the current state
     @property
@@ -980,6 +983,7 @@ class DataPartitionStatus:
                 for field_name in empty_fields:
                     self.field_metadata.pop(field_name)
             self._drop_links(indexes_to_release)
+            self.ever_linked.difference_update(indexes_to_release)
             for idx in indexes_to_release:
                 self.field_custom_backend_meta.pop(idx, None)
                 self.custom_meta.pop(idx, None)
@@ -2104,9 +2108,10 @@ class TransferQueueController:
         partition = self._get_partition(partition_id)
         assert partition is not None
         partition.link_fields(metadata.global_indexes, public, source, fields)
+        public.ever_linked.add(source)
 
     def mark_unlinked_public_clearing(self) -> tuple[BatchMeta, list[str]]:
-        """Mark every ``PUBLIC_PARTITION`` key that no key links to as clearing.
+        """Mark every ``PUBLIC_PARTITION`` key that keys linked to before but none links to now as clearing.
 
         Selecting and marking in one controller call means a concurrent kv_link cannot link
         a row this clear deletes: kv_link refuses fields whose production status was zeroed.
@@ -2118,7 +2123,7 @@ class TransferQueueController:
         if public is None:
             return BatchMeta.empty(), []
         linked = set().union(*(p.linked_by.keys() for p in self.partitions.values()))
-        keys = sorted(key for key, idx in public.keys_mapping.items() if idx not in linked)
+        keys = sorted(public.revert_keys_mapping[idx] for idx in public.ever_linked - linked)
         if not keys:
             return BatchMeta.empty(), []
         metadata = self.kv_retrieve_meta(keys, PUBLIC_PARTITION)

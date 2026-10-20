@@ -729,12 +729,13 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: l
 
 
 def kv_clear_unlinked_public() -> list[str]:
-    """Clear every key in ``PUBLIC_PARTITION`` that no key links to, and return those keys.
+    """Clear every key in ``PUBLIC_PARTITION`` that keys linked to but none links to now; return them.
 
     For example, after clearing a step's trajectories, this frees the prompt videos no
-    trajectory reads any more. A public key that is put but not linked yet is cleared too,
-    so call it when no writer is between its ``kv_put`` and ``kv_link``. A ``kv_link``
-    that races with it is refused for the keys it clears.
+    trajectory reads any more. A public key never linked yet is left alone, so a producer
+    between its ``kv_put`` and ``kv_link`` is safe; clear such a key with ``kv_clear``. A
+    ``kv_link`` that races with it is refused for the keys it clears. ``PUBLIC_PARTITION``
+    is shared by every job on this TransferQueue, so prefix public keys with a job id.
 
     Example:
         >>> tq.kv_clear(trajectory_keys, partition_id="train")

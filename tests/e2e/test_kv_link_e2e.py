@@ -207,15 +207,16 @@ def test_public_key_cannot_be_cleared_while_linked(tq_system):
     assert all(not _links(key) for key in keys[1:])
 
 
-def test_clear_unlinked_public_frees_only_unlinked_keys(tq_system):
+def test_clear_unlinked_public_frees_only_keys_no_longer_linked(tq_system):
     keys0, keys1 = _put_group(0), _put_group(1)
+    # Put but not linked yet, as by a producer between kv_put and kv_link.
     tq.kv_put(key="p2", partition_id=PUBLIC, fields={"prompt": _prompt(2)})
     tq.kv_clear(keys1[:2], PARTITION)
     tq.kv_clear(keys1[2:], PARTITION, fields="prompt")
 
-    assert tq.kv_clear_unlinked_public() == ["p1", "p2"]
+    assert tq.kv_clear_unlinked_public() == ["p1"]
 
-    assert tq.kv_list(PUBLIC)[PUBLIC].keys() == {"p0"}
+    assert tq.kv_list(PUBLIC)[PUBLIC].keys() == {"p0", "p2"}
     with pytest.raises(ValueError, match="not found"):
         tq.kv_batch_get("p1", PUBLIC)
     assert _rows(tq.kv_batch_get(keys0, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
@@ -223,7 +224,8 @@ def test_clear_unlinked_public_frees_only_unlinked_keys(tq_system):
 
 
 def test_link_refuses_a_key_marked_by_clear_unlinked_public(tq_system):
-    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    keys = _put_group(0)
+    tq.kv_clear(keys, PARTITION)
     controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
     ray.get(controller.mark_unlinked_public_clearing.remote())
 
