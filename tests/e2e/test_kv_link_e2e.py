@@ -179,6 +179,18 @@ def test_link_with_conflicting_dtype_creates_no_keys(tq_system):
     assert tq.kv_list(PARTITION)[PARTITION].keys() == {"a"}
 
 
+def test_link_a_tensor_into_a_field_put_as_non_tensor(tq_system):
+    # A put of a non-tensor value turns the field non-tensor for the partition, and later tensor puts still land.
+    tq.kv_put(key="text", partition_id=PARTITION, fields={"prompt": "no image"})
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+
+    tq.kv_link(["r0", "r1"], PARTITION, "p0", "prompt")
+
+    data = tq.kv_batch_get(["text", "r0", "r1"], PARTITION)["prompt"]
+    assert data[0] == "no image"
+    assert [row.tolist() for row in data[1:]] == [_prompt(0).tolist()] * 2
+
+
 def test_link_refuses_a_public_key_being_cleared(tq_system):
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
     source = tq.get_client().kv_describe(["p0"], PUBLIC)["rows"]["p0"]["global_index"]

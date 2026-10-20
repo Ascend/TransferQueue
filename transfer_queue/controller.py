@@ -624,6 +624,19 @@ class DataPartitionStatus:
             if dtype is not None and existing.dtype is not None and dtype != existing.dtype:
                 raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
 
+    def validate_link_schema(self, field_schema: dict[str, dict[str, Any]]) -> None:
+        """Reject only what linking would fail on: two tensor schemas of different dtypes.
+
+        A link merges like a put does, so a non-tensor schema on either side makes the field non-tensor.
+        """
+        for name, incoming in field_schema.items():
+            existing = self.field_metadata.get(name)
+            if existing is None or existing.is_non_tensor or incoming.get("is_non_tensor", False):
+                continue
+            dtype = incoming.get("dtype")
+            if dtype is not None and existing.dtype is not None and dtype != existing.dtype:
+                raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
+
     def _update_field_metadata(
         self,
         global_indexes: list[int],
@@ -2112,7 +2125,7 @@ class TransferQueueController:
                     "kv_clear those fields before linking them"
                 )
             metas = {name: public.field_metadata[name] for name in fields}
-            partition.validate_field_schema(
+            partition.validate_link_schema(
                 {name: {"dtype": meta.dtype, "is_non_tensor": meta.is_non_tensor} for name, meta in metas.items()}
             )
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
