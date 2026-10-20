@@ -825,18 +825,26 @@ class AsyncSimpleStorageManager(StorageManager):
         # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
         max_attempts = 1 if data_parser is not None else None
 
-        # A unit request reads the same fields for every row in it, and a row stores only its
-        # unlinked fields, so rows are grouped by the field set they physically hold. Without
-        # links this is one group in batch order, so batch_positions index parser_args.
-        fields_by_row: dict[int, set[str]] = defaultdict(set)
-        for global_index, links in zip(metadata.global_indexes, metadata._links, strict=True):
-            for field in metadata.field_names:
-                fields_by_row[links.get(field, global_index)].add(field)
+        # A unit request reads the same fields for every row in it, so rows are grouped by the
+        # fields read from them: a sample's own fields once per occurrence, so repeated keys
+        # keep their parser_args, and a linked field once per source row however many link to it.
+        # Without links this is one group in batch order, so batch_positions index parser_args.
         rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
-        for global_index, fields in fields_by_row.items():
-            rows_by_fields[tuple(sorted(fields))].append(global_index)
+        slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (sample, field) -> (fields, row)
+        linked_slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (source, field) -> slot
+        for pos, (global_index, links) in enumerate(zip(metadata.global_indexes, metadata._links, strict=True)):
+            own = tuple(f for f in metadata.field_names if f not in links)
+            if own:
+                slots.update({(pos, f): (own, len(rows_by_fields[own])) for f in own})
+                rows_by_fields[own].append(global_index)
+            for field in metadata.field_names:
+                if field in links:
+                    if (links[field], field) not in linked_slots:
+                        linked_slots[links[field], field] = ((field,), len(rows_by_fields[field,]))
+                        rows_by_fields[field,].append(links[field])
+                    slots[pos, field] = linked_slots[links[field], field]
         requests = [
-            (su_id, list(fields), group)
+            (su_id, fields, group)
             for fields, rows in rows_by_fields.items()
             for su_id, group in self._group_by_hash(rows).items()
         ]
@@ -845,11 +853,11 @@ class AsyncSimpleStorageManager(StorageManager):
             self._request_with_retry(
                 "get",
                 su_id,
-                f"samples={len(group.global_indexes)} fields={fields}",
+                f"samples={len(group.global_indexes)} fields={list(fields)}",
                 partial(
                     self._get_from_single_storage_unit,
                     group.global_indexes,
-                    fields,
+                    list(fields),
                     target_storage_unit=su_id,
                     data_parser=data_parser,
                     parser_args=None if parser_args is None else [parser_args[p] for p in group.batch_positions],
@@ -873,17 +881,13 @@ class AsyncSimpleStorageManager(StorageManager):
             )
             raise
 
-        values: dict[tuple[int, str], Any] = {}
-        for (_, _, group), (fields, su_data) in zip(requests, results, strict=True):
+        values: dict[tuple[tuple[tuple[str, ...], int], str], Any] = {}
+        for (_, fields, group), (_, su_data) in zip(requests, results, strict=True):
             for field in fields:
-                for i, global_index in enumerate(group.global_indexes):
-                    values[global_index, field] = su_data[field][i]
+                for i, row in enumerate(group.batch_positions):
+                    values[(fields, row), field] = su_data[field][i]
         ordered_data = {
-            field: [
-                values[links.get(field, global_index), field]
-                for global_index, links in zip(metadata.global_indexes, metadata._links, strict=True)
-            ]
-            for field in metadata.field_names
+            field: [values[slots[pos, field], field] for pos in range(metadata.size)] for field in metadata.field_names
         }
 
         tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}

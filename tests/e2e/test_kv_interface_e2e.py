@@ -812,6 +812,12 @@ class TestKVGetE2E:
         assert_nested_tensor_equal(retrieved["input_ids"], [input_ids[0, :2], input_ids[1, :3], input_ids[2, :1]])
         assert_tensor_equal(retrieved["scores"], scores * 10)
 
+        # A repeated key reads its own argument, and the keys after it keep theirs.
+        retrieved = tq_api.kv_batch_get(
+            keys=["parse_0", "parse_0", "parse_1"], partition_id=partition_id, data_parser=parse, parser_args=[1, 2, 3]
+        )
+        assert_nested_tensor_equal(retrieved["input_ids"], [input_ids[0, :1], input_ids[0, :2], input_ids[1, :3]])
+
         retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
         assert_tensor_equal(retrieved["input_ids"], input_ids)
         assert_tensor_equal(retrieved["scores"], scores)
