@@ -216,6 +216,7 @@ _num_shards: int | None = None  # the lock actor count, asked of shard 0 on firs
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
 _closes = 0  # this process's tq.close() calls: a lease created before the latest one is given up
+_inherited_after_fork: list = []  # a forked child's copies of the parent's handles, never released
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
 # the queue position. The bound is long because every waiter spends one call per window, and
 # those calls share the actor's limited throughput with everyone else's, renewals included.
@@ -585,7 +586,10 @@ def _close_lock_managers() -> None:
 
 def _reset_after_fork() -> None:
     # The child inherits keys, leases and Ray handles that belong to threads and connections it lacks.
+    # Releasing an inherited handle runs the parent's core worker in the child: that crashes the child,
+    # can report the parent's lock actors out of scope, and leaves the parent's GCS calls timing out.
     global _state_lock, _table, _registry, _leases, _renewer_running, _managers, _owned
+    _inherited_after_fork.append((_owned, _managers, _leases))
     _state_lock, _table = threading.Lock(), {}
     _registry, _leases, _renewer_running, _managers, _owned = threading.Condition(), {}, False, {}, []
 

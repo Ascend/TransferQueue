@@ -14,9 +14,11 @@
 # limitations under the License.
 
 import asyncio
+import gc
 import importlib
 import threading
 import time
+import weakref
 from unittest.mock import MagicMock
 
 import pytest
@@ -170,6 +172,26 @@ def test_invalid_lock_settings_raise_before_any_actor_starts(fake_lock_actors, m
     with pytest.raises(ValueError, match=f"{name} must be an integer >= 1"):
         kvl._lock_settings()
     fake_lock_actors.options.assert_not_called()
+
+
+def test_fork_child_keeps_inherited_lock_handles_referenced(monkeypatch):
+    class Handle:
+        pass
+
+    owned, managed = Handle(), Handle()
+    for name in ("_state_lock", "_table", "_registry", "_leases", "_renewer_running"):
+        monkeypatch.setattr(kvl, name, getattr(kvl, name))
+    monkeypatch.setattr(kvl, "_owned", [owned])
+    monkeypatch.setattr(kvl, "_managers", {0: managed})
+    monkeypatch.setattr(kvl, "_inherited_after_fork", [])
+    owned_ref, managed_ref = weakref.ref(owned), weakref.ref(managed)
+    del owned, managed
+
+    kvl._reset_after_fork()
+    gc.collect()
+
+    assert kvl._owned == [] and kvl._managers == {}
+    assert owned_ref() is not None and managed_ref() is not None
 
 
 def test_lock_settings_are_ignored_while_the_lock_is_off(monkeypatch):
