@@ -56,7 +56,8 @@ These count application reads, not filesystem read-ahead or physical disk traffi
 ## Format and compatibility
 
 Dumps use `format_version: 5`. Version 5 adds each row's `links`, the fields it reads
-from `PUBLIC_PARTITION` keys through `kv_link`; version 4 added `unfinalized`, the
+from `PUBLIC_PARTITION` keys through `kv_link`, recorded by public key name: load
+relinks to whatever those keys hold then, so load their dump first. Version 4 added `unfinalized`, the
 fields restore keeps hidden. This build also reads versions 3 and 4: version 4 rows
 have no links, and version 3 fields restore as ready. Older builds reject newer dumps
 instead of dropping linked fields or exposing hidden ones. The layout:

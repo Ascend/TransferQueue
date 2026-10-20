@@ -290,16 +290,24 @@ def test_update_refuses_a_linked_field(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
 
-def test_linked_keys_follow_public_readiness_and_shape(tq_system):
+def test_linked_public_key_is_read_only(tq_system):
     keys = _put_group(0)
 
-    tq.kv_update("p0", PUBLIC, {"prompt": _prompt(5, 5)}, merge_fn=lambda old, new: new, finalize=False)
-    with pytest.raises(ValueError, match="not ready"):
-        tq.kv_batch_get(keys, PARTITION, select_fields="prompt")
+    for write in (
+        lambda: tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(5, 5)}),
+        lambda: tq.kv_put(key="p0", partition_id=PUBLIC, tag={"step": 1}),
+        lambda: tq.kv_update("p0", PUBLIC, {"prompt": _prompt(5, 5)}, merge_fn=lambda old, new: new),
+    ):
+        with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+            write()
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
-    tq.kv_update("p0", PUBLIC, {"prompt": _prompt(5, 5)}, merge_fn=lambda old, new: new)
+    # A BatchMeta put skips the KV write path; linked keys still follow the new payload's shape.
+    client = tq.get_client()
+    meta = client.kv_retrieve_meta(["p0"], PUBLIC)
+    client.put(TensorDict({"prompt": _prompt(5, 5).unsqueeze(0)}, batch_size=1), metadata=meta)
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(5, 5).tolist()] * N
-    meta = tq.get_client().kv_retrieve_meta(keys, PARTITION)
+    meta = client.kv_retrieve_meta(keys, PARTITION)
     assert [tuple(shape) for shape in meta.get_shapes("prompt")] == [(5,)] * N
 
 

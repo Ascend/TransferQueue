@@ -1670,7 +1670,7 @@ class TransferQueueController:
                 partition.production_status[existing, :] = 0
 
     def _check_public_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
-        """Refuse to clear public payloads that keys of other partitions still link to."""
+        """Refuse to clear or rewrite public payloads that keys of other partitions still link to."""
         linked = set().union(*(p.linked_sources(global_indexes, field_names) for p in self.partitions.values()))
         if linked:
             public = self.partitions[PUBLIC_PARTITION]
@@ -1838,6 +1838,10 @@ class TransferQueueController:
 
         assert partition is not None
         global_indexes = partition.kv_retrieve_indexes(keys)
+        if create and partition_id == PUBLIC_PARTITION:
+            # create=True is the KV write path (kv_put, kv_update, restore); a linked public row
+            # stays read-only so linking keys never see their shared payload change.
+            self._check_public_not_linked([idx for idx in global_indexes if idx is not None])
 
         none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
         if len(none_indexes) > 0:

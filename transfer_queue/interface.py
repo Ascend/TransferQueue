@@ -702,10 +702,10 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: l
     Put a payload shared by many keys, e.g. the video of a GRPO prompt read by its n
     responses, once into ``tq.PUBLIC_PARTITION`` and link the keys to it. Its rows are
     spread evenly over the storage units, apart from the rows of every other partition.
-    Missing ``keys`` are created, and linked fields read the public key's current value
-    and are ready whenever its fields are. Putting a linked field stores a private value
-    in place of the link, and ``kv_update`` refuses it; clearing a linked key or field
-    drops only the link. ``public_key`` cannot be cleared while keys link to it.
+    Missing ``keys`` are created, and linked fields read the public key's payload and are
+    ready whenever its fields are. Putting a linked field stores a private value in place
+    of the link, and ``kv_update`` refuses it; clearing a linked key or field drops only
+    the link. ``public_key`` cannot be written or cleared while keys link to it.
 
     Args:
         keys: Single key or list of keys that will read the linked fields.
@@ -1547,8 +1547,9 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
     Args:
         dump_dir: Directory to write the dump into.
         keys: Keys to dump. Duplicates are dropped, first occurrence wins. Fields linked
-            by ``kv_link`` are dumped as links; dump their ``PUBLIC_PARTITION`` keys
-            separately and load that dump first.
+            by ``kv_link`` are dumped as links by public key name; dump those
+            ``PUBLIC_PARTITION`` keys too and load that dump first, since load relinks to
+            whatever the names hold then.
         partition_id: Partition that owns ``keys``.
 
     Returns:
