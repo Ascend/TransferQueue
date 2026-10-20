@@ -26,6 +26,7 @@ from tensordict import TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -1196,6 +1197,9 @@ class AsyncTransferQueueClient:
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """Asynchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
+        # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
+        if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support kv_link")
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.KV_LINK,

@@ -135,6 +135,19 @@ def test_link_refuses_a_field_the_key_stores_itself(tq_system):
     assert _links("r0") == {"prompt": "p0"}
 
 
+def test_link_requires_simple_storage_on_the_client_too(tq_system, monkeypatch):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    client = tq.get_client()
+    monkeypatch.setattr(client, "storage_manager", object())
+
+    with pytest.raises(NotImplementedError, match="does not support kv_link"):
+        client.kv_link(["r"], PARTITION, "p0", ["prompt"])
+    with pytest.raises(NotImplementedError, match="does not support kv_link"):
+        tq.kv_link("r", PARTITION, "p0", "prompt")
+    monkeypatch.undo()
+    assert tq.kv_list().get(PARTITION, {}) == {}
+
+
 def test_link_with_conflicting_dtype_creates_no_keys(tq_system):
     tq.kv_put(key="a", partition_id=PARTITION, fields={"prompt": _prompt(0)})
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0).float()})

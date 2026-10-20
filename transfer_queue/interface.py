@@ -1278,9 +1278,6 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[
 async def async_kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: list[str] | str) -> None:
     """Asynchronously let ``keys`` read ``fields`` from ``public_key``. See ``kv_link``."""
     tq_client = _maybe_create_tq_client()
-    # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
-    if not isinstance(tq_client.storage_manager, AsyncSimpleStorageManager):
-        raise NotImplementedError(f"{type(tq_client.storage_manager).__name__} does not support kv_link")
     keys = [keys] if isinstance(keys, str) else keys
     _check_unique_keys(keys)
     await tq_client.async_kv_link(keys, partition_id, public_key, [fields] if isinstance(fields, str) else fields)
