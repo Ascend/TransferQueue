@@ -1650,8 +1650,8 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
         )
         if unready:
             raise ValueError(f"linked fields of {PUBLIC_PARTITION!r} keys {unready} are not ready; load them first")
-    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
-    # One kv_link per public key and field set.
+    # Links first: kv_link checks field types before creating any key, so an incompatible
+    # destination fails before any payload is written. One kv_link per public key and field set.
     link_groups: dict[tuple[str, tuple[str, ...]], list[str]] = defaultdict(list)
     for key, row in rows.items():
         links = row.get("links", {})
@@ -1659,5 +1659,6 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
             link_groups[public_key, tuple(sorted(name for name, k in links.items() if k == public_key))].append(key)
     for (public_key, names), keys in link_groups.items():
         client.kv_link(keys, partition_id, public_key, list(names))
+    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

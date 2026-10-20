@@ -322,3 +322,18 @@ def test_dump_and_load_relink(tq_system, dump_test_root):
 
     assert all(_links(key) == {"prompt": "p0"} for key in keys)
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
+
+
+def test_load_with_an_incompatible_linked_field_writes_nothing(tq_system, dump_test_root):
+    keys = _put_group(0)
+    tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
+    linked_dir = dump_test_root / "incompatible_link_dump"
+    tq.dump_data_by_key(linked_dir, keys, PARTITION)
+    tq.get_client().clear_partition(PARTITION)
+    tq.kv_put(key="other", partition_id=PARTITION, fields={"prompt": _prompt(0).float()})
+
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        tq.load_data_by_key(linked_dir)
+    shutil.rmtree(linked_dir)
+
+    assert tq.kv_list(PARTITION)[PARTITION].keys() == {"other"}
