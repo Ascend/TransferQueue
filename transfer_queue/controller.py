@@ -2043,11 +2043,13 @@ class TransferQueueController:
 
         Raises:
             KeyError: ``public_key`` does not exist.
-            ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, or ``fields`` is empty or not
-                all produced by ``public_key``.
+            ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, ``keys`` or ``fields`` is empty,
+                or ``public_key`` has not produced all ``fields``.
         """
         if partition_id == PUBLIC_PARTITION:
             raise ValueError(f"keys of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
+        if not keys:
+            raise ValueError("keys must not be empty")
         public = self._get_partition(PUBLIC_PARTITION)
         if public is None or public_key not in public.keys_mapping:
             raise KeyError(f"key {public_key!r} not found in partition {PUBLIC_PARTITION!r}")

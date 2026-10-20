@@ -117,6 +117,8 @@ def test_link_requires_a_produced_public_field(tq_system):
         tq.kv_link("r", PUBLIC, "p0", "prompt")
     with pytest.raises(ValueError, match="duplicates"):
         tq.kv_link(["r", "r"], PARTITION, "p0", "prompt")
+    with pytest.raises(RuntimeError, match="must not be empty"):
+        tq.kv_link([], PARTITION, "p0", "prompt")
     assert tq.kv_list().get(PARTITION, {}) == {}
 
 
