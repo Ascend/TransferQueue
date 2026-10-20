@@ -55,10 +55,11 @@ These count application reads, not filesystem read-ahead or physical disk traffi
 
 ## Format and compatibility
 
-Dumps use `format_version: 4`. Version 4 adds each row's `unfinalized` fields, which
-restore keeps hidden. This build also reads version 3 dumps, whose fields restore as
-ready. Builds that only read version 3 reject version 4 dumps instead of exposing
-hidden fields. The layout:
+Dumps use `format_version: 5`. Version 5 adds each row's `links`, the fields it reads
+from `PUBLIC_PARTITION` keys through `kv_link`; version 4 added `unfinalized`, the
+fields restore keeps hidden. This build also reads versions 3 and 4: version 4 rows
+have no links, and version 3 fields restore as ready. Older builds reject newer dumps
+instead of dropping linked fields or exposing hidden ones. The layout:
 
 ```text
 dump_info.json

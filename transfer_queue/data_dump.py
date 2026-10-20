@@ -42,10 +42,11 @@ from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-DUMP_FORMAT_VERSION = 4
-# Version 3 predates ``unfinalized``; every field it holds was ready. A version-3 reader
-# rejects version 4 instead of restoring hidden fields as ready.
-_READABLE_FORMAT_VERSIONS = (3, DUMP_FORMAT_VERSION)
+DUMP_FORMAT_VERSION = 5
+# Version 3 predates ``unfinalized``, so every field it holds was ready; version 4 predates
+# ``links``. Older readers reject newer dumps instead of restoring hidden fields as ready or
+# dropping linked fields, which ``fields`` leaves out.
+_READABLE_FORMAT_VERSIONS = (3, 4, DUMP_FORMAT_VERSION)
 SHARD_SUBDIR = "shards"
 
 _DUMP_INFO_FILE = "dump_info.json"
