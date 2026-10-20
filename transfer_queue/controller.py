@@ -1671,13 +1671,22 @@ class TransferQueueController:
 
     def _check_public_not_linked(self, global_indexes: list[int], field_names: list[str] | None = None) -> None:
         """Refuse to clear or rewrite public payloads that keys of other partitions still link to."""
-        linked = set().union(*(p.linked_sources(global_indexes, field_names) for p in self.partitions.values()))
+        linked: set[int] = set()
+        linkers: list[str] = []
+        for p in self.partitions.values():
+            for source in p.linked_sources(global_indexes, field_names):
+                linked.add(source)
+                linkers.extend(
+                    f"{p.partition_id}:{p.revert_keys_mapping.get(idx, idx)}"
+                    for idx in p.linked_by[source]
+                    if field_names is None or any(p.links[idx].get(name) == source for name in field_names)
+                )
         if linked:
             public = self.partitions[PUBLIC_PARTITION]
             keys = sorted(str(public.revert_keys_mapping.get(idx, idx)) for idx in linked)
             raise ValueError(
-                f"keys {keys} in partition {PUBLIC_PARTITION!r} are linked by keys of other partitions; "
-                "clear those keys first"
+                f"keys {keys} in partition {PUBLIC_PARTITION!r} are linked by keys of other partitions "
+                f"({len(linkers)} keys, e.g. {sorted(linkers)[:20]}); clear those keys first"
             )
 
     def _unlink_released_public(self, global_indexes: list[int]) -> None:
@@ -1995,10 +2004,10 @@ class TransferQueueController:
 
         Returns:
             ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
-            {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` lists the row's stored fields and is
-            empty for a row with no produced field yet; ``unfinalized`` lists the stored fields not yet
-            ready (written by ``kv_update(finalize=False)``); ``links`` maps each linked field to its
-            key in ``PUBLIC_PARTITION``; ``field_schema`` covers the described rows' stored fields.
+            {field: {"is_nested", "is_non_tensor"}}}``. ``fields`` lists the row's readable fields, linked
+            ones included, and is empty for a row with no produced field yet; ``unfinalized`` lists those
+            not yet ready (written by ``kv_update(finalize=False)``); ``links`` maps each linked field to
+            its key in ``PUBLIC_PARTITION``; ``field_schema`` covers the described rows' stored fields.
 
         Raises:
             KeyError: The partition or any key does not exist.
@@ -2019,7 +2028,7 @@ class TransferQueueController:
             fields = sorted(
                 field_name
                 for field_name, field_meta in partition.field_metadata.items()
-                if global_index in field_meta.global_indexes and field_name not in links
+                if global_index in field_meta.global_indexes
             )
             rows[key] = {
                 "global_index": global_index,
@@ -2036,7 +2045,7 @@ class TransferQueueController:
         field_schema = {
             name: {"is_nested": bool(meta.is_nested), "is_non_tensor": bool(meta.is_non_tensor)}
             for name, meta in partition.field_metadata.items()
-            if any(name in row["fields"] for row in rows.values())
+            if any(name in row["fields"] and name not in row["links"] for row in rows.values())
         }
         return {"rows": rows, "field_schema": field_schema}
 

@@ -1216,9 +1216,10 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
         partition_id: Partition containing the keys.
 
     Returns:
-        ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every stored field of
-        the key and ``unfinalized`` the subset that is not ready yet. ``links`` maps each field
-        linked by ``kv_link`` to its key in ``PUBLIC_PARTITION``, whose readiness it shares.
+        ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every field the key
+        can read, linked ones included, and ``unfinalized`` the subset that is not ready yet.
+        ``links`` maps each field linked by ``kv_link`` to its key in ``PUBLIC_PARTITION``,
+        whose readiness it shares.
 
     Raises:
         RuntimeError: If the partition or any key does not exist.
@@ -1578,6 +1579,10 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         description = client.kv_describe(unique_keys, partition_id) if unique_keys else {"rows": {}, "field_schema": {}}
         row_index = {"partition_id": partition_id, **description}
         rows = row_index["rows"]
+        # Linked payloads stay with their public keys; the row index records them as links.
+        for row in rows.values():
+            row["fields"] = [name for name in row["fields"] if name not in row["links"]]
+            row["unfinalized"] = [name for name in row["unfinalized"] if name not in row["links"]]
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.
         fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}

@@ -24,6 +24,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 import transfer_queue as tq
+from transfer_queue.data_dump import _read_row_index
 
 PUBLIC = tq.PUBLIC_PARTITION
 PARTITION = "link"
@@ -103,7 +104,11 @@ def test_linked_keys_read_the_public_payload(tq_system):
 
     assert _rows(data["prompt"]) == [_prompt(0).tolist()] * N + [_prompt(10).tolist()] * N
     assert _rows(data["response"]) == [[i] for i in range(len(keys))]
-    assert _links(keys[0]) == {"prompt": "p0"}
+    assert tq.kv_describe(keys[0], PARTITION)[keys[0]] == {
+        "fields": ["prompt", "response"],
+        "unfinalized": [],
+        "links": {"prompt": "p0"},
+    }
 
 
 def test_link_requires_a_produced_public_field(tq_system):
@@ -185,7 +190,7 @@ def test_link_made_while_its_public_key_is_cleared_is_dropped(tq_system):
 def test_public_key_cannot_be_cleared_while_linked(tq_system):
     keys = _put_group(0)
 
-    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+    with pytest.raises(RuntimeError, match=r"linked by keys of other partitions \(3 keys, e.g. \['link:p0_r0'"):
         tq.kv_clear("p0", PUBLIC)
     with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
         tq.kv_clear("p0", PUBLIC, fields="prompt")
@@ -334,6 +339,7 @@ def test_dump_and_load_relink(tq_system, dump_test_root):
         tq.load_data_by_key(linked_dir)
     assert tq.kv_list().get(PARTITION, {}) == {}
 
+    assert _read_row_index(linked_dir)["rows"][keys[0]]["fields"] == []
     tq.load_data_by_key(public_dir)
     tq.load_data_by_key(linked_dir)
     shutil.rmtree(public_dir)
