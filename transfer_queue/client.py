@@ -1200,11 +1200,11 @@ class AsyncTransferQueueClient:
         self,
         keys: list[str],
         partition_id: str,
-        public_key: str,
+        public_keys: list[str],
         fields: list[str],
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Asynchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
+        """Asynchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
         # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
         if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support kv_link")
@@ -1212,7 +1212,7 @@ class AsyncTransferQueueClient:
             socket=socket,
             request_type=ZMQRequestType.KV_LINK,
             response_type=ZMQRequestType.KV_LINK_RESPONSE,
-            body={"keys": keys, "partition_id": partition_id, "public_key": public_key, "fields": fields},
+            body={"keys": keys, "partition_id": partition_id, "public_keys": public_keys, "fields": fields},
         )
 
     async def async_clear_unlinked_public(self) -> list[str]:
@@ -2032,9 +2032,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._kv_describe(keys, partition_id)
 
-    def kv_link(self, keys: list[str], partition_id: str, public_key: str, fields: list[str]) -> None:
-        """Synchronously make ``fields`` of ``keys`` read the payload of ``public_key``; see ``kv_link``."""
-        return self._kv_link(keys, partition_id, public_key, fields)
+    def kv_link(self, keys: list[str], partition_id: str, public_keys: list[str], fields: list[str]) -> None:
+        """Synchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        return self._kv_link(keys, partition_id, public_keys, fields)
 
     def clear_unlinked_public(self) -> list[str]:
         """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""

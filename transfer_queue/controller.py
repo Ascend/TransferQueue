@@ -2053,33 +2053,44 @@ class TransferQueueController:
         }
         return {"rows": rows, "field_schema": field_schema}
 
-    def kv_link(self, keys: list[str], partition_id: str, public_key: str, fields: list[str]) -> None:
-        """Make ``fields`` of ``keys`` read the payload of ``public_key`` in ``PUBLIC_PARTITION``.
+    def kv_link(self, keys: list[str], partition_id: str, public_keys: list[str], fields: list[str]) -> None:
+        """Make ``fields`` of each key read the payload of its key in ``PUBLIC_PARTITION``.
 
-        Missing ``keys`` are created. ``public_key`` must already have produced ``fields``.
+        ``public_keys`` is aligned with ``keys``. Missing ``keys`` are created. Every check
+        runs before anything changes, so a refused call creates no key and links nothing.
 
         Raises:
-            KeyError: ``public_key`` does not exist.
+            KeyError: A public key does not exist.
             ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, ``keys`` or ``fields`` is empty,
-                ``public_key`` has not produced all ``fields``, or a key stores one of them itself.
+                ``public_keys`` is not aligned with ``keys``, a public key has not produced all
+                ``fields``, or a key stores one of them itself.
         """
         if partition_id == PUBLIC_PARTITION:
             raise ValueError(f"keys of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
         if not keys:
             raise ValueError("keys must not be empty")
+        if len(public_keys) != len(keys):
+            raise ValueError(f"{len(public_keys)} public keys for {len(keys)} keys")
         public = self._get_partition(PUBLIC_PARTITION)
-        if public is None or public_key not in public.keys_mapping:
-            raise KeyError(f"key {public_key!r} not found in partition {PUBLIC_PARTITION!r}")
-        source = public.keys_mapping[public_key]
+        absent = sorted({k for k in public_keys if public is None or k not in public.keys_mapping})
+        if absent:
+            raise KeyError(f"keys {absent[:20]} not found in partition {PUBLIC_PARTITION!r}")
+        assert public is not None
+        sources = [public.keys_mapping[k] for k in public_keys]
         # Production status, not field metadata: mark_clearing zeroes it before storage deletes the payload.
-        missing = [
-            name
-            for name in fields
-            if name not in public.field_name_mapping
-            or public.production_status[source, public.field_name_mapping[name]] != 1
-        ]
-        if not fields or missing:
-            raise ValueError(f"public key {public_key!r} must have produced fields {missing or fields}")
+        unproduced = sorted(
+            {
+                public_key
+                for public_key, source in zip(public_keys, sources, strict=True)
+                if any(
+                    name not in public.field_name_mapping
+                    or public.production_status[source, public.field_name_mapping[name]] != 1
+                    for name in fields
+                )
+            }
+        )
+        if not fields or unproduced:
+            raise ValueError(f"public keys {unproduced[:20]} must have produced fields {fields}")
         # Before creating keys, so an incompatible link leaves none behind.
         partition = self._get_partition(partition_id)
         if partition is not None:
@@ -2107,8 +2118,12 @@ class TransferQueueController:
         metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
         partition = self._get_partition(partition_id)
         assert partition is not None
-        partition.link_fields(metadata.global_indexes, public, source, fields)
-        public.ever_linked.add(source)
+        rows_by_source: dict[int, list[int]] = defaultdict(list)
+        for idx, source in zip(metadata.global_indexes, sources, strict=True):
+            rows_by_source[source].append(idx)
+        for source, indexes in rows_by_source.items():
+            partition.link_fields(indexes, public, source, fields)
+            public.ever_linked.add(source)
 
     def mark_unlinked_public_clearing(self) -> tuple[BatchMeta, list[str]]:
         """Mark every ``PUBLIC_PARTITION`` key that keys linked to before but none links to now as clearing.
@@ -2566,7 +2581,7 @@ class TransferQueueController:
 
     def _handle_kv_link_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
-        self.kv_link(params["keys"], params["partition_id"], params["public_key"], params["fields"])
+        self.kv_link(params["keys"], params["partition_id"], params["public_keys"], params["fields"])
         return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
 
     def _handle_mark_unlinked_public_clearing_request(self, request_msg: ZMQMessage) -> ZMQMessage:

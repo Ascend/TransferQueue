@@ -696,7 +696,7 @@ def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str |
     tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id, fields=fields))
 
 
-def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: list[str] | str) -> None:
+def kv_link(keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str) -> None:
     """Let ``keys`` read ``fields`` from ``public_key`` in ``PUBLIC_PARTITION`` without another copy.
 
     Put a payload shared by many keys, e.g. the video of a GRPO prompt read by its n
@@ -711,18 +711,22 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: l
     Args:
         keys: Single key or list of keys that will read the linked fields.
         partition_id: Partition holding ``keys``; not ``PUBLIC_PARTITION``.
-        public_key: Key in ``PUBLIC_PARTITION`` that has produced ``fields``.
+        public_key: Key in ``PUBLIC_PARTITION`` that has produced ``fields``, or a list of
+            such keys aligned with ``keys`` to link a whole batch in one atomic call.
         fields: Single field name or list of field names to link.
 
     Raises:
-        RuntimeError: If ``public_key`` does not exist or has not produced all of ``fields``,
-            or ``partition_id`` is ``PUBLIC_PARTITION``.
+        RuntimeError: If a public key does not exist or has not produced all of ``fields``,
+            a list ``public_key`` is not aligned with ``keys``, or ``partition_id`` is
+            ``PUBLIC_PARTITION``. Nothing is created or linked then.
         ValueError: If ``keys`` contains duplicates.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Example:
         >>> tq.kv_put(key="prompt_0", partition_id=tq.PUBLIC_PARTITION, fields={"video": video})
         >>> tq.kv_link([f"prompt_0_{i}" for i in range(n)], "train", "prompt_0", "video")
+        >>> # A batch of prompts at once: each response key with its own prompt key.
+        >>> tq.kv_link(response_keys, "train", [key.rsplit("_", 1)[0] for key in response_keys], "video")
     """
     tq_client = _maybe_create_tq_client()
     tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
@@ -1278,12 +1282,15 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[
         await tq_client.async_clear_samples(batch_meta)
 
 
-async def async_kv_link(keys: list[str] | str, partition_id: str, public_key: str, fields: list[str] | str) -> None:
+async def async_kv_link(
+    keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str
+) -> None:
     """Asynchronously let ``keys`` read ``fields`` from ``public_key``. See ``kv_link``."""
     tq_client = _maybe_create_tq_client()
     keys = [keys] if isinstance(keys, str) else keys
     _check_unique_keys(keys)
-    await tq_client.async_kv_link(keys, partition_id, public_key, [fields] if isinstance(fields, str) else fields)
+    public_keys = [public_key] * len(keys) if isinstance(public_key, str) else public_key
+    await tq_client.async_kv_link(keys, partition_id, public_keys, [fields] if isinstance(fields, str) else fields)
 
 
 async def async_kv_clear_unlinked_public() -> list[str]:
@@ -1659,14 +1666,14 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
         if unready:
             raise ValueError(f"linked fields of {PUBLIC_PARTITION!r} keys {unready} are not ready; load them first")
     # Links first: kv_link checks field types before creating any key, so an incompatible
-    # destination fails before any payload is written. One kv_link per public key and field set.
-    link_groups: dict[tuple[str, tuple[str, ...]], list[str]] = defaultdict(list)
+    # destination fails before any payload is written. One kv_link per linked field set.
+    link_groups: dict[tuple[str, ...], list[tuple[str, str]]] = defaultdict(list)
     for key, row in rows.items():
         links = row.get("links", {})
         for public_key in set(links.values()):
-            link_groups[public_key, tuple(sorted(name for name, k in links.items() if k == public_key))].append(key)
-    for (public_key, names), keys in link_groups.items():
-        client.kv_link(keys, partition_id, public_key, list(names))
+            link_groups[tuple(sorted(name for name, k in links.items() if k == public_key))].append((key, public_key))
+    for names, pairs in link_groups.items():
+        client.kv_link([key for key, _ in pairs], partition_id, [public_key for _, public_key in pairs], list(names))
     bytes_read = client.load_rows_by_key(partition_id, rows, shards)
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

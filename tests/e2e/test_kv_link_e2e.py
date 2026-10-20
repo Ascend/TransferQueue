@@ -127,6 +127,23 @@ def test_link_requires_a_produced_public_field(tq_system):
     assert tq.kv_list().get(PARTITION, {}) == {}
 
 
+def test_link_a_batch_of_public_keys_in_one_call(tq_system):
+    for p in range(2):
+        tq.kv_put(key=f"p{p}", partition_id=PUBLIC, fields={"prompt": _prompt(p)})
+    keys = ["p0_r0", "p0_r1", "p1_r0"]
+
+    with pytest.raises(RuntimeError, match="2 public keys for 3 keys"):
+        tq.kv_link(keys, PARTITION, ["p0", "p1"], "prompt")
+    # Atomic: one missing public key links and creates nothing.
+    with pytest.raises(RuntimeError, match=r"keys \['missing'\] not found"):
+        tq.kv_link(keys, PARTITION, ["p0", "p0", "missing"], "prompt")
+    assert tq.kv_list().get(PARTITION, {}) == {}
+
+    tq.kv_link(keys, PARTITION, ["p0", "p0", "p1"], "prompt")
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * 2 + [_prompt(1).tolist()]
+    assert [_links(key) for key in keys] == [{"prompt": "p0"}, {"prompt": "p0"}, {"prompt": "p1"}]
+
+
 def test_link_refuses_a_field_the_key_stores_itself(tq_system):
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
     tq.kv_put(key="r0", partition_id=PARTITION, fields={"prompt": _prompt(7)})
@@ -146,7 +163,7 @@ def test_link_requires_simple_storage_on_the_client_too(tq_system, monkeypatch):
     monkeypatch.setattr(client, "storage_manager", object())
 
     with pytest.raises(NotImplementedError, match="does not support kv_link"):
-        client.kv_link(["r"], PARTITION, "p0", ["prompt"])
+        client.kv_link(["r"], PARTITION, ["p0"], ["prompt"])
     with pytest.raises(NotImplementedError, match="does not support kv_link"):
         tq.kv_link("r", PARTITION, "p0", "prompt")
     monkeypatch.undo()
