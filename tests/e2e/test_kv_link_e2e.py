@@ -122,6 +122,19 @@ def test_link_requires_a_produced_public_field(tq_system):
     assert tq.kv_list().get(PARTITION, {}) == {}
 
 
+def test_link_refuses_a_field_the_key_stores_itself(tq_system):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    tq.kv_put(key="r0", partition_id=PARTITION, fields={"prompt": _prompt(7)})
+
+    with pytest.raises(RuntimeError, match="already store"):
+        tq.kv_link(["r0", "r1"], PARTITION, "p0", "prompt")
+    assert tq.kv_list(PARTITION)[PARTITION].keys() == {"r0"}
+
+    tq.kv_clear("r0", PARTITION, fields="prompt")
+    tq.kv_link(["r0", "r1"], PARTITION, "p0", "prompt")
+    assert _links("r0") == {"prompt": "p0"}
+
+
 def test_link_with_conflicting_dtype_creates_no_keys(tq_system):
     tq.kv_put(key="a", partition_id=PARTITION, fields={"prompt": _prompt(0)})
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0).float()})

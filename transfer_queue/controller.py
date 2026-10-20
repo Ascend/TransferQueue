@@ -2044,7 +2044,7 @@ class TransferQueueController:
         Raises:
             KeyError: ``public_key`` does not exist.
             ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, ``keys`` or ``fields`` is empty,
-                or ``public_key`` has not produced all ``fields``.
+                ``public_key`` has not produced all ``fields``, or a key stores one of them itself.
         """
         if partition_id == PUBLIC_PARTITION:
             raise ValueError(f"keys of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
@@ -2066,6 +2066,23 @@ class TransferQueueController:
         # Before creating keys, so an incompatible link leaves none behind.
         partition = self._get_partition(partition_id)
         if partition is not None:
+            # Linking only redirects reads, so a value the key stores itself would stay in storage unread.
+            stored = [
+                key
+                for key, idx in zip(keys, partition.kv_retrieve_indexes(keys), strict=True)
+                if idx is not None
+                and any(
+                    name not in partition.links.get(idx, {})
+                    and name in partition.field_metadata
+                    and idx in partition.field_metadata[name].global_indexes
+                    for name in fields
+                )
+            ]
+            if stored:
+                raise ValueError(
+                    f"keys {stored[:20]} already store some of fields {fields}; "
+                    "kv_clear those fields before linking them"
+                )
             metas = {name: public.field_metadata[name] for name in fields}
             partition.validate_field_schema(
                 {name: {"dtype": meta.dtype, "is_non_tensor": meta.is_non_tensor} for name, meta in metas.items()}
