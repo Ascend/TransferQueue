@@ -1910,6 +1910,33 @@ class TransferQueueController:
 
         return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
+    def kv_exists(self, keys: list[str], partition_id: str) -> dict[str, list[str]]:
+        """Map each existing key to its ready fields, linked ones included, without logging the missing.
+
+        Unlike ``kv_retrieve_meta``, a missing key or partition is an expected answer here, so a
+        caller can probe keys that are usually absent without flooding the controller log.
+
+        Args:
+            keys: Keys to look up.
+            partition_id: Partition holding ``keys``.
+
+        Returns:
+            ``{key: sorted ready field names}`` for every key that exists; a missing key, or every
+            key of a missing partition, is left out. A key with no ready field maps to ``[]``.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            return {}
+        ready: dict[str, list[str]] = {}
+        for key, global_index in zip(keys, partition.kv_retrieve_indexes(keys), strict=True):
+            if global_index is None:
+                continue
+            row = partition.production_status[global_index]
+            ready[key] = sorted(
+                name for name, col in partition.field_name_mapping.items() if col < len(row) and row[col] == 1
+            )
+        return ready
+
     def kv_prepare_update(
         self, keys: list[str], partition_id: str, fields: list[str]
     ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
@@ -2138,11 +2165,15 @@ class TransferQueueController:
             partition.link_fields(indexes, public, source, fields)
             public.ever_linked.add(source)
 
-    def mark_unlinked_public_clearing(self) -> tuple[BatchMeta, list[str]]:
+    def mark_unlinked_public_clearing(self, stale_keys: list[str] | None = None) -> tuple[BatchMeta, list[str]]:
         """Mark every ``PUBLIC_PARTITION`` key that keys linked to before but none links to now as clearing.
 
         Selecting and marking in one controller call means a concurrent kv_link cannot link
         a row this clear deletes: kv_link refuses fields whose production status was zeroed.
+
+        Args:
+            stale_keys: Public keys the caller gave up waiting on; each one no key links to now
+                is marked too, even if none ever linked it. Missing keys are ignored.
 
         Returns:
             The marked rows' BatchMeta, for storage deletion and clear_meta, and their keys.
@@ -2151,7 +2182,8 @@ class TransferQueueController:
         if public is None:
             return BatchMeta.empty(), []
         linked = set().union(*(p.linked_by.keys() for p in self.partitions.values()))
-        keys = sorted(public.revert_keys_mapping[idx] for idx in public.ever_linked - linked)
+        stale = {public.keys_mapping[key] for key in stale_keys or () if key in public.keys_mapping}
+        keys = sorted(public.revert_keys_mapping[idx] for idx in (public.ever_linked | stale) - linked)
         if not keys:
             return BatchMeta.empty(), []
         metadata = self.kv_retrieve_meta(keys, PUBLIC_PARTITION)
@@ -2382,6 +2414,7 @@ class TransferQueueController:
             ZMQRequestType.KV_RETRIEVE_KEYS: self._handle_kv_retrieve_keys_request,
             ZMQRequestType.KV_LIST: self._handle_kv_list_request,
             ZMQRequestType.KV_DESCRIBE: self._handle_kv_describe_request,
+            ZMQRequestType.KV_EXISTS: self._handle_kv_exists_request,
             ZMQRequestType.KV_PREPARE_UPDATE: self._handle_kv_prepare_update_request,
             ZMQRequestType.VALIDATE_DUMP_SCHEMA: self._handle_validate_dump_schema_request,
             ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
@@ -2585,6 +2618,11 @@ class TransferQueueController:
         description = self.kv_describe(params["keys"], params["partition_id"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
 
+    def _handle_kv_exists_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        ready = self.kv_exists(keys=params["keys"], partition_id=params["partition_id"])
+        return self._make_response(request_msg, ZMQRequestType.KV_EXISTS_RESPONSE, {"ready": ready})
+
     def _handle_kv_prepare_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         metadata, merge_plan = self.kv_prepare_update(params["keys"], params["partition_id"], params["fields"])
@@ -2598,7 +2636,7 @@ class TransferQueueController:
         return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
 
     def _handle_mark_unlinked_public_clearing_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        metadata, keys = self.mark_unlinked_public_clearing()
+        metadata, keys = self.mark_unlinked_public_clearing(request_msg.body.get("stale_keys"))
         return self._make_response(
             request_msg, ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE, {"metadata": metadata, "keys": keys}
         )

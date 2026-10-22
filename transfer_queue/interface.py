@@ -668,6 +668,31 @@ def kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str,
     return tq_client._run_coroutine(async_kv_describe(keys=keys, partition_id=partition_id))
 
 
+def kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Report which keys exist and the fields each has ready, without logging the missing ones.
+
+    ``kv_describe`` raises and ``kv_batch_get`` warns for a missing key or partition; this
+    treats absence as an ordinary answer, for probing keys that are often not written yet,
+    e.g. whether another worker has already put a shared prompt.
+
+    Args:
+        keys: Single key or list of keys to look up.
+        partition_id: Partition containing the keys; it need not exist.
+
+    Returns:
+        ``{key: sorted ready field names}`` for every key that exists, linked fields included.
+        Missing keys are left out; a key with no ready field (e.g. being cleared) maps to ``[]``.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> ready = tq.kv_exists(keys=["prompt_0", "prompt_1"], partition_id=tq.PUBLIC_PARTITION)
+        >>> missing = [key for key in ("prompt_0", "prompt_1") if key not in ready]
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_exists(keys=keys, partition_id=partition_id))
+
+
 def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Clear key-value pairs from TransferQueue.
 
@@ -732,21 +757,26 @@ def kv_link(keys: list[str] | str, partition_id: str, public_key: str | list[str
     tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
 
 
-def kv_clear_unlinked_public() -> list[str]:
+def kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
     """Clear every key in ``PUBLIC_PARTITION`` that keys linked to but none links to now; return them.
 
     For example, after clearing a step's trajectories, this frees the prompt videos no
     trajectory reads any more. A public key never linked yet is left alone, so a producer
-    between its ``kv_put`` and ``kv_link`` is safe; clear such a key with ``kv_clear``. A
-    ``kv_link`` that races with it is refused for the keys it clears. ``PUBLIC_PARTITION``
-    is shared by every job on this TransferQueue, so prefix public keys with a job id.
+    between its ``kv_put`` and ``kv_link`` is safe; pass it in ``stale_keys`` once its
+    producer is given up on. A ``kv_link`` that races with it is refused for the keys it
+    clears. ``PUBLIC_PARTITION`` is shared by every job on this TransferQueue, so prefix
+    public keys with a job id.
+
+    Args:
+        stale_keys: Public keys to clear as well if no key links to them now, even if none
+            ever did, e.g. the keys a previous call left behind. Missing keys are ignored.
 
     Example:
         >>> tq.kv_clear(trajectory_keys, partition_id="train")
-        >>> freed = tq.kv_clear_unlinked_public()
+        >>> freed = tq.kv_clear_unlinked_public(stale_keys=keys_left_by_the_previous_step)
     """
     tq_client = _maybe_create_tq_client()
-    return tq_client._run_coroutine(async_kv_clear_unlinked_public())
+    return tq_client._run_coroutine(async_kv_clear_unlinked_public(stale_keys))
 
 
 def kv_update(
@@ -1244,6 +1274,13 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
     }
 
 
+async def async_kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Asynchronously report which keys exist and their ready fields. See ``kv_exists``."""
+    keys = [keys] if isinstance(keys, str) else keys
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_kv_exists(list(dict.fromkeys(keys)), partition_id)
+
+
 async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Asynchronously clear key-value pairs from TransferQueue.
 
@@ -1293,10 +1330,10 @@ async def async_kv_link(
     await tq_client.async_kv_link(keys, partition_id, public_keys, [fields] if isinstance(fields, str) else fields)
 
 
-async def async_kv_clear_unlinked_public() -> list[str]:
+async def async_kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
     """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to. See ``kv_clear_unlinked_public``."""
     tq_client = _maybe_create_tq_client()
-    return await tq_client.async_clear_unlinked_public()
+    return await tq_client.async_clear_unlinked_public(stale_keys)
 
 
 def _single_update_batch(fields: dict[str, Any]) -> TensorDict:

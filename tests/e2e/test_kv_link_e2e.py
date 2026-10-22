@@ -15,6 +15,7 @@
 
 """End-to-end tests for kv_link: n keys reading one PUBLIC_PARTITION payload without copies."""
 
+import asyncio
 import shutil
 
 import pytest
@@ -144,6 +145,26 @@ def test_link_a_batch_of_public_keys_in_one_call(tq_system):
     assert [_links(key) for key in keys] == [{"prompt": "p0"}, {"prompt": "p0"}, {"prompt": "p1"}]
 
 
+def test_exists_reports_ready_fields_and_omits_missing_keys(tq_system):
+    assert tq.kv_exists(["p0"], "never_created") == {}
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"meta": _prompt(1)})
+    tq.kv_link("r0", PARTITION, "p0", "prompt")
+
+    assert tq.kv_exists(["p0", "missing", "p0"], PUBLIC) == {"p0": ["meta", "prompt"]}
+    assert tq.kv_exists("r0", PARTITION) == {"r0": ["prompt"]}
+    assert asyncio.run(tq.async_kv_exists(["missing", "p0"], PUBLIC)) == {"p0": ["meta", "prompt"]}
+
+
+def test_exists_reports_no_ready_field_for_a_key_being_cleared(tq_system):
+    tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
+    source = tq.get_client().kv_describe(["p0"], PUBLIC)["rows"]["p0"]["global_index"]
+    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    ray.get(controller.mark_clearing.remote([source], [PUBLIC]))
+
+    assert tq.kv_exists("p0", PUBLIC) == {"p0": []}
+
+
 def test_link_refuses_a_field_the_key_stores_itself(tq_system):
     tq.kv_put(key="p0", partition_id=PUBLIC, fields={"prompt": _prompt(0)})
     tq.kv_put(key="r0", partition_id=PARTITION, fields={"prompt": _prompt(7)})
@@ -250,6 +271,19 @@ def test_clear_unlinked_public_frees_only_keys_no_longer_linked(tq_system):
         tq.kv_batch_get("p1", PUBLIC)
     assert _rows(tq.kv_batch_get(keys0, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
     assert tq.kv_clear_unlinked_public() == []
+
+
+def test_clear_unlinked_public_frees_stale_keys_no_key_links(tq_system):
+    keys0 = _put_group(0)
+    # Never linked, as when every waiter of a producer was cancelled before kv_link.
+    tq.kv_put(key="p1", partition_id=PUBLIC, fields={"prompt": _prompt(1)})
+    tq.kv_put(key="p2", partition_id=PUBLIC, fields={"prompt": _prompt(2)})
+
+    assert tq.kv_clear_unlinked_public(stale_keys=["p0", "p1", "missing"]) == ["p1"]
+
+    assert tq.kv_list(PUBLIC)[PUBLIC].keys() == {"p0", "p2"}
+    assert _rows(tq.kv_batch_get(keys0, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
+    assert asyncio.run(tq.async_kv_clear_unlinked_public(stale_keys=["p2"])) == ["p2"]
 
 
 def test_link_refuses_a_key_marked_by_clear_unlinked_public(tq_system):

@@ -1196,6 +1196,22 @@ class AsyncTransferQueueClient:
         return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
 
     @with_controller_socket
+    async def async_kv_exists(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, list[str]]:
+        """Asynchronously map each existing key to its ready fields; see ``kv_exists``."""
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_EXISTS,
+            response_type=ZMQRequestType.KV_EXISTS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return response.body["ready"]
+
+    @with_controller_socket
     async def async_kv_link(
         self,
         keys: list[str],
@@ -1215,25 +1231,27 @@ class AsyncTransferQueueClient:
             body={"keys": keys, "partition_id": partition_id, "public_keys": public_keys, "fields": fields},
         )
 
-    async def async_clear_unlinked_public(self) -> list[str]:
+    async def async_clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
         """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to; see ``kv_clear_unlinked_public``.
 
         Returns:
             The cleared keys.
         """
-        metadata, keys = await self._mark_unlinked_public_clearing()
+        metadata, keys = await self._mark_unlinked_public_clearing(stale_keys)
         if metadata.size > 0:
             await self.storage_manager.clear_data(metadata)
             await self._clear_meta_in_controller(metadata)
         return keys
 
     @with_controller_socket
-    async def _mark_unlinked_public_clearing(self, socket=None) -> tuple[BatchMeta, list[str]]:
+    async def _mark_unlinked_public_clearing(
+        self, stale_keys: list[str] | None, socket=None
+    ) -> tuple[BatchMeta, list[str]]:
         response = await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING,
             response_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE,
-            body={},
+            body={"stale_keys": stale_keys},
         )
         return response.body["metadata"], response.body["keys"]
 
@@ -2036,9 +2054,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """Synchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
         return self._kv_link(keys, partition_id, public_keys, fields)
 
-    def clear_unlinked_public(self) -> list[str]:
+    def clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
         """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""
-        return self._clear_unlinked_public()
+        return self._clear_unlinked_public(stale_keys)
 
     # ==================== Selective Data Dump API ====================
 
