@@ -28,14 +28,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import math
 import os
 import pickle
 import shutil
+import sys
 import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Thread
@@ -118,6 +121,23 @@ TQ_STORAGE_EXIT_ON_WORKER_DEATH = get_env_bool("TQ_STORAGE_EXIT_ON_WORKER_DEATH"
 
 # Distinguishes a worker-death abort from a normal exit in Ray's actor-failure logs.
 _WORKER_DEATH_EXIT_CODE = 70
+
+
+def _flush_log_output() -> None:
+    """Flush every handler this module's records reach, and stdio, since ``os._exit`` skips both.
+
+    ``get_logger`` adds no handler when an ancestor already has one, so the records can live
+    entirely in a parent's handlers. A failing flush is ignored: the process exits regardless.
+    """
+    current: logging.Logger | None = logger
+    while current is not None:
+        for handler in current.handlers:
+            with suppress(Exception):
+                handler.flush()
+        current = current.parent if current.propagate else None
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(Exception):
+            stream.flush()
 
 
 def _check_value_type(field: str, value: Any, is_tensor: bool, dtype: Any) -> None:
@@ -1097,10 +1117,7 @@ class SimpleStorageUnit:
             self._worker_loop(worker_socket, poller, perf_monitor)
         except BaseException:
             logger.critical(
-                f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception. "
-                f"This storage unit can no longer answer any request even though its process and "
-                f"ROUTER socket stay up; every client will time out until the job is restarted.",
-                exc_info=True,
+                f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception.", exc_info=True
             )
             self._abort_process("the worker thread died")
             raise
@@ -1131,8 +1148,7 @@ class SimpleStorageUnit:
             f"the unit fails visibly rather than lingering as one that cannot reply. "
             f"Set TQ_STORAGE_EXIT_ON_WORKER_DEATH=0 to keep the process alive for inspection."
         )
-        for handler in logger.handlers:
-            handler.flush()
+        _flush_log_output()
         os._exit(_WORKER_DEATH_EXIT_CODE)
 
     def _worker_loop(self, worker_socket: zmq.Socket, poller: zmq.Poller, perf_monitor: Any) -> None:
