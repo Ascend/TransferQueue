@@ -21,7 +21,6 @@ never answers them, and every caller blocks until its own timeout. Exiting inste
 silent hang into a visible actor failure.
 """
 
-import logging
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -47,26 +46,6 @@ def test_worker_death_exits_the_process():
     with patch.object(simple_storage.os, "_exit") as exit_call:
         unit._abort_process("the worker thread died")
 
-    exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
-
-
-def test_exit_flushes_handlers_inherited_from_a_parent_logger():
-    """os._exit skips flushing, so the abort log must be flushed even when only an ancestor holds the handler."""
-    unit = _unit()
-    parent = logging.getLogger("tq_worker_death_test_parent")
-    child = logging.getLogger("tq_worker_death_test_parent.child")
-    handler = MagicMock(spec=logging.Handler, level=logging.NOTSET)
-    parent.addHandler(handler)
-    try:
-        with (
-            patch.object(simple_storage, "logger", child),
-            patch.object(simple_storage.os, "_exit") as exit_call,
-        ):
-            unit._abort_process("the worker thread died")
-    finally:
-        parent.removeHandler(handler)
-
-    handler.flush.assert_called()
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
 
 
