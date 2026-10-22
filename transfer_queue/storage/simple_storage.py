@@ -111,9 +111,9 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
 
-# Exit the unit process when its worker thread dies. On by default: the worker is a daemon
-# thread, so without this the process keeps accepting requests it can never answer and every
-# caller blocks until its own timeout. Disable only to inspect a dead worker in place.
+# Exit the unit process when its worker or proxy thread dies, so the unit fails visibly. Both are
+# daemon threads, so without this the process keeps accepting requests it can never answer and
+# looks alive. Disable only to inspect a dead worker in place.
 TQ_STORAGE_EXIT_ON_WORKER_DEATH = get_env_bool("TQ_STORAGE_EXIT_ON_WORKER_DEATH", True)
 
 # Distinguishes a worker-death abort from a normal exit in Ray's actor-failure logs.
@@ -1110,7 +1110,7 @@ class SimpleStorageUnit:
             worker_socket.close(linger=0)
 
     def _abort_process(self, reason: str) -> None:
-        """Kill the whole unit process so callers fail fast instead of blocking on a dead unit.
+        """Kill the whole unit process so it fails visibly instead of lingering as a dead unit.
 
         The worker runs as a daemon thread, so re-raising only unwinds that thread while the
         process, its ROUTER and the proxy stay up and keep queueing requests nobody will ever
@@ -1128,7 +1128,7 @@ class SimpleStorageUnit:
 
         logger.critical(
             f"[{self.storage_unit_id}]: {reason}; exiting with code {_WORKER_DEATH_EXIT_CODE} so "
-            f"callers fail fast rather than blocking on a unit that cannot reply. "
+            f"the unit fails visibly rather than lingering as one that cannot reply. "
             f"Set TQ_STORAGE_EXIT_ON_WORKER_DEATH=0 to keep the process alive for inspection."
         )
         for handler in logger.handlers:
