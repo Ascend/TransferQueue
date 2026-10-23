@@ -216,7 +216,7 @@ _num_shards: int | None = None  # the lock actor count, asked of shard 0 on firs
 _managers: dict = {}  # shard -> TransferQueueLockManager handle, looked up on first use
 _owned: list = []  # the lock actors this process's tq.init() created, killed by its tq.close()
 _closes = 0  # this process's tq.close() calls: a lease created before the latest one is given up
-_inherited_after_fork: list = []  # a forked child's copies of the parent's handles, never released
+_inherited_after_fork: list = []
 # Longest one call waits inside a lock actor; waiting longer takes another call that keeps
 # the queue position. The bound is long because every waiter spends one call per window, and
 # those calls share the actor's limited throughput with everyone else's, renewals included.
