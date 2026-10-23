@@ -98,6 +98,7 @@ class PartitionIndexManager:
 
     @property
     def reusable_indexes(self) -> list[int]:
+        """Every reusable index, unit by unit and FIFO within each unit."""
         return [idx for pool in self.reusable_by_unit for idx in pool]
 
     def set_num_storage_units(self, num_storage_units: int, reusable_indexes: list[int] | None = None) -> None:
