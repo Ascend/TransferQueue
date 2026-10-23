@@ -178,20 +178,21 @@ def test_fork_child_keeps_inherited_lock_handles_referenced(monkeypatch):
     class Handle:
         pass
 
-    owned, managed = Handle(), Handle()
-    for name in ("_state_lock", "_table", "_registry", "_leases", "_renewer_running"):
+    owned, managed, lease = Handle(), Handle(), Handle()
+    for name in ("_state_lock", "_table", "_registry", "_renewer_running"):
         monkeypatch.setattr(kvl, name, getattr(kvl, name))
     monkeypatch.setattr(kvl, "_owned", [owned])
     monkeypatch.setattr(kvl, "_managers", {0: managed})
+    monkeypatch.setattr(kvl, "_leases", {"token": lease})
     monkeypatch.setattr(kvl, "_inherited_after_fork", [])
-    owned_ref, managed_ref = weakref.ref(owned), weakref.ref(managed)
-    del owned, managed
+    refs = [weakref.ref(obj) for obj in (owned, managed, lease)]
+    del owned, managed, lease
 
     kvl._reset_after_fork()
     gc.collect()
 
-    assert kvl._owned == [] and kvl._managers == {}
-    assert owned_ref() is not None and managed_ref() is not None
+    assert kvl._owned == [] and kvl._managers == {} and kvl._leases == {}
+    assert all(ref() is not None for ref in refs)
 
 
 def test_lock_settings_are_ignored_while_the_lock_is_off(monkeypatch):
