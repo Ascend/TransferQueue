@@ -383,13 +383,11 @@ def test_linked_public_key_is_read_only(tq_system):
             write()
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
-    # A BatchMeta put skips the KV write path; linked keys still follow the new payload's shape.
     client = tq.get_client()
     meta = client.kv_retrieve_meta(["p0"], PUBLIC)
-    client.put(TensorDict({"prompt": _prompt(5, 5).unsqueeze(0)}, batch_size=1), metadata=meta)
-    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(5, 5).tolist()] * N
-    meta = client.kv_retrieve_meta(keys, PARTITION)
-    assert [tuple(shape) for shape in meta.get_shapes("prompt")] == [(5,)] * N
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        client.put(TensorDict({"prompt": _prompt(5, 5).unsqueeze(0)}, batch_size=1), metadata=meta)
+    assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
 
 def test_dump_and_load_relink(tq_system, dump_test_root):
@@ -427,3 +425,72 @@ def test_load_with_an_incompatible_linked_field_writes_nothing(tq_system, dump_t
     shutil.rmtree(linked_dir)
 
     assert tq.kv_list(PARTITION)[PARTITION].keys() == {"other"}
+
+
+def _meta_group(p: int):
+    """Put prompt ``p`` into the public partition and N response rows, all through a BatchMeta with no keys."""
+    client = tq.get_client()
+    public_meta = client.put(TensorDict({"prompt": _prompt(p).unsqueeze(0)}, batch_size=1), partition_id=PUBLIC)
+    rows_meta = client.put(TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N), partition_id=PARTITION)
+    return public_meta, rows_meta
+
+
+def test_batch_meta_rows_read_a_public_row_put_through_a_batch_meta(tq_system):
+    client = tq.get_client()
+    public_meta, rows_meta = _meta_group(0)
+
+    linked = client.link(rows_meta, public_meta.select_samples([0] * N), "prompt")
+
+    data = client.get_data(linked)
+    assert _rows(data["prompt"]) == [_prompt(0).tolist()] * N
+    assert _rows(data["response"]) == [[i] for i in range(N)]
+    assert linked._links == [{"prompt": public_meta.global_indexes[0]}] * N
+
+
+def test_batch_meta_put_refuses_a_linked_public_row_until_no_row_links_it(tq_system):
+    client = tq.get_client()
+    public_meta, rows_meta = _meta_group(0)
+    linked = client.link(rows_meta, public_meta.select_samples([0] * N), "prompt")
+    rewrite = TensorDict({"prompt": _prompt(7).unsqueeze(0)}, batch_size=1)
+
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        client.put(rewrite, metadata=public_meta)
+    assert _rows(client.get_data(linked)["prompt"]) == [_prompt(0).tolist()] * N
+
+    client.clear_samples(linked)
+    client.put(rewrite, metadata=public_meta)
+    assert _rows(client.get_data(public_meta)["prompt"]) == [_prompt(7).tolist()]
+
+
+def test_unlinked_public_rows_without_keys_are_freed_once_their_rows_are_cleared(tq_system):
+    client = tq.get_client()
+    public_meta, rows_meta = _meta_group(0)
+    linked = client.link(rows_meta, public_meta.select_samples([0] * N), "prompt")
+
+    with pytest.raises(RuntimeError, match="linked by keys of other partitions"):
+        client.clear_samples(public_meta)
+
+    client.clear_samples(linked)
+    assert tq.kv_clear_unlinked_public() == []
+    _, more_rows = _meta_group(1)
+    with pytest.raises(RuntimeError, match="not found"):
+        client.link(more_rows, public_meta.select_samples([0] * N), "prompt")
+
+
+def test_batch_meta_link_refuses_what_kv_link_refuses(tq_system):
+    client = tq.get_client()
+    public_meta, rows_meta = _meta_group(0)
+    public_rows = public_meta.select_samples([0] * N)
+
+    with pytest.raises(RuntimeError, match="must have produced"):
+        client.link(rows_meta, public_rows, "response")
+    with pytest.raises(RuntimeError, match="cannot link"):
+        client.link(public_meta, public_meta, "prompt")
+    with pytest.raises(RuntimeError, match=f"1 public rows for {N} rows"):
+        client.link(rows_meta, public_meta, "prompt")
+    with pytest.raises(ValueError, match=f"only partition {PUBLIC!r}"):
+        client.link(rows_meta, rows_meta, "prompt")
+
+    client.put(TensorDict({"prompt": _prompt(5).unsqueeze(0).repeat(N, 1)}, batch_size=N), metadata=rows_meta)
+    with pytest.raises(RuntimeError, match="already store"):
+        client.link(rows_meta, public_rows, "prompt")

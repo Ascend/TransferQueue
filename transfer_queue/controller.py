@@ -64,6 +64,13 @@ TQ_CONTROLLER_ZMQ_MAX_SOCKETS = int(os.environ.get("TQ_CONTROLLER_ZMQ_MAX_SOCKET
 # shared by its n responses. Its rows are balanced over storage units like any partition's.
 PUBLIC_PARTITION = "__public__"
 
+
+def _fields_ready_in_all(partition: "DataPartitionStatus", global_indexes: list[int]) -> list[str]:
+    """Return the fields every one of ``global_indexes`` has produced, all fields for no rows."""
+    col_mask = partition.production_status[global_indexes, :].sum(dim=0).reshape(-1) == len(global_indexes)
+    return [name for name, col in partition.field_name_mapping.items() if col < len(col_mask) and col_mask[col]]
+
+
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
 # determine consumption status even before producers have generated the samples.
@@ -1900,14 +1907,7 @@ class TransferQueueController:
         verified_global_indexes = [idx for idx in global_indexes if idx is not None]
 
         # must fetch fields that the requested samples all have
-        col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
-            verified_global_indexes
-        )
-        data_fields = []
-        for field_name, col_idx in partition.field_name_mapping.items():
-            if col_idx < len(col_mask) and col_mask[col_idx]:
-                data_fields.append(field_name)
-
+        data_fields = _fields_ready_in_all(partition, verified_global_indexes)
         return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
     def kv_exists(self, keys: list[str], partition_id: str) -> dict[str, list[str]]:
@@ -2117,49 +2117,123 @@ class TransferQueueController:
             raise KeyError(f"keys {absent[:20]} not found in partition {PUBLIC_PARTITION!r}")
         assert public is not None
         sources = [public.keys_mapping[k] for k in public_keys]
-        # Production status, not field metadata: mark_clearing zeroes it before storage deletes the payload.
-        unproduced = sorted(
-            {
-                public_key
-                for public_key, source in zip(public_keys, sources, strict=True)
-                if any(
-                    name not in public.field_name_mapping
-                    or public.production_status[source, public.field_name_mapping[name]] != 1
-                    for name in fields
-                )
-            }
-        )
-        if not fields or unproduced:
-            raise ValueError(f"public keys {unproduced[:20]} must have produced fields {fields}")
-        # Before creating keys, so an incompatible link leaves none behind.
         partition = self._get_partition(partition_id)
-        if partition is not None:
-            # Linking only redirects reads, so a value the key stores itself would stay in storage unread.
-            stored = [
-                key
-                for key, idx in zip(keys, partition.kv_retrieve_indexes(keys), strict=True)
-                if idx is not None
-                and any(
-                    name not in partition.links.get(idx, {})
-                    and name in partition.field_metadata
-                    and idx in partition.field_metadata[name].global_indexes
-                    for name in fields
-                )
-            ]
-            if stored:
-                raise ValueError(
-                    f"keys {stored[:20]} already store some of fields {fields}; "
-                    "kv_clear those fields before linking them"
-                )
+        rows = [None] * len(keys) if partition is None else partition.kv_retrieve_indexes(keys)
+        # Before creating keys, so an incompatible link leaves none behind.
+        unproduced, stored = self._link_conflicts(partition, rows, public, sources, fields)
+        if not fields or unproduced:
+            raise ValueError(
+                f"public keys {sorted({public_keys[i] for i in unproduced})[:20]} must have produced fields {fields}"
+            )
+        if stored:
+            raise ValueError(
+                f"keys {[keys[i] for i in stored][:20]} already store some of fields {fields}; "
+                "kv_clear those fields before linking them"
+            )
+        metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
+        self._link_rows(partition_id, metadata.global_indexes, public, sources, fields)
+
+    def link(
+        self,
+        global_indexes: list[int],
+        partition_id: str,
+        public_indexes: list[int],
+        fields: list[str],
+        data_fields: list[str],
+    ) -> BatchMeta:
+        """Make ``fields`` of these rows read the payload of the aligned rows of ``PUBLIC_PARTITION``.
+
+        The BatchMeta counterpart of ``kv_link``: rows are named by global index, so neither side
+        needs a key. Every check runs before anything changes, so a refused call links nothing.
+
+        Returns:
+            The linked rows' BatchMeta over ``data_fields``, carrying the new links.
+
+        Raises:
+            KeyError: A row is not in its partition.
+            ValueError: ``partition_id`` is ``PUBLIC_PARTITION``, the rows are empty, repeated or not
+                aligned, a public row has not produced all ``fields``, or a row stores one of them itself.
+        """
+        if partition_id == PUBLIC_PARTITION:
+            raise ValueError(f"rows of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
+        if not global_indexes:
+            raise ValueError("rows must not be empty")
+        if len(public_indexes) != len(global_indexes):
+            raise ValueError(f"{len(public_indexes)} public rows for {len(global_indexes)} rows")
+        if len(set(global_indexes)) != len(global_indexes):
+            raise ValueError(f"rows must be unique, got {len(global_indexes) - len(set(global_indexes))} repeats")
+        public = self._get_partition(PUBLIC_PARTITION)
+        absent = sorted({idx for idx in public_indexes if public is None or idx not in public.global_indexes})
+        if absent:
+            raise KeyError(f"rows {absent[:20]} not found in partition {PUBLIC_PARTITION!r}")
+        partition = self._get_partition(partition_id)
+        missing = sorted({idx for idx in global_indexes if partition is None or idx not in partition.global_indexes})
+        if missing:
+            raise KeyError(f"rows {missing[:20]} not found in partition {partition_id!r}")
+        assert public is not None and partition is not None
+        unproduced, stored = self._link_conflicts(partition, global_indexes, public, public_indexes, fields)
+        if not fields or unproduced:
+            raise ValueError(
+                f"public rows {sorted({public_indexes[i] for i in unproduced})[:20]} must have produced fields {fields}"
+            )
+        if stored:
+            raise ValueError(
+                f"rows {[global_indexes[i] for i in stored][:20]} already store some of fields {fields}; "
+                "clear those fields before linking them"
+            )
+        self._link_rows(partition_id, global_indexes, public, public_indexes, fields)
+        return self.generate_batch_meta(partition_id, global_indexes, data_fields, mode="force_fetch")
+
+    def _link_conflicts(
+        self,
+        partition: "DataPartitionStatus | None",
+        rows: list[int | None],
+        public: "DataPartitionStatus",
+        sources: list[int],
+        fields: list[str],
+    ) -> tuple[list[int], list[int]]:
+        """Return the positions whose source lacks a field, and those whose row stores one itself.
+
+        Also refuses fields whose dtype the linking partition already holds differently.
+        """
+        # Production status, not field metadata: mark_clearing zeroes it before storage deletes the payload.
+        unproduced = [
+            pos
+            for pos, source in enumerate(sources)
+            if any(
+                name not in public.field_name_mapping
+                or public.production_status[source, public.field_name_mapping[name]] != 1
+                for name in fields
+            )
+        ]
+        if partition is None or unproduced or not fields:
+            return unproduced, []
+        # Linking only redirects reads, so a value the row stores itself would stay in storage unread.
+        stored = [
+            pos
+            for pos, idx in enumerate(rows)
+            if idx is not None
+            and any(
+                name not in partition.links.get(idx, {})
+                and name in partition.field_metadata
+                and idx in partition.field_metadata[name].global_indexes
+                for name in fields
+            )
+        ]
+        if not stored:
             metas = {name: public.field_metadata[name] for name in fields}
             partition.validate_link_schema(
                 {name: {"dtype": meta.dtype, "is_non_tensor": meta.is_non_tensor} for name, meta in metas.items()}
             )
-        metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
+        return unproduced, stored
+
+    def _link_rows(
+        self, partition_id: str, rows: list[int], public: "DataPartitionStatus", sources: list[int], fields: list[str]
+    ) -> None:
         partition = self._get_partition(partition_id)
         assert partition is not None
         rows_by_source: dict[int, list[int]] = defaultdict(list)
-        for idx, source in zip(metadata.global_indexes, sources, strict=True):
+        for idx, source in zip(rows, sources, strict=True):
             rows_by_source[source].append(idx)
         for source, indexes in rows_by_source.items():
             partition.link_fields(indexes, public, source, fields)
@@ -2176,19 +2250,22 @@ class TransferQueueController:
                 is marked too, even if none ever linked it. Missing keys are ignored.
 
         Returns:
-            The marked rows' BatchMeta, for storage deletion and clear_meta, and their keys.
+            The marked rows' BatchMeta, for storage deletion and clear_meta, and the keys of those
+            rows; a row put through a BatchMeta has no key, so it is in the BatchMeta only.
         """
         public = self._get_partition(PUBLIC_PARTITION)
         if public is None:
             return BatchMeta.empty(), []
         linked = set().union(*(p.linked_by.keys() for p in self.partitions.values()))
         stale = {public.keys_mapping[key] for key in stale_keys or () if key in public.keys_mapping}
-        keys = sorted(public.revert_keys_mapping[idx] for idx in (public.ever_linked | stale) - linked)
-        if not keys:
+        indexes = sorted((public.ever_linked | stale) - linked)
+        if not indexes:
             return BatchMeta.empty(), []
-        metadata = self.kv_retrieve_meta(keys, PUBLIC_PARTITION)
+        metadata = self.generate_batch_meta(
+            PUBLIC_PARTITION, indexes, _fields_ready_in_all(public, indexes), mode="force_fetch"
+        )
         self.mark_clearing(metadata.global_indexes, metadata.partition_ids)
-        return metadata, keys
+        return metadata, sorted(public.revert_keys_mapping[idx] for idx in indexes if idx in public.revert_keys_mapping)
 
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
@@ -2420,6 +2497,8 @@ class TransferQueueController:
             ZMQRequestType.KV_CLEAR_FIELDS: self._handle_kv_clear_fields_request,
             ZMQRequestType.KV_LINK: self._handle_kv_link_request,
             ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING: self._handle_mark_unlinked_public_clearing_request,
+            ZMQRequestType.LINK: self._handle_link_request,
+            ZMQRequestType.CHECK_PUBLIC_WRITE: self._handle_check_public_write_request,
             ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT: self._handle_save_controller_checkpoint_request,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT: self._handle_load_controller_checkpoint_request,
         }
@@ -2634,6 +2713,22 @@ class TransferQueueController:
         params = request_msg.body
         self.kv_link(params["keys"], params["partition_id"], params["public_keys"], params["fields"])
         return self._make_response(request_msg, ZMQRequestType.KV_LINK_RESPONSE, {})
+
+    def _handle_link_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        metadata = self.link(
+            params["global_indexes"],
+            params["partition_id"],
+            params["public_indexes"],
+            params["fields"],
+            params["data_fields"],
+        )
+        return self._make_response(request_msg, ZMQRequestType.LINK_RESPONSE, {"metadata": metadata})
+
+    def _handle_check_public_write_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        # A BatchMeta put names its rows directly, so it must be refused here, before storage is written.
+        self._check_public_not_linked(request_msg.body["global_indexes"])
+        return self._make_response(request_msg, ZMQRequestType.CHECK_PUBLIC_WRITE_RESPONSE, {})
 
     def _handle_mark_unlinked_public_clearing_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         metadata, keys = self.mark_unlinked_public_clearing(request_msg.body.get("stale_keys"))
