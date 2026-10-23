@@ -1492,3 +1492,77 @@ class TestFieldMetaIntegration:
         schema = field_meta.to_batch_schema([0, 1])
 
         assert schema["per_sample_shapes"] == [(3,), None]
+
+
+def test_index_manager_balances_each_partition_across_storage_units():
+    """Alternating one-row allocations put every row of a partition on one unit before."""
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    manager.set_num_storage_units(2)
+    for _ in range(4):
+        manager.allocate_indexes("__public__", 1)
+        manager.allocate_indexes("train", 1)
+    for partition_id in ("__public__", "train"):
+        assert sorted(idx % 2 for idx in manager.partition_to_indexes[partition_id]) == [0, 0, 1, 1]
+
+    manager.release_indexes("train", [idx for idx in manager.partition_to_indexes["train"] if idx % 2 == 0])
+    manager.allocate_indexes("val", 3)
+    assert sorted(idx % 2 for idx in manager.partition_to_indexes["val"]) == [0, 0, 1]
+    assert manager.unit_loads["train"] == [0, 2]
+
+    reusable = manager.reusable_indexes
+    manager.set_num_storage_units(2, reusable)
+    assert sorted(manager.reusable_indexes) == sorted(reusable)
+    assert manager.unit_loads == {"__public__": [2, 2], "train": [0, 2], "val": [2, 1]}
+
+
+def test_index_manager_with_one_unit_reuses_fifo():
+    from transfer_queue.controller import PartitionIndexManager
+
+    manager = PartitionIndexManager()
+    assert manager.allocate_indexes("p", 3) == [0, 1, 2]
+    manager.release_indexes("p", [2, 0])
+    assert manager.allocate_indexes("q", 3) == [2, 0, 3]
+
+
+class TestFieldLinks:
+    """Rows of a partition linking to a public row through DataPartitionStatus.link_fields."""
+
+    SCHEMA = {"x": {"dtype": "torch.int64", "shape": (3,), "is_nested": False, "is_non_tensor": False}}
+
+    def _public(self):
+        """Public row 0 holds ``x``."""
+        from transfer_queue.controller import PUBLIC_PARTITION, DataPartitionStatus
+
+        public = DataPartitionStatus(partition_id=PUBLIC_PARTITION)
+        assert public.update_production_status([0], ["x"], field_schema=self.SCHEMA)
+        return public
+
+    def test_source_index_follows_link_put_and_clear(self):
+        from transfer_queue.controller import DataPartitionStatus
+
+        public = self._public()
+        partition = DataPartitionStatus(partition_id="train")
+        partition.link_fields([1, 2], public, 0, ["x"])
+        assert partition.linked_by == {0: {1, 2}}
+        assert partition.field_metadata["x"].shape == (3,) and partition.production_status[[1, 2], 0].tolist() == [1, 1]
+        assert partition.linked_sources([0], ["x"]) == {0} and partition.linked_sources([0], ["y"]) == set()
+
+        assert partition.update_production_status([1], ["x"], field_schema=self.SCHEMA)
+        partition.clear_data([2])
+
+        assert partition.links == {} and partition.linked_by == {}
+        assert partition.linked_sources([0]) == set()
+
+    def test_checkpoint_saved_before_links_still_loads(self):
+        import pickle
+
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="old")
+        del partition.links, partition.linked_by
+        partition = pickle.loads(pickle.dumps(partition))
+
+        partition.link_fields([1], self._public(), 0, ["x"])
+        assert partition.linked_by == {0: {1}}

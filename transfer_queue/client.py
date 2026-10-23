@@ -24,8 +24,10 @@ import zmq
 import zmq.asyncio
 from tensordict import TensorDict
 
+from transfer_queue.controller import PUBLIC_PARTITION
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -416,8 +418,10 @@ class AsyncTransferQueueClient:
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
-            RuntimeError: If storage operation fails
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
+                other rows link to: those stay read-only until no row links to them
 
         Example:
             >>> batch_size = 4
@@ -466,6 +470,7 @@ class AsyncTransferQueueClient:
                     f"You may receive 2D tensors in key-value based backend."
                 )
 
+        inserted = metadata is None
         if metadata is None:
             if partition_id is None:
                 raise ValueError("partition_id must be provided if metadata is not given")
@@ -479,6 +484,20 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        # A read-modify-write would otherwise turn every link into a private copy without notice.
+        linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
+        if linked:
+            raise ValueError(
+                f"fields {linked} are linked by kv_link on some samples; leave them out of the put, "
+                "or kv_clear those fields first to store private values"
+            )
+        public_rows = [
+            idx
+            for idx, pid in zip(metadata.global_indexes, metadata.partition_ids, strict=True)
+            if pid == PUBLIC_PARTITION
+        ]
+        if public_rows and not inserted:
+            await self._check_public_write(public_rows)
 
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{self.client_id}] async_put"
@@ -1179,7 +1198,7 @@ class AsyncTransferQueueClient:
         key raises instead of being dropped.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "unfinalized", "tag"}}, "field_schema":
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
             {field: {"is_nested", "is_non_tensor"}}}``.
         """
         response = await self._request_controller(
@@ -1189,6 +1208,127 @@ class AsyncTransferQueueClient:
             body={"keys": keys, "partition_id": partition_id},
         )
         return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
+
+    @with_controller_socket
+    async def async_kv_exists(
+        self,
+        keys: list[str],
+        partition_id: str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> dict[str, list[str]]:
+        """Asynchronously map each existing key to its ready fields; see ``kv_exists``."""
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_EXISTS,
+            response_type=ZMQRequestType.KV_EXISTS_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id},
+        )
+        return response.body["ready"]
+
+    @with_controller_socket
+    async def async_kv_link(
+        self,
+        keys: list[str],
+        partition_id: str,
+        public_keys: list[str],
+        fields: list[str],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        """Asynchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
+        if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support kv_link")
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.KV_LINK,
+            response_type=ZMQRequestType.KV_LINK_RESPONSE,
+            body={"keys": keys, "partition_id": partition_id, "public_keys": public_keys, "fields": fields},
+        )
+
+    @with_controller_socket
+    async def async_link(
+        self,
+        metadata: BatchMeta,
+        public_metadata: BatchMeta,
+        fields: list[str] | str,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> BatchMeta:
+        """Asynchronously make ``fields`` of each row of ``metadata`` read the aligned row of ``public_metadata``.
+
+        The BatchMeta counterpart of ``kv_link``: neither side needs a key, so rows put through a
+        BatchMeta, e.g. ``put(data, partition_id=PUBLIC_PARTITION)``, can be shared too. A linked
+        public row is read-only, and ``clear_samples`` refuses it, until no row links to it;
+        ``kv_clear_unlinked_public`` then frees it.
+
+        Args:
+            metadata: Rows of one partition, not ``PUBLIC_PARTITION``, that will read ``fields``.
+            public_metadata: Rows of ``PUBLIC_PARTITION`` that produced ``fields``, aligned with ``metadata``.
+            fields: Single field name or list of field names to link.
+
+        Returns:
+            ``metadata``'s rows over its fields and ``fields``, carrying the new links; reads and
+            puts through it see the links.
+
+        Raises:
+            ValueError: ``metadata`` spans several partitions or ``public_metadata`` is not all in
+                ``PUBLIC_PARTITION``.
+            RuntimeError: The controller refused the link; see ``TransferQueueController.link``.
+            NotImplementedError: If the storage backend is not SimpleStorage.
+        """
+        if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
+            raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support link")
+        fields = [fields] if isinstance(fields, str) else list(fields)
+        partition_ids = set(metadata.partition_ids)
+        if len(partition_ids) != 1:
+            raise ValueError(f"metadata must cover exactly one partition, got {sorted(partition_ids)}")
+        if set(public_metadata.partition_ids) != {PUBLIC_PARTITION}:
+            raise ValueError(f"public_metadata must cover only partition {PUBLIC_PARTITION!r}")
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.LINK,
+            response_type=ZMQRequestType.LINK_RESPONSE,
+            body={
+                "global_indexes": metadata.global_indexes,
+                "partition_id": partition_ids.pop(),
+                "public_indexes": public_metadata.global_indexes,
+                "fields": fields,
+                "data_fields": list(dict.fromkeys([*metadata.field_names, *fields])),
+            },
+        )
+        return response.body["metadata"]
+
+    @with_controller_socket
+    async def _check_public_write(self, global_indexes: list[int], socket=None) -> None:
+        await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.CHECK_PUBLIC_WRITE,
+            response_type=ZMQRequestType.CHECK_PUBLIC_WRITE_RESPONSE,
+            body={"global_indexes": global_indexes},
+        )
+
+    async def async_clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
+        """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to; see ``kv_clear_unlinked_public``.
+
+        Returns:
+            The cleared keys.
+        """
+        metadata, keys = await self._mark_unlinked_public_clearing(stale_keys)
+        if metadata.size > 0:
+            await self.storage_manager.clear_data(metadata)
+            await self._clear_meta_in_controller(metadata)
+        return keys
+
+    @with_controller_socket
+    async def _mark_unlinked_public_clearing(
+        self, stale_keys: list[str] | None, socket=None
+    ) -> tuple[BatchMeta, list[str]]:
+        response = await self._request_controller(
+            socket=socket,
+            request_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING,
+            response_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE,
+            body={"stale_keys": stale_keys},
+        )
+        return response.body["metadata"], response.body["keys"]
 
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
@@ -1505,6 +1645,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
         self._kv_list = _make_sync(self.async_kv_list)
         self._kv_describe = _make_sync(self.async_kv_describe)
+        self._kv_link = _make_sync(self.async_kv_link)
+        self._clear_unlinked_public = _make_sync(self.async_clear_unlinked_public)
+        self._link = _make_sync(self.async_link)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
@@ -1646,8 +1789,10 @@ class TransferQueueClient(AsyncTransferQueueClient):
                        metadata; will be updated in a future version to reflect the post-put state)
 
         Raises:
-            ValueError: If metadata is None or empty, or if partition_id is None when metadata is not provided
-            RuntimeError: If storage operation fails
+            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
+                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
+                other rows link to: those stay read-only until no row links to them
 
         Example:
             >>> batch_size = 4
@@ -1981,6 +2126,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
         See ``async_kv_describe``.
         """
         return self._kv_describe(keys, partition_id)
+
+    def kv_link(self, keys: list[str], partition_id: str, public_keys: list[str], fields: list[str]) -> None:
+        """Synchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        return self._kv_link(keys, partition_id, public_keys, fields)
+
+    def link(self, metadata: BatchMeta, public_metadata: BatchMeta, fields: list[str] | str) -> BatchMeta:
+        """Synchronously make ``fields`` of ``metadata``'s rows read ``public_metadata``'s; see ``async_link``."""
+        return self._link(metadata, public_metadata, fields)
+
+    def clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
+        """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""
+        return self._clear_unlinked_public(stale_keys)
 
     # ==================== Selective Data Dump API ====================
 

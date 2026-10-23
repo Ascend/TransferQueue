@@ -33,7 +33,7 @@ import os
 import shutil
 import subprocess
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -47,7 +47,7 @@ from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue import data_dump
 from transfer_queue.client import TransferQueueClient
-from transfer_queue.controller import TransferQueueController
+from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
@@ -561,7 +561,10 @@ def kv_batch_get(
             - It is sent with cloudpickle, so a module-level function must be importable on the
               storage units. SSD-offloaded values are read in full before parsing.
 
-            Only supported by SimpleStorage; KV backends raise ``NotImplementedError``.
+            A field linked by ``kv_link`` is parsed on its public row's unit, which holds it once
+            per distinct plain ``parser_args`` entry (scalars and lists of them) among the keys
+            linking to it, so only the parsed part is sent back. Only supported by SimpleStorage;
+            KV backends raise ``NotImplementedError``.
         parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
             Requires ``data_parser``. They are serialized like request data, so tuples
             arrive as lists.
@@ -666,6 +669,31 @@ def kv_describe(keys: list[str] | str, partition_id: str) -> dict[str, dict[str,
     return tq_client._run_coroutine(async_kv_describe(keys=keys, partition_id=partition_id))
 
 
+def kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Report which keys exist and the fields each has ready, without logging the missing ones.
+
+    ``kv_describe`` raises and ``kv_batch_get`` warns for a missing key or partition; this
+    treats absence as an ordinary answer, for probing keys that are often not written yet,
+    e.g. whether another worker has already put a shared prompt.
+
+    Args:
+        keys: Single key or list of keys to look up.
+        partition_id: Partition containing the keys; it need not exist.
+
+    Returns:
+        ``{key: sorted ready field names}`` for every key that exists, linked fields included.
+        Missing keys are left out; a key with no ready field (e.g. being cleared) maps to ``[]``.
+
+    Example:
+        >>> import transfer_queue as tq
+        >>> tq.init()
+        >>> ready = tq.kv_exists(keys=["prompt_0", "prompt_1"], partition_id=tq.PUBLIC_PARTITION)
+        >>> missing = [key for key in ("prompt_0", "prompt_1") if key not in ready]
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_exists(keys=keys, partition_id=partition_id))
+
+
 def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
     """Clear key-value pairs from TransferQueue.
 
@@ -692,6 +720,64 @@ def kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str |
 
     tq_client = _maybe_create_tq_client()
     tq_client._run_coroutine(async_kv_clear(keys=keys, partition_id=partition_id, fields=fields))
+
+
+def kv_link(keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str) -> None:
+    """Let ``keys`` read ``fields`` from ``public_key`` in ``PUBLIC_PARTITION`` without another copy.
+
+    Put a payload shared by many keys, e.g. the video of a GRPO prompt read by its n
+    responses, once into ``tq.PUBLIC_PARTITION`` and link the keys to it. Its rows are
+    spread evenly over the storage units, apart from the rows of every other partition.
+    Missing ``keys`` are created, and linked fields read the public key's payload and are
+    ready whenever its fields are. ``kv_put`` and ``kv_update`` refuse a linked field, so
+    a read-modify-write must leave it out; clearing a linked key or field drops only the
+    link, after which the field takes a private value. ``public_key`` cannot be written
+    or cleared while keys link to it.
+
+    Args:
+        keys: Single key or list of keys that will read the linked fields.
+        partition_id: Partition holding ``keys``; not ``PUBLIC_PARTITION``.
+        public_key: Key in ``PUBLIC_PARTITION`` that has produced ``fields``, or a list of
+            such keys aligned with ``keys`` to link a whole batch in one atomic call.
+        fields: Single field name or list of field names to link.
+
+    Raises:
+        RuntimeError: If a public key does not exist or has not produced all of ``fields``,
+            a list ``public_key`` is not aligned with ``keys``, or ``partition_id`` is
+            ``PUBLIC_PARTITION``. Nothing is created or linked then.
+        ValueError: If ``keys`` contains duplicates.
+        NotImplementedError: If the storage backend is not SimpleStorage.
+
+    Example:
+        >>> tq.kv_put(key="prompt_0", partition_id=tq.PUBLIC_PARTITION, fields={"video": video})
+        >>> tq.kv_link([f"prompt_0_{i}" for i in range(n)], "train", "prompt_0", "video")
+        >>> # A batch of prompts at once: each response key with its own prompt key.
+        >>> tq.kv_link(response_keys, "train", [key.rsplit("_", 1)[0] for key in response_keys], "video")
+    """
+    tq_client = _maybe_create_tq_client()
+    tq_client._run_coroutine(async_kv_link(keys, partition_id, public_key, fields))
+
+
+def kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
+    """Clear every key in ``PUBLIC_PARTITION`` that keys linked to but none links to now; return them.
+
+    For example, after clearing a step's trajectories, this frees the prompt videos no
+    trajectory reads any more. A public key never linked yet is left alone, so a producer
+    between its ``kv_put`` and ``kv_link`` is safe; pass it in ``stale_keys`` once its
+    producer is given up on. A ``kv_link`` that races with it is refused for the keys it
+    clears. ``PUBLIC_PARTITION`` is shared by every job on this TransferQueue, so prefix
+    public keys with a job id.
+
+    Args:
+        stale_keys: Public keys to clear as well if no key links to them now, even if none
+            ever did, e.g. the keys a previous call left behind. Missing keys are ignored.
+
+    Example:
+        >>> tq.kv_clear(trajectory_keys, partition_id="train")
+        >>> freed = tq.kv_clear_unlinked_public(stale_keys=keys_left_by_the_previous_step)
+    """
+    tq_client = _maybe_create_tq_client()
+    return tq_client._run_coroutine(async_kv_clear_unlinked_public(stale_keys))
 
 
 def kv_update(
@@ -725,7 +811,8 @@ def kv_update(
     Raises:
         TypeError: If ``fields`` is not a non-empty dict or ``merge_fn`` is not callable.
         RuntimeError: If ``merge_fn`` fails or a stored value would change the field's
-            tensor/non-tensor type or dtype; the failing storage unit writes nothing.
+            tensor/non-tensor type or dtype; the failing storage unit writes nothing. Also
+            if a field is linked by ``kv_link``, before anything is registered or written.
         NotImplementedError: If the storage backend is not SimpleStorage.
 
     Note:
@@ -1165,8 +1252,10 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
         partition_id: Partition containing the keys.
 
     Returns:
-        ``{key: {"fields", "unfinalized"}}``. ``fields`` lists every stored field of the
-        key and ``unfinalized`` the subset that is not ready yet.
+        ``{key: {"fields", "unfinalized", "links"}}``. ``fields`` lists every field the key
+        can read, linked ones included, and ``unfinalized`` the subset that is not ready yet.
+        ``links`` maps each field linked by ``kv_link`` to its key in ``PUBLIC_PARTITION``,
+        whose readiness it shares.
 
     Raises:
         RuntimeError: If the partition or any key does not exist.
@@ -1181,8 +1270,16 @@ async def async_kv_describe(keys: list[str] | str, partition_id: str) -> dict[st
     tq_client = _maybe_create_tq_client()
     description = await tq_client.async_kv_describe(list(dict.fromkeys(keys)), partition_id)
     return {
-        key: {"fields": row["fields"], "unfinalized": row["unfinalized"]} for key, row in description["rows"].items()
+        key: {"fields": row["fields"], "unfinalized": row["unfinalized"], "links": row["links"]}
+        for key, row in description["rows"].items()
     }
+
+
+async def async_kv_exists(keys: list[str] | str, partition_id: str) -> dict[str, list[str]]:
+    """Asynchronously report which keys exist and their ready fields. See ``kv_exists``."""
+    keys = [keys] if isinstance(keys, str) else keys
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_kv_exists(list(dict.fromkeys(keys)), partition_id)
 
 
 async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[str] | str | None = None) -> None:
@@ -1221,6 +1318,23 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str, fields: list[
 
     if batch_meta.size > 0:
         await tq_client.async_clear_samples(batch_meta)
+
+
+async def async_kv_link(
+    keys: list[str] | str, partition_id: str, public_key: str | list[str], fields: list[str] | str
+) -> None:
+    """Asynchronously let ``keys`` read ``fields`` from ``public_key``. See ``kv_link``."""
+    tq_client = _maybe_create_tq_client()
+    keys = [keys] if isinstance(keys, str) else keys
+    _check_unique_keys(keys)
+    public_keys = [public_key] * len(keys) if isinstance(public_key, str) else public_key
+    await tq_client.async_kv_link(keys, partition_id, public_keys, [fields] if isinstance(fields, str) else fields)
+
+
+async def async_kv_clear_unlinked_public(stale_keys: list[str] | None = None) -> list[str]:
+    """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to. See ``kv_clear_unlinked_public``."""
+    tq_client = _maybe_create_tq_client()
+    return await tq_client.async_clear_unlinked_public(stale_keys)
 
 
 def _single_update_batch(fields: dict[str, Any]) -> TensorDict:
@@ -1480,7 +1594,10 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
 
     Args:
         dump_dir: Directory to write the dump into.
-        keys: Keys to dump. Duplicates are dropped, first occurrence wins.
+        keys: Keys to dump. Duplicates are dropped, first occurrence wins. Fields linked
+            by ``kv_link`` are dumped as links by public key name; dump those
+            ``PUBLIC_PARTITION`` keys too and load that dump first, since load relinks to
+            whatever the names hold then.
         partition_id: Partition that owns ``keys``.
 
     Returns:
@@ -1508,6 +1625,10 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         description = client.kv_describe(unique_keys, partition_id) if unique_keys else {"rows": {}, "field_schema": {}}
         row_index = {"partition_id": partition_id, **description}
         rows = row_index["rows"]
+        # Linked payloads stay with their public keys; the row index records them as links.
+        for row in rows.values():
+            row["fields"] = [name for name in row["fields"] if name not in row["links"]]
+            row["unfinalized"] = [name for name in row["unfinalized"] if name not in row["links"]]
         # A row whose fields are all still unproduced has nothing for a storage unit to
         # dump, but it keeps its key and tag so the restore can recreate the row.
         fields_by_index = {row["global_index"]: row["fields"] for row in rows.values() if row["fields"]}
@@ -1548,10 +1669,12 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
         ``{key: tag}`` for every restored key.
 
     Raises:
-        RuntimeError: TransferQueue is not initialized or a storage unit fails.
+        RuntimeError: TransferQueue is not initialized, a storage unit fails, or a key
+            linked to ``PUBLIC_PARTITION`` names a public key that does not exist.
         NotImplementedError: The storage backend is not SimpleStorage.
         FileNotFoundError: The dump is incomplete.
-        ValueError: The manifest or a row disagrees with the row index.
+        ValueError: The manifest or a row disagrees with the row index, or a linked public
+            field is not ready.
     """
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
@@ -1566,6 +1689,29 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
     partition_id = row_index["partition_id"]
     rows = row_index["rows"]
     client.validate_dump_schema(partition_id, row_index["field_schema"])
+    # Checked before loading anything: relinking needs the public fields, restored by their own load.
+    public_keys = sorted({key for row in rows.values() for key in row.get("links", {}).values()})
+    if public_keys:
+        public_rows = client.kv_describe(public_keys, PUBLIC_PARTITION)["rows"]
+        unready = sorted(
+            {
+                key
+                for row in rows.values()
+                for name, key in row.get("links", {}).items()
+                if name not in public_rows[key]["fields"] or name in public_rows[key]["unfinalized"]
+            }
+        )
+        if unready:
+            raise ValueError(f"linked fields of {PUBLIC_PARTITION!r} keys {unready} are not ready; load them first")
+    # Links first: kv_link checks field types before creating any key, so an incompatible
+    # destination fails before any payload is written. One kv_link per linked field set.
+    link_groups: dict[tuple[str, ...], list[tuple[str, str]]] = defaultdict(list)
+    for key, row in rows.items():
+        links = row.get("links", {})
+        for public_key in set(links.values()):
+            link_groups[tuple(sorted(name for name, k in links.items() if k == public_key))].append((key, public_key))
+    for names, pairs in link_groups.items():
+        client.kv_link([key for key, _ in pairs], partition_id, [public_key for _, public_key in pairs], list(names))
     bytes_read = client.load_rows_by_key(partition_id, rows, shards)
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

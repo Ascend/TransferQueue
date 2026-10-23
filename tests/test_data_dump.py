@@ -67,7 +67,7 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     tag = {"nested": [SimpleNamespace(value=batch[0])]}
     client = SimpleNamespace(
         kv_describe=lambda *_: {
-            "rows": {"key": {"global_index": 0, "fields": [], "tag": tag}},
+            "rows": {"key": {"global_index": 0, "fields": [], "unfinalized": [], "links": {}, "tag": tag}},
             "field_schema": {},
         }
     )

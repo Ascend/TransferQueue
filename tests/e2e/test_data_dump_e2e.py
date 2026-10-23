@@ -272,18 +272,21 @@ class TestDumpLoadRoundtrip:
         retrieved = tq.kv_batch_get(keys="u1", partition_id=partition_id, select_fields="response")
         _assert_rows_equal(retrieved["response"], [torch.tensor([1, 2, 3])])
 
-    def test_restores_a_version_3_dump_as_ready(self, tq_system, dump_dir, controller):
-        partition_id = "d_version3"
+    @pytest.mark.parametrize("version", [3, 4])
+    def test_restores_an_older_dump_as_ready(self, tq_system, dump_dir, controller, version):
+        partition_id = f"d_version{version}"
         _put_rows(partition_id, ["w0"])
         tq.dump_data_by_key(dump_dir, ["w0"], partition_id)
 
-        # Rewrite it as version 3 wrote it: no ``unfinalized`` in the row index.
+        # Rewrite it as that version wrote it: no ``links``, and before 4 no ``unfinalized``.
         row_index = _read_row_index(dump_dir)
-        del row_index["rows"]["w0"]["unfinalized"]
+        del row_index["rows"]["w0"]["links"]
+        if version == 3:
+            del row_index["rows"]["w0"]["unfinalized"]
         torch.save(row_index, dump_dir / "row_index.pt")
         info_path = dump_dir / "dump_info.json"
         info = json.loads(info_path.read_text(encoding="utf-8"))
-        info["format_version"] = 3
+        info["format_version"] = version
         info_path.write_text(json.dumps(info), encoding="utf-8")
 
         ray.get(controller.clear_partition.remote(partition_id))

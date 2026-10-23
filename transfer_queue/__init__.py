@@ -16,6 +16,7 @@
 import os
 
 from .client import TransferQueueClient
+from .controller import PUBLIC_PARTITION
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
     async_kv_batch_get,
@@ -23,7 +24,10 @@ from .interface import (
     async_kv_batch_put,
     async_kv_batch_update,
     async_kv_clear,
+    async_kv_clear_unlinked_public,
     async_kv_describe,
+    async_kv_exists,
+    async_kv_link,
     async_kv_list,
     async_kv_put,
     async_kv_update,
@@ -37,7 +41,10 @@ from .interface import (
     kv_batch_put,
     kv_batch_update,
     kv_clear,
+    kv_clear_unlinked_public,
     kv_describe,
+    kv_exists,
+    kv_link,
     kv_list,
     kv_put,
     kv_update,
@@ -75,7 +82,10 @@ __all__ = (
         "kv_batch_get_by_meta",
         "kv_list",
         "kv_describe",
+        "kv_exists",
         "kv_clear",
+        "kv_link",
+        "kv_clear_unlinked_public",
         "kv_update",
         "async_kv_put",
         "async_kv_batch_put",
@@ -84,9 +94,13 @@ __all__ = (
         "async_kv_batch_get_by_meta",
         "async_kv_list",
         "async_kv_describe",
+        "async_kv_exists",
         "async_kv_clear",
+        "async_kv_link",
+        "async_kv_clear_unlinked_public",
         "async_kv_update",
         "KVBatchMeta",
+        "PUBLIC_PARTITION",
     ]
     + [
         # KV key locks: process-local and cluster-wide
