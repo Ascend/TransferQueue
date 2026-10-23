@@ -25,6 +25,7 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import AsyncSimpleStorageManager
+from transfer_queue.storage.managers.simple_storage_manager import _parser_arg_identity
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
@@ -664,3 +665,54 @@ class TestPackFieldValues:
 
         assert isinstance(result, NonTensorStack)
         assert result.tolist() == [None, None]
+
+
+@pytest.mark.asyncio
+async def test_get_data_parses_a_linked_field_on_its_source_unit_once_per_distinct_arg():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test_parser_links"
+    manager.storage_unit_infos = {
+        su: ZMQServerInfo(role=Role.STORAGE, id=su, ip="127.0.0.1", ports={"put_get_socket": port})
+        for su, port in (("storage_0", 19014), ("storage_1", 19015))
+    }
+    non_tensor = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+    # The linking rows are odd, so on storage_1; their public source 4 is on storage_0.
+    batch_meta = BatchMeta(
+        global_indexes=[1, 3, 5, 7],
+        partition_ids=["p0"] * 4,
+        field_schema={"images": non_tensor, "response": non_tensor},
+        production_status=np.ones(4, dtype=np.int8),
+        _links=[{"images": 4}] * 4,
+    )
+    tensor_arg = torch.tensor([1])
+    parser_args = [[0], [1], [0], tensor_arg]
+    requests = []
+
+    async def fake_get(global_indexes, fields, target_storage_unit=None, data_parser=None, parser_args=None, **_):
+        requests.append((target_storage_unit, list(global_indexes), list(fields), parser_args))
+        rows = list(zip(global_indexes, parser_args, strict=True))
+        return fields, {f: [f"{f}_{gi}_{arg}" for gi, arg in rows] for f in fields}
+
+    manager._get_from_single_storage_unit = fake_get
+
+    def parser(data, args):
+        return data
+
+    data = await manager.get_data(batch_meta, data_parser=parser, parser_args=parser_args)
+
+    assert sorted(requests, key=lambda r: r[0]) == [
+        ("storage_0", [4, 4, 4], ["images"], [[0], [1], tensor_arg]),
+        ("storage_1", [1, 3, 5, 7], ["response"], parser_args),
+    ]
+    assert list(data["images"]) == ["images_4_[0]", "images_4_[1]", "images_4_[0]", f"images_4_{tensor_arg}"]
+    assert list(data["response"]) == [f"response_{gi}_{arg}" for gi, arg in zip([1, 3, 5, 7], parser_args, strict=True)]
+
+
+def test_parser_arg_identity_shares_only_equal_plain_args():
+    assert _parser_arg_identity([0, 2], 0) == _parser_arg_identity([0, 2], 1)
+    assert _parser_arg_identity(None, 0) == _parser_arg_identity(None, 1)
+    assert _parser_arg_identity([0, 2], 0) != _parser_arg_identity((0, 2), 1)
+    assert _parser_arg_identity(1, 0) != _parser_arg_identity(True, 1)
+    assert _parser_arg_identity(1, 0) != _parser_arg_identity(1.0, 1)
+    assert _parser_arg_identity(torch.tensor([0]), 0) != _parser_arg_identity(torch.tensor([0]), 1)
+    assert _parser_arg_identity([torch.tensor([0])], 0) != _parser_arg_identity([torch.tensor([0])], 1)

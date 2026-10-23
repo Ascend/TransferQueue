@@ -63,6 +63,28 @@ TQ_SIMPLE_STORAGE_PROBE_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_PROBE_TI
 TQ_SIMPLE_STORAGE_DUMP_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_DUMP_TIMEOUT", 3600))
 
 
+_SHAREABLE_PARSER_ARG_TYPES = (type(None), bool, int, float, str)
+
+
+def _parser_arg_identity(parser_arg: Any, pos: int) -> tuple:
+    """Return a key equal for two plain parser_args (scalars and lists of them) of equal type and value.
+
+    Any other argument, such as a tensor, gets one unique to batch position ``pos``: a linked
+    row is then parsed once per such key instead of being shared across keys.
+    """
+
+    def identity(value: Any) -> tuple | None:
+        if isinstance(value, _SHAREABLE_PARSER_ARG_TYPES):
+            return (type(value), value)
+        if isinstance(value, list | tuple):
+            items = [identity(item) for item in value]
+            return None if None in items else (type(value), tuple(items))
+        return None
+
+    key = identity(parser_arg)
+    return ("position", pos) if key is None else ("value", key)
+
+
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
 
@@ -801,7 +823,8 @@ class AsyncSimpleStorageManager(StorageManager):
         Retrieve data from remote StorageUnit based on metadata.
 
         Routes to each SU using global_idx % num_su (hash routing). A linked field is read
-        from its source row, once however many samples link to it.
+        from its source row, once however many samples link to it, or with ``parser_args`` once
+        per distinct plain parser_arg of those samples.
 
         Args:
             metadata: BatchMeta that contains metadata for data retrieval.
@@ -819,30 +842,32 @@ class AsyncSimpleStorageManager(StorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        # A parser sees every selected field of each sample on one unit; a linked field lives on another row.
-        if data_parser is not None and any(metadata._links):
-            raise NotImplementedError("data_parser does not support samples with fields linked by kv_link")
         # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
         max_attempts = 1 if data_parser is not None else None
 
         # A unit request reads the same fields for every row in it, so rows are grouped by the
         # fields read from them: a sample's own fields once per occurrence, so repeated keys
-        # keep their parser_args, and a linked field once per source row however many link to it.
-        # Without links this is one group in batch order, so batch_positions index parser_args.
+        # keep their parser_args, and a linked field once per source row and parser_arg however
+        # many link to it, so the source's unit parses it and replies with the parsed part only.
         rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
+        args_by_fields: dict[tuple[str, ...], list[Any]] = defaultdict(list)
         slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (sample, field) -> (fields, row)
-        linked_slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (source, field) -> slot
+        linked_slots: dict[tuple, tuple[tuple[str, ...], int]] = {}  # (source, field, arg) -> slot
         for pos, (global_index, links) in enumerate(zip(metadata.global_indexes, metadata._links, strict=True)):
+            parser_arg = None if parser_args is None else parser_args[pos]
             own = tuple(f for f in metadata.field_names if f not in links)
             if own:
                 slots.update({(pos, f): (own, len(rows_by_fields[own])) for f in own})
                 rows_by_fields[own].append(global_index)
+                args_by_fields[own].append(parser_arg)
             for field in metadata.field_names:
                 if field in links:
-                    if (links[field], field) not in linked_slots:
-                        linked_slots[links[field], field] = ((field,), len(rows_by_fields[field,]))
+                    linked = (links[field], field, _parser_arg_identity(parser_arg, pos))
+                    if linked not in linked_slots:
+                        linked_slots[linked] = ((field,), len(rows_by_fields[field,]))
                         rows_by_fields[field,].append(links[field])
-                    slots[pos, field] = linked_slots[links[field], field]
+                        args_by_fields[field,].append(parser_arg)
+                    slots[pos, field] = linked_slots[linked]
         requests = [
             (su_id, fields, group)
             for fields, rows in rows_by_fields.items()
@@ -860,7 +885,9 @@ class AsyncSimpleStorageManager(StorageManager):
                     list(fields),
                     target_storage_unit=su_id,
                     data_parser=data_parser,
-                    parser_args=None if parser_args is None else [parser_args[p] for p in group.batch_positions],
+                    parser_args=None
+                    if parser_args is None
+                    else [args_by_fields[fields][p] for p in group.batch_positions],
                 ),
                 max_attempts=max_attempts,
             )

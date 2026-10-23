@@ -343,17 +343,37 @@ def test_put_through_meta_refuses_a_linked_field(tq_system):
     assert _rows(tq.kv_batch_get(keys, PARTITION)["prompt"]) == [_prompt(0).tolist()] * N
 
 
-def test_data_parser_refuses_linked_fields(tq_system):
+def _per_value(parse):
+    """A data_parser applying ``parse(value, arg)`` to each value of every field."""
+    return lambda data, args: {
+        field: [parse(value, arg) for value, arg in zip(values, args, strict=True)] for field, values in data.items()
+    }
+
+
+def test_data_parser_slices_a_linked_field_per_key(tq_system):
     keys = _put_group(0)
     tq.kv_batch_put(keys, PARTITION, fields=TensorDict({"response": torch.arange(N).unsqueeze(1)}, batch_size=N))
 
-    def identity(data, args):
-        return data
+    data = tq.kv_batch_get(
+        keys, PARTITION, data_parser=_per_value(lambda value, length: value[:length]), parser_args=[1, 3, 1]
+    )
 
-    with pytest.raises(NotImplementedError, match="kv_link"):
-        tq.kv_batch_get(keys, PARTITION, data_parser=identity)
-    data = tq.kv_batch_get(keys, PARTITION, select_fields="response", data_parser=identity)
+    assert _rows(data["prompt"]) == [_prompt(0)[:1].tolist(), _prompt(0).tolist(), _prompt(0)[:1].tolist()]
     assert _rows(data["response"]) == [[i] for i in range(N)]
+
+
+def test_data_parser_selects_elements_of_a_linked_field_per_key(tq_system):
+    keys = _put_group(0) + _put_group(10)
+
+    data = tq.kv_batch_get(
+        keys,
+        PARTITION,
+        select_fields="prompt",
+        data_parser=_per_value(lambda value, positions: value[positions]),
+        parser_args=[[0, 2], [1], [2, 2, 0], [0], [0], [1, 2]],
+    )
+
+    assert _rows(data["prompt"]) == [[0, 2], [1], [2, 2, 0], [10], [10], [11, 12]]
 
 
 def test_update_refuses_a_linked_field(tq_system):

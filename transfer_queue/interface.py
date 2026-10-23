@@ -561,8 +561,10 @@ def kv_batch_get(
             - It is sent with cloudpickle, so a module-level function must be importable on the
               storage units. SSD-offloaded values are read in full before parsing.
 
-            Only supported by SimpleStorage; KV backends raise ``NotImplementedError``, and so
-            does a selected field linked by ``kv_link``.
+            A field linked by ``kv_link`` is parsed on its public row's unit, which holds it once
+            per distinct plain ``parser_args`` entry (scalars and lists of them) among the keys
+            linking to it, so only the parsed part is sent back. Only supported by SimpleStorage;
+            KV backends raise ``NotImplementedError``.
         parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
             Requires ``data_parser``. They are serialized like request data, so tuples
             arrive as lists.
@@ -577,7 +579,6 @@ def kv_batch_get(
         ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
             number of keys
         RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
-        NotImplementedError: If ``data_parser`` is given and a selected field is linked by ``kv_link``
 
     Example:
         >>> import transfer_queue as tq
