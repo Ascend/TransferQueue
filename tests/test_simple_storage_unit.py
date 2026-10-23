@@ -1228,3 +1228,29 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
     assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
     client.close()
+
+
+def test_worker_survives_a_failed_request():
+    """A failure outside the per-operation handlers, e.g. in send, must not end the only worker."""
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    process_request = unit._process_one_worker_request
+    failed = []
+
+    def fail_first_request(worker_socket, monitor):
+        if not failed:
+            failed.append(True)
+            worker_socket.recv_multipart()
+            raise zmq.ZMQError(errno.EAGAIN)
+        process_request(worker_socket, monitor)
+
+    unit._process_one_worker_request = fail_first_request
+    client = MockStorageClient(unit.zmq_server_info.to_addr("put_get_socket"), unit.zmq_server_info.ip)
+    client.socket.setsockopt(zmq.RCVTIMEO, 1000)
+    try:
+        with pytest.raises(zmq.Again):
+            client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+        response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+        assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    finally:
+        client.close()
+        unit.shutdown()

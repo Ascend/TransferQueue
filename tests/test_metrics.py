@@ -309,6 +309,28 @@ class TestStorageQuerySocketPool:
             router.close(linger=0)
             ctx_peer.term()
 
+    def test_unanswered_probe_warns_once_per_hang(self):
+        """A unit that stops answering must be visible, without a warning every collection cycle."""
+        ctx_peer = zmq.Context()
+        silent_unit = ctx_peer.socket(zmq.ROUTER)
+        port = silent_unit.bind_to_random_port("tcp://127.0.0.1")
+        su_info = ZMQServerInfo(role=Role.STORAGE, id="storage_0", ip="127.0.0.1", ports={"put_get_socket": port})
+        ctx = zmq.Context()
+        try:
+            with (
+                patch("transfer_queue.metrics.TQ_METRICS_STORAGE_TIMEOUT", 1),
+                patch("transfer_queue.metrics.logger.warning") as warning,
+            ):
+                exporter = TQMetricsExporter(zmq_context=ctx)
+                for _ in range(2):
+                    assert exporter._query_storage_unit(su_info, "storage_0") is None
+            warning.assert_called_once()
+            assert f"127.0.0.1:{port}" in warning.call_args.args[0]
+        finally:
+            ctx.destroy(linger=0)
+            silent_unit.close(linger=0)
+            ctx_peer.term()
+
 
 class TestStorageMetricsCollection:
     def test_collect_with_no_storage_units(self):

@@ -1172,7 +1172,12 @@ class SimpleStorageUnit:
             if worker_socket in socks:
                 # Keep request handling in a separate scope so payload references are
                 # released before the worker waits for the next request.
-                self._process_one_worker_request(worker_socket, monitor)
+                try:
+                    self._process_one_worker_request(worker_socket, monitor)
+                except Exception as e:
+                    # This is the unit's only worker: if a failed recv or send ended it, the
+                    # proxy would keep queueing requests that nobody answers. Strand one caller.
+                    logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
