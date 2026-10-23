@@ -18,6 +18,7 @@ import os
 import pickle
 import time
 from collections import defaultdict, deque
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
@@ -2188,7 +2189,7 @@ class TransferQueueController:
     def _link_conflicts(
         self,
         partition: "DataPartitionStatus | None",
-        rows: list[int | None],
+        rows: Sequence[int | None],
         public: "DataPartitionStatus",
         sources: list[int],
         fields: list[str],
