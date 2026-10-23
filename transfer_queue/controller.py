@@ -121,12 +121,12 @@ class PartitionIndexManager:
             new_indexes = list(range(start_index, end_index))
 
             # Batch update status
-            self.allocated_indexes.update(new_indexes)
             self.global_index_counter = end_index
 
             indexes.extend(new_indexes)
 
         # Record partition-index relationship
+        self.allocated_indexes.update(indexes)
         self.partition_to_indexes[partition_id].update(indexes)
 
         return indexes
