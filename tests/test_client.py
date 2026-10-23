@@ -1355,6 +1355,27 @@ def test_controller_rpc_reuses_one_socket(client_setup):
     assert len(mock_controller.caller_identities) == 1, "each request opened its own socket"
 
 
+def test_controller_rpc_raises_when_controller_never_replies():
+    """A lost controller reply must surface as an error, not block the caller forever."""
+    context = zmq.Context()
+    silent_controller = context.socket(zmq.ROUTER)
+    port = silent_controller.bind_to_random_port("tcp://127.0.0.1")
+    controller_info = ZMQServerInfo(
+        role=Role.CONTROLLER, id="silent_controller", ip="127.0.0.1", ports={"request_handle_socket": port}
+    )
+    with patch("transfer_queue.client.TQ_CONTROLLER_SEND_RECV_TIMEOUT", 1):
+        client = TransferQueueClient(client_id="client_timeout", controller_info=controller_info)
+    try:
+        start = time.monotonic()
+        with pytest.raises(RuntimeError, match="Resource temporarily unavailable"):
+            client.get_partition_list()
+        assert time.monotonic() - start < 10
+    finally:
+        client.close()
+        silent_controller.close(linger=0)
+        context.term()
+
+
 # =====================================================
 # Checkpoint Interface Tests
 # =====================================================

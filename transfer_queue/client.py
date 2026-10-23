@@ -48,6 +48,9 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
+# A DEALER drops a reply it can no longer route, so without a bound a lost response blocks
+# the caller forever. Generous: a busy controller is normal, an unanswered request is not.
+TQ_CONTROLLER_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_SEND_RECV_TIMEOUT", 200))  # seconds
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
@@ -156,6 +159,7 @@ class AsyncTransferQueueClient:
             self.zmq_context,
             client_id,
             "request_handle_socket",
+            timeout=TQ_CONTROLLER_SEND_RECV_TIMEOUT,
         )
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
