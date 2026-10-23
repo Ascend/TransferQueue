@@ -97,6 +97,8 @@ class TQMetricsExporter:
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
         self._zmq_ctx = zmq_context
         self._zmq_socket_pool: ZMQSocketPool | None = None
+        # Units whose last probe timed out, so a hung unit warns once rather than every cycle.
+        self._unresponsive_storage_units: set[str] = set()
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
@@ -541,12 +543,21 @@ class TQMetricsExporter:
                 # a kept socket holds budget for the whole walk to save one handshake.
                 sock.close(linger=0)
                 if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
+                    if su_id in self._unresponsive_storage_units:
+                        self._unresponsive_storage_units.discard(su_id)
+                        logger.warning(f"Storage unit {su_id} is answering metrics probes again.")
                     return response_msg.body
                 return None
         except zmq.error.Again:
             # The pool discarded the socket, so the next cycle starts clean. Reusing it
             # would read this reply, if it lands late, as the answer to that cycle's query.
-            logger.debug(f"Timeout querying metrics from {su_id}")
+            # The probe shares the unit's only worker with put/get, so this is the earliest sign it stopped.
+            if su_id not in self._unresponsive_storage_units:
+                self._unresponsive_storage_units.add(su_id)
+                logger.warning(
+                    f"Timeout ({TQ_METRICS_STORAGE_TIMEOUT}s) querying metrics from storage unit {su_id} at "
+                    f"{su_info.ip}:{su_info.ports.get('put_get_socket')}; put/get on it may stall too."
+                )
             return None
         except Exception as e:
             logger.warning(f"Error querying metrics from {su_id}: {e}")
