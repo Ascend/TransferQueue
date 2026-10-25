@@ -548,6 +548,10 @@ class BatchMeta:
 
         Returns:
             BatchMeta: A new BatchMeta instance containing only the specified fields.
+
+        Note:
+            This filters only this local metadata, links included; it neither unlinks fields on the
+            controller nor selects the data a put writes. Select those fields from the data too.
         """
         new_field_schema = {}
         for field_name in field_names:

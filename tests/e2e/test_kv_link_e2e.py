@@ -514,3 +514,34 @@ def test_batch_meta_link_refuses_what_kv_link_refuses(tq_system):
     client.put(TensorDict({"prompt": _prompt(5).unsqueeze(0).repeat(N, 1)}, batch_size=N), metadata=rows_meta)
     with pytest.raises(RuntimeError, match="already store"):
         client.link(rows_meta, public_rows, "prompt")
+
+
+def test_data_parser_sees_every_field_a_row_links_to_one_public_row(tq_system):
+    client = tq.get_client()
+    public_meta = client.put(
+        TensorDict({"prompt": torch.tensor([[1, 2, 3]]), "length": torch.tensor([[2]])}, batch_size=1),
+        partition_id=PUBLIC,
+    )
+    rows_meta = client.put(TensorDict({"response": torch.tensor([[0]])}, batch_size=1), partition_id=PARTITION)
+    linked = client.link(rows_meta, public_meta, ["prompt", "length"]).select_fields(["prompt", "length"])
+
+    def trim_prompt_to_length(data, args):
+        prompts = zip(data["prompt"], data["length"], strict=True)
+        return {"prompt": [value[: int(length.item())] for value, length in prompts], "length": data["length"]}
+
+    data = client.get_data(linked, data_parser=trim_prompt_to_length)
+
+    assert _rows(data["prompt"]) == [[1, 2]]
+    assert _rows(data["length"]) == [[2]]
+
+
+def test_batch_meta_link_keeps_the_callers_extra_info_and_custom_meta(tq_system):
+    client = tq.get_client()
+    public_meta, rows_meta = _meta_group(0)
+    rows_meta.extra_info["epoch"] = 3
+    rows_meta.update_custom_meta([{"group": f"g{i}"} for i in range(N)])
+
+    linked = client.link(rows_meta, public_meta.select_samples([0] * N), "prompt")
+
+    assert linked.extra_info == {"epoch": 3}
+    assert linked.custom_meta == [{"group": f"g{i}"} for i in range(N)]

@@ -716,3 +716,38 @@ def test_parser_arg_identity_shares_only_equal_plain_args():
     assert _parser_arg_identity(1, 0) != _parser_arg_identity(1.0, 1)
     assert _parser_arg_identity(torch.tensor([0]), 0) != _parser_arg_identity(torch.tensor([0]), 1)
     assert _parser_arg_identity([torch.tensor([0])], 0) != _parser_arg_identity([torch.tensor([0])], 1)
+
+
+@pytest.mark.asyncio
+async def test_get_data_reads_the_fields_a_row_links_to_one_source_together():
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "test_links_by_source"
+    manager.storage_unit_infos = {
+        su: ZMQServerInfo(role=Role.STORAGE, id=su, ip="127.0.0.1", ports={"put_get_socket": port})
+        for su, port in (("storage_0", 19016), ("storage_1", 19017))
+    }
+    non_tensor = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+    # Rows 1 and 3 link prompt and length to source 4; row 5 links them to sources 4 and 6.
+    batch_meta = BatchMeta(
+        global_indexes=[1, 3, 5],
+        partition_ids=["p0"] * 3,
+        field_schema={"prompt": non_tensor, "length": non_tensor},
+        production_status=np.ones(3, dtype=np.int8),
+        _links=[{"prompt": 4, "length": 4}, {"prompt": 4, "length": 4}, {"prompt": 4, "length": 6}],
+    )
+    requests = []
+
+    async def fake_get(global_indexes, fields, target_storage_unit=None, data_parser=None, parser_args=None, **_):
+        requests.append((list(global_indexes), sorted(fields)))
+        return fields, {f: [f"{f}_{gi}" for gi in global_indexes] for f in fields}
+
+    manager._get_from_single_storage_unit = fake_get
+
+    def parser(data, args):
+        return data
+
+    data = await manager.get_data(batch_meta, data_parser=parser)
+
+    assert sorted(requests) == [([4], ["length", "prompt"]), ([4], ["prompt"]), ([6], ["length"])]
+    assert list(data["prompt"]) == ["prompt_4"] * 3
+    assert list(data["length"]) == ["length_4", "length_4", "length_6"]

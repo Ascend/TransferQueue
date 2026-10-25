@@ -409,6 +409,18 @@ class AsyncTransferQueueClient:
                          Do not change the inner order of values within each column.
                          Only supported by SimpleStorage.
 
+        Warning:
+            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
+            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
+            links. A linked field is refused only by the links ``metadata`` still carries, so a
+            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
+            private copies of its linked fields and drops those links. To write back a batch
+            holding linked fields, select the fields to write from ``data``, e.g.
+            ``put(batch.select("response"), metadata=linked)``.
+
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it: the check before writing does not reserve the row; see ``async_link``.
+
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
                        metadata; will be updated in a future version to reflect the post-put state)
@@ -1261,9 +1273,16 @@ class AsyncTransferQueueClient:
             public_metadata: Rows of ``PUBLIC_PARTITION`` that produced ``fields``, aligned with ``metadata``.
             fields: Single field name or list of field names to link.
 
+        Warning:
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it. A put checks the row's links before writing storage but does not reserve it,
+            so a link accepted in between reads the old payload and then the new one. Write each
+            public row once before linking it; to replace one, wait until no row links to it,
+            overwrite it, wait for the put to return, and only then link to it again.
+
         Returns:
-            ``metadata``'s rows over its fields and ``fields``, carrying the new links; reads and
-            puts through it see the links.
+            ``metadata``'s rows over its fields and ``fields``, carrying the new links and keeping
+            ``metadata``'s ``extra_info`` and ``custom_meta``; reads and puts through it see the links.
 
         Raises:
             ValueError: ``metadata`` spans several partitions or ``public_metadata`` is not all in
@@ -1291,7 +1310,11 @@ class AsyncTransferQueueClient:
                 "data_fields": list(dict.fromkeys([*metadata.field_names, *fields])),
             },
         )
-        return response.body["metadata"]
+        linked: BatchMeta = response.body["metadata"]
+        # The controller knows only synced custom_meta, and extra_info never leaves the caller.
+        linked.extra_info = dict(metadata.extra_info)
+        linked.custom_meta = [dict(meta) for meta in metadata.custom_meta]
+        return linked
 
     @with_controller_socket
     async def _check_public_write(self, global_indexes: list[int], socket=None) -> None:
@@ -1779,6 +1802,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
                          The number of elements per column must also remain unchanged.
                          Do not change the inner order of values within each column.
                          Only supported by SimpleStorage.
+
+        Warning:
+            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
+            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
+            links. A linked field is refused only by the links ``metadata`` still carries, so a
+            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
+            private copies of its linked fields and drops those links. To write back a batch
+            holding linked fields, select the fields to write from ``data``, e.g.
+            ``put(batch.select("response"), metadata=linked)``.
+
+            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
+            to it: the check before writing does not reserve the row; see ``async_link``.
 
         Returns:
             BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved

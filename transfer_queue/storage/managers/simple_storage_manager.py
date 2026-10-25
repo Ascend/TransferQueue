@@ -847,12 +847,13 @@ class AsyncSimpleStorageManager(StorageManager):
 
         # A unit request reads the same fields for every row in it, so rows are grouped by the
         # fields read from them: a sample's own fields once per occurrence, so repeated keys
-        # keep their parser_args, and a linked field once per source row and parser_arg however
-        # many link to it, so the source's unit parses it and replies with the parsed part only.
+        # keep their parser_args, and the fields it links to one source row together, once per
+        # source, field set and parser_arg however many link to it. The source's unit then
+        # parses those fields in one call and replies with the parsed part only.
         rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
         args_by_fields: dict[tuple[str, ...], list[Any]] = defaultdict(list)
         slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (sample, field) -> (fields, row)
-        linked_slots: dict[tuple, tuple[tuple[str, ...], int]] = {}  # (source, field, arg) -> slot
+        linked_slots: dict[tuple, tuple[tuple[str, ...], int]] = {}  # (source, fields, arg) -> slot
         for pos, (global_index, links) in enumerate(zip(metadata.global_indexes, metadata._links, strict=True)):
             parser_arg = None if parser_args is None else parser_args[pos]
             own = tuple(f for f in metadata.field_names if f not in links)
@@ -860,14 +861,18 @@ class AsyncSimpleStorageManager(StorageManager):
                 slots.update({(pos, f): (own, len(rows_by_fields[own])) for f in own})
                 rows_by_fields[own].append(global_index)
                 args_by_fields[own].append(parser_arg)
+            fields_by_source: dict[int, list[str]] = defaultdict(list)
             for field in metadata.field_names:
                 if field in links:
-                    linked = (links[field], field, _parser_arg_identity(parser_arg, pos))
-                    if linked not in linked_slots:
-                        linked_slots[linked] = ((field,), len(rows_by_fields[field,]))
-                        rows_by_fields[field,].append(links[field])
-                        args_by_fields[field,].append(parser_arg)
-                    slots[pos, field] = linked_slots[linked]
+                    fields_by_source[links[field]].append(field)
+            for source, source_fields in fields_by_source.items():
+                fields = tuple(source_fields)
+                linked = (source, fields, _parser_arg_identity(parser_arg, pos))
+                if linked not in linked_slots:
+                    linked_slots[linked] = (fields, len(rows_by_fields[fields]))
+                    rows_by_fields[fields].append(source)
+                    args_by_fields[fields].append(parser_arg)
+                slots.update({(pos, f): linked_slots[linked] for f in fields})
         requests = [
             (su_id, fields, group)
             for fields, rows in rows_by_fields.items()
