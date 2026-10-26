@@ -54,7 +54,7 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
 
 ### Control Plane: Panoramic Data Management
 
-In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. Once all required data fields are ready (i.e., written to the `StorageManager`), the data sample can be consumed by downstream tasks.
+In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. A sample becomes available to downstream tasks when every required field is ready.
 
 We also track the consumption history for each computational task (e.g., `generate_sequences`, `compute_log_prob`, etc.). Therefore, even when different computational tasks require the same data field, they can consume the data independently without interfering with each other.
 
@@ -80,12 +80,12 @@ This class encapsulates the core interaction logic within the TransferQueue syst
 
 Currently, we support the following storage backends:
 
-- SimpleStorage: A basic CPU memory storage with minimal data format constraints and ease of use.
+- SimpleStorage: Distributed CPU storage with optional [local SSD offload](docs/ssd_offload.md), storage-side parsing and updates, and shared fields. It is the default backend and needs no external storage service.
 - [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) ([usage guide](docs/storage_backends/openyuanrong_datasystem.md), beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
 - [MooncakeStore](https://github.com/kvcache-ai/Mooncake) (beta, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
 - [RayRDT](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
 
-Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Each storage unit can be deployed on a separate node, allowing for distributed data management.
+Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Storage units are distributed across eligible Ray nodes. Within SimpleStorage, each partition's rows are balanced across units by row count; this does not account for differences in payload size.
 
 `SimpleStorageUnit` employs a 2D data structure as follows:
 
@@ -100,54 +100,29 @@ This data structure design is motivated by the computational characteristics of 
 
 ### User Interface: High-Level & Low-Level APIs
 
-| Level | Tier | Style | Fine-Grained Access | Streaming | Sampler | Multiple-Backends | 
-|---|---|---|---|------------------|---|---|
-| High | **KV Interface** ([PR#28](https://github.com/Ascend/TransferQueue/pull/28))| Put/Get/List/Clear | ✓ | ○                | ✗ | ✓ | 
-| High |  **StreamingDataLoader** ([PR#23](https://github.com/Ascend/TransferQueue/pull/23)) | PyTorch DataLoader | ✓ | ✓                | ✓ | ✓ | 
-| Low |  **TransferQueueClient** | Metadata-based | ✓ | ✓                | ✓ | ✓ | 
+| Interface | How consumers select data | Typical use |
+|---|---|---|
+| **KV Interface** | Explicit string keys and selected fields | A trainer or replay buffer dispatches samples |
+| **StreamingDataLoader** | A sampler selects samples whose required fields are ready | Distributed ranks consume a streaming pipeline |
+| **TransferQueueClient** | `BatchMeta` identifies rows, fields and readiness | Custom scheduling and metadata-based integrations |
 
+#### Key-Value API
 
-#### Key-Value based API
+Use string keys to read or write selected fields when your application controls
+sample dispatch. Each key identifies a sample within a partition. Start with
+[the interactive notebook](tutorial/basic.ipynb) or [Tutorial 02](tutorial/02_kv_interface.py).
 
-To simplify the usage of TransferQueue, we provide a Redis-style high-level API that exposes most of its advanced features ([PR#28](https://github.com/Ascend/TransferQueue/pull/28)).
-
-**Methods**
-
-- **(async_)kv_put**: Insert/Update a multi-column sample by key, with an optional metadata tag.
-- **(async_)kv_batch_put**: Put multiple key-value pairs efficiently in batches.
-- **(async_)kv_batch_get**: Retrieve samples (by keys), supporting column selection (by fields) and, on SimpleStorage, an optional `data_parser` run on the storage units.
-- **(async_)kv_update / (async_)kv_batch_update**: Merge new values into fields with `merge_fn(old, new)`, adding missing keys and fields. SimpleStorage only.
-- **(async_)kv_list**: List keys and tags (metadata) in a partition.
-- **(async_)kv_describe**: Show each key's stored fields, including those `kv_update(finalize=False)` keeps hidden.
-- **(async_)kv_clear**: Remove key-value pairs from storage, or only selected `fields` while keeping the keys.
-
-`kv_update` merges only the rows the controller records as holding the field
-(including hidden ones); every other row takes the new value as given, without
-calling `merge_fn`, and overwrites anything a storage unit kept after a failed
-clear. Every stored value must keep the field's tensor/non-tensor type and
-tensor dtype in the partition. A timeout has an unknown outcome because a
-storage unit may commit after the caller stops waiting, so non-idempotent merge
-operations must not be retried blindly. Updates are atomic within one
-storage-unit request; a batch spanning multiple units is not a distributed
-transaction.
-
-To build a field over several updates without exposing intermediate values, pass
-`finalize=False` to every `kv_update` except the last one, which uses the default
-`finalize=True`. Until then the field is stored but not ready, so samplers, the
-dataloader and `kv_batch_get` do not see it. Updates to one key must come from
-one writer at a time; use `kv_global_lock` if several processes write the same key.
-
-**Advanced: parsing on get.** Like `kv_batch_put`, `kv_batch_get` takes a
-`data_parser`, here run by each SimpleStorage unit before it replies, so only the
-parsed values cross the network (e.g. trimming padding or picking a few frames).
-It is called as `data_parser(data, args)`: `data` maps each selected field to the
-unit's stored values, one per sample, and `args` holds the matching entries of the
-optional per-key `parser_args`. Each field may be parsed differently, but the
-result must keep the keys and the number and order of values. `data` holds the
-stored objects themselves, so never modify them in place; build new values
-instead. As with put, a get with a parser is not retried on a storage-unit
-timeout; the call raises, and retrying it yourself may run the parser again, so
-keep it free of side effects. See the `kv_batch_get` docstring for details.
+| API | Behavior |
+|---|---|
+| `(async_)kv_put`, `(async_)kv_batch_put` | Store samples or add/replace fields, with optional metadata tags |
+| `(async_)kv_update`, `(async_)kv_batch_update` | Merge new values into stored fields, such as appending response chunks |
+| `(async_)kv_batch_get` | Read selected fields for the requested keys |
+| `(async_)kv_list` | List keys and tags in one or all partitions |
+| `(async_)kv_describe` | Show a key's fields, readiness and shared-field sources |
+| `(async_)kv_exists` | Check key existence and list ready fields |
+| `(async_)kv_link` | Link fields to shared data in `tq.PUBLIC_PARTITION` |
+| `(async_)kv_clear` | Delete keys or selected fields |
+| `(async_)kv_clear_unlinked_public` | Reclaim shared data no longer referenced by trajectories |
 
 **Key Features**
 
@@ -156,35 +131,10 @@ keep it free of side effects. See the `kv_batch_get` docstring for details.
 - **Partition Isolation**: Logical separation of storage namespaces.
 - **Metadata Tags**: Lightweight metadata for status tracking.
 - **Pluggable Backends**: Supports multiple backends.
-
-Refer to [tutorials/basic.ipynb](https://github.com/Ascend/TransferQueue/blob/main/tutorial/basic.ipynb) and [tutorials/02_kv_interface.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/02_kv_interface.py) for detailed usage examples.
-
-**KV Key Locks**
-
-Locks are **advisory**: KV calls never check them, so every writer that needs mutual exclusion must take the lock. `(async_)kv_local_lock` excludes threads and asyncio tasks of one process and needs no setup.
-
-- **(async_)kv_global_lock(keys, partition_id, timeout=None, lease_s=30)**: Hold an exclusive cluster-wide lock on `(partition_id, key)` pairs under a lease that a background thread renews. Yields a **GlobalLease**: call `check()` right before writes (it raises **LockLostError** once the lease is lost); `names` lists the locked pairs. Exiting the block also raises `LockLostError` if the lease was lost.
-- **kv_lock_list(partition_id=None)**: Return `{"holders": [...], "waiters": n}` for live global locks.
-
-```python
-import os
-os.environ["TQ_ENABLE_KV_GLOBAL_LOCK"] = "1"  # only in the process that creates TransferQueue, before tq.init()
-tq.init()
-with tq.kv_global_lock(["a", "b"], "train", timeout=30) as lease:
-    lease.check()
-    tq.kv_put("a", "train", fields={"v": torch.tensor([1])})
-```
-
-- **Enabling**: set these before `tq.init()` in the process that creates TransferQueue; only that process reads them. Processes and Ray workers that attach find the lock actors by name and need nothing. Without the switch, `kv_global_lock` raises `RuntimeError`.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `TQ_ENABLE_KV_GLOBAL_LOCK` | off | `1`/`true`/`yes`/`y`/`on` starts the lock actors |
-| `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` | `8` | Number of lock actors (integer >= 1) |
-| `TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES` | `10000` | Acquire calls each lock actor lets wait at once (integer >= 1) |
-
-- **Shards**: keys are spread by hash over `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` `TransferQueueLockManager` actors, which `tq.init()` pins round-robin to the alive Ray nodes (per-node counts differ by at most 1). Keys on several actors are taken one actor at a time, so a multi-key request may hold some keys while it waits for others.
-- **Capacity**: `TQ_KV_GLOBAL_LOCK_MAX_WAITING_ACQUIRES` caps the acquire calls each actor lets wait at once. A request past the cap keeps its queue place but polls once per window (5 s, or `lease_s / 3` if shorter), so it may see its grant up to a window late. About `TQ_KV_GLOBAL_LOCK_NUM_SHARDS` × this value (80,000 by default) requests can wait without that delay. More shards spread the load, but all waiters on one key share one actor, so a hot key is bounded by this value alone. Each actor's Ray `max_concurrency` is this value plus 16 reserved slots shared, without priority, by renew, release, `kv_lock_list` and turned-away acquires. Every waiter still costs one call per window: past an actor's call throughput, renewals are delayed and leases can be lost.
+- **Incremental Updates**: Build responses in chunks and publish complete fields to consumers. See [Tutorial 02](tutorial/02_kv_interface.py).
+- **Shared Fields**: Store a field once for reuse across samples. See [Tutorial 07](tutorial/07_shared_fields.py).
+- **Storage-side Parsing**: Decode references on put or return selected tokens and frames on get. See [Tutorial 08](tutorial/08_data_parser.py) and [the notebook](tutorial/basic.ipynb).
+- **Selective Recovery**: Save unfinished rollout samples and restore them into a running TQ. See [Tutorial 09](tutorial/09_data_dump.py).
 
 #### StreamingDataLoader API
 
@@ -193,17 +143,34 @@ Designed as a drop-in replacement for the standard PyTorch `DataLoader`, this AP
 In this scenario, `TransferQueueController` serves as a side-controller for data dispatching, with a user-defined `Sampler` class to organize the dataflow.
 It encapsulates the complex scheduling and data transfer logic required for various parallelism strategies, seamlessly integrating TransferQueue into existing training workflows and simplifying the development of disaggregated frameworks.
 
-See the [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/06_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/06_streaming_dataloader.py) for more details.
+See [tutorial/06_streaming_dataloader.py](tutorial/06_streaming_dataloader.py) for more details.
 
 #### Low-Level Native API
 
 The native interfaces of TransferQueue are implemented in `TransferQueueClient`. It offers maximum flexibility through native, atomic operations.
 
 Developers can leverage `TransferQueueClient` directly to implement advanced features that require fine-grained control and fully streamed data scheduling, as illustrated in the following tutorials:
-- [tutorial/03_metadata_concepts.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/03_metadata_concepts.py)
-- [tutorial/04_understanding_controller.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/04_understanding_controller.py)
-- [tutorial/05_custom_sampler.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_custom_sampler.py)
 
+- [tutorial/03_metadata_concepts.py](tutorial/03_metadata_concepts.py)
+- [tutorial/04_understanding_controller.py](tutorial/04_understanding_controller.py)
+- [tutorial/05_custom_sampler.py](tutorial/05_custom_sampler.py)
+
+### Tutorials
+
+Start with [the basic notebook](tutorial/basic.ipynb) for an interactive walkthrough.
+The scripts below run from the repository root with CPU tensors and SimpleStorage.
+
+| Tutorial | What you will learn |
+|---|---|
+| [01: Core components](tutorial/01_core_components.py) | Controller, client and storage responsibilities |
+| [02: KV interface](tutorial/02_kv_interface.py) | Put/get, staged updates, readiness probes and field-level clear |
+| [03: Metadata](tutorial/03_metadata_concepts.py) | BatchMeta operations and shared fields without string keys |
+| [04: Controller](tutorial/04_understanding_controller.py) | Partitions, field readiness and consumption tracking |
+| [05: Custom samplers](tutorial/05_custom_sampler.py) | Select and consume ready samples |
+| [06: StreamingDataLoader](tutorial/06_streaming_dataloader.py) | Distributed consumption, DP rank coordination and micro-batches |
+| [07: Shared fields](tutorial/07_shared_fields.py) | Share fields across samples, read shared and private fields, and reclaim shared data |
+| [08: Data parsers](tutorial/08_data_parser.py) | Load files on put and select tensor rows on get using storage-side parsers |
+| [09: Selective recovery](tutorial/09_data_dump.py) | Save and resume unfinished samples with shared fields |
 
 <h2 id="show-cases">🔥 Showcases</h2>
 
@@ -225,7 +192,7 @@ We have experimentally implemented a **standardized, fully-streamed distributed*
 
 By leveraging the `RankAwareSampler` and `StreamingDataLoader` interfaces, we achieve a **streamlined micro-batch-level producer-consumer pipeline**. This design eliminates the need to manually determine data dispatching logic across varying parallelism strategies—a typical complexity in the single-controller paradigm—thereby greatly simplifying framework design. 
 
-Please refer to our [Roadmap](https://github.com/Ascend/TransferQueue/issues/1) and [tutorials/05_streaming_dataloader.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_streaming_dataloader.py) for more details.
+Please refer to [tutorial/06_streaming_dataloader.py](tutorial/06_streaming_dataloader.py) for more details.
 
 <p align="center">
   <img src="https://github.com/TransferQueue/community_doc/blob/main/docs/tq_streaming_dataloader.png?raw=true" width="70%">

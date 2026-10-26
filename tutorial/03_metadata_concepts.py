@@ -317,6 +317,30 @@ def demonstrate_real_workflow():
         chunk_data = tq_client.get_data(chunk)
         print(f"  Chunk {i}: Retrieved chunk data: {chunk_data}")
 
+    print("[Step 7] Selecting rows and fields from BatchMeta with shared fields...")
+    video = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    public_meta = tq_client.put(
+        TensorDict({"video": video.unsqueeze(0)}, batch_size=1),
+        partition_id=tq.PUBLIC_PARTITION,
+    )
+    linked_meta = tq_client.link(batch_meta.select_samples([0, 1]), public_meta.select_samples([0, 0]), fields="video")
+    print("  Linked the first two samples to the same public video field.")
+    # Payloads stay on the public row; _links holds source indexes aligned with global_indexes.
+    # Selection filters these local references without changing the controller's links.
+    print(f"  Rows: {linked_meta.global_indexes}, fields: {linked_meta.field_names}")
+    print(f"  Internal links: {linked_meta._links}")
+
+    selected_meta = linked_meta.select_samples([1]).select_fields(["video"])
+    print("  Selected the second sample and kept only its video field.")
+    print(f"  Selected rows: {selected_meta.global_indexes}, fields: {selected_meta.field_names}")
+    print(f"  Links after selection: {selected_meta._links}")
+    torch.testing.assert_close(tq_client.get_data(selected_meta)["video"][0], video)
+    print("  Reading through the selected metadata returned the original public video.")
+
+    private_meta = linked_meta.select_fields(["input_ids"])
+    print("  Kept only the private input_ids field for both samples; video links are excluded from this metadata.")
+    print(f"  Private fields: {private_meta.field_names}, links: {private_meta._links}")
+
     # Cleanup
     tq_client.clear_partition(partition_id=partition_id)
     tq.close()
@@ -341,6 +365,7 @@ def main():
         - custom_meta: list[dict] aligned with global_indexes (one dict per sample)
         - Metadata operations: chunk, concat, union, select_fields, select_samples, reorder
         - batch.samples[i] returns a lazy view with .fields -> field_schema (read-only)
+        - client.link shares public fields across keyless rows on SimpleStorage
     """
         )
     )
