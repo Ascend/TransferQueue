@@ -1230,27 +1230,31 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     client.close()
 
 
-def test_worker_survives_a_failed_request():
-    """A failure outside the per-operation handlers, e.g. in send, must not end the only worker."""
+def test_worker_survives_a_reply_failing_between_frames():
+    """A reply that fails mid-message must neither end the only worker nor misroute the next reply."""
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
     process_request = unit._process_one_worker_request
     failed = []
 
-    def fail_first_request(worker_socket, monitor):
+    def fail_after_identity_frame(worker_socket, monitor):
         if not failed:
             failed.append(True)
-            worker_socket.recv_multipart()
-            raise zmq.ZMQError(errno.EAGAIN)
+            identity = worker_socket.recv_multipart()[0]
+            worker_socket.send(identity, zmq.SNDMORE)
+            raise MemoryError
         process_request(worker_socket, monitor)
 
-    unit._process_one_worker_request = fail_first_request
-    client = MockStorageClient(unit.zmq_server_info.to_addr("put_get_socket"), unit.zmq_server_info.ip)
-    client.socket.setsockopt(zmq.RCVTIMEO, 1000)
+    unit._process_one_worker_request = fail_after_identity_frame
+    address, ip = unit.zmq_server_info.to_addr("put_get_socket"), unit.zmq_server_info.ip
+    stranded, next_client = MockStorageClient(address, ip), MockStorageClient(address, ip)
+    stranded.socket.setsockopt(zmq.RCVTIMEO, 1000)
     try:
         with pytest.raises(zmq.Again):
-            client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
-        response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+            stranded.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+        response = next_client.send_put(1, [1], {"val": [torch.tensor([2.0])]})
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        assert not stranded.socket.poll(500), "the next reply was routed to the stranded caller"
     finally:
-        client.close()
+        stranded.close()
+        next_client.close()
         unit.shutdown()

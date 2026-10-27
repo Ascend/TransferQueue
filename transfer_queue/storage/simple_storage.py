@@ -1103,18 +1103,11 @@ class SimpleStorageUnit:
 
     def _worker_routine(self) -> None:
         """Worker thread for processing requests."""
-
-        worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
-        worker_socket.connect(self._inproc_addr)
-
-        poller = zmq.Poller()
-        poller.register(worker_socket, zmq.POLLIN)
-
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
 
         try:
-            self._worker_loop(worker_socket, poller, perf_monitor)
+            self._worker_loop(perf_monitor)
         except BaseException:
             logger.critical(
                 f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception.", exc_info=True
@@ -1123,8 +1116,6 @@ class SimpleStorageUnit:
             raise
         finally:
             logger.info(f"[{self.storage_unit_id}]: worker stopped.")
-            poller.unregister(worker_socket)
-            worker_socket.close(linger=0)
 
     def _abort_process(self, reason: str) -> None:
         """Kill the whole unit process so it fails visibly instead of lingering as a dead unit.
@@ -1151,33 +1142,46 @@ class SimpleStorageUnit:
         _flush_log_output()
         os._exit(_WORKER_DEATH_EXIT_CODE)
 
-    def _worker_loop(self, worker_socket: zmq.Socket, poller: zmq.Poller, perf_monitor: Any) -> None:
+    def _connect_worker_socket(self, poller: zmq.Poller) -> zmq.Socket:
+        worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
+        worker_socket.connect(self._inproc_addr)
+        poller.register(worker_socket, zmq.POLLIN)
+        return worker_socket
+
+    def _worker_loop(self, perf_monitor: Any) -> None:
         """Poll for requests and answer them until shutdown is signalled."""
-        while not self._shutdown_event.is_set():
-            monitor = self._metrics if self._metrics is not None else perf_monitor
-            try:
-                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
-                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
-            except zmq.error.ContextTerminated:
-                # ZMQ context was terminated, exit gracefully
-                logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
-                break
-            except Exception as e:
-                logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
-                continue
-
-            if self._shutdown_event.is_set():
-                break
-
-            if worker_socket in socks:
-                # Keep request handling in a separate scope so payload references are
-                # released before the worker waits for the next request.
+        poller = zmq.Poller()
+        worker_socket = self._connect_worker_socket(poller)
+        try:
+            while not self._shutdown_event.is_set():
+                monitor = self._metrics if self._metrics is not None else perf_monitor
                 try:
-                    self._process_one_worker_request(worker_socket, monitor)
+                    # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                    socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+                except zmq.error.ContextTerminated:
+                    # ZMQ context was terminated, exit gracefully
+                    logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
+                    break
                 except Exception as e:
-                    # This is the unit's only worker: if a failed recv or send ended it, the
-                    # proxy would keep queueing requests that nobody answers. Strand one caller.
-                    logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
+                    logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
+                    continue
+
+                if self._shutdown_event.is_set():
+                    break
+
+                if worker_socket in socks:
+                    # Keep request handling in a separate scope so payload references are
+                    # released before the worker waits for the next request.
+                    try:
+                        self._process_one_worker_request(worker_socket, monitor)
+                    except Exception as e:
+                        logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
+                        # The socket may be left mid-message; a fresh one keeps the next reply routed correctly.
+                        poller.unregister(worker_socket)
+                        worker_socket.close(linger=0)
+                        worker_socket = self._connect_worker_socket(poller)
+        finally:
+            worker_socket.close(linger=0)
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
