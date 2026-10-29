@@ -54,6 +54,7 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils.common import ray_namespace
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
@@ -123,7 +124,7 @@ def _init_from_existing() -> bool:
     global _TQ_CONTROLLER
     try:
         if _TQ_CONTROLLER is None:
-            _TQ_CONTROLLER = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+            _TQ_CONTROLLER = ray.get_actor("TransferQueueController", namespace=ray_namespace())
 
     except ValueError:
         logger.info("Called _init_from_existing() but TransferQueueController has not been initialized yet.")
@@ -207,7 +208,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     try:
         global _TQ_CONTROLLER, _TQ_IS_OWNER
         _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
-            name="TransferQueueController", namespace="transfer_queue"
+            name="TransferQueueController", namespace=ray_namespace()
         ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")

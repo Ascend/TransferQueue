@@ -20,6 +20,7 @@ import ray
 import torch
 
 from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
+from transfer_queue.utils.common import ray_namespace
 
 
 @ray.remote(max_concurrency=8)
@@ -57,10 +58,10 @@ class RayStorageClient(StorageKVClient):
 
         # initialize actor
         try:
-            self.storage_actor = ray.get_actor("RayObjectRefStorage", namespace="transfer_queue")
+            self.storage_actor = ray.get_actor("RayObjectRefStorage", namespace=ray_namespace())
         except ValueError:
             self.storage_actor = RayObjectRefStorage.options(
-                name="RayObjectRefStorage", namespace="transfer_queue", get_if_exists=False
+                name="RayObjectRefStorage", namespace=ray_namespace(), get_if_exists=False
             ).remote()
 
     def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:

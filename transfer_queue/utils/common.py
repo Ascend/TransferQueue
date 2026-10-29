@@ -122,6 +122,15 @@ def limit_pytorch_auto_parallel_threads(target_num_threads: int | None = None, i
         )
 
 
+def ray_namespace() -> str:
+    """Ray namespace of the TransferQueue named actors.
+
+    Defaults to ``transfer_queue``, shared by every job on the Ray cluster (see #115). Set
+    ``TQ_RAY_NAMESPACE`` in every process of a job to keep concurrent jobs apart.
+    """
+    return os.environ.get("TQ_RAY_NAMESPACE") or "transfer_queue"
+
+
 def get_env_bool(env_key: str, default: bool = False) -> bool:
     """Robustly get a boolean from an environment variable."""
     env_value = os.getenv(env_key)
