@@ -205,10 +205,6 @@ Developers can leverage `TransferQueueClient` directly to implement advanced fea
 - [tutorial/05_custom_sampler.py](https://github.com/Ascend/TransferQueue/blob/main/tutorial/05_custom_sampler.py)
 
 
-#### Concurrent jobs on one Ray cluster
-
-The controller and `RayStorageClient`'s storage actor are named actors in the Ray namespace `transfer_queue`, so every job on the cluster that calls `tq.init()` attaches to the same controller. This is what lets a trainer job connect to TransferQueue created by another job. Jobs that must not share data set `TQ_RAY_NAMESPACE` to a value unique per job (for example the job id) in every process of the job, for instance through the job-level `runtime_env` `env_vars`. Without it, a second job reads the first job's partitions, and the first job's `tq.close()` kills the controller the second one is using.
-
 <h2 id="show-cases">🔥 Showcases</h2>
 
 ### Collocated Example
