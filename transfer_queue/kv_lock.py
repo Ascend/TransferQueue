@@ -42,7 +42,7 @@ import ray
 from ray.exceptions import GetTimeoutError, RayActorError
 
 from transfer_queue.lock_manager import _RESERVED_SLOTS, TransferQueueLockManager
-from transfer_queue.utils.common import get_env_bool, get_node_round_robin_scheduling_strategies
+from transfer_queue.utils.common import get_env_bool, get_node_round_robin_scheduling_strategies, ray_namespace
 
 # Not asyncio.Lock: it is bound to one event loop and is not thread-safe, while a process
 # may run several loops plus plain threads. A key is held exactly while it is in _table,
@@ -292,7 +292,7 @@ def _manager_name(shard: int) -> str:
 def _lock_manager(shard: int):
     if shard not in _managers:
         try:
-            _managers[shard] = ray.get_actor(_manager_name(shard), namespace="transfer_queue")
+            _managers[shard] = ray.get_actor(_manager_name(shard), namespace=ray_namespace())
         except ValueError:
             raise RuntimeError(_NOT_INITIALIZED) from None
     return _managers[shard]
@@ -556,7 +556,7 @@ def _start_lock_managers(settings: tuple[int, int] | None) -> None:
         _owned = [
             TransferQueueLockManager.options(  # type: ignore[attr-defined]
                 name=_manager_name(shard),
-                namespace="transfer_queue",
+                namespace=ray_namespace(),
                 get_if_exists=True,
                 max_concurrency=max_waiting_acquires + _RESERVED_SLOTS,
                 scheduling_strategy=strategy,

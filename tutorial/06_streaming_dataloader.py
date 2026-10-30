@@ -70,6 +70,7 @@ from transfer_queue import (  # noqa: E402
     StreamingDataLoader,
     StreamingDataset,
 )
+from transfer_queue.utils.common import ray_namespace  # noqa: E402
 
 
 def setup_transfer_queue():
@@ -184,7 +185,7 @@ def update_worker(
     # Step 1: Create StreamingDataset
     # This dataset integrates with TransferQueue and handles batch retrieval
 
-    controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+    controller = ray.get_actor("TransferQueueController", namespace=ray_namespace())
     config = ray.get(controller.get_config.remote())
 
     dataset = StreamingDataset(

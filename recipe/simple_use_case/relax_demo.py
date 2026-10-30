@@ -40,6 +40,7 @@ from tensordict import TensorDict
 import transfer_queue as tq
 from transfer_queue import RankAwareSampler, StreamingDataLoader, StreamingDataset
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.utils.common import ray_namespace
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger("MAIN", default_level="INFO")
@@ -131,7 +132,7 @@ class BaseStageWorker:
     def __init__(self, tq_config, tracker, worker_id: int, config: "DemoConfig"):
         tq.init(tq_config)
         self.tq_client = tq.get_client()
-        controller = ray.get_actor("TransferQueueController", namespace="transfer_queue")
+        controller = ray.get_actor("TransferQueueController", namespace=ray_namespace())
         self.cfg = ray.get(controller.get_config.remote())
         self.tracker = tracker
         self.worker_id = worker_id
