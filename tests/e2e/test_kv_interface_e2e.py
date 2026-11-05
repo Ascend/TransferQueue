@@ -1390,10 +1390,12 @@ class TestKVUpdateE2E:
             meta = tq_api.kv_update(key=key, partition_id=partition_id, fields=fields, merge_fn=concat, finalize=False)
             assert not tokens_ready()
         assert set(tq_api.kv_batch_get(keys=key, partition_id=partition_id).keys()) == {"prompt"}
-        with pytest.raises(ValueError, match="not finalized"):
-            tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens")
-        with pytest.raises(ValueError, match="not finalized"):
-            tq_api.kv_batch_get_by_meta(meta)
+        assert "tokens" not in tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields="tokens").keys()
+        partial = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields=["prompt", "tokens"])
+        assert set(partial.keys()) == {"prompt"}
+        absent = tq_api.kv_batch_get(keys=key, partition_id=partition_id, select_fields=["prompt", "never_written"])
+        assert set(absent.keys()) == {"prompt"}
+        assert "tokens" not in tq_api.kv_batch_get_by_meta(meta).keys()
         row = tq_api.kv_describe(keys=key, partition_id=partition_id)[key]
         assert row == {"fields": ["prompt", "tokens"], "unfinalized": ["tokens"], "links": {}}
         with pytest.raises(RuntimeError, match="not found"):
