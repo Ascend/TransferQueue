@@ -544,7 +544,8 @@ def kv_batch_get(
     Args:
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
-        select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        select_fields: Optional field(s) to retrieve. If None, retrieves all fields. Fields
+            not ready in every key (missing, or not finalized) are omitted from the result.
         data_parser: Advanced. Optional ``data_parser(data, args) -> dict`` that each storage
             unit runs on its share of the batch before replying, so only the parsed values cross
             the network (the get-side counterpart of ``kv_batch_put``'s ``data_parser``).
@@ -576,7 +577,6 @@ def kv_batch_get(
     Raises:
         ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
-        ValueError: If a field in ``select_fields`` is not ready in every found key
         ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
             number of keys
         RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
@@ -1136,7 +1136,8 @@ async def async_kv_batch_get(
     Args:
         keys: Single key or list of keys to retrieve
         partition_id: Partition containing the keys
-        select_fields: Optional field(s) to retrieve. If None, retrieves all fields
+        select_fields: Optional field(s) to retrieve. If None, retrieves all fields. Fields
+            not ready in every key (missing, or not finalized) are omitted from the result.
         data_parser: Advanced. Optional parser the storage units run before replying; see
             ``kv_batch_get`` for its contract and constraints.
         parser_args: Optional per-key arguments for ``data_parser``, aligned with ``keys``.
@@ -1147,7 +1148,6 @@ async def async_kv_batch_get(
     Raises:
         ValueError: If the partition or any of the keys is not found
         ValueError: If empty fields exist in any key (sample)
-        ValueError: If a field in ``select_fields`` is not ready in every found key
         ValueError: If ``parser_args`` is given without ``data_parser`` or does not match the
             number of keys
         RuntimeError: If ``data_parser`` fails or breaks its contract on a storage unit
@@ -1184,13 +1184,6 @@ async def async_kv_batch_get(
             fields_to_fetch = [select_fields]
         else:
             fields_to_fetch = select_fields
-        # The meta keeps only fields ready in every key; select_fields would drop the rest silently.
-        not_ready = [f for f in fields_to_fetch if f not in batch_meta.field_names]
-        if not_ready:
-            raise ValueError(
-                f"Fields {not_ready} are not ready in all the requested keys: missing, or written by "
-                "kv_update(finalize=False) and not finalized yet"
-            )
         batch_meta = batch_meta.select_fields(fields_to_fetch)
 
     if not batch_meta.is_ready:
