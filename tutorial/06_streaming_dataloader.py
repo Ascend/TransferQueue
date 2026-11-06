@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """
-Tutorial 5: Streaming DataLoader for Distributed Training
+Tutorial 6: Streaming DataLoader for Distributed Training
 
 This script demonstrates how to use StreamingDataset and StreamingDataLoader
 for efficient streaming data loading in distributed training scenarios.

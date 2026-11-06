@@ -146,6 +146,7 @@ def demonstrate_kv_api():
 
     # Step 4: Only update tags through kv_put
     print("\n[Step 4] Update existing tags without providing value...")
+    print("  Tags hold application metadata; TQ tracks field readiness separately.")
     key_for_update_tags = "0_0"
     tag_update = {"global_steps": 0, "status": "finish", "model_version": 0}
     print(f"  Target Key: {key_for_update_tags}")
@@ -153,18 +154,31 @@ def demonstrate_kv_api():
     tq.kv_put(key=key_for_update_tags, partition_id=partition_id, fields=None, tag=tag_update)
     print(f"  ✓ Update success: Samples '0_0' now has tag as {tag_update}.")
 
-    # Step 5: Concatenate a field with kv_update, then clear only that field
-    print("\n[Step 5] Updating a field with kv_update (concat, then clear the field)...")
-    tq.kv_put(key=key, partition_id=partition_id, fields={"scratch": torch.tensor([1, 2])})
+    response_key = keys[0]
+    print(f"\n[Step 5] Building a response for '{response_key}' in chunks...")
+    print("  kv_update requires SimpleStorage; use one writer per key or coordinate writers with a KV lock.")
+    print("  A timed-out merge may have committed; retrying it blindly can append the same chunk twice.")
     tq.kv_update(
-        key=key,
+        key=response_key,
         partition_id=partition_id,
-        fields={"scratch": torch.tensor([3, 4])},
+        fields={"response": torch.tensor([1, 2])},
         merge_fn=lambda old, new: torch.cat([old, new]),
+        finalize=False,
     )
-    print("  ✓ kv_update concat: scratch of '0_0' is now [1, 2, 3, 4].")
-    tq.kv_clear(keys=key, partition_id=partition_id, fields="scratch")
-    print("  ✓ tq.kv_clear(fields=...): scratch of '0_0' is removed (key and other fields remain).")
+    print("  Stored fields:", tq.kv_describe(response_key, partition_id)[response_key])
+    print("  Ready fields:", tq.kv_exists(response_key, partition_id)[response_key])
+
+    tq.kv_update(
+        key=response_key,
+        partition_id=partition_id,
+        fields={"response": torch.tensor([3, 4])},
+        merge_fn=lambda old, new: torch.cat([old, new]),
+        finalize=True,
+    )
+    response = tq.kv_batch_get(response_key, partition_id, select_fields="response")
+    assert response["response"][0].tolist() == [1, 2, 3, 4]
+    print("  Published response:", response["response"][0])
+    tq.kv_put(response_key, partition_id, tag={"status": "finish"})
 
     # Step 6: List all keys and tags in a partition
     print("\n[Step 6] Listing all keys and tags in partition...")
@@ -183,17 +197,17 @@ def demonstrate_kv_api():
     retrieved_input_ids = tq.kv_batch_get(keys=all_keys, partition_id=partition_id, select_fields="input_ids")
     print(f"  ✓ Successfully retrieved only {list(retrieved_input_ids.keys())} field for all samples.")
 
-    # Step 8: Retrieve all fields using kv_batch_get
-    print("\n[Step 8] Retrieving all fields with kv_batch_get...")
+    print("\n[Step 8] Retrieving the fields ready in every requested key...")
     retrieved_all = tq.kv_batch_get(keys=all_keys, partition_id=partition_id)
-    print(f"  Retrieved all fields for {all_keys}:")
-    print(f"  Fields: {list(retrieved_all.keys())}")
-    print(
-        f"  Note: We cannot retrieve fields {list(response_batch.keys())}, since they only available in {append_keys}"
-    )
+    print(f"  Requested keys: {all_keys}")
+    print(f"  Common ready fields: {list(retrieved_all.keys())}")
 
-    # Step 9: Clear specific keys
-    print("\n[Step 9] Clearing keys from partition...")
+    print("\n[Step 9] Clearing selected fields while keeping keys...")
+    tq.kv_clear(all_keys, partition_id, fields="attention_mask")
+    print("  Keys and their other fields remain:", tq.kv_exists(all_keys, partition_id))
+
+    # Step 10: Clear specific keys
+    print("\n[Step 10] Clearing keys from partition...")
     keys_to_clear = all_keys[:2]  # Delete the first 2 keys
     tq.kv_clear(keys=keys_to_clear, partition_id=partition_id)
     print(f"  ✓ Cleared keys: {keys_to_clear}")
@@ -231,10 +245,6 @@ def main():
         - Focusing on fine-grained data access where extreme streaming performance is non-essential
         - Integration with external ReplayBuffer/single-controller that manage sample dispatching
         
-        Limitations (vs low-level native APIs):
-        - No built-in production/consumption tracking: Users must manually check status via tags externally.
-        - No built-in Sampler support: Must implement data dispatch by ReplayBuffer or single-controller externally.
-        - Not fully streaming: Consumers must wait for single-controller to dispatch `keys`.
         """
         )
     )
@@ -252,9 +262,11 @@ def main():
         print("=" * 80)
         print("\nKey Takeaways:")
         print("  1. KV API simplifies data access with Redis-style semantics")
-        print("  2. Use 'fields' parameter to get/put specific fields only")
-        print("  3. Tags enable custom metadata for production status, scores, etc.")
-        print("  4. Use kv_list to inspect partition contents")
+        print("  2. Read or write only the fields you need")
+        print("  3. Tags store custom metadata such as status and scores")
+        print("  4. Use `kv_list` to inspect keys and tags")
+        print("  5. Supports incremental updates and publishing completed responses")
+        print("  6. Supports field-level clearing while keeping keys")
 
         # Cleanup
         tq.close()
