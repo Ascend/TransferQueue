@@ -1,3 +1,17 @@
+# Copyright 2025 The TransferQueue Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import asyncio
 import time
 from uuid import uuid4
@@ -29,6 +43,7 @@ async def test_waiting_fetch_allows_put_and_notification(monkeypatch):
         client = tq.get_client()
         client.controller_rpc_pool._maxsize = 1
         monkeypatch.setattr(client_module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 4)
+        monkeypatch.setattr(client_module, "TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 1)
 
         reader = asyncio.create_task(
             asyncio.to_thread(
@@ -48,6 +63,16 @@ async def test_waiting_fetch_allows_put_and_notification(monkeypatch):
         assert torch.equal(result["input_ids"][0], data["input_ids"][0])
 
         monkeypatch.setattr(client_module, "TQ_CONTROLLER_GET_METADATA_TIMEOUT", 0.25)
+        monkeypatch.setattr(client_module, "TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5)
+        request_count = 0
+        original_request = client._request_controller
+
+        async def count_requests(*args, **kwargs):
+            nonlocal request_count
+            request_count += 1
+            return await original_request(*args, **kwargs)
+
+        monkeypatch.setattr(client, "_request_controller", count_requests)
         started = time.monotonic()
         with pytest.raises(TimeoutError, match="Timeout while waiting for sufficient data"):
             await asyncio.to_thread(
@@ -58,6 +83,7 @@ async def test_waiting_fetch_allows_put_and_notification(monkeypatch):
                 task_name="trainer",
             )
         assert time.monotonic() - started < 2
+        assert request_count == 1
     finally:
         tq.close()
         ray.shutdown()

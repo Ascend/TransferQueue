@@ -314,8 +314,12 @@ class AsyncTransferQueueClient:
             "sampling_config": sampling_config,
         }
         deadline = time.monotonic() + TQ_CONTROLLER_GET_METADATA_TIMEOUT
-        retry_interval = min(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL, TQ_CONTROLLER_GET_METADATA_TIMEOUT / 4)
         while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timeout while waiting for sufficient data for task {task_name}. "
+                    f"Required: {batch_size}, partition: {partition_id}, fields: {data_fields}"
+                )
             async with self.controller_rpc_pool.alease(self._controller) as socket:
                 response_msg = await self._request_controller(
                     socket=socket,
@@ -326,12 +330,8 @@ class AsyncTransferQueueClient:
             if not response_msg.body.get("retry", False):
                 return response_msg.body["metadata"]
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError(
-                    f"Timeout while waiting for sufficient data for task {task_name}. "
-                    f"Required: {batch_size}, partition: {partition_id}, fields: {data_fields}"
-                )
-            await asyncio.sleep(min(retry_interval, remaining))
+            if remaining > 0:
+                await asyncio.sleep(min(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL, remaining))
 
     @with_controller_socket
     async def async_set_custom_meta(

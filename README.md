@@ -148,10 +148,6 @@ See [tutorial/06_streaming_dataloader.py](tutorial/06_streaming_dataloader.py) f
 #### Low-Level Native API
 
 The native interfaces of TransferQueue are implemented in `TransferQueueClient`. It offers maximum flexibility through native, atomic operations.
-For `get_meta(mode="fetch")`, the client retries until `TQ_CONTROLLER_GET_METADATA_TIMEOUT`
-when data is insufficient and `polling_mode` is false. With `polling_mode` true, it
-returns an empty `BatchMeta` immediately. Waiting happens in the client, so the
-controller can continue processing producers' data-update notifications.
 
 Developers can leverage `TransferQueueClient` directly to implement advanced features that require fine-grained control and fully streamed data scheduling, as illustrated in the following tutorials:
 
