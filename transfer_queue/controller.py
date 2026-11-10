@@ -1398,6 +1398,7 @@ class TransferQueueController:
         batch_size: int | None = None,
         sampling_config: dict[str, Any] | None = None,
         *args,
+        wait_for_data: bool = True,
         **kwargs,
     ) -> BatchMeta:
         """
@@ -1413,11 +1414,14 @@ class TransferQueueController:
                                       (excludes already consumed samples)
             task_name: Name of the consumer task (required for fetch modes)
             batch_size: Number of samples to retrieve
+            wait_for_data: Whether to wait for enough samples in fetch mode. The ZMQ
+                           request loop disables this so it can process data updates.
             *args: Additional positional arguments
             **kwargs: Additional keyword arguments
 
         Returns:
-            BatchMeta object containing the requested metadata
+            BatchMeta object containing the requested metadata, or an empty batch when
+            wait_for_data is disabled and insufficient data is ready
 
         Raises:
             TimeoutError: If waiting for sufficient data times out in fetch mode
@@ -1458,7 +1462,7 @@ class TransferQueueController:
             if batch_size is None:
                 raise ValueError("must provide batch_size in fetch mode")
 
-            start_time = time.time()
+            deadline = time.monotonic() + TQ_CONTROLLER_GET_METADATA_TIMEOUT
             while True:
                 # ready_for_consume_indexes: samples where all required fields are produced
                 # (production status is ready) and not yet consumed
@@ -1477,19 +1481,22 @@ class TransferQueueController:
                                 f" Returning None due to polling mode."
                             )
                             return BatchMeta.empty()
-                    else:
-                        logger.warning(
-                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
-                        )
-                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
-                    if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
+                    if not wait_for_data:
+                        return BatchMeta.empty()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
                         raise TimeoutError(
                             f"Timeout while waiting for sufficient data for task {task_name}. "
                             f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
                         )
+                    delay = min(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL, remaining)
+                    logger.warning(
+                        f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
+                        f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                        f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                        f"Retrying in {delay:.2f}s..."
+                    )
+                    time.sleep(delay)
                 else:
                     break
 
@@ -2541,8 +2548,12 @@ class TransferQueueController:
             mode=params.get("mode", "fetch"),
             task_name=params.get("task_name"),
             sampling_config=params.get("sampling_config", {}),
+            wait_for_data=False,
         )
-        return self._make_response(request_msg, ZMQRequestType.GET_META_RESPONSE, {"metadata": metadata})
+        retry = params.get("mode", "fetch") == "fetch" and not self.polling_mode and metadata.size == 0
+        return self._make_response(
+            request_msg, ZMQRequestType.GET_META_RESPONSE, {"metadata": metadata, "retry": retry}
+        )
 
     def _handle_notify_data_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
