@@ -22,6 +22,9 @@ backend:
 
   # SimpleStorage: ZMQ-based in-memory storage for out-of-the-box usage
   SimpleStorage:
+    payload_transfer:
+      backend: zmq  # Use nixl-ucx for NIXL notifications and UCX READ.
+      # ucx_env_vars: {}
     # Maximum number of experience samples to hold across all storage units.
     # Set to null for unlimited capacity (no capacity check).
     total_storage_size: null

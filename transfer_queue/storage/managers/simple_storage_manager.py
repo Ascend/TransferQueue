@@ -31,10 +31,17 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.simple_storage import (
-    KEY_NOT_FOUND_MARKER,
-    StorageKeyNotFoundError,
+from transfer_queue.storage.payload_transfer import (
+    Operation,
+    RequestHeader,
+    StorageRejected,
+    TransferTimeout,
+    create_payload_transfer,
+    decode_spans,
+    encode_spans,
+    payload_backend,
 )
+from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -43,7 +50,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    frame_nbytes,
     with_zmq_socket,
 )
 
@@ -238,6 +244,21 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+        transfer_config = config.get("payload_transfer")
+        if payload_backend(transfer_config) == "zmq":
+            self._payload_peers = {
+                unit: {"backend": "zmq", "address": info} for unit, info in self.storage_unit_infos.items()
+            }
+        else:
+            self._payload_peers = dict(config.get("payload_transfer_infos") or {})
+            if self._payload_peers.keys() != self.storage_unit_infos.keys():
+                raise ValueError("NIXL payload endpoints do not match the SimpleStorage units")
+        self.payload_transfer = create_payload_transfer(
+            transfer_config,
+            owner_id=self.storage_manager_id,
+            pool=self.storage_rpc_pool,
+            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+        )
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
 
     def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
@@ -645,64 +666,45 @@ class AsyncSimpleStorageManager(StorageManager):
             )
         return field_schema
 
-    @with_storage_unit_socket
+    async def _request_payload(self, target, operation, body, *, data=None, recv=()):
+        started = time.perf_counter()
+        try:
+            connection = await self.payload_transfer.connect(self._payload_peers[target])
+            reply, spans = await self.payload_transfer.request(
+                connection, RequestHeader(operation, body), send=encode_spans(data) if data is not None else (),
+                recv=recv,
+            )
+        except TransferTimeout as exc:
+            verb = operation.name.lower()
+            size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {verb} at storage unit "
+                f"{target} ({self._describe_storage_unit(target)}){size}"
+            ) from exc
+        except StorageRejected as exc:
+            error = StorageKeyNotFoundError if exc.missing_key else RuntimeError
+            raise error(f"Failed to {operation.name.lower()} data on storage unit {target}: {exc}") from exc
+
+        if data is not None:
+            log_heavy_operation(
+                self.storage_manager_id, operation.name.lower(), time.perf_counter() - started, reply.wire_bytes,
+                f"to {target} at {self._describe_storage_unit(target)} "
+                f"samples={len(body['global_indexes'])} fields={list(data)}",
+            )
+        return reply, spans
+
     async def _put_to_single_storage_unit(
         self,
         global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
         data_parser: Callable[[Any], Any] | None = None,
-        socket: zmq.Socket = None,
     ):
-        """
-        Send data to a specific storage unit.
-        """
-
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "data": storage_data, "data_parser": data_parser},
+        await self._request_payload(
+            target_storage_unit, Operation.PUT,
+            {"global_indexes": global_indexes, "data_parser": data_parser}, data=storage_data,
         )
 
-        serialized_bytes = 0
-        started = time.perf_counter()
-        try:
-            frames = request_msg.serialize()
-            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-            await socket.send_multipart(frames, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to put data to storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-            # This end serializes the put payload and waits out the round trip, so it holds both
-            # the true wire size and the end-to-end latency.
-            log_heavy_operation(
-                self.storage_manager_id,
-                "put",
-                time.perf_counter() - started,
-                serialized_bytes,
-                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
-                f"samples={len(global_indexes)} fields={list(storage_data.keys())}",
-            )
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"serialized_mb={serialized_bytes / 2**20:.1f}"
-            ) from e
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error during put to storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
-
-    @with_storage_unit_socket
     async def _update_to_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -710,58 +712,13 @@ class AsyncSimpleStorageManager(StorageManager):
         merge_fn: Callable[[Any, Any], Any],
         merge_plan: dict[str, dict[str, Any]],
         target_storage_unit: str,
-        socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
-        """Send an update to one storage unit and return what it stored, per field."""
-        body: dict[str, Any] = {
-            "global_indexes": global_indexes,
-            "data": storage_data,
-            "merge_fn": merge_fn,
-            "merge_plan": merge_plan,
-        }
-
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body=body,
+        reply, _ = await self._request_payload(
+            target_storage_unit, Operation.UPDATE,
+            {"global_indexes": global_indexes, "merge_fn": merge_fn, "merge_plan": merge_plan},
+            data=storage_data,
         )
-
-        serialized_bytes = 0
-        started = time.perf_counter()
-        try:
-            frames = request_msg.serialize()
-            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-            await socket.send_multipart(frames, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to update data on storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-            log_heavy_operation(
-                self.storage_manager_id,
-                "update",
-                time.perf_counter() - started,
-                serialized_bytes,
-                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
-                f"samples={len(global_indexes)} fields={list(storage_data)}",
-            )
-            return response_msg.body.get("stored_shapes", {})
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during update to storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"serialized_mb={serialized_bytes / 2**20:.1f}"
-            ) from e
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error during update to storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"Error in update to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+        return reply.body.get("stored_shapes", {})
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -926,7 +883,6 @@ class AsyncSimpleStorageManager(StorageManager):
 
         return TensorDict(tensor_data, batch_size=len(metadata))
 
-    @with_storage_unit_socket
     async def _get_from_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -934,48 +890,16 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         data_parser: Callable[[Any, Any], Any] | None = None,
         parser_args: list | None = None,
-        socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={
-                "global_indexes": global_indexes,
-                "fields": fields,
-                "data_parser": data_parser,
-                "parser_args": parser_args,
-            },
+        _, spans = await self._request_payload(
+            target_storage_unit,
+            Operation.GET,
+            {"global_indexes": global_indexes, "fields": fields,
+             "data_parser": data_parser, "parser_args": parser_args},
+            recv=None,
         )
-        try:
-            await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
-                storage_unit_data = response_msg.body["data"]
-                return fields, storage_unit_data
-            else:
-                message = response_msg.body.get("message", "Unknown error")
-                error_type = StorageKeyNotFoundError if KEY_NOT_FOUND_MARKER in message else RuntimeError
-                raise error_type(f"Failed to get data from storage unit {target_storage_unit}: {message}")
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
-            ) from e
-        except StorageKeyNotFoundError:
-            # Already logged at debug by the storage unit; propagate for the caller to classify.
-            raise
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error from storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(
-                f"Error getting data from storage unit {target_storage_unit}: {type(e).__name__}: {e}"
-            ) from e
+        return fields, decode_spans(spans)
 
     async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
@@ -1325,6 +1249,9 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
+        transfer = getattr(self, "payload_transfer", None)
+        if transfer is not None:
+            transfer.shutdown()
         # Before super(), which may destroy the context these sockets live on. Absent when
         # the base constructor raised (a failed handshake does), and __del__ still calls this.
         pool = getattr(self, "storage_rpc_pool", None)
