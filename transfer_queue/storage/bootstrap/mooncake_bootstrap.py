@@ -1,5 +1,5 @@
 # Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
-# Copyright 2025 The TransferQueue Team
+# Copyright 2026 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,12 +18,31 @@ import subprocess
 import time
 from urllib.parse import urlparse
 
+import psutil
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _wait_for_master_exit(masters: list[psutil.Process], timeout: float) -> list[psutil.Process]:
+    """Wait for masters to exit, including zombies owned by another process."""
+    deadline = time.monotonic() + timeout
+    while masters:
+        _, alive = psutil.wait_procs(masters, timeout=min(0.1, max(0, deadline - time.monotonic())))
+        masters = []
+        for master in alive:
+            try:
+                # Zombies have released their listeners; only their parent can reap them.
+                if master.status() != psutil.STATUS_ZOMBIE:
+                    masters.append(master)
+            except psutil.NoSuchProcess:
+                pass
+        if time.monotonic() >= deadline:
+            break
+    return masters
 
 
 @StorageBootstrapProvider.register_provider("MooncakeStore")
@@ -58,11 +77,26 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
         pids = check.stdout.strip().replace("\n", ", ")
         logger.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
 
-        result = os.system('pkill -f "[m]ooncake_master"')
-        if result == 0:
-            logger.info("Successfully killed existing mooncake_master processes.")
-        else:
-            raise RuntimeError(f"Failed to kill existing mooncake_master processes (exit code: {result}).")
+        masters = []
+        for pid in check.stdout.split():
+            try:
+                master = psutil.Process(int(pid))
+                master.terminate()
+                masters.append(master)
+            except psutil.NoSuchProcess:
+                pass
+        # Sending SIGTERM is asynchronous; the new master must not race the old
+        # HTTP metadata listener for its port. Escalate only these captured PIDs.
+        alive = _wait_for_master_exit(masters, timeout=10)
+        for master in alive:
+            try:
+                master.kill()
+            except psutil.NoSuchProcess:
+                pass
+        alive = _wait_for_master_exit(alive, timeout=5)
+        if alive:
+            raise RuntimeError(f"Existing mooncake_master processes did not exit: {[p.pid for p in alive]}")
+        logger.info("Existing mooncake_master processes have exited.")
 
     # process metadata_server (normalize and validate)
     metadata_server_raw_address = str(conf.backend.MooncakeStore.metadata_server).strip()
