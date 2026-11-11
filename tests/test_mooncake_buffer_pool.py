@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Pooled receive buffers on the MooncakeStore tensor read path.
+"""Pooled receive and send buffers on the MooncakeStore tensor read and put paths.
 
 The store and the buffer pool are faked, so these tests need neither mooncake nor RDMA.
 The fake pool keeps the upstream properties this path depends on: buffers are carved out
@@ -60,6 +60,7 @@ class FakeStore:
         self.closed = False
         self.transfer_error: Exception | None = None
         self.on_transfer = None
+        self.put_calls: list[tuple[list[str], list[int], list[int]]] = []
 
     def setup(self, *args):
         return 0
@@ -80,6 +81,16 @@ class FakeStore:
         for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
             ctypes.memmove(ptr, self.objects[key], size)
         return list(sizes)
+
+    def batch_upsert_from(self, keys, ptrs, sizes, config):
+        self.put_calls.append((list(keys), list(ptrs), list(sizes)))
+        if self.transfer_error is not None:
+            raise self.transfer_error
+        if self.on_transfer is not None:
+            self.on_transfer()
+        for key, ptr, size in zip(keys, ptrs, sizes, strict=True):
+            self.objects[key] = ctypes.string_at(ptr, size)
+        return [0] * len(keys)
 
     def close(self):
         self.closed = True
@@ -389,64 +400,79 @@ def test_returned_tensors_survive_buffer_reuse(store, monkeypatch):
     assert_payloads(second)
 
 
-def test_failed_transfer_returns_the_buffer_and_keeps_the_cause(store, monkeypatch):
+@pytest.mark.parametrize("operation", ["get", "put"])
+def test_failed_transfer_returns_the_buffer_and_keeps_the_cause(store, monkeypatch, operation):
     client, pool = make_client_and_pool(monkeypatch)
     store.transfer_error = RuntimeError("transport is down")
 
-    with pytest.raises(RuntimeError, match="transport is down"):
-        read_all(client)
+    with pytest.raises(RuntimeError, match="transport is down") as exc:
+        if operation == "get":
+            read_all(client)
+        else:
+            client._put_tensors_thread_worker(KEYS, expected_tensors())
 
-    assert pool.active == {} and pool.returned == len(pool.acquired)
+    assert exc.value is store.transfer_error
+    assert pool.active == {} and pool.returned == len(pool.acquired) == 1
 
 
-def test_failed_copy_out_returns_the_buffer_and_keeps_the_cause(store, monkeypatch):
+@pytest.mark.parametrize("operation", ["get", "put"])
+def test_failed_copy_returns_the_buffer_and_keeps_the_cause(store, monkeypatch, operation):
     client, pool = make_client_and_pool(monkeypatch)
+    error = RuntimeError("copy failed")
 
     def boom(self, source, *args, **kwargs):
-        # Drop the staged view the caller passed in: a real copy_ failure comes from C++
-        # and leaves no Python frame holding it, so only the client's own reference counts.
-        del source
-        raise RuntimeError("copy-out failed")
+        # A real copy_ failure leaves no Python mock frame holding either tensor.
+        # Drop both references so the mock does not keep pooled memory alive.
+        del self, source
+        raise error
 
     monkeypatch.setattr(torch.Tensor, "copy_", boom)
 
-    # A staged view left alive by the failing copy would make release() raise and
-    # replace the real cause, so the view has to be dropped on the error path too.
-    with pytest.raises(RuntimeError, match="copy-out failed"):
-        read_all(client)
+    with pytest.raises(RuntimeError, match="copy failed") as exc:
+        if operation == "get":
+            read_all(client)
+        else:
+            client._put_tensors_thread_worker(KEYS, expected_tensors())
 
-    assert pool.active == {} and pool.returned == len(pool.acquired)
+    assert exc.value is error
+    assert pool.active == {} and pool.returned == len(pool.acquired) == 1
 
 
-def test_concurrent_readers_stay_within_the_local_buffer(store, monkeypatch):
+@pytest.mark.parametrize("mixed", [False, True], ids=["get_only", "mixed"])
+def test_concurrent_transfers_stay_within_the_local_buffer(store, monkeypatch, mixed):
     local_buffer_size = 8192
-    readers = 8
+    workers = 8
     client, pool = make_client_and_pool(monkeypatch, local_buffer_size=local_buffer_size)
-    barrier = threading.Barrier(readers)
-    # Hold every reader inside its transfer, so all of them need memory at the same time.
+    barrier = threading.Barrier(workers)
+    # Hold every worker inside its transfer, so all of them need memory at the same time.
     store.on_transfer = lambda: barrier.wait(timeout=30)
-    results: list[list[torch.Tensor]] = [None] * readers  # type: ignore[list-item]
     failures: list[Exception] = []
 
-    def reader(slot):
+    def transfer(slot):
         try:
-            results[slot] = read_all(client)
+            if mixed and slot % 2:
+                client._put_tensors_thread_worker([f"put{slot}/{key}" for key in KEYS], expected_tensors())
+            else:
+                assert_payloads(read_all(client))
         except Exception as e:  # reported after the join below
             failures.append(e)
 
-    threads = [threading.Thread(target=reader, args=(i,)) for i in range(readers)]
+    threads = [threading.Thread(target=transfer, args=(i,)) for i in range(workers)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(timeout=35)
 
+    assert not any(t.is_alive() for t in threads)
     assert not failures
-    for tensors in results:
-        assert_payloads(tensors)
-    # Readers past the region cap fall back instead of eating into the store's headroom.
+    if mixed:
+        for slot in range(1, workers, 2):
+            for key, tensor in zip(KEYS, expected_tensors(), strict=True):
+                assert store.objects[f"put{slot}/{key}"] == tensor.numpy().tobytes()
+    # Workers past the region cap fall back instead of eating into the store's headroom.
     assert pool.peak_regions <= mcc.MAX_BATCH_WORKER_THREADS
     assert pool.peak_bytes <= local_buffer_size // 2
-    assert pool.active == {}
+    assert pool.active == {} and pool.returned == len(pool.acquired)
 
 
 @pytest.mark.parametrize(
@@ -507,3 +533,124 @@ def test_empty_tensor_reads_like_the_register_path(store, monkeypatch):
     for got, want in zip(pooled, registered, strict=True):
         assert got.shape == want.shape and torch.equal(got, want)
     assert pool.returned == len(pool.acquired)
+
+
+def test_public_put_get_and_overwrite_mixed_values(store, monkeypatch):
+    client, pool = make_client_and_pool(monkeypatch)
+    keys = ["matrix", "metadata", "scalar", "tokens"]
+    matrix = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
+    assert not matrix.is_contiguous()
+    values = [matrix, {"step": 1, "labels": ["a", "b"]}, torch.tensor(17), torch.arange(5, dtype=torch.int16)]
+    shapes = [tuple(matrix.shape), None, (), (5,)]
+    dtypes = [torch.float32, None, torch.int64, torch.int16]
+
+    meta = client.put(keys, values)
+
+    assert meta[0] is None and meta[2:] == [None, None]
+    assert meta[1] == {"packed_size": len(store.objects["metadata"])}
+    assert store.registered == [] and store.unregistered == []
+    first = client.get(keys, shapes, dtypes, meta)
+    for index in [0, 2, 3]:
+        assert first[index].dtype == values[index].dtype
+        assert first[index].shape == values[index].shape
+        assert torch.equal(first[index], values[index])
+    assert first[1] == values[1]
+
+    updated = [matrix + 10, {"step": 2, "labels": []}, torch.tensor(-3), values[3] + 4]
+    store.registered.clear()
+    store.unregistered.clear()
+    meta = client.put(keys, updated)
+
+    assert store.registered == [] and store.unregistered == []
+    for _, ptrs, sizes in store.put_calls:
+        for ptr, size in zip(ptrs, sizes, strict=True):
+            assert pool.arena.data_ptr() <= ptr < ptr + size <= pool.arena.data_ptr() + pool.capacity
+    second = client.get(keys, shapes, dtypes, meta)
+    for index in [0, 2, 3]:
+        assert torch.equal(second[index], updated[index])
+        # Reusing pooled memory must not overwrite tensors returned by an earlier read.
+        assert torch.equal(first[index], values[index])
+    assert second[1] == updated[1]
+    assert pool.active == {} and pool.returned == len(pool.acquired)
+
+
+@pytest.mark.parametrize("fallback", ["missing_pool", "tcp", "exhausted"])
+def test_put_falls_back_to_registered_buffers(store, monkeypatch, fallback):
+    held = None
+    if fallback == "missing_pool":
+        monkeypatch.setattr(mcc, "MOONCAKE_BUFFER_POOL_IMPORTED", False)
+        client = make_client()
+        pool = None
+    else:
+        client, pool = make_client_and_pool(monkeypatch, protocol="tcp" if fallback == "tcp" else "rdma")
+        if fallback == "exhausted":
+            held = pool.acquire(pool.capacity)
+    tensor = torch.arange(12, dtype=torch.int16).reshape(3, 4).t()
+    assert not tensor.is_contiguous()
+    values = [tensor, {"fallback": fallback}]
+
+    try:
+        meta = client.put(["tensor", "object"], values)
+
+        assert store.registered and len(store.unregistered) == len(store.registered)
+        assert store.objects["tensor"] == values[0].numpy().tobytes()
+        assert meta == [None, {"packed_size": len(store.objects["object"])}]
+        result = client.get(["tensor", "object"], [(4, 3), None], [torch.int16, None], meta)
+        assert torch.equal(result[0], tensor) and result[1] == values[1]
+        if pool is not None:
+            assert pool.acquired == [pool.capacity]
+    finally:
+        if held is not None:
+            held.release()
+
+
+def test_put_splits_groups_and_registers_only_oversized_values(store, monkeypatch):
+    client, pool = make_client_and_pool(monkeypatch, local_buffer_size=4096)
+    keys = ["big", "small0", "small1", "small2", "object"]
+    values = [
+        torch.arange(256, dtype=torch.float32),
+        torch.arange(4),
+        torch.arange(5),
+        torch.arange(6),
+        {"text": "x" * 1024},
+    ]
+
+    meta = client.put(keys, values)
+
+    assert len(pool.acquired) == 2
+    assert all(nbytes <= client._pool_share_bytes for nbytes in pool.acquired)
+    assert store.registered and len(store.registered) == len(store.unregistered)
+    for key, value in zip(keys[:4], values[:4], strict=True):
+        assert store.objects[key] == value.numpy().tobytes()
+    assert meta[4] == {"packed_size": len(store.objects["object"])}
+    assert pool.active == {} and pool.returned == len(pool.acquired)
+
+
+def test_put_repeated_key_preserves_input_order(store, monkeypatch):
+    client, pool = make_client_and_pool(monkeypatch, local_buffer_size=4096)
+    values = [torch.arange(256, dtype=torch.float32), torch.arange(4, dtype=torch.float32)]
+
+    assert client.put(["repeated", "repeated"], values) == [None, None]
+
+    assert store.objects["repeated"] == values[-1].numpy().tobytes()
+    assert pool.active == {}
+
+
+def test_put_keeps_the_same_lease_during_partial_retry(store, monkeypatch):
+    client, pool = make_client_and_pool(monkeypatch)
+    upsert = store.batch_upsert_from
+
+    def retry_once(keys, ptrs, sizes, config):
+        assert len(pool.active) == 1 and pool.returned == 0
+        results = upsert(keys, ptrs, sizes, config)
+        return [-1, 0] if len(store.put_calls) == 1 else results
+
+    monkeypatch.setattr(store, "batch_upsert_from", retry_once)
+    tensors = [torch.arange(4), torch.arange(5)]
+
+    client._put_tensors_thread_worker(["retry", "done"], tensors)
+
+    initial, retry = store.put_calls
+    assert retry == (["retry"], [initial[1][0]], [initial[2][0]])
+    assert store.objects["retry"] == tensors[0].numpy().tobytes()
+    assert pool.active == {} and pool.returned == len(pool.acquired) == 1
