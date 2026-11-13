@@ -16,6 +16,7 @@
 import asyncio
 import os
 import threading
+import time
 import weakref
 from typing import Any, Callable
 
@@ -24,7 +25,11 @@ import zmq
 import zmq.asyncio
 from tensordict import TensorDict
 
-from transfer_queue.controller import PUBLIC_PARTITION
+from transfer_queue.controller import (
+    PUBLIC_PARTITION,
+    TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL,
+    TQ_CONTROLLER_GET_METADATA_TIMEOUT,
+)
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
@@ -239,7 +244,6 @@ class AsyncTransferQueueClient:
         return response_msg
 
     # ==================== Basic API ====================
-    @with_controller_socket
     async def async_get_meta(
         self,
         data_fields: list[str],
@@ -248,7 +252,6 @@ class AsyncTransferQueueClient:
         mode: str = "fetch",
         task_name: str | None = None,
         sampling_config: dict[str, Any] | None = None,
-        socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
         """Asynchronously fetch data metadata from the controller via ZMQ.
 
@@ -260,9 +263,10 @@ class AsyncTransferQueueClient:
                 - 'fetch': Get ready data only
                 - 'force_fetch': Get data regardless of readiness (may return unready samples)
                 - 'insert': Internal usage - should not be used by users
+                In fetch mode, insufficient data returns an empty batch immediately when
+                polling_mode is enabled; otherwise this client retries until the configured timeout.
             task_name: Optional task name associated with the request
             sampling_config: Optional sampling configuration for custom samplers.
-            socket: ZMQ async socket for message transmission (injected by decorator)
 
         Returns:
             BatchMeta: Metadata object containing data structure, sample information, and readiness status
@@ -301,20 +305,33 @@ class AsyncTransferQueueClient:
             ...     )
             ...     print(batch_meta.is_ready)  # May be False if some samples not ready
         """
-        response_msg = await self._request_controller(
-            socket=socket,
-            request_type=ZMQRequestType.GET_META,
-            response_type=ZMQRequestType.GET_META_RESPONSE,
-            body={
-                "data_fields": data_fields,
-                "batch_size": batch_size,
-                "partition_id": partition_id,
-                "mode": mode,
-                "task_name": task_name,
-                "sampling_config": sampling_config,
-            },
-        )
-        return response_msg.body["metadata"]
+        request = {
+            "data_fields": data_fields,
+            "batch_size": batch_size,
+            "partition_id": partition_id,
+            "mode": mode,
+            "task_name": task_name,
+            "sampling_config": sampling_config,
+        }
+        deadline = time.monotonic() + TQ_CONTROLLER_GET_METADATA_TIMEOUT
+        while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Timeout while waiting for sufficient data for task {task_name}. "
+                    f"Required: {batch_size}, partition: {partition_id}, fields: {data_fields}"
+                )
+            async with self.controller_rpc_pool.alease(self._controller) as socket:
+                response_msg = await self._request_controller(
+                    socket=socket,
+                    request_type=ZMQRequestType.GET_META,
+                    response_type=ZMQRequestType.GET_META_RESPONSE,
+                    body=request,
+                )
+            if not response_msg.body.get("retry", False):
+                return response_msg.body["metadata"]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL, remaining))
 
     @with_controller_socket
     async def async_set_custom_meta(
