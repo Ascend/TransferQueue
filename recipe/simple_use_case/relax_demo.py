@@ -324,7 +324,7 @@ def build_tq_config(config: DemoConfig):
     base = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     override = OmegaConf.create(
         {
-            "controller": {"sampler": RankAwareSampler, "polling_mode": True},
+            "controller": {"sampler": RankAwareSampler},
             "backend": {
                 "storage_backend": "SimpleStorage",
                 "SimpleStorage": {"num_data_storage_units": config.num_data_storage_units},

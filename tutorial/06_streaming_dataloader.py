@@ -83,17 +83,12 @@ def setup_transfer_queue():
         "Note: Using RankAwareSampler when each rank retrieves data independently. It guarantees that "
         "The same DP rank receives the same sample indices."
     )
-    print(
-        "Note: When using streaming data retrieval, please set polling_mode=True when initializing "
-        "TransferQueueController. In polling_mode, the controller will return empty BatchMeta when "
-        "available data cannot meet the consumption requirements. User side need to retry later."
-    )
+    print("StreamingDataset retries when a metadata fetch returns an empty batch.")
 
     config = OmegaConf.create(
         {
             "controller": {
                 "sampler": RankAwareSampler,  # RankAwareSampler enables consistent sampling for each DP rank
-                "polling_mode": True,  # Enable polling mode for streaming data retrieval
             },
             "backend": {"SimpleStorage": {"num_data_storage_units": 2}},
         },

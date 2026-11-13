@@ -52,7 +52,6 @@ def tq_system(ssd_root):
 
     config = OmegaConf.create(
         {
-            "controller": {"polling_mode": True},
             "backend": {
                 "storage_backend": "SimpleStorage",
                 "SimpleStorage": {

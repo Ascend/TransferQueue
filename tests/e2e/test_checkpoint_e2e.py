@@ -34,7 +34,6 @@ os.environ["RAY_DEDUP_LOGS"] = "0"
 
 _TQ_CONFIG = OmegaConf.create(
     {
-        "controller": {"polling_mode": True},
         "backend": {
             "storage_backend": "SimpleStorage",
             "SimpleStorage": {

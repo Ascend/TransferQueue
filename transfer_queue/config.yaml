@@ -10,8 +10,6 @@ metrics:
 controller:
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
   sampler: SequentialSampler
-  # Whether return an empty BatchMeta to prevent request blocking when no enough data is available
-  polling_mode: False
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 
@@ -86,9 +84,6 @@ backend:
     #   from ANY node's memory to this offload client via TCP/RDMA.
     #   Ensure that `local_hostname` (above) is set to a cluster-reachable address so that
     #   all nodes can transfer data to the offload client.
-    #
-    # TODO: Support multi-node distributed offload (one client per node) for better
-    #       scalability in large clusters.
     offload:
       # Master switch for SSD offload.
       enabled: false

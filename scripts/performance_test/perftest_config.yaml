@@ -10,8 +10,6 @@ metrics:
 controller:
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
   sampler: SequentialSampler
-  # Whether return an empty BatchMeta to prevent request blocking when no enough data is available
-  polling_mode: False
   # ZMQ Server IP & Ports (automatically generated during init)
   zmq_info: null
 

@@ -39,7 +39,6 @@ def tq_system():
     tq.init(
         OmegaConf.create(
             {
-                "controller": {"polling_mode": True},
                 "backend": {
                     "storage_backend": "SimpleStorage",
                     "SimpleStorage": {"total_storage_size": 200, "num_data_storage_units": 2},

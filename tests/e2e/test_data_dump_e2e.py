@@ -49,7 +49,6 @@ _NUM_STORAGE_UNITS = 3
 def _tq_config(num_storage_units: int) -> OmegaConf:
     return OmegaConf.create(
         {
-            "controller": {"polling_mode": True},
             "backend": {
                 "storage_backend": "SimpleStorage",
                 "SimpleStorage": {

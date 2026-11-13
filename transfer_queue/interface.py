@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import time
+import warnings
 from collections import Counter, defaultdict
 from importlib import resources
 from pathlib import Path
@@ -41,7 +42,7 @@ from uuid import uuid4
 
 import ray
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
@@ -177,6 +178,17 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         >>> metadata = tq.get_meta(...)
         >>> data = tq.get_data(metadata)
     """
+    controller_conf = conf.get("controller") if conf is not None else None
+    has_legacy_polling_mode = controller_conf is not None and "polling_mode" in controller_conf.keys()
+    if has_legacy_polling_mode:
+        warnings.warn(
+            "`controller.polling_mode` is deprecated and ignored. It will be removed in the next release. "
+            "Remove this setting. "
+            "A metadata fetch returns an empty BatchMeta when no batch is available.",
+            FutureWarning,
+            stacklevel=2,
+        )
+
     if _init_from_existing():
         return conf
 
@@ -187,6 +199,9 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
+    if has_legacy_polling_mode:
+        with open_dict(final_conf.controller):
+            del final_conf.controller["polling_mode"]
 
     # TODO(hz): support load custom sampler class from external module.
     try:
@@ -209,7 +224,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         global _TQ_CONTROLLER, _TQ_IS_OWNER
         _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace=ray_namespace()
-        ).remote(sampler=sampler, polling_mode=final_conf.controller.polling_mode)
+        ).remote(sampler=sampler)
         _TQ_IS_OWNER = True
         logger.info("TransferQueueController has been created.")
         _start_lock_managers(lock_settings)

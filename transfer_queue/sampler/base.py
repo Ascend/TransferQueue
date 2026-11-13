@@ -83,9 +83,8 @@ class BaseSampler(ABC):
     ) -> bool:
         """Check whether the sampler has a cached sampling result for the given context.
 
-        This is used by the controller in polling mode to determine if a previously
-        computed sampling result is already available, so that it can skip waiting
-        for more data and directly proceed to return the cached result.
+        The controller checks this when there are too few unconsumed samples for a
+        new batch. A cache hit lets the sampler return its previous result.
 
         The check is based on the ``_states`` cache structure:
         ``_states[partition_id][task_name][dp_rank][batch_index]``.

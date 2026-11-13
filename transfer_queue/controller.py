@@ -17,6 +17,7 @@ import copy
 import os
 import pickle
 import time
+import warnings
 from collections import defaultdict, deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -55,10 +56,6 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
-TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
-# Above libzmq's default of 1023: the metrics exporter borrows this context to query
-# storage units, so the budget covers a fleet rather than the two ROUTERs bound here.
 TQ_CONTROLLER_ZMQ_MAX_SOCKETS = int(os.environ.get("TQ_CONTROLLER_ZMQ_MAX_SOCKETS", 4096))
 
 # Holds payloads that keys of other partitions read through kv_link, e.g. a prompt video
@@ -1124,7 +1121,7 @@ class TransferQueueController:
     def __init__(
         self,
         sampler: BaseSampler | type[BaseSampler] = SequentialSampler,
-        polling_mode: bool = False,
+        polling_mode: bool | None = None,
     ) -> None:
         """Initialize the TransferQueue Controller.
 
@@ -1135,11 +1132,17 @@ class TransferQueueController:
                     - Defaults to SequentialSampler for simple sequential sampling
                     - Example: sampler=GRPOGroupNSampler() (instance)
                     - Example: sampler=SequentialSampler (class)
-            polling_mode: Whether to use polling mode for TransferQueue controller.
-                    - If False, the controller will raise an error when no enough data is available.
-                    - If True, the controller will return an empty BatchMeta when no enough data is available.
-                               The user side is responsible for handling this empty case (retrying later).
+            polling_mode: Deprecated. A metadata fetch returns an empty batch when no batch is available.
         """
+        if polling_mode is not None:
+            warnings.warn(
+                "The `polling_mode` argument is deprecated and ignored. It will be removed in the next release. "
+                "Remove it when creating the controller. "
+                "A metadata fetch returns an empty BatchMeta when no batch is available.",
+                FutureWarning,
+                stacklevel=2,
+            )
+
         if isinstance(sampler, BaseSampler):
             self.sampler = sampler
         elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
@@ -1150,7 +1153,6 @@ class TransferQueueController:
             )
 
         self.controller_id = f"TQ_CONTROLLER_{uuid4().hex[:8]}"
-        self.polling_mode = polling_mode
         self.tq_config = None  # global config for TransferQueue system
 
         # Initialize ZMQ sockets for communication
@@ -1417,10 +1419,8 @@ class TransferQueueController:
             **kwargs: Additional keyword arguments
 
         Returns:
-            BatchMeta object containing the requested metadata
-
-        Raises:
-            TimeoutError: If waiting for sufficient data times out in fetch mode
+            BatchMeta containing the requested metadata. A fetch returns an empty batch
+            when no batch is available.
         """
 
         if mode == "insert":
@@ -1458,40 +1458,19 @@ class TransferQueueController:
             if batch_size is None:
                 raise ValueError("must provide batch_size in fetch mode")
 
-            start_time = time.time()
-            while True:
-                # ready_for_consume_indexes: samples where all required fields are produced
-                # (production status is ready) and not yet consumed
-                ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
+            # ready_for_consume_indexes: samples where all required fields are produced
+            # (production status is ready) and not yet consumed
+            ready_for_consume_indexes = self.scan_data_status(partition_id, data_fields, task_name)
 
-                if len(ready_for_consume_indexes) < batch_size:
-                    if self.polling_mode:
-                        # Return cached result if available
-                        if self.sampler.has_cached_result(partition_id, task_name, sampling_config):
-                            break
-                        else:
-                            logger.debug(
-                                f"[{self.controller_id}]: Not enough data for task {task_name} in "
-                                f"partition {partition_id}. Required: {batch_size}, "
-                                f"Available: {len(ready_for_consume_indexes)}."
-                                f" Returning None due to polling mode."
-                            )
-                            return BatchMeta.empty()
-                    else:
-                        logger.warning(
-                            f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
-                            f"samples with fields {data_fields} in partition {partition_id}, but only have "
-                            f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
-                            f"Retrying in {TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL}s..."
-                        )
-                        time.sleep(TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL)
-                    if time.time() - start_time > TQ_CONTROLLER_GET_METADATA_TIMEOUT:
-                        raise TimeoutError(
-                            f"Timeout while waiting for sufficient data for task {task_name}. "
-                            f"Required: {batch_size}, Available: {len(ready_for_consume_indexes)}"
-                        )
-                else:
-                    break
+            if len(ready_for_consume_indexes) < batch_size:
+                # Return cached result if available
+                if not self.sampler.has_cached_result(partition_id, task_name, sampling_config):
+                    logger.debug(
+                        f"[{self.controller_id}]: Insufficient data for task {task_name}. Required: {batch_size} "
+                        f"samples with fields {data_fields} in partition {partition_id}, but only have "
+                        f"{len(ready_for_consume_indexes)} samples meeting the criteria. "
+                    )
+                    return BatchMeta.empty()
 
             batch_global_indexes, consumed_indexes = self.sampler(
                 ready_for_consume_indexes,
@@ -1505,13 +1484,13 @@ class TransferQueueController:
             # Some samplers (e.g. SeqlenBalancedSampler) may return variable-size
             # batches per DP rank, so we only check for empty results.
             if len(batch_global_indexes) == 0:
-                if self.polling_mode:
-                    return BatchMeta.empty()
-                raise RuntimeError(
+                logger.debug(
                     f"Sampler returned no samples. Please check the sampler logic. "
                     f"Expected: {batch_size}, before sampling: {len(ready_for_consume_indexes)}, "
                     f"after sampling: {len(batch_global_indexes)}"
                 )
+
+                return BatchMeta.empty()
 
             # Mark samples as consumed if in fetch mode
             if consumed_indexes:
@@ -1520,7 +1499,6 @@ class TransferQueueController:
 
         elif mode == "force_fetch":
             batch_global_indexes = self.index_manager.get_indexes_for_partition(partition_id)
-            consumed_indexes = []
 
         # Package into metadata
         metadata = self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)

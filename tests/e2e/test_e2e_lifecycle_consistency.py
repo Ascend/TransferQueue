@@ -46,9 +46,6 @@ DEFAULT_FIELDS = [
 # Backend configurations for E2E tests
 BACKEND_CONFIGS = {
     "SimpleStorage": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "SimpleStorage",
             "SimpleStorage": {
@@ -58,9 +55,6 @@ BACKEND_CONFIGS = {
         },
     },
     "MooncakeStore": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "MooncakeStore",
             "MooncakeStore": {
@@ -74,9 +68,6 @@ BACKEND_CONFIGS = {
         },
     },
     "Yuanrong": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "Yuanrong",
             "Yuanrong": {
@@ -90,9 +81,6 @@ BACKEND_CONFIGS = {
     # GPUDirect RDMA transfers directly from the registered CUDA staging buffer.
     # auto_init=true: TQ starts mooncake_master automatically on transfer_queue.init().
     "MooncakeStore_GDR": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "MooncakeStore",
             "MooncakeStore": {
