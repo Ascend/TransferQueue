@@ -31,9 +31,11 @@
 from typing import Any
 from uuid import uuid4
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
+from transfer_queue.storage.payload_transfer import payload_backend
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
@@ -50,6 +52,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
 
     simple_storage_handles = {}
     simple_storage_config = dict(conf.backend.SimpleStorage)
+    transfer_backend = payload_backend(simple_storage_config.get("payload_transfer"))
     simple_storage_config["_run_id"] = uuid4().hex
     num_data_storage_units = simple_storage_config["num_data_storage_units"]
     required_node_resource = simple_storage_config.get("required_node_resource")
@@ -85,5 +88,10 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
+    if transfer_backend == "nixl-ucx":
+        endpoints = ray.get([unit.get_payload_transfer_info.remote() for unit in simple_storage_handles.values()])
+        conf.backend[backend_name].payload_transfer_infos = {
+            info.id: endpoint for info, endpoint in zip(storage_zmq_info.values(), endpoints, strict=True)
+        }
 
     return simple_storage_handles
