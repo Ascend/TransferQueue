@@ -67,9 +67,6 @@ os.environ["RAY_DEDUP_LOGS"] = "0"
 # Adjust values for GitHub CI environment (smaller memory footprint)
 BACKEND_CONFIGS = {
     "SimpleStorage": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "SimpleStorage",
             "SimpleStorage": {
@@ -79,9 +76,6 @@ BACKEND_CONFIGS = {
         },
     },
     "MooncakeStore": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "MooncakeStore",
             "MooncakeStore": {
@@ -96,9 +90,6 @@ BACKEND_CONFIGS = {
         },
     },
     "Yuanrong": {
-        "controller": {
-            "polling_mode": True,
-        },
         "backend": {
             "storage_backend": "Yuanrong",
             "Yuanrong": {

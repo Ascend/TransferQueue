@@ -169,10 +169,8 @@ class SeqlenBalancedSampler(GRPOGroupNSampler):
         # Cache the result
         self._balanced_cache[cache_key] = partitions
 
-        # Populate the inherited _states cache for ALL dp_ranks so that
-        # the controller's polling check (which looks at self.sampler._states)
-        # works correctly even when ready_indexes < batch_size for later ranks
-        # (because earlier ranks already consumed their portion).
+        # Cache each DP rank's assignment so later fetches can reuse it after
+        # earlier fetches reduce the ready sample count.
         if partition_id not in self._states:
             self._states[partition_id] = {}
         if task_name not in self._states[partition_id]:

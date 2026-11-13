@@ -20,7 +20,9 @@ import pytest
 import ray
 import torch
 import zmq
+from omegaconf import OmegaConf
 
+import transfer_queue as tq
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
@@ -45,6 +47,39 @@ def ray_setup():
 
 
 class TestTransferQueueController:
+    @pytest.mark.parametrize("polling_mode", [False, True])
+    def test_init_ignores_deprecated_polling_mode(self, ray_setup, monkeypatch, polling_mode):
+        monkeypatch.setenv("TQ_RAY_NAMESPACE", f"polling-mode-{uuid4().hex}")
+        conf = OmegaConf.create(
+            {
+                "controller": {"polling_mode": polling_mode},
+                "backend": {"SimpleStorage": {"num_data_storage_units": 1}},
+            }
+        )
+
+        try:
+            with pytest.warns(FutureWarning, match=r"controller\.polling_mode"):
+                final_conf = tq.init(conf)
+            assert "polling_mode" not in final_conf.controller
+            assert conf.controller.polling_mode is polling_mode
+
+            with pytest.warns(FutureWarning, match=r"controller\.polling_mode"):
+                tq.init(conf)
+        finally:
+            tq.close()
+
+    @pytest.mark.parametrize("polling_mode", [False, True])
+    def test_controller_ignores_deprecated_polling_mode(self, monkeypatch, polling_mode):
+        controller_class = TransferQueueController.__ray_metadata__.modified_class
+        monkeypatch.setattr(controller_class, "_init_zmq_socket", lambda self: None)
+        monkeypatch.setattr(controller_class, "_start_process_handshake", lambda self: None)
+        monkeypatch.setattr(controller_class, "_start_process_request", lambda self: None)
+
+        with pytest.warns(FutureWarning, match=r"`polling_mode` argument"):
+            controller = controller_class(polling_mode=polling_mode)
+        metadata = controller.get_metadata(["tokens"], "train", batch_size=1, task_name="trainer")
+        assert metadata.size == 0
+
     def test_controller_with_single_partition(self, ray_setup):
         gbs = 8
         num_n_samples = 4

@@ -34,7 +34,6 @@ P = "global_lock_e2e"
 # Bound every wait so that a lock regression fails the test instead of hanging it.
 TIMEOUT_S = 60
 CONF = {
-    "controller": {"polling_mode": True},
     "backend": {"storage_backend": "SimpleStorage", "SimpleStorage": {"total_storage_size": 100}},
 }
 
