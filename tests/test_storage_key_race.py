@@ -20,6 +20,7 @@ import logging
 import pytest
 import torch
 
+from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
     SimpleStorageUnit,
@@ -76,8 +77,10 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
+    transport = ZmqPayloadTransfer(owner_id=unit.storage_unit_id)
+    transport.listen(handle=unit._handle_payload)
     with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
-        reply = unit_class._handle_get(unit, request)
+        reply = transport.handle_legacy(request)
 
     assert reply.request_type == ZMQRequestType.GET_ERROR
     assert KEY_NOT_FOUND_MARKER in reply.body["message"]
