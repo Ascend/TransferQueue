@@ -30,88 +30,6 @@ from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
-TagScalar = str | int | float | bool | None
-Tag = dict[str, TagScalar | list[TagScalar]]
-BackendMeta = Tag | str | None
-
-
-class TagValidationError(ValueError):
-    """A tag cannot be represented by the native metadata format."""
-
-
-def _metadata_scalar_error(value: object) -> str | None:
-    if type(value) is str:
-        if not value.isascii():
-            try:
-                value.encode("utf-8")
-            except UnicodeEncodeError:
-                return "must be valid UTF-8"
-    elif type(value) is int:
-        if not -(2**63) <= value < 2**63:
-            return "must fit in a signed 64-bit integer"
-    elif value is not None and type(value) not in (bool, float):
-        return f"expected a str, int, float, bool, or None, got {type(value).__name__}"
-    return None
-
-
-def _metadata_map_error(metadata: object) -> tuple[str, str] | None:
-    if type(metadata) is not dict:
-        return "", "expected a dict"
-    for key, value in metadata.items():
-        if type(key) is not str or _metadata_scalar_error(key):
-            return f"key {key!r}", "expected UTF-8 str"
-        # The ZMQ decoder recognizes this marker before the request reaches a handler.
-        if key == "__tq_tensordict__":
-            return "", f"{key!r} is reserved"
-        if type(value) is list:
-            for i, item in enumerate(value):
-                if error := _metadata_scalar_error(item):
-                    return f"{key!r}[{i}]", error
-        elif error := _metadata_scalar_error(value):
-            return repr(key), error
-    return None
-
-
-def validate_tag(tag: object, *, partition_id: str, sample: str | int) -> None:
-    """Check a tag before storing it as a native MessagePack map."""
-    if issue := _metadata_map_error(tag):
-        path, error = issue
-        entry = f"tag {path}" if path else "tag"
-        raise TagValidationError(f"Invalid {entry} for {sample!r} in partition {partition_id!r}: {error}")
-
-
-def copy_tag(tag: Tag) -> Tag:
-    """Snapshot a validated tag, including its mutable list values."""
-    return {key: value.copy() if type(value) is list else value for key, value in tag.items()}
-
-
-def validate_backend_meta(metadata: dict[int, dict[str, BackendMeta]] | None, *, partition_id: str) -> None:
-    """Check each backend value before notifying the Controller or restoring its state."""
-    if not metadata:
-        return
-    for index, row in metadata.items():
-        for field_name, value in row.items():
-            if value is None or (type(value) is str and value.isascii()):
-                continue
-            error: str | None
-            if type(value) is dict:
-                issue = _metadata_map_error(value)
-                if issue is None:
-                    continue
-                path, error = issue
-                if path:
-                    error = f"{path}: {error}"
-            elif type(value) is str:
-                error = _metadata_scalar_error(value)
-                if error is None:
-                    continue
-            else:
-                error = f"expected a dict, str, or None, got {type(value).__name__}"
-            raise ValueError(
-                f"Invalid backend metadata for field {field_name!r}, sample {index!r} "
-                f"in partition {partition_id!r}: {error}"
-            )
-
 
 def _extra_info_values_equal(a: Any, b: Any) -> bool:
     """Compare two extra_info values for equality.
@@ -309,8 +227,8 @@ class BatchMeta:
         field_schema: dict[str, dict[str, Any]] | None = None,
         production_status: np.ndarray | None = None,
         extra_info: dict[str, Any] | None = None,
-        custom_meta: list[Tag] | None = None,
-        _custom_backend_meta: list[dict[str, BackendMeta]] | None = None,
+        custom_meta: list[dict[str, Any]] | None = None,
+        _custom_backend_meta: list[dict[str, Any]] | None = None,
         _links: list[dict[str, int]] | None = None,
     ) -> None:
         if field_schema is None:
@@ -361,13 +279,13 @@ class BatchMeta:
 
         # Validate or initialize columnar custom_meta / _custom_backend_meta
         if not custom_meta:
-            self.custom_meta: list[Tag] = [{} for _ in range(batch_size)]
+            self.custom_meta: list[dict[str, Any]] = [{} for _ in range(batch_size)]
         else:
             self.custom_meta = [dict(d) for d in custom_meta]
             if len(self.custom_meta) != batch_size:
                 raise ValueError(f"custom_meta length {len(self.custom_meta)} != batch_size {batch_size}")
         if not _custom_backend_meta:
-            self._custom_backend_meta: list[dict[str, BackendMeta]] = [{} for _ in range(batch_size)]
+            self._custom_backend_meta: list[dict[str, Any]] = [{} for _ in range(batch_size)]
         else:
             self._custom_backend_meta = [dict(d) for d in _custom_backend_meta]
             if len(self._custom_backend_meta) != batch_size:
@@ -386,7 +304,6 @@ class BatchMeta:
 
         Returns tuple of slot values to ensure proper reconstruction.
         """
-        self._validate_custom_meta()
         return tuple(getattr(self, slot) for slot in self.__slots__)
 
     def __setstate__(self, state):
@@ -403,10 +320,6 @@ class BatchMeta:
             elif slot == "global_indexes":
                 value = list(map(operator.index, value))
             setattr(self, slot, value)
-
-    def _validate_custom_meta(self) -> None:
-        for partition_id, index, tag in zip(self.partition_ids, self.global_indexes, self.custom_meta, strict=True):
-            validate_tag(tag, partition_id=partition_id, sample=index)
 
     @property
     def size(self) -> int:
@@ -510,7 +423,7 @@ class BatchMeta:
         return key in self.extra_info
 
     # ==================== Custom Meta Methods (User Layer) ====================
-    def get_all_custom_meta(self) -> list[Tag]:
+    def get_all_custom_meta(self) -> list[dict[str, Any]]:
         """Get all custom_meta as a list of dictionary (one per sample, in global_indexes order).
 
         Returns:
@@ -518,7 +431,7 @@ class BatchMeta:
         """
         return copy.deepcopy(self.custom_meta)
 
-    def update_custom_meta(self, custom_meta: list[Tag]):
+    def update_custom_meta(self, custom_meta: list[dict[str, Any]]):
         """Update custom_meta with a list of dictionary of custom metadata.
 
         Args:
@@ -901,8 +814,8 @@ class BatchMeta:
                         all_shapes.extend([uniform_shape] * chunk.size)
                 all_field_schema[field_name]["per_sample_shapes"] = all_shapes
 
-        all_custom_meta: list[Tag] = []
-        all_custom_backend_meta: list[dict[str, BackendMeta]] = []
+        all_custom_meta: list[dict[str, Any]] = []
+        all_custom_backend_meta: list[dict[str, Any]] = []
         for chunk in data:
             all_custom_meta.extend(chunk.custom_meta)
             all_custom_backend_meta.extend(chunk._custom_backend_meta)
@@ -1010,7 +923,7 @@ class KVBatchMeta:
     keys: list[str] = dataclasses.field(default_factory=list)
 
     # sample-level tags
-    tags: list[Tag] = dataclasses.field(default_factory=list)
+    tags: list[dict] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch
     partition_id: str | None = None

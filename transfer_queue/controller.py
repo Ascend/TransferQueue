@@ -34,7 +34,9 @@ import zmq
 from omegaconf import DictConfig
 from torch import Tensor
 
-from transfer_queue.metadata import BackendMeta, BatchMeta, Tag, validate_backend_meta, validate_tag
+from transfer_queue.metadata import (
+    BatchMeta,
+)
 from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import Role
@@ -389,11 +391,11 @@ class DataPartitionStatus:
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     # O(F) columnar field metadata: field_name -> FieldMeta
     field_metadata: dict[str, FieldMeta] = field(default_factory=dict)
-    field_custom_backend_meta: dict[int, dict[str, BackendMeta]] = field(
+    field_custom_backend_meta: dict[int, dict[str, Any]] = field(
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
     # User-defined metadata that may not apply to field level
-    custom_meta: dict[int, Tag] = field(default_factory=dict)  # global_idx -> tag
+    custom_meta: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {}
 
     # User-defined Keys
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
@@ -542,7 +544,7 @@ class DataPartitionStatus:
         global_indices: list[int],
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
         ready: bool = True,
     ) -> bool:
         """
@@ -566,11 +568,10 @@ class DataPartitionStatus:
             True if update was successful, False on error
 
         Raises:
-            ValueError: If a dtype conflicts with the partition's or backend metadata is invalid.
+            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
-        # Validate before changing controller metadata or readiness.
+        # A dtype conflict must leave controller metadata and readiness unchanged.
         # Payloads are already stored, so this check cannot roll back the write.
-        validate_backend_meta(custom_backend_meta, partition_id=self.partition_id)
         for name, incoming in field_schema.items():
             existing = self.field_metadata.get(name)
             dtype = incoming.get("dtype")
@@ -649,7 +650,7 @@ class DataPartitionStatus:
         self,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ):
         """Update field metadata from columnar field_schema."""
         if not global_indexes:
@@ -852,7 +853,7 @@ class DataPartitionStatus:
 
     def get_field_custom_backend_meta(
         self, global_indices: list[int], field_names: list[str]
-    ) -> dict[int, dict[str, BackendMeta]]:
+    ) -> dict[int, dict[str, Any]]:
         """
         Get custom_backend_meta for multiple samples and fields.
 
@@ -899,7 +900,7 @@ class DataPartitionStatus:
         """
         return {idx: self.custom_meta[idx] for idx in global_indices if idx in self.custom_meta}
 
-    def set_custom_meta(self, custom_meta: dict[int, Tag]) -> None:
+    def set_custom_meta(self, custom_meta: dict[int, dict]) -> None:
         """
         Set custom_meta for multiple samples.
 
@@ -1162,7 +1163,6 @@ class TransferQueueController:
 
         # Partition management
         self.partitions: dict[str, DataPartitionStatus] = {}  # partition_id -> DataPartitionStatus
-        self._prepared_checkpoint: tuple[str, str, dict[str, Any], bool] | None = None
 
         # Partition-GlobalIndex management
         self.index_manager = PartitionIndexManager()  # partition_id -> global_indexes
@@ -1270,7 +1270,7 @@ class TransferQueueController:
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
         ready: bool = True,
     ) -> bool:
         """
@@ -1288,7 +1288,7 @@ class TransferQueueController:
             True if update was successful, False otherwise
 
         Raises:
-            ValueError: If a dtype conflicts with the partition's or backend metadata is invalid.
+            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
         partition = self._get_partition(partition_id)
         if not partition:
@@ -1366,7 +1366,7 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
-    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, Tag]]) -> None:
+    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
         """
         Set custom_meta for samples in partitions.
 
@@ -1394,10 +1394,6 @@ class TransferQueueController:
             ...     }
             ... })
         """
-
-        for partition_id, custom_meta in partition_custom_meta.items():
-            for index, tag in custom_meta.items():
-                validate_tag(tag, partition_id=partition_id, sample=index)
 
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
@@ -2446,8 +2442,7 @@ class TransferQueueController:
                         receiver_id=request_msg.sender_id,
                         message=f"no handler for request_type {request_msg.request_type}",
                     )
-                # Controller tags have already been checked on writes and checkpoint restore.
-                response_frames = response_msg.serialize(validate_batch_tags=False)
+                response_frames = response_msg.serialize()
             except Exception as e:
                 # Report errors from both the handler and response codec; the caller awaits a reply.
                 logger.exception(
@@ -2775,28 +2770,7 @@ class TransferQueueController:
         )
 
     def _handle_load_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        params = request_msg.body
-        path = params["path"]
-        phase = params.get("phase", "load")
-        if phase == "load":
-            self.load_checkpoint(path)
-        else:
-            restore_id = params["restore_id"]
-            prepared = self._prepared_checkpoint
-            if phase == "prepare":
-                # Keep one validated snapshot while the client restores storage.
-                state, converted_legacy_dtype = self._read_checkpoint(path)
-                self._prepared_checkpoint = (restore_id, path, state, converted_legacy_dtype)
-            elif phase == "apply":
-                if prepared is None or prepared[:2] != (restore_id, path):
-                    raise RuntimeError(f"No prepared checkpoint for restore {restore_id!r} at {path!r}")
-                self._prepared_checkpoint = None
-                self._apply_checkpoint(path, prepared[2], prepared[3])
-            elif phase == "discard":
-                if prepared is not None and prepared[:2] == (restore_id, path):
-                    self._prepared_checkpoint = None
-            else:
-                raise ValueError(f"Invalid checkpoint restore phase: {phase!r}")
+        self.load_checkpoint(request_msg.body["path"])
         return self._make_response(
             request_msg,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
@@ -2865,55 +2839,46 @@ class TransferQueueController:
             Exception: If deserialization or file I/O fails.
         """
         try:
-            state, converted_legacy_dtype = self._read_checkpoint(path)
-            self._apply_checkpoint(path, state, converted_legacy_dtype)
+            with open(path, "rb") as f:
+                state = pickle.load(f)
+
+            # Normalize legacy dtype names and shape lists before comparing
+            # restored fields with subsequent writes.
+            converted_legacy_dtype = False
+            for partition_id, partition in state["partitions"].items():
+                for name, field_meta in partition.field_metadata.items():
+                    if isinstance(field_meta.shape, list):
+                        field_meta.shape = tuple(field_meta.shape)
+                    for index, shape in (field_meta.per_sample_shapes or {}).items():
+                        if isinstance(shape, list):
+                            field_meta.per_sample_shapes[index] = tuple(shape)
+                    if isinstance(field_meta.dtype, str):
+                        field_meta.dtype = serial_utils.parse_torch_dtype(field_meta.dtype, f"{partition_id}.{name}")
+                        converted_legacy_dtype = True
+
+            if converted_legacy_dtype:
+                warnings.warn(
+                    "String dtypes in Controller checkpoints are deprecated. "
+                    "Support for restoring them will be removed in the next release. "
+                    "Re-save the restored checkpoint with this release to migrate it.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
+
+            self.controller_id = state["controller_id"]
+            self.partitions = state["partitions"]
+
+            im = state["index_manager"]
+            self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
+            self.index_manager.global_index_counter = im["global_index_counter"]
+            self.index_manager.allocated_indexes = im["allocated_indexes"]
+            self.index_manager.set_num_storage_units(self.index_manager.num_storage_units, im["reusable_indexes"])
+
+            self.sampler.load_checkpoint(state["sampler"])
+
+            logger.info(f"[{self.controller_id}]: restored from {path}")
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: load checkpoint failed: {e}") from e
-
-    def _read_checkpoint(self, path: str) -> tuple[dict[str, Any], bool]:
-        with open(path, "rb") as f:
-            state = pickle.load(f)
-
-        # Normalize legacy dtype names and shape arrays before comparing
-        # restored fields with subsequent writes.
-        converted_legacy_dtype = False
-        for partition_id, partition in state["partitions"].items():
-            for index, tag in partition.custom_meta.items():
-                validate_tag(tag, partition_id=partition_id, sample=index)
-            validate_backend_meta(partition.field_custom_backend_meta, partition_id=partition_id)
-            for name, field_meta in partition.field_metadata.items():
-                if isinstance(field_meta.shape, list):
-                    field_meta.shape = tuple(field_meta.shape)
-                for index, shape in (field_meta.per_sample_shapes or {}).items():
-                    if isinstance(shape, list):
-                        field_meta.per_sample_shapes[index] = tuple(shape)
-                if isinstance(field_meta.dtype, str):
-                    field_meta.dtype = serial_utils.parse_torch_dtype(field_meta.dtype, f"{partition_id}.{name}")
-                    converted_legacy_dtype = True
-        return state, converted_legacy_dtype
-
-    def _apply_checkpoint(self, path: str, state: dict[str, Any], converted_legacy_dtype: bool) -> None:
-        if converted_legacy_dtype:
-            warnings.warn(
-                "String dtypes in Controller checkpoints are deprecated. "
-                "Support for restoring them will be removed in the next release. "
-                "Re-save the restored checkpoint with this release to migrate it.",
-                FutureWarning,
-                stacklevel=2,
-            )
-
-        self.controller_id = state["controller_id"]
-        self.partitions = state["partitions"]
-
-        im = state["index_manager"]
-        self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
-        self.index_manager.global_index_counter = im["global_index_counter"]
-        self.index_manager.allocated_indexes = im["allocated_indexes"]
-        self.index_manager.set_num_storage_units(self.index_manager.num_storage_units, im["reusable_indexes"])
-
-        self.sampler.load_checkpoint(state["sampler"])
-
-        logger.info(f"[{self.controller_id}]: restored from {path}")
 
     def register_sampler(
         self,

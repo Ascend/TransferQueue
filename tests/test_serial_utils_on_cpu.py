@@ -109,17 +109,11 @@ def test_batch_meta_encoding_rejects_unknown_dtype():
         encode(metadata)
 
 
-@pytest.mark.parametrize("value", [(1, 2), np.int64(1), 2**70], ids=["tuple", "numpy-int", "large-int"])
-def test_batch_meta_encoding_rejects_invalid_tags(value):
+@pytest.mark.parametrize("value", [torch.ones(1), np.int64(1), 2**70], ids=["tensor", "numpy-int", "large-int"])
+def test_batch_meta_encoding_rejects_non_msgpack_metadata(value):
     metadata = BatchMeta([7], ["train"], custom_meta=[{"value": value}])
-    with pytest.raises(ValueError, match="Invalid tag 'value' for 7 in partition 'train'"):
+    with pytest.raises(RuntimeError, match="Failed to encode BatchMeta as native MessagePack"):
         encode(metadata)
-
-    metadata.clear_custom_meta()
-    metadata.update_custom_meta([{"value": value}])
-    # Even if an earlier field selects the envelope's pickle fallback, reject the tag.
-    with pytest.raises(ValueError, match="Invalid tag 'value' for 7 in partition 'train'"):
-        encode({"large_int": 2**70, "metadata": metadata})
 
 
 @pytest.mark.parametrize("field", ["sender_id", "receiver_id", "request_id", "timestamp"])

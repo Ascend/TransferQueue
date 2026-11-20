@@ -62,19 +62,21 @@ def test_dump_excludes_unselected_tensor_storage(unit, tmp_path, row_count):
     assert unit.storage_data.field_data["x"][0].untyped_storage().nbytes() == batch.numel() * batch.element_size()
 
 
-def test_restore_rejects_tensor_tags_in_legacy_dumps(tmp_path):
-    staging = tmp_path / "staging"
-    staging.mkdir()
-    dump = tmp_path / "dump"
-    row_index = {
-        "partition_id": "p",
-        "field_schema": {},
-        "rows": {"key": {"global_index": 0, "fields": [], "tag": {"metric": torch.ones(1)}}},
-    }
-    data_dump.publish_dump(staging, dump, row_index, [])
-
-    with pytest.raises(ValueError, match="Invalid tag 'metric' for 'key' in partition 'p'"):
-        data_dump.read_dump(dump)
+def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
+    batch = torch.arange(64 * 4096).reshape(64, 4096)
+    tag = {"nested": [SimpleNamespace(value=batch[0])]}
+    client = SimpleNamespace(
+        kv_describe=lambda *_: {
+            "rows": {"key": {"global_index": 0, "fields": [], "unfinalized": [], "links": {}, "tag": tag}},
+            "field_schema": {},
+        }
+    )
+    monkeypatch.setattr(interface, "_TQ_CONTROLLER", object())
+    monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: client)
+    interface.dump_data_by_key(tmp_path / "dump", ["key"], "p")
+    restored = data_dump._read_row_index(tmp_path / "dump")["rows"]["key"]["tag"]["nested"][0].value
+    torch.testing.assert_close(restored, batch[0])
+    assert restored.untyped_storage().nbytes() == restored.numel() * restored.element_size()
 
 
 @pytest.fixture

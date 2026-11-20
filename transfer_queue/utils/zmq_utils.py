@@ -32,9 +32,9 @@ import ray
 import zmq
 import zmq.asyncio
 
-from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
@@ -247,17 +247,17 @@ class ZMQMessage:
             timestamp=time.time(),
         )
 
-    def serialize(self, *, validate_batch_tags: bool = True) -> list:
+    def serialize(self) -> list:
         """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
         msg_dict = {
-            "request_type": self.request_type.value,
+            "request_type": self.request_type.value,  # Enum -> str for msgpack
             "sender_id": self.sender_id,
             "receiver_id": self.receiver_id,
             "request_id": self.request_id,
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        return serial_utils.encode(msg_dict, validate_batch_tags=validate_batch_tags)
+        return encode(msg_dict)
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
@@ -273,14 +273,12 @@ class ZMQMessage:
             raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
 
         try:
-            result = serial_utils.decode(frames)
-            request_type = ZMQRequestType(result["request_type"])
-            body = result["body"]
+            result = decode(frames)
             return cls(
-                request_type=request_type,
+                request_type=ZMQRequestType(result["request_type"]),
                 sender_id=result["sender_id"],
                 receiver_id=result["receiver_id"],
-                body=body,
+                body=result["body"],
                 request_id=result["request_id"],
                 timestamp=result["timestamp"],
             )

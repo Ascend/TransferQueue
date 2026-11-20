@@ -21,7 +21,6 @@ Run with:
 
 import json
 import os
-import pickle
 
 import pytest
 import ray
@@ -312,9 +311,7 @@ class TestIncludeStorageFalse:
         assert meta["storage_saved"] is True
         assert (checkpoint_dir / "simple_storage").exists()
 
-    def test_restores_controller_and_storage_with_one_controller_read(
-        self, tq_system, checkpoint_dir, controller, monkeypatch
-    ):
+    def test_both_restored_after_load(self, tq_system, checkpoint_dir, controller):
         # Define test data
         keys = ["n0", "n1"]
         partition_id = "p_nometa2"
@@ -334,15 +331,7 @@ class TestIncludeStorageFalse:
         # Wipe
         ray.get(controller.clear_partition.remote(partition_id))
 
-        client = tq.interface._maybe_create_tq_client()
-        load_storage = client.load_storage_checkpoint
-
-        def load_storage_and_remove_controller_file(path):
-            load_storage(path)
-            (checkpoint_dir / "controller_state.pkl").unlink()
-
-        # Applying the prepared state must work after the preflight file is gone.
-        monkeypatch.setattr(client, "load_storage_checkpoint", load_storage_and_remove_controller_file)
+        # Load
         tq.load_checkpoint(checkpoint_dir)
 
         # Check loaded state: both controller and storage restored
@@ -391,38 +380,6 @@ class TestCheckpointErrors:
         ck.mkdir()
         with pytest.raises(FileNotFoundError, match="metadata.json"):
             tq.load_checkpoint(ck)
-
-    @pytest.mark.parametrize("invalid_metadata", ["tag", "dtype", "backend_meta"])
-    def test_invalid_checkpoint_metadata_is_rejected_before_storage_restore(
-        self, tq_system, checkpoint_dir, invalid_metadata
-    ):
-        partition_id = f"invalid_{invalid_metadata}_checkpoint"
-        tq.kv_put("row", partition_id, fields={"ids": torch.tensor([1, 2])}, tag={"score": 1})
-        tq.save_checkpoint(checkpoint_dir)
-        path = checkpoint_dir / "controller_state.pkl"
-        with path.open("rb") as file:
-            state = pickle.load(file)
-        partition = state["partitions"][partition_id]
-        index = partition.keys_mapping["row"]
-        if invalid_metadata == "tag":
-            partition.custom_meta[index]["score"] = (1, 2)
-            error = rf"Invalid tag 'score' for {index} in partition '{partition_id}'"
-        elif invalid_metadata == "dtype":
-            partition.field_metadata["ids"].dtype = "torch.not_a_dtype"
-            error = r"Invalid Torch dtype 'torch.not_a_dtype'"
-        else:
-            partition.field_custom_backend_meta[index] = {"ids": (1, 2)}
-            error = rf"Invalid backend metadata for field 'ids', sample {index} in partition '{partition_id}'"
-        with path.open("wb") as file:
-            pickle.dump(state, file)
-
-        live = torch.tensor([3, 4])
-        tq.kv_put("row", partition_id, fields={"ids": live}, tag={"score": 2})
-        with pytest.raises(RuntimeError, match=error):
-            tq.load_checkpoint(checkpoint_dir)
-
-        _assert_tensor_equal(tq.kv_batch_get(["row"], partition_id)["ids"], live.unsqueeze(0))
-        assert tq.kv_list(partition_id)[partition_id] == {"row": {"score": 2}}
 
     def test_load_raises_on_storage_unit_count_mismatch(self, tq_system, tmp_path, checkpoint_dir):
         # Define test data + Put + Save

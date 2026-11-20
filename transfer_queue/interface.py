@@ -47,10 +47,10 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue import data_dump
-from transfer_queue.client import TransferQueueClient, _group_custom_meta
+from transfer_queue.client import TransferQueueClient
 from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
-from transfer_queue.metadata import KVBatchMeta, Tag, copy_tag, validate_tag
+from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
@@ -378,7 +378,7 @@ def kv_put(
     key: str,
     partition_id: str,
     fields: TensorDict | dict[str, Any] | None = None,
-    tag: Tag | None = None,
+    tag: dict[str, Any] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Put a single key-value pair to TransferQueue.
@@ -394,7 +394,7 @@ def kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Metadata with string keys and scalar or flat list values.
+        tag: Optional metadata tag to associate with the key
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -447,7 +447,7 @@ def kv_batch_put(
     keys: list[str],
     partition_id: str,
     fields: TensorDict | None = None,
-    tags: list[Tag] | None = None,
+    tags: list[dict[str, Any]] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Batch put multiple key-value pairs into the TransferQueue.
@@ -460,7 +460,7 @@ def kv_batch_put(
         partition_id: Logical partition where the data will be stored.
         fields: TensorDict containing batched data for all keys. Must have ``batch_size == len(keys)``.
             If not provided, only the associated tags will be updated.
-        tags: One tag per key, with string keys and scalar or flat list values.
+        tags: List of metadata dictionaries, one per key.  Length must match the number of keys.
         data_parser: Optional callable to parse raw reference data (e.g., URLs) into real content
             before storage. The input is a plain dict (not TensorDict) mapping field names to
             batched values. The parser  **must modify data in-place** without adding/removing
@@ -871,7 +871,7 @@ async def async_kv_put(
     key: str,
     partition_id: str,
     fields: TensorDict | dict[str, Any] | None = None,
-    tag: Tag | None = None,
+    tag: dict[str, Any] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put a single key-value pair to TransferQueue.
@@ -887,7 +887,7 @@ async def async_kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Metadata with string keys and scalar or flat list values.
+        tag: Optional metadata tag to associate with the key
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -927,9 +927,6 @@ async def async_kv_put(
 
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of fields or tag.")
-    if tag is not None:
-        validate_tag(tag, partition_id=partition_id, sample=key)
-        tag = copy_tag(tag)
 
     tq_client = _maybe_create_tq_client()
 
@@ -960,10 +957,10 @@ async def async_kv_put(
             raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client._put_data(fields, batch_meta, data_parser=data_parser, tags_validated=True)
+        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
     else:
         # Directly update custom_meta (tag) to controller
-        await tq_client._send_custom_meta(_group_custom_meta(batch_meta, tags_validated=True))
+        await tq_client.async_set_custom_meta(batch_meta)
 
     fields_to_return = batch_meta.field_names
 
@@ -987,7 +984,7 @@ async def async_kv_batch_put(
     keys: list[str],
     partition_id: str,
     fields: TensorDict | None = None,
-    tags: list[Tag] | None = None,
+    tags: list[dict[str, Any]] | None = None,
     data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put multiple key-value pairs to TransferQueue in batch.
@@ -1000,7 +997,7 @@ async def async_kv_batch_put(
         partition_id: Logical partition to store the data in
         fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
                 If not provided, will only update the newly given tags to the keys.
-        tags: One tag per key, with string keys and scalar or flat list values.
+        tags: List of metadata tags, one for each key
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -1047,12 +1044,6 @@ async def async_kv_batch_put(
             f"batch_size {fields.batch_size[0]}"
         )
     _check_unique_keys(keys)
-    if tags is not None:
-        if len(tags) != len(keys):
-            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
-        for key, tag in zip(keys, tags, strict=True):
-            validate_tag(tag, partition_id=partition_id, sample=key)
-        tags = [copy_tag(tag) for tag in tags]
 
     tq_client = _maybe_create_tq_client()
 
@@ -1066,15 +1057,17 @@ async def async_kv_batch_put(
 
     # 2. register the user-specified tags to BatchMeta
     if tags is not None:
+        if len(tags) != len(keys):
+            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         batch_meta.update_custom_meta(tags)
 
     # 3. put data
     if fields is not None:
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client._put_data(fields, batch_meta, data_parser=data_parser, tags_validated=True)
+        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
     else:
         # Directly update custom_meta (tags) to controller
-        await tq_client._send_custom_meta(_group_custom_meta(batch_meta, tags_validated=True))
+        await tq_client.async_set_custom_meta(batch_meta)
 
     fields_to_return = batch_meta.field_names
 
@@ -1579,22 +1572,10 @@ def load_checkpoint(
     if not controller_path.exists():
         raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
 
-    controller_path_str = str(controller_path)
     if meta.get("storage_saved"):
-        # Check Controller metadata before replacing live payloads, then apply that same snapshot.
-        restore_id = uuid4().hex
-        try:
-            client._load_controller_checkpoint(controller_path_str, phase="prepare", restore_id=restore_id)
-            client.load_storage_checkpoint(str(checkpoint_dir))
-            client._load_controller_checkpoint(controller_path_str, phase="apply", restore_id=restore_id)
-        except BaseException:
-            try:
-                client._load_controller_checkpoint(controller_path_str, phase="discard", restore_id=restore_id)
-            except Exception:
-                logger.warning("Failed to discard prepared checkpoint %s", controller_path, exc_info=True)
-            raise
-    else:
-        client.load_controller_checkpoint(controller_path_str)
+        client.load_storage_checkpoint(str(checkpoint_dir))
+
+    client.load_controller_checkpoint(str(controller_path))
 
     logger.info(f"Checkpoint loaded from {checkpoint_dir}")
 
@@ -1740,6 +1721,6 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
             link_groups[tuple(sorted(name for name, k in links.items() if k == public_key))].append((key, public_key))
     for names, pairs in link_groups.items():
         client.kv_link([key for key, _ in pairs], partition_id, [public_key for _, public_key in pairs], list(names))
-    bytes_read = client._load_rows_by_key(partition_id, rows, shards, tags_validated=True)
+    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

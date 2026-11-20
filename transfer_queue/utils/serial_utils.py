@@ -34,7 +34,7 @@ import zmq
 from msgspec import msgpack
 from tensordict import TensorDictBase
 
-from transfer_queue.metadata import BatchMeta, TagValidationError
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.logging_utils import get_logger
 
 CUSTOM_TYPE_PICKLE = 1
@@ -71,8 +71,7 @@ class MsgpackEncoder:
 
     """
 
-    def __init__(self, *, validate_batch_tags: bool = True):
-        self.validate_batch_tags = validate_batch_tags
+    def __init__(self):
         self.encoder = msgpack.Encoder(enc_hook=self.enc_hook)
 
     @property
@@ -125,9 +124,10 @@ class MsgpackEncoder:
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if isinstance(obj, BatchMeta):
-            if self.validate_batch_tags:
-                obj._validate_custom_meta()
-            return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
+            try:
+                return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
+            except _ENCODE_FALLBACK_ERRORS as e:
+                raise RuntimeError(f"Failed to encode BatchMeta as native MessagePack: {e}") from e
 
         if callable(obj):
             # cloudpickle for arbitrary callables (functions, lambdas, functools.partial,
@@ -398,7 +398,7 @@ def encode_field_schema(
                     f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
                     f"number of global_indexes ({len(global_indexes)}) for field '{name}'. "
                 )
-            field["per_sample_shapes"] = dict(zip(map(operator.index, global_indexes), per_sample_shapes, strict=True))
+            field["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
         elif isinstance(per_sample_shapes, dict):
             field["per_sample_shapes"] = {operator.index(index): shape for index, shape in per_sample_shapes.items()}
         encoded[name] = field
@@ -456,7 +456,6 @@ def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
 
 
 _encoder = MsgpackEncoder()
-_controller_encoder = MsgpackEncoder(validate_batch_tags=False)
 _decoder = MsgpackDecoder()
 
 
@@ -488,17 +487,14 @@ def _is_pickle_fallback(frame: bytestr) -> bool:
     return view.nbytes == _PICKLE_FALLBACK_SENTINEL_SIZE and view.tobytes() == _PICKLE_FALLBACK_SENTINEL
 
 
-def encode(obj: Any, *, validate_batch_tags: bool = True) -> list[bytestr]:
+def encode(obj: Any) -> list[bytestr]:
     """Encode an object via msgpack zero-copy; falls back to pickle on failure.
 
     The pickle path is a normal degradation path (e.g. body contains torch.dtype
     objects). Use this as the single entry point for all ZMQ message serialization.
     """
-    encoder = _encoder if validate_batch_tags else _controller_encoder
     try:
-        return list(encoder.encode(obj))
-    except TagValidationError:
-        raise
+        return list(_encoder.encode(obj))
     except _ENCODE_FALLBACK_ERRORS as e:
         logger.warning(
             "encode: msgpack failed (%s), falling back to pickle.",

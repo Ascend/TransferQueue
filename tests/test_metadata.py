@@ -15,30 +15,27 @@
 
 """Unit tests for TransferQueue metadata module - Columnar BatchMeta + KVBatchMeta."""
 
+import copy
+import pickle
+
 import numpy as np
 import pytest
 import torch
 
-from transfer_queue.metadata import BatchMeta, KVBatchMeta, validate_tag
+from transfer_queue.metadata import BatchMeta, KVBatchMeta
 
 
-@pytest.mark.parametrize(
-    ("tag", "reason"),
-    [
-        pytest.param({"score": np.int64(1)}, "got int64", id="numpy-scalar"),
-        pytest.param({"metric": torch.ones(1)}, "got Tensor", id="tensor"),
-        pytest.param({"source": ("rollout", 5)}, "got tuple", id="tuple"),
-        pytest.param({"scores": [[1]]}, r"'scores'\[0\].*got list", id="nested-list"),
-        pytest.param({"value": [2**63]}, "signed 64-bit integer", id="integer-overflow"),
-        pytest.param({"value": "\ud800"}, "valid UTF-8", id="invalid-utf8"),
-        pytest.param({1: "value"}, "expected UTF-8 str", id="non-string-key"),
-        pytest.param({"__tq_tensordict__": True}, "is reserved", id="reserved-key"),
-    ],
-)
-def test_validate_tag_reports_sample_and_reason(tag, reason):
-    with pytest.raises(ValueError, match=reason) as error:
-        validate_tag(tag, partition_id="train", sample="key0")
-    assert "'key0' in partition 'train'" in str(error.value)
+def test_batch_meta_normalizes_numpy_indexes_and_deepcopies():
+    metadata = BatchMeta([np.int64(3), np.int32(7)], ["train", "train"], extra_info={"step": 1})
+    assert all(type(index) is int for index in metadata.global_indexes)
+
+    state = list(metadata.__getstate__())
+    state[metadata.__slots__.index("global_indexes")] = [np.int64(11), np.int64(13)]
+    restored = pickle.loads(pickle.dumps(metadata))
+    restored.__setstate__(tuple(state))
+    assert restored.global_indexes == [11, 13]
+    assert all(type(index) is int for index in restored.global_indexes)
+    assert copy.deepcopy(metadata).global_indexes == [3, 7]
 
 
 # ==============================================================================
