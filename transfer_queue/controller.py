@@ -2414,31 +2414,29 @@ class TransferQueueController:
 
             try:
                 response_msg: ZMQMessage | None = self._handle_request(request_msg, monitor)
+                if response_msg is None:
+                    logger.error(
+                        f"[{self.controller_id}]: no handler for request_type={request_msg.request_type} "
+                        f"from sender={request_msg.sender_id}; request {request_msg.request_id}"
+                    )
+                    response_msg = self._make_error_response(
+                        receiver_id=request_msg.sender_id,
+                        message=f"no handler for request_type {request_msg.request_type}",
+                    )
+                response_frames = response_msg.serialize()
             except Exception as e:
-                # A failing handler must not kill the loop (it used to terminate this
-                # thread) nor hang the requester, so report the failure back.
+                # Report errors from both the handler and response codec; the caller awaits a reply.
                 logger.exception(
-                    f"[{self.controller_id}]: handler for request_type={request_msg.request_type} "
+                    f"[{self.controller_id}]: request_type={request_msg.request_type} "
                     f"from sender={request_msg.sender_id} raised {type(e).__name__}: {e}"
                 )
                 response_msg = self._make_error_response(
                     receiver_id=request_msg.sender_id,
                     message=f"{request_msg.request_type} failed: {type(e).__name__}: {e}",
                 )
+                response_frames = response_msg.serialize()
 
-            if response_msg is None:
-                # No branch matched. Without this guard the reply below would send the
-                # previous iteration's response to an unrelated requester.
-                logger.error(
-                    f"[{self.controller_id}]: no handler for request_type={request_msg.request_type} "
-                    f"from sender={request_msg.sender_id}; request {request_msg.request_id}"
-                )
-                response_msg = self._make_error_response(
-                    receiver_id=request_msg.sender_id,
-                    message=f"no handler for request_type {request_msg.request_type}",
-                )
-
-            self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
+            self.request_handle_socket.send_multipart([identity, *response_frames])
 
     def _make_error_response(self, receiver_id: str | None, message: str) -> ZMQMessage:
         """Build a generic error reply so the requester raises instead of hanging on recv."""

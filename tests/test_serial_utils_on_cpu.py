@@ -18,16 +18,121 @@ import numpy as np
 import pytest
 import torch
 import zmq
+from msgspec import msgpack
 from tensordict import TensorDict
 
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.serial_utils import (
     _PICKLE_FALLBACK_SENTINEL,
+    CUSTOM_TYPE_BATCH_META,
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
     decode,
     encode,
 )
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+
+
+def test_batch_meta_round_trip_without_rpc():
+    metadata = BatchMeta(global_indexes=[7], partition_ids=["train"])
+    frames = encode({"payload": [metadata]})
+    (frame,) = frames
+    extension = msgpack.decode(frame)["payload"][0]
+    assert isinstance(extension, msgpack.Ext)
+    assert extension.code == CUSTOM_TYPE_BATCH_META
+
+    restored = decode(frames)["payload"][0]
+    assert isinstance(restored, BatchMeta)
+    assert restored.global_indexes == [7]
+    assert restored.partition_ids == ["train"]
+
+
+def test_batch_meta_reply_uses_native_msgpack():
+    """A standard MessagePack decoder can read the BatchMeta extension payload."""
+    field = "__tq_tensordict__"
+    metadata = BatchMeta(
+        global_indexes=[101, 7],
+        partition_ids=["train", "train"],
+        field_schema={
+            field: {"dtype": torch.bfloat16, "shape": (), "is_nested": False},
+            "nested": {
+                "dtype": torch.int64,
+                "shape": None,
+                "is_nested": True,
+                "per_sample_shapes": [(3,), None],
+            },
+            "text": {"dtype": None, "shape": None, "is_non_tensor": True},
+        },
+        production_status=np.array([1, 0], dtype=np.int8),
+        custom_meta=[{"score": 3}, {"shape": (2, 4)}],
+        _custom_backend_meta=[{field: {"offset": 12}, "nested": (4, 8)}, {}],
+        _links=[{field: 1}, {}],
+        extra_info={"large_int": 2**70},
+    )
+    message = ZMQMessage.create(
+        ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
+        sender_id="controller",
+        body={
+            "metadata": metadata,
+            "merge_plan": {field: {"dtype": torch.bfloat16}, "literal": {"dtype": "bfloat16"}},
+        },
+    )
+    (frame,) = message.serialize()
+    wire = msgpack.decode(frame)["body"]
+    extension = wire["metadata"]
+    assert isinstance(extension, msgpack.Ext)
+    assert extension.code == CUSTOM_TYPE_BATCH_META
+    batch = msgpack.decode(extension.data)
+    assert batch["global_indexes"] == [101, 7]
+    assert batch["production_status"] == b"\x01\x00"
+    assert batch["field_schema"][field] == {"dtype": "bfloat16", "shape": [], "is_nested": False}
+    assert batch["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
+    assert batch["field_schema"]["text"]["dtype"] is None
+    assert batch["links"] == [{field: 1}, {}]
+    assert batch["custom_meta"][0] == ["msgpack", msgpack.encode({"score": 3})]
+    assert batch["custom_meta"][1][0] == "python_pickle"
+    assert batch["custom_backend_meta"][0][field] == ["msgpack", msgpack.encode({"offset": 12})]
+    assert batch["custom_backend_meta"][0]["nested"][0] == "python_pickle"
+    assert batch["extra_info"][0] == "python_pickle"
+    assert wire["merge_plan"][field]["dtype"] == "bfloat16"
+
+    reply = ZMQMessage.deserialize([zmq.Frame(frame)]).body
+    restored = reply["metadata"]
+    assert isinstance(restored, BatchMeta)
+    assert restored.get_dtypes(field) == [torch.bfloat16, torch.bfloat16]
+    assert restored.get_shapes("nested") == [[3], None]
+    assert restored.custom_meta == metadata.custom_meta
+    assert restored._custom_backend_meta == metadata._custom_backend_meta
+    assert restored._links == metadata._links
+    assert restored.extra_info == metadata.extra_info
+    assert restored.production_status.dtype == np.int8
+    assert restored.production_status.tolist() == [1, 0]
+    restored.production_status[0] = 0
+    assert reply["merge_plan"][field]["dtype"] == torch.bfloat16
+    assert reply["merge_plan"]["literal"]["dtype"] == "bfloat16"
+
+
+def test_empty_and_missing_batch_meta_are_distinct_on_wire():
+    """An empty fetch and a missing partition carry distinct metadata."""
+    empty = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": BatchMeta.empty()})
+    (frame,) = empty.serialize()
+    extension = msgpack.decode(frame)["body"]["metadata"]
+    assert isinstance(extension, msgpack.Ext)
+    assert extension.code == CUSTOM_TYPE_BATCH_META
+    assert msgpack.decode(extension.data) == {
+        "global_indexes": [],
+        "partition_ids": [],
+        "field_schema": {},
+        "production_status": b"",
+    }
+    restored = ZMQMessage.deserialize([frame]).body["metadata"]
+    assert isinstance(restored, BatchMeta)
+    assert restored.size == 0
+    assert not restored.is_ready
+
+    missing = ZMQMessage.create(ZMQRequestType.GET_PARTITION_META_RESPONSE, "controller", {"metadata": None})
+    assert ZMQMessage.deserialize(missing.serialize()).body["metadata"] is None
 
 
 @pytest.mark.parametrize(

@@ -34,7 +34,13 @@ import zmq.asyncio
 
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import decode, encode
+from transfer_queue.utils.serial_utils import (
+    convert_field_dtypes,
+    decode,
+    decode_metadata_blob,
+    encode,
+    encode_metadata_blob,
+)
 
 logger = get_logger(__name__)
 
@@ -216,6 +222,34 @@ def describe_frames(frames: Sequence[Any], max_reported: int = 32) -> str:
     return f"num_frames={len(frames)}, frame_sizes=[{shown}{ellipsis}]"
 
 
+def _convert_controller_body(request_type: ZMQRequestType, body: dict[str, Any], *, to_wire: bool) -> dict[str, Any]:
+    """Convert the standalone schema and user metadata carried as plain dicts."""
+    convert_blob = encode_metadata_blob if to_wire else decode_metadata_blob
+
+    if request_type == ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE:
+        body = {**body, "merge_plan": convert_field_dtypes(body["merge_plan"], to_wire=to_wire)}
+    elif request_type in (ZMQRequestType.NOTIFY_DATA_UPDATE, ZMQRequestType.VALIDATE_DUMP_SCHEMA):
+        if "field_schema" in body:
+            body = {**body, "field_schema": convert_field_dtypes(body["field_schema"], to_wire=to_wire)}
+        if request_type == ZMQRequestType.NOTIFY_DATA_UPDATE and body.get("custom_backend_meta") is not None:
+            backend_meta = {
+                index: {field: convert_blob(value) for field, value in row.items()}
+                for index, row in body["custom_backend_meta"].items()
+            }
+            body = {**body, "custom_backend_meta": backend_meta}
+    elif request_type in (ZMQRequestType.SET_CUSTOM_META, ZMQRequestType.KV_LIST_RESPONSE):
+        key = "partition_custom_meta" if request_type == ZMQRequestType.SET_CUSTOM_META else "partition_info"
+        tags = {
+            partition: {sample: convert_blob(tag) for sample, tag in rows.items()}
+            for partition, rows in body[key].items()
+        }
+        body = {**body, key: tags}
+    elif request_type == ZMQRequestType.KV_DESCRIBE_RESPONSE:
+        rows = {key: {**row, "tag": convert_blob(row["tag"])} for key, row in body["rows"].items()}
+        body = {**body, "rows": rows}
+    return body
+
+
 @dataclass
 class ZMQMessage:
     """
@@ -250,12 +284,12 @@ class ZMQMessage:
     def serialize(self) -> list:
         """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
         msg_dict = {
-            "request_type": self.request_type.value,  # Enum -> str for msgpack
+            "request_type": self.request_type.value,
             "sender_id": self.sender_id,
             "receiver_id": self.receiver_id,
             "request_id": self.request_id,
             "timestamp": self.timestamp,
-            "body": self.body,
+            "body": _convert_controller_body(self.request_type, self.body, to_wire=True),
         }
         return encode(msg_dict)
 
@@ -274,14 +308,16 @@ class ZMQMessage:
 
         try:
             result = decode(frames)
+            request_type = ZMQRequestType(result["request_type"])
+            body = _convert_controller_body(request_type, result["body"], to_wire=False)
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
 
         return cls(
-            request_type=ZMQRequestType(result["request_type"]),
+            request_type=request_type,
             sender_id=result["sender_id"],
             receiver_id=result["receiver_id"],
-            body=result["body"],
+            body=body,
             request_id=result["request_id"],
             timestamp=result["timestamp"],
         )

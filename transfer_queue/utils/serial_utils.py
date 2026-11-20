@@ -33,6 +33,7 @@ import zmq
 from msgspec import msgpack
 from tensordict import TensorDictBase
 
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.logging_utils import get_logger
 
 CUSTOM_TYPE_PICKLE = 1
@@ -40,6 +41,7 @@ CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
+CUSTOM_TYPE_BATCH_META = 6  # Plain MessagePack metadata in the extension payload
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
@@ -60,7 +62,7 @@ _decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder
 
 
 class MsgpackEncoder:
-    """Encoder with custom torch tensor and numpy array serialization.
+    """Encoder with custom tensor, NumPy array, and BatchMeta serialization.
 
     This implementation uses ContextVar for thread-safe buffer storage,
     allowing the global encoder instance to be safely used across multiple
@@ -119,6 +121,9 @@ class MsgpackEncoder:
                     pass
             # Only true object arrays (or structured dtypes with object fields) reach here
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+        if isinstance(obj, BatchMeta):
+            return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
 
         if callable(obj):
             # cloudpickle for arbitrary callables (functions, lambdas, functools.partial,
@@ -237,7 +242,7 @@ class MsgpackEncoder:
 
 
 class MsgpackDecoder:
-    """Decoder with custom torch tensor and numpy array serialization.
+    """Decoder with custom tensor, NumPy array, and BatchMeta serialization.
 
     This implementation uses ContextVar for thread-safe buffer storage,
     allowing the global decoder instance to be safely used across multiple
@@ -272,7 +277,7 @@ class MsgpackDecoder:
         """Recursively reconstruct special types (TensorDict) from their dict representation."""
         if isinstance(obj, dict):
             # Check if this is a TensorDict marker
-            if obj.get("__tq_tensordict__"):
+            if obj.get("__tq_tensordict__") is True:
                 return self._reconstruct_tensordict(obj)
             # Recursively process dict values
             return {k: self._reconstruct_special_types(v) for k, v in obj.items()}
@@ -358,8 +363,113 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NUMPY:
             meta = pickle.loads(data)
             return self._decode_numpy(meta)
+        if code == CUSTOM_TYPE_BATCH_META:
+            return _batch_meta_from_wire(msgpack.decode(data))
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
+
+
+def _is_native_tree(value: Any, seen: set[int]) -> bool:
+    value_type = type(value)
+    if value_type in (type(None), bool, int, float, str, bytes):
+        return True
+    if value_type not in (list, dict) or id(value) in seen:
+        return False
+    # MessagePack arrays cannot distinguish tuples or preserve shared container references.
+    seen.add(id(value))
+    if value_type is list:
+        return all(_is_native_tree(item, seen) for item in value)
+    return all(type(key) in (str, int) and _is_native_tree(item, seen) for key, item in value.items())
+
+
+def encode_metadata_blob(value: Any) -> tuple[str, bytes]:
+    """Encode one user metadata value with its codec name."""
+    try:
+        if _is_native_tree(value, set()):
+            return "msgpack", msgpack.encode(value)
+    except (OverflowError, RecursionError, UnicodeError, msgspec.MsgspecError):
+        pass
+    return "python_pickle", cloudpickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def decode_metadata_blob(blob: Sequence[Any]) -> Any:
+    """Decode one user metadata value using its declared codec."""
+    codec, payload = blob
+    if not isinstance(payload, bytes):
+        raise TypeError("Expected a binary metadata blob")
+    if codec == "msgpack":
+        return msgpack.decode(payload)
+    if codec == "python_pickle":
+        return pickle.loads(payload)
+    raise ValueError(f"Unsupported metadata codec: {codec!r}")
+
+
+def _encode_dtype(dtype: torch.dtype | str | None) -> str | None:
+    if dtype is None:
+        return None
+    if isinstance(dtype, torch.dtype):
+        return str(dtype).removeprefix("torch.")
+    if isinstance(dtype, str):
+        # Some callers pass literal strings, including strings that name a Torch dtype.
+        return f"str:{dtype}"
+    raise TypeError(f"Unsupported field dtype: {type(dtype).__name__}")
+
+
+def _decode_dtype(dtype: str | None) -> torch.dtype | str | None:
+    if dtype is None:
+        return None
+    if dtype.startswith("str:"):
+        return dtype.removeprefix("str:")
+    torch_dtype = getattr(torch, dtype, None)
+    if not isinstance(torch_dtype, torch.dtype):
+        raise ValueError(f"Unknown Torch dtype: {dtype!r}")
+    return torch_dtype
+
+
+def convert_field_dtypes(fields: dict[str, dict[str, Any]], *, to_wire: bool) -> dict[str, dict[str, Any]]:
+    """Translate dtype entries in a field schema or a KV merge plan."""
+    convert_dtype = _encode_dtype if to_wire else _decode_dtype
+    return {
+        name: {**field, "dtype": convert_dtype(field["dtype"])} if "dtype" in field else field
+        for name, field in fields.items()
+    }
+
+
+def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
+    wire: dict[str, Any] = {
+        "global_indexes": metadata.global_indexes,
+        "partition_ids": metadata.partition_ids,
+        "field_schema": convert_field_dtypes(metadata.field_schema, to_wire=True),
+        "production_status": metadata.production_status.tobytes(),
+    }
+    if metadata.extra_info:
+        wire["extra_info"] = encode_metadata_blob(metadata.extra_info)
+    if any(metadata.custom_meta):
+        wire["custom_meta"] = [encode_metadata_blob(tag) for tag in metadata.custom_meta]
+    if any(metadata._custom_backend_meta):
+        wire["custom_backend_meta"] = [
+            {field: encode_metadata_blob(value) for field, value in row.items()}
+            for row in metadata._custom_backend_meta
+        ]
+    if any(metadata._links):
+        wire["links"] = metadata._links
+    return wire
+
+
+def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
+    return BatchMeta(
+        global_indexes=wire["global_indexes"],
+        partition_ids=wire["partition_ids"],
+        field_schema=convert_field_dtypes(wire["field_schema"], to_wire=False),
+        production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
+        extra_info=decode_metadata_blob(wire["extra_info"]) if "extra_info" in wire else None,
+        custom_meta=[decode_metadata_blob(tag) for tag in wire.get("custom_meta", [])],
+        _custom_backend_meta=[
+            {field: decode_metadata_blob(value) for field, value in row.items()}
+            for row in wire.get("custom_backend_meta", [])
+        ],
+        _links=wire.get("links"),
+    )
 
 
 _encoder = MsgpackEncoder()
