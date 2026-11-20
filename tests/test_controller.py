@@ -1424,7 +1424,11 @@ class TestTransferQueueControllerCheckpoint:
         )
         field_schema = {
             "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
-            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+            "attention_mask": {
+                "dtype": "torch.bool",
+                "is_nested": True,
+                "per_sample_shapes": dict.fromkeys(metadata.global_indexes, (32,)),
+            },
         }
         ray.get(
             tq_controller.update_production_status.remote(
@@ -1438,9 +1442,12 @@ class TestTransferQueueControllerCheckpoint:
         ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
         with open(ckpt_path, "rb") as f:
             state = pickle.load(f)
-        # Older checkpoints could contain dtype names with or without the Torch prefix.
-        state["partitions"][partition_id].field_metadata["prompt_ids"].dtype = "torch.long"
-        state["partitions"][partition_id].field_metadata["attention_mask"].dtype = "bool"
+        # Older checkpoints could store dtype names and shapes decoded from MessagePack arrays.
+        fields = state["partitions"][partition_id].field_metadata
+        fields["prompt_ids"].dtype = "torch.long"
+        fields["prompt_ids"].shape = [32]
+        fields["attention_mask"].dtype = "bool"
+        fields["attention_mask"].per_sample_shapes = dict.fromkeys(metadata.global_indexes, [32])
         with open(ckpt_path, "wb") as f:
             pickle.dump(state, f)
 
@@ -1459,8 +1466,12 @@ class TestTransferQueueControllerCheckpoint:
         assert partition is not None
         assert set(partition.global_indexes) == set(metadata.global_indexes)
         assert partition.production_status is not None
-        assert partition.field_metadata["prompt_ids"].dtype is torch.int64
-        assert partition.field_metadata["attention_mask"].dtype is torch.bool
+        prompt_ids = partition.field_metadata["prompt_ids"]
+        attention_mask = partition.field_metadata["attention_mask"]
+        assert prompt_ids.dtype is torch.int64
+        assert prompt_ids.shape == (32,)
+        assert attention_mask.dtype is torch.bool
+        assert attention_mask.per_sample_shapes == dict.fromkeys(metadata.global_indexes, (32,))
         assert ray.get(
             new_controller.update_production_status.remote(partition_id, metadata.global_indexes, field_schema)
         )
@@ -1594,6 +1605,8 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         }
         backend_meta = {left: {"ids": {"offset": 10}}, right: {"ids": (5, 6)}}
         assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
+        partition = ray.get(controller.get_partition_snapshot.remote(partition_id))
+        assert partition.field_metadata["ids"].per_sample_shapes == {left: (2,), right: (4,)}
 
         batch = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
         assert batch.global_indexes == [left, right]
