@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import copy
 import os
 import threading
 import weakref
@@ -28,6 +29,7 @@ from transfer_queue.controller import PUBLIC_PARTITION
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -351,23 +353,16 @@ class AsyncTransferQueueClient:
             raise RuntimeError("No controller registered")
 
         global_indexes = metadata.global_indexes
-        custom_meta = metadata.get_all_custom_meta()
+        custom_meta = metadata.custom_meta
 
-        if len(global_indexes) == 0 or len(custom_meta) == 0:
+        if not global_indexes or not custom_meta:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
-        # chunk metadata according to partition_ids
-        metadata_chunks = metadata.chunk_by_partition()
-
         # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
-        partition_custom_meta: dict[str, dict[int, dict]] = {pid: {} for pid in set(metadata.partition_ids)}
-
-        for meta in metadata_chunks:
-            custom_meta = meta.get_all_custom_meta()
-            partition_custom_meta[meta.partition_ids[0]].update(
-                {meta.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))}
-            )
+        partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
+        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
+            partition_custom_meta[partition_id][index] = copy.deepcopy(tag) if tag else {}
 
         await self._request_controller(
             socket=socket,
@@ -1085,7 +1080,8 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
-        return response_msg.body["metadata"], response_msg.body["merge_plan"]
+        merge_plan = serial_utils.decode_field_schema(response_msg.body["merge_plan"])
+        return response_msg.body["metadata"], merge_plan
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
         """Clear fields of existing keys while keeping the keys, tags and consumption status.
@@ -1419,6 +1415,7 @@ class AsyncTransferQueueClient:
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """Reject incompatible destination fields before restoring payloads."""
+        field_schema = serial_utils.encode_field_schema(field_schema)
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,

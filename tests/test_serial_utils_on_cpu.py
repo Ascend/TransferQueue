@@ -18,16 +18,138 @@ import numpy as np
 import pytest
 import torch
 import zmq
+from msgspec import msgpack
 from tensordict import TensorDict
 
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.serial_utils import (
     _PICKLE_FALLBACK_SENTINEL,
+    CUSTOM_TYPE_BATCH_META,
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
     decode,
+    decode_field_schema,
     encode,
+    encode_field_schema,
 )
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZMQRequestType
+
+
+def test_batch_meta_round_trips_through_native_msgpack():
+    """A standard MessagePack decoder can read a populated BatchMeta payload."""
+    tags = [{"source": ["rollout", 5, 0.5, False, None], "empty": []}, {}]
+    backend_meta = [{"scalar": None, "nested": {"n_chunks": 2}}, {"scalar": "strategy"}]
+    metadata = BatchMeta(
+        global_indexes=[np.int64(101), 7],
+        partition_ids=["train", "train"],
+        field_schema={
+            "scalar": {"dtype": torch.bfloat16, "shape": ()},
+            "nested": {"dtype": torch.int64, "is_nested": True, "per_sample_shapes": [(3,), None]},
+        },
+        production_status=np.array([1, 0], dtype=np.int8),
+        custom_meta=tags,
+        _custom_backend_meta=backend_meta,
+        _links=[{"scalar": 1}, {}],
+        extra_info={"large_int": 2**70},
+    )
+    assert all(type(index) is int for index in metadata.global_indexes)
+    frames = encode({"payload": [metadata]})
+    (frame,) = frames
+    extension = msgpack.decode(frame)["payload"][0]
+    assert isinstance(extension, msgpack.Ext)
+    assert extension.code == CUSTOM_TYPE_BATCH_META
+    wire = msgpack.decode(extension.data)
+    assert wire["global_indexes"] == [101, 7]
+    assert wire["custom_meta"] == tags
+    assert wire["custom_backend_meta"] == backend_meta
+    assert "extra_info" not in wire
+    assert wire["production_status"] == b"\x01\x00"
+    assert wire["field_schema"]["scalar"] == {"dtype": "bfloat16", "shape": []}
+    assert wire["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
+
+    restored = decode(frames)["payload"][0]
+    assert isinstance(restored, BatchMeta)
+    assert restored.global_indexes == [101, 7]
+    assert restored.partition_ids == ["train", "train"]
+    assert restored.get_dtypes("scalar") == [torch.bfloat16, torch.bfloat16]
+    assert restored.get_shapes("scalar") == [(), ()]
+    assert restored.get_shapes("nested") == [(3,), None]
+    assert restored.custom_meta == tags
+    assert restored._custom_backend_meta == backend_meta
+    assert restored._links == metadata._links
+    assert restored.extra_info == {}
+    assert metadata.extra_info == {"large_int": 2**70}
+    assert restored.production_status.dtype == np.int8
+    assert restored.production_status.tolist() == [1, 0]
+    assert restored.production_status.flags.writeable
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, "int64", "torch.int64", "torch.long", None])
+def test_field_dtype_uses_canonical_wire_name(dtype):
+    fields = {"ids": {"dtype": dtype}}
+    wire = encode_field_schema(fields)
+    restored = decode_field_schema(wire)
+    assert wire["ids"]["dtype"] == (None if dtype is None else "int64")
+    assert restored["ids"]["dtype"] is (None if dtype is None else torch.int64)
+    assert fields["ids"]["dtype"] is dtype
+    assert wire["ids"] is not fields["ids"]
+    assert restored["ids"] is not wire["ids"]
+
+
+def test_encode_field_schema_normalizes_numpy_sample_keys():
+    fields = {"ids": {"dtype": torch.int64, "per_sample_shapes": {np.int64(101): (3,)}}}
+    wire = encode_field_schema(fields)
+    assert wire["ids"]["dtype"] == "int64"
+    assert wire["ids"]["per_sample_shapes"] == {101: (3,)}
+    assert all(type(index) is int for index in wire["ids"]["per_sample_shapes"])
+
+
+def test_batch_meta_encoding_rejects_unknown_dtype():
+    metadata = BatchMeta([7], ["train"], {"ids": {"dtype": "unknown_dtype"}})
+    with pytest.raises(RuntimeError, match="Invalid Torch dtype"):
+        encode(metadata)
+
+
+@pytest.mark.parametrize("value", [torch.ones(1), np.int64(1), 2**70], ids=["tensor", "numpy-int", "large-int"])
+def test_batch_meta_encoding_rejects_non_msgpack_metadata(value):
+    metadata = BatchMeta([7], ["train"], custom_meta=[{"value": value}])
+    with pytest.raises(RuntimeError, match="Failed to encode BatchMeta as native MessagePack"):
+        encode(metadata)
+
+
+@pytest.mark.parametrize("field", ["sender_id", "receiver_id", "request_id", "timestamp"])
+def test_zmq_decode_error_reports_missing_field_and_frame_count(field):
+    message = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": None})
+    (frame,) = message.serialize()
+    envelope = msgpack.decode(frame)
+    del envelope[field]
+    received = zmq.Frame(msgpack.encode(envelope))
+
+    with pytest.raises(ZMQMessageDecodeError, match=rf"KeyError: '{field}'.*num_frames=1"):
+        ZMQMessage.deserialize([received])
+
+
+def test_empty_and_missing_batch_meta_are_distinct_on_wire():
+    """An empty fetch and a missing partition carry distinct metadata."""
+    empty = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": BatchMeta.empty()})
+    (frame,) = empty.serialize()
+    extension = msgpack.decode(frame)["body"]["metadata"]
+    assert isinstance(extension, msgpack.Ext)
+    assert extension.code == CUSTOM_TYPE_BATCH_META
+    assert msgpack.decode(extension.data) == {
+        "global_indexes": [],
+        "partition_ids": [],
+        "field_schema": {},
+        "production_status": b"",
+    }
+    restored = ZMQMessage.deserialize([frame]).body["metadata"]
+    assert isinstance(restored, BatchMeta)
+    assert restored.size == 0
+    assert not restored.is_ready
+
+    missing = ZMQMessage.create(ZMQRequestType.GET_PARTITION_META_RESPONSE, "controller", {"metadata": None})
+    assert ZMQMessage.deserialize(missing.serialize()).body["metadata"] is None
 
 
 @pytest.mark.parametrize(

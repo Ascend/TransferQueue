@@ -16,6 +16,7 @@
 import copy
 import dataclasses
 import itertools
+import operator
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -199,7 +200,7 @@ class BatchMeta:
         partition_ids: List of partition IDs corresponding to each sample.
         field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}.
         production_status: Vectorized production status, shape (B,) where B is batch size.
-        extra_info: Additional batch-level information.
+        extra_info: Additional batch information omitted from the Controller's MessagePack payload.
         custom_meta: Per-sample user-defined metadata, list aligned with global_indexes.
         _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
         _links: Per-sample {field: source global_index} for linked fields, list aligned with global_indexes.
@@ -239,7 +240,7 @@ class BatchMeta:
         if _custom_backend_meta is None:
             _custom_backend_meta = []
 
-        self.global_indexes = list(global_indexes)
+        self.global_indexes = list(map(operator.index, global_indexes))
         self.partition_ids = list(partition_ids)
         self.field_schema = {k: dict(v) for k, v in field_schema.items()}
         self.extra_info = dict(extra_info)
@@ -316,6 +317,8 @@ class BatchMeta:
             # Ray Arrow zero-copy produces read-only numpy arrays
             if slot == "production_status" and isinstance(value, np.ndarray) and not value.flags.writeable:
                 value = value.copy()
+            elif slot == "global_indexes":
+                value = list(map(operator.index, value))
             setattr(self, slot, value)
 
     @property
