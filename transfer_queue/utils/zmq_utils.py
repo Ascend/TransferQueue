@@ -32,15 +32,9 @@ import ray
 import zmq
 import zmq.asyncio
 
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import ExplicitEnum, Role
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.serial_utils import (
-    convert_field_dtypes,
-    decode,
-    decode_metadata_blob,
-    encode,
-    encode_metadata_blob,
-)
 
 logger = get_logger(__name__)
 
@@ -224,13 +218,13 @@ def describe_frames(frames: Sequence[Any], max_reported: int = 32) -> str:
 
 def _convert_controller_body(request_type: ZMQRequestType, body: dict[str, Any], *, to_wire: bool) -> dict[str, Any]:
     """Convert the standalone schema and user metadata carried as plain dicts."""
-    convert_blob = encode_metadata_blob if to_wire else decode_metadata_blob
+    convert_blob = serial_utils.encode_metadata_blob if to_wire else serial_utils.decode_metadata_blob
 
     if request_type == ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE:
-        body = {**body, "merge_plan": convert_field_dtypes(body["merge_plan"], to_wire=to_wire)}
+        body = {**body, "merge_plan": serial_utils.convert_field_dtypes(body["merge_plan"], to_wire=to_wire)}
     elif request_type in (ZMQRequestType.NOTIFY_DATA_UPDATE, ZMQRequestType.VALIDATE_DUMP_SCHEMA):
         if "field_schema" in body:
-            body = {**body, "field_schema": convert_field_dtypes(body["field_schema"], to_wire=to_wire)}
+            body = {**body, "field_schema": serial_utils.convert_field_dtypes(body["field_schema"], to_wire=to_wire)}
         if request_type == ZMQRequestType.NOTIFY_DATA_UPDATE and body.get("custom_backend_meta") is not None:
             backend_meta = {
                 index: {field: convert_blob(value) for field, value in row.items()}
@@ -291,7 +285,7 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": _convert_controller_body(self.request_type, self.body, to_wire=True),
         }
-        return encode(msg_dict)
+        return serial_utils.encode(msg_dict)
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":
@@ -307,7 +301,7 @@ class ZMQMessage:
             raise ZMQMessageDecodeError(f"leading frame is empty; {describe_frames(frames)}")
 
         try:
-            result = decode(frames)
+            result = serial_utils.decode(frames)
             request_type = ZMQRequestType(result["request_type"])
             body = _convert_controller_body(request_type, result["body"], to_wire=False)
         except Exception as e:
