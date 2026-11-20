@@ -2692,6 +2692,8 @@ class TransferQueueController:
     def _handle_kv_describe_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         description = self.kv_describe(params["keys"], params["partition_id"])
+        for row in description["rows"].values():
+            row["tag"] = serial_utils.MetadataBlob(row["tag"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
 
     def _handle_kv_exists_request(self, request_msg: ZMQMessage) -> ZMQMessage:
@@ -2752,7 +2754,8 @@ class TransferQueueController:
                 message = f"partition {partition_id} does not exist"
                 continue
             partition_info[partition_id] = {
-                key: partition.custom_meta.get(index, {}) for key, index in partition.keys_mapping.items()
+                key: serial_utils.MetadataBlob(partition.custom_meta.get(index, {}))
+                for key, index in partition.keys_mapping.items()
             }
 
         return self._make_response(

@@ -354,21 +354,15 @@ class AsyncTransferQueueClient:
         global_indexes = metadata.global_indexes
         custom_meta = metadata.get_all_custom_meta()
 
-        if len(global_indexes) == 0 or len(custom_meta) == 0:
+        if not global_indexes or not custom_meta:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
-        # chunk metadata according to partition_ids
-        metadata_chunks = metadata.chunk_by_partition()
-
-        # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
-        partition_custom_meta: dict[str, dict[int, dict]] = {pid: {} for pid in set(metadata.partition_ids)}
-
-        for meta in metadata_chunks:
-            custom_meta = meta.get_all_custom_meta()
-            partition_custom_meta[meta.partition_ids[0]].update(
-                {meta.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))}
-            )
+        partition_custom_meta: dict[str, dict[int, serial_utils.MetadataBlob]] = {
+            pid: {} for pid in set(metadata.partition_ids)
+        }
+        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
+            partition_custom_meta[partition_id][index] = serial_utils.MetadataBlob(tag)
 
         await self._request_controller(
             socket=socket,

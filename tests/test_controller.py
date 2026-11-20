@@ -26,6 +26,7 @@ from msgspec import msgpack
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
 from transfer_queue.storage.managers.base import StorageManager
+from transfer_queue.utils.serial_utils import CUSTOM_TYPE_METADATA_BLOB
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1557,8 +1558,11 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
             body = msgpack.decode(frame)["body"]
             first, second = body["global_indexes"]
             assert body["field_schema"]["ids"]["dtype"] == "int64"
-            assert body["custom_backend_meta"][first]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
-            assert body["custom_backend_meta"][second]["ids"][0] == "python_pickle"
+            native = body["custom_backend_meta"][first]["ids"]
+            pickled = body["custom_backend_meta"][second]["ids"]
+            assert native.code == pickled.code == CUSTOM_TYPE_METADATA_BLOB
+            assert msgpack.decode(native.data) == ["msgpack", msgpack.encode({"offset": 10})]
+            assert msgpack.decode(pickled.data)[0] == "python_pickle"
             return await super()._notify_and_wait(frames)
 
     controller = TransferQueueController.remote()
