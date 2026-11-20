@@ -17,6 +17,7 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
+import io
 import pickle
 import struct
 import warnings
@@ -381,6 +382,21 @@ def _is_native_tree(value: Any, seen: set[int]) -> bool:
     return all(type(key) in (str, int) and _is_native_tree(item, seen) for key, item in value.items())
 
 
+class _MetadataPickler(cloudpickle.CloudPickler):
+    """Move accelerator tensors to CPU before a receiver unpickles metadata."""
+
+    def reducer_override(self, value: Any) -> Any:
+        if isinstance(value, torch.Tensor) and value.device.type not in ("cpu", "meta"):
+            return value.cpu().__reduce_ex__(self.proto)
+        return super().reducer_override(value)
+
+
+def _pickle_metadata(value: Any) -> bytes:
+    buffer = io.BytesIO()
+    _MetadataPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
+    return buffer.getvalue()
+
+
 def encode_metadata_blob(value: Any) -> tuple[str, bytes]:
     """Encode one user metadata value with its codec name."""
     try:
@@ -388,7 +404,7 @@ def encode_metadata_blob(value: Any) -> tuple[str, bytes]:
             return "msgpack", msgpack.encode(value)
     except (OverflowError, RecursionError, UnicodeError, msgspec.MsgspecError):
         pass
-    return "python_pickle", cloudpickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    return "python_pickle", _pickle_metadata(value)
 
 
 def decode_metadata_blob(blob: Sequence[Any]) -> Any:
@@ -524,6 +540,15 @@ def _is_pickle_fallback(frame: bytestr) -> bool:
     return view.nbytes == _PICKLE_FALLBACK_SENTINEL_SIZE and view.tobytes() == _PICKLE_FALLBACK_SENTINEL
 
 
+class _MessageFallbackPickler(pickle.Pickler):
+    """Keep BatchMeta tensors CPU-safe when a message falls back to pickle."""
+
+    def reducer_override(self, value: Any) -> Any:
+        if isinstance(value, BatchMeta):
+            return pickle.loads, (_pickle_metadata(value),)
+        return NotImplemented
+
+
 def encode(obj: Any) -> list[bytestr]:
     """Encode an object via msgpack zero-copy; falls back to pickle on failure.
 
@@ -537,7 +562,9 @@ def encode(obj: Any) -> list[bytestr]:
             "encode: msgpack failed (%s), falling back to pickle.",
             type(e).__name__,
         )
-        return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
+        buffer = io.BytesIO()
+        _MessageFallbackPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(obj)
+        return [_PICKLE_FALLBACK_SENTINEL, buffer.getvalue()]
 
 
 def decode(frames: list) -> Any:

@@ -114,6 +114,41 @@ def test_metadata_blob_round_trip_without_rpc(tag, codec):
     assert decode_metadata_blob(blob) == tag
 
 
+@pytest.mark.parametrize("route", ["blob", "batch_meta", "message_fallback"])
+def test_metadata_serializes_accelerator_tensors_on_cpu(route):
+    class AcceleratorTensor(torch.Tensor):
+        @property
+        def device(self) -> torch.device:
+            return torch.device("cuda")
+
+        def cpu(self) -> torch.Tensor:
+            return self.as_subclass(torch.Tensor)
+
+    class Metric:
+        def __init__(self, tensor):
+            self.values = (tensor, [tensor])
+
+    tensor = torch.arange(4)
+    metadata_value = {"metric": Metric(tensor.as_subclass(AcceleratorTensor))}
+    if route == "blob":
+        restored_values = [decode_metadata_blob(encode_metadata_blob(metadata_value))]
+    else:
+        metadata = BatchMeta([7], ["train"], extra_info=metadata_value, custom_meta=[metadata_value])
+        body = {"metadata": metadata}
+        if route == "message_fallback":
+            body["offset"] = 2**70
+        frames = encode(body)
+        assert _is_pickle_fallback(frames[0]) is (route == "message_fallback")
+        restored = decode(frames)["metadata"]
+        restored_values = [restored.extra_info, restored.custom_meta[0]]
+
+    for value in restored_values:
+        result, repeated = value["metric"].values
+        assert result.device.type == "cpu"
+        assert torch.equal(result, tensor)
+        assert result is repeated[0]
+
+
 def test_empty_and_missing_batch_meta_are_distinct_on_wire():
     """An empty fetch and a missing partition carry distinct metadata."""
     empty = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": BatchMeta.empty()})
