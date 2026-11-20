@@ -312,7 +312,9 @@ class TestIncludeStorageFalse:
         assert meta["storage_saved"] is True
         assert (checkpoint_dir / "simple_storage").exists()
 
-    def test_both_restored_after_load(self, tq_system, checkpoint_dir, controller):
+    def test_restores_controller_and_storage_with_one_controller_read(
+        self, tq_system, checkpoint_dir, controller, monkeypatch
+    ):
         # Define test data
         keys = ["n0", "n1"]
         partition_id = "p_nometa2"
@@ -332,7 +334,15 @@ class TestIncludeStorageFalse:
         # Wipe
         ray.get(controller.clear_partition.remote(partition_id))
 
-        # Load
+        client = tq.interface._maybe_create_tq_client()
+        load_storage = client.load_storage_checkpoint
+
+        def load_storage_and_remove_controller_file(path):
+            load_storage(path)
+            (checkpoint_dir / "controller_state.pkl").unlink()
+
+        # Applying the prepared state must work after the preflight file is gone.
+        monkeypatch.setattr(client, "load_storage_checkpoint", load_storage_and_remove_controller_file)
         tq.load_checkpoint(checkpoint_dir)
 
         # Check loaded state: both controller and storage restored

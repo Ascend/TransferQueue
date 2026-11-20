@@ -1579,12 +1579,22 @@ def load_checkpoint(
     if not controller_path.exists():
         raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
 
+    controller_path_str = str(controller_path)
     if meta.get("storage_saved"):
-        # Reject incompatible metadata before storage restore replaces live payloads.
-        client.load_controller_checkpoint(str(controller_path), validate_only=True)
-        client.load_storage_checkpoint(str(checkpoint_dir))
-
-    client.load_controller_checkpoint(str(controller_path))
+        # Check Controller metadata before replacing live payloads, then apply that same snapshot.
+        restore_id = uuid4().hex
+        try:
+            client._load_controller_checkpoint(controller_path_str, phase="prepare", restore_id=restore_id)
+            client.load_storage_checkpoint(str(checkpoint_dir))
+            client._load_controller_checkpoint(controller_path_str, phase="apply", restore_id=restore_id)
+        except BaseException:
+            try:
+                client._load_controller_checkpoint(controller_path_str, phase="discard", restore_id=restore_id)
+            except Exception:
+                logger.warning("Failed to discard prepared checkpoint %s", controller_path, exc_info=True)
+            raise
+    else:
+        client.load_controller_checkpoint(controller_path_str)
 
     logger.info(f"Checkpoint loaded from {checkpoint_dir}")
 
