@@ -26,7 +26,6 @@ from msgspec import msgpack
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
 from transfer_queue.storage.managers.base import StorageManager
-from transfer_queue.utils.serial_utils import CUSTOM_TYPE_METADATA_BLOB
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1541,7 +1540,7 @@ class TestControllerSocketBudget:
 
 @pytest.mark.asyncio
 async def test_native_metadata_round_trip_over_zmq(ray_setup):
-    """Notify a live Controller and fetch the metadata over ZMQ."""
+    """Round-trip tags and producer metadata through a live Controller."""
 
     class NotifyOnlyStorageManager(StorageManager):
         async def put_data(self, *args, **kwargs):
@@ -1558,11 +1557,8 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
             body = msgpack.decode(frame)["body"]
             first, second = body["global_indexes"]
             assert body["field_schema"]["ids"]["dtype"] == "int64"
-            native = body["custom_backend_meta"][first]["ids"]
-            pickled = body["custom_backend_meta"][second]["ids"]
-            assert native.code == pickled.code == CUSTOM_TYPE_METADATA_BLOB
-            assert msgpack.decode(native.data) == ["msgpack", msgpack.encode({"offset": 10})]
-            assert msgpack.decode(pickled.data)[0] == "python_pickle"
+            assert body["custom_backend_meta"][first]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
+            assert body["custom_backend_meta"][second]["ids"][0] == "python_pickle"
             return await super()._notify_and_wait(frames)
 
     controller = TransferQueueController.remote()
@@ -1571,11 +1567,15 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
     producer = NotifyOnlyStorageManager(info, {})
     try:
         partition_id = "native-wire"
-        inserted = await client.async_get_meta(["ids"], 2, partition_id, mode="insert")
+        keys = ["left", "right"]
+        inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
         left, right = inserted.global_indexes
         tags = [{"score": 3}, {"source": ("rollout", 5), "__tq_tensordict__": True}]
         inserted.update_custom_meta(tags)
         await client.async_set_custom_meta(inserted)
+        assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
+        rows = (await client.async_kv_describe(keys, partition_id))["rows"]
+        assert [rows[key]["tag"] for key in keys] == tags
 
         schema = {
             "ids": {

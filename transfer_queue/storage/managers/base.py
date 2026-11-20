@@ -267,7 +267,7 @@ class StorageManager(ABC):
 
         if custom_backend_meta is not None:
             custom_backend_meta = {
-                index: {field: serial_utils.MetadataBlob(value) for field, value in row.items()}
+                index: {field: serial_utils.encode_metadata_blob(value) for field, value in row.items()}
                 for index, row in custom_backend_meta.items()
             }
 
