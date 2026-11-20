@@ -1135,11 +1135,12 @@ class TransferQueueController:
                     - Defaults to SequentialSampler for simple sequential sampling
                     - Example: sampler=GRPOGroupNSampler() (instance)
                     - Example: sampler=SequentialSampler (class)
-            polling_mode: Deprecated. A metadata fetch returns an empty batch when no batch is available.
+            polling_mode: Deprecated (removed in 0.2.0). Metadata fetches return an empty batch when unavailable.
         """
+        # TODO(0.2.0): Remove deprecated `polling_mode` parameter.
         if polling_mode is not None:
             warnings.warn(
-                "The `polling_mode` argument is deprecated and ignored. It will be removed in the next release. "
+                "The `polling_mode` argument is deprecated and ignored, and will be removed in 0.2.0. "
                 "Remove it when creating the controller. "
                 "A metadata fetch returns an empty BatchMeta when no batch is available.",
                 FutureWarning,
@@ -2842,25 +2843,28 @@ class TransferQueueController:
             with open(path, "rb") as f:
                 state = pickle.load(f)
 
-            # Normalize legacy dtype names and shape lists before comparing
-            # restored fields with subsequent writes.
-            converted_legacy_dtype = False
+            # TODO(0.2.0): Remove legacy checkpoint migration for list shapes and string dtypes.
+            migrated_legacy_fields = False
             for partition_id, partition in state["partitions"].items():
                 for name, field_meta in partition.field_metadata.items():
                     if isinstance(field_meta.shape, list):
                         field_meta.shape = tuple(field_meta.shape)
+                        migrated_legacy_fields = True
                     for index, shape in (field_meta.per_sample_shapes or {}).items():
                         if isinstance(shape, list):
                             field_meta.per_sample_shapes[index] = tuple(shape)
+                            migrated_legacy_fields = True
                     if isinstance(field_meta.dtype, str):
                         field_meta.dtype = serial_utils.parse_torch_dtype(field_meta.dtype, f"{partition_id}.{name}")
-                        converted_legacy_dtype = True
+                        migrated_legacy_fields = True
 
-            if converted_legacy_dtype:
+            if migrated_legacy_fields:
                 warnings.warn(
-                    "String dtypes in Controller checkpoints are deprecated. "
-                    "Support for restoring them will be removed in the next release. "
-                    "Re-save the restored checkpoint with this release to migrate it.",
+                    f"Controller checkpoint {path!r} uses legacy FieldMeta formats "
+                    "(dtype stored as str such as 'torch.int64' instead of torch.dtype, "
+                    "or shape stored as list instead of tuple). Automatic migration is "
+                    "deprecated and will be removed in 0.2.0; "
+                    "call save_checkpoint() to re-save it in the current format.",
                     FutureWarning,
                     stacklevel=2,
                 )

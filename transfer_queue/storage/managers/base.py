@@ -253,7 +253,19 @@ class StorageManager(ABC):
             return False
 
         global_indexes = list(map(operator.index, global_indexes))
-        field_schema = serial_utils.encode_field_schema(field_schema, global_indexes=global_indexes)
+        normalized_field_schema = {}
+        for field_name, field in field_schema.items():
+            field_copy = field.copy()
+            per_sample_shapes = field_copy.get("per_sample_shapes", None)
+            if isinstance(per_sample_shapes, list | tuple):
+                if len(per_sample_shapes) != len(global_indexes):
+                    raise ValueError(
+                        f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
+                    )
+                field_copy["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
+            normalized_field_schema[field_name] = field_copy
+        normalized_field_schema = serial_utils.encode_field_schema(normalized_field_schema)
         if custom_backend_meta and any(type(index) is not int for index in custom_backend_meta):
             custom_backend_meta = {operator.index(index): row for index, row in custom_backend_meta.items()}
 
@@ -263,7 +275,7 @@ class StorageManager(ABC):
             body={
                 "partition_id": partition_id,
                 "global_indexes": global_indexes,
-                "field_schema": field_schema,
+                "field_schema": normalized_field_schema,
                 "custom_backend_meta": custom_backend_meta,
                 "ready": ready,
             },
