@@ -2856,12 +2856,24 @@ class TransferQueueController:
                 state = pickle.load(f)
 
             partitions = state["partitions"]
+            # Normalize legacy dtype names so schema checks can compare them
+            # with the Torch dtypes from subsequent writes.
+            converted_legacy_dtype = False
             for partition in partitions.values():
                 for field_meta in partition.field_metadata.values():
                     if isinstance(field_meta.dtype, str):
                         dtype = getattr(torch, field_meta.dtype.removeprefix("torch."), None)
                         if isinstance(dtype, torch.dtype):
                             field_meta.dtype = dtype
+                            converted_legacy_dtype = True
+            if converted_legacy_dtype:
+                warnings.warn(
+                    "String dtypes in Controller checkpoints are deprecated. "
+                    "Support for restoring them will be removed in the next release. "
+                    "Re-save the restored checkpoint with this release to migrate it.",
+                    FutureWarning,
+                    stacklevel=2,
+                )
 
             self.controller_id = state["controller_id"]
             self.partitions = partitions
