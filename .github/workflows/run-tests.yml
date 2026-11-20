@@ -33,7 +33,7 @@ jobs:
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[test,build,yuanrong]"
-        pip install "mooncake-transfer-engine-non-cuda"
+        pip install "mooncake-transfer-engine-non-cuda>=0.3.13"
     - name: Run Tests
       run: |
         pytest tests
