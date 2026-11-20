@@ -265,6 +265,12 @@ class StorageManager(ABC):
                     "per_sample_shapes": dict(zip(global_indexes, per_sample_shapes, strict=True)),
                 }
 
+        if custom_backend_meta is not None:
+            custom_backend_meta = {
+                index: {field: serial_utils.MetadataBlob(value) for field, value in row.items()}
+                for index, row in custom_backend_meta.items()
+            }
+
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
