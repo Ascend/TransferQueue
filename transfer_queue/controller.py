@@ -38,6 +38,7 @@ from transfer_queue.metadata import (
     BatchMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -1289,7 +1290,6 @@ class TransferQueueController:
         Raises:
             ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
-        field_names = list(field_schema.keys())
         partition = self._get_partition(partition_id)
         if not partition:
             logger.error(f"Partition {partition_id} not found")
@@ -1305,6 +1305,8 @@ class TransferQueueController:
                 )
                 return False
 
+        field_schema = serial_utils.convert_dtypes(field_schema, to_wire=False)
+        field_names = list(field_schema.keys())
         success = partition.update_production_status(
             global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
         )
@@ -2700,6 +2702,7 @@ class TransferQueueController:
     def _handle_kv_prepare_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         metadata, merge_plan = self.kv_prepare_update(params["keys"], params["partition_id"], params["fields"])
+        merge_plan = serial_utils.convert_dtypes(merge_plan, to_wire=True)
         return self._make_response(
             request_msg, ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE, {"metadata": metadata, "merge_plan": merge_plan}
         )
@@ -2778,7 +2781,8 @@ class TransferQueueController:
         params = request_msg.body
         partition = self._get_partition(params["partition_id"])
         if partition is not None:
-            partition.validate_field_schema(params["field_schema"])
+            field_schema = serial_utils.convert_dtypes(params["field_schema"], to_wire=False)
+            partition.validate_field_schema(field_schema)
         return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
@@ -2838,8 +2842,16 @@ class TransferQueueController:
             with open(path, "rb") as f:
                 state = pickle.load(f)
 
+            partitions = state["partitions"]
+            for partition in partitions.values():
+                for field_meta in partition.field_metadata.values():
+                    if isinstance(field_meta.dtype, str):
+                        dtype = getattr(torch, field_meta.dtype.removeprefix("torch."), None)
+                        if isinstance(dtype, torch.dtype):
+                            field_meta.dtype = dtype
+
             self.controller_id = state["controller_id"]
-            self.partitions = state["partitions"]
+            self.partitions = partitions
 
             im = state["index_manager"]
             self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])

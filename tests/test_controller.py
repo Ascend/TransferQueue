@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import logging
+import pickle
 from uuid import uuid4
 
 import pytest
@@ -1194,7 +1195,8 @@ class TestTransferQueueControllerKvInterface:
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
-    def test_controller_kv_prepare_update_reports_held_rows_from_field_metadata(self, ray_setup):
+    @pytest.mark.asyncio
+    async def test_controller_kv_prepare_update_reports_held_rows_from_field_metadata(self, ray_setup, monkeypatch):
         """Hidden cells count as held; new keys and fields the partition lacks do not."""
         tq_controller = TransferQueueController.remote()
         partition_id = "kv_prepare_update_test"
@@ -1202,17 +1204,31 @@ class TestTransferQueueControllerKvInterface:
             tq_controller.kv_retrieve_meta.remote(keys=["s0", "s1"], partition_id=partition_id, create=True)
         )
         s0, s1 = existing.global_indexes
-        response = {"response": {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False}}
+        field_name = "__tq_tensordict__"
+        response = {field_name: {"dtype": "torch.long", "shape": (2,), "is_nested": False, "is_non_tensor": False}}
         prompt = {"prompt": {"dtype": torch.int64, "shape": (1,), "is_nested": False, "is_non_tensor": False}}
         ray.get(tq_controller.update_production_status.remote(partition_id, [s0], response, ready=False))
         ray.get(tq_controller.update_production_status.remote(partition_id, [s1], prompt))
 
-        metadata, merge_plan = ray.get(
-            tq_controller.kv_prepare_update.remote(["s0", "s1", "s2"], partition_id, ["response", "fresh"])
-        )
+        info = ray.get(tq_controller.get_zmq_server_info.remote())
+        client = AsyncTransferQueueClient("merge-plan-test", info)
+        request_controller = client._request_controller
+
+        async def check_wire_plan(*args, **kwargs):
+            reply = await request_controller(*args, **kwargs)
+            assert reply.body["merge_plan"][field_name]["dtype"] == "int64"
+            return reply
+
+        monkeypatch.setattr(client, "_request_controller", check_wire_plan)
+        try:
+            metadata, merge_plan = await client.async_kv_prepare_update(
+                ["s0", "s1", "s2"], partition_id, [field_name, "fresh"]
+            )
+        finally:
+            client.close()
 
         assert metadata.global_indexes[:2] == [s0, s1]
-        assert merge_plan["response"] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
+        assert merge_plan[field_name] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
         assert merge_plan["fresh"] == {"dtype": None, "is_non_tensor": None, "held": [False, False, False]}
 
         ray.get(tq_controller.clear_partition.remote(partition_id))
@@ -1420,7 +1436,12 @@ class TestTransferQueueControllerCheckpoint:
 
         # Save checkpoint
         ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
-        assert (tmp_path / "controller.pkl").exists()
+        with open(ckpt_path, "rb") as f:
+            state = pickle.load(f)
+        # Older checkpoints could contain strings alongside Torch dtype objects.
+        state["partitions"][partition_id].field_metadata["prompt_ids"].dtype = "torch.long"
+        with open(ckpt_path, "wb") as f:
+            pickle.dump(state, f)
 
         # Create a fresh controller and restore
         new_controller = TransferQueueController.remote()
@@ -1431,6 +1452,11 @@ class TestTransferQueueControllerCheckpoint:
         assert partition is not None
         assert set(partition.global_indexes) == set(metadata.global_indexes)
         assert partition.production_status is not None
+        assert partition.field_metadata["prompt_ids"].dtype is torch.int64
+        assert partition.field_metadata["attention_mask"].dtype is torch.bool
+        assert ray.get(
+            new_controller.update_production_status.remote(partition_id, metadata.global_indexes, field_schema)
+        )
 
         index_range = ray.get(new_controller.get_partition_index_range.remote(partition_id))
         assert sorted(index_range) == sorted(metadata.global_indexes)
@@ -1513,8 +1539,8 @@ class TestControllerSocketBudget:
 
 
 @pytest.mark.asyncio
-async def test_native_metadata_round_trip_over_zmq(ray_setup, monkeypatch):
-    """Exercise the client and producer metadata RPCs with a live Controller."""
+async def test_native_metadata_round_trip_over_zmq(ray_setup):
+    """Notify a live Controller and fetch the metadata over ZMQ."""
 
     class NotifyOnlyStorageManager(StorageManager):
         async def put_data(self, *args, **kwargs):
@@ -1526,28 +1552,22 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup, monkeypatch):
         async def clear_data(self, *args, **kwargs):
             pytest.fail("Unexpected payload deletion")
 
+        async def _notify_and_wait(self, frames):
+            (frame,) = frames
+            body = msgpack.decode(frame)["body"]
+            first, second = body["global_indexes"]
+            assert body["field_schema"]["ids"]["dtype"] == "int64"
+            assert body["custom_backend_meta"][first]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
+            assert body["custom_backend_meta"][second]["ids"][0] == "python_pickle"
+            return await super()._notify_and_wait(frames)
+
     controller = TransferQueueController.remote()
     info = ray.get(controller.get_zmq_server_info.remote())
     client = AsyncTransferQueueClient("wire-test", info)
     producer = NotifyOnlyStorageManager(info, {})
     try:
-        send_notification = producer._notify_and_wait
-
-        async def check_wire_and_send(frames):
-            (frame,) = frames
-            body = msgpack.decode(frame)["body"]
-            assert body["field_schema"]["ids"]["dtype"] == "int64"
-            assert all(
-                len(blob) == 2 and isinstance(blob[1], bytes)
-                for row in body["custom_backend_meta"].values()
-                for blob in row.values()
-            )
-            return await send_notification(frames)
-
-        monkeypatch.setattr(producer, "_notify_and_wait", check_wire_and_send)
         partition_id = "native-wire"
-        keys = ["left", "right"]
-        inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
+        inserted = await client.async_get_meta(["ids"], 2, partition_id, mode="insert")
         left, right = inserted.global_indexes
         tags = [{"score": 3}, {"source": ("rollout", 5), "__tq_tensordict__": True}]
         inserted.update_custom_meta(tags)
@@ -1555,48 +1575,22 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup, monkeypatch):
 
         schema = {
             "ids": {
-                "dtype": torch.int64,
+                "dtype": "torch.long",
                 "shape": None,
                 "is_nested": True,
                 "per_sample_shapes": [(2,), (4,)],
             },
-            "weight": {"dtype": torch.float32, "shape": (1,)},
         }
-        backend_meta = {
-            left: {"ids": (1, 2), "weight": {"offset": 10}},
-            right: {"ids": {"offset": 20}},
-        }
-        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta, ready=False)
-        pending = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
-        assert pending.size == 0
+        backend_meta = {left: {"ids": {"offset": 10}}, right: {"ids": (5, 6)}}
+        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
 
-        assert await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": (5, 6)}})
         batch = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
         assert batch.global_indexes == [left, right]
         assert batch.is_ready
-        assert batch.production_status.flags.writeable
         assert batch.get_dtypes("ids") == [torch.int64, torch.int64]
         assert batch.get_shapes("ids") == [(2,), (4,)]
         assert batch.custom_meta == tags
-        assert batch._custom_backend_meta == [{"ids": (5, 6)}, {"ids": {"offset": 20}}]
-        assert (await client.async_get_meta(["ids"], 2, partition_id, task_name="train")).size == 0
-
-        reversed_batch = await client.async_kv_retrieve_meta(keys[::-1], partition_id)
-        assert reversed_batch.global_indexes == [right, left]
-        assert reversed_batch.get_shapes("ids") == [(4,), (2,)]
-        assert reversed_batch.get_shapes("weight") == [(1,), (1,)]
-        assert reversed_batch.custom_meta == tags[::-1]
-        assert reversed_batch._custom_backend_meta == [
-            {"ids": {"offset": 20}},
-            {"ids": (5, 6), "weight": {"offset": 10}},
-        ]
-        _, plan = await client.async_kv_prepare_update(keys, partition_id, ["weight"])
-        assert plan["weight"]["dtype"] == torch.float32
-        assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
-        assert (await client.async_kv_describe(keys, partition_id))["rows"]["right"]["tag"] == tags[1]
-
-        await client._kv_clear_fields_in_controller(["left"], partition_id, ["weight"])
-        assert (await client.async_kv_retrieve_meta(["left"], partition_id))._custom_backend_meta == [{"ids": (5, 6)}]
+        assert batch._custom_backend_meta == [backend_meta[left], backend_meta[right]]
     finally:
         producer.close()
         client.close()

@@ -404,42 +404,27 @@ def decode_metadata_blob(blob: Sequence[Any]) -> Any:
     raise ValueError(f"Unsupported metadata codec: {codec!r}")
 
 
-def _encode_dtype(dtype: torch.dtype | str | None) -> str | None:
-    if dtype is None:
-        return None
-    if isinstance(dtype, torch.dtype):
-        return str(dtype).removeprefix("torch.")
-    if isinstance(dtype, str):
-        # Some callers pass literal strings, including strings that name a Torch dtype.
-        return f"str:{dtype}"
-    raise TypeError(f"Unsupported field dtype: {type(dtype).__name__}")
-
-
-def _decode_dtype(dtype: str | None) -> torch.dtype | str | None:
-    if dtype is None:
-        return None
-    if dtype.startswith("str:"):
-        return dtype.removeprefix("str:")
-    torch_dtype = getattr(torch, dtype, None)
-    if not isinstance(torch_dtype, torch.dtype):
-        raise ValueError(f"Unknown Torch dtype: {dtype!r}")
-    return torch_dtype
-
-
-def convert_field_dtypes(fields: dict[str, dict[str, Any]], *, to_wire: bool) -> dict[str, dict[str, Any]]:
-    """Translate dtype entries in a field schema or a KV merge plan."""
-    convert_dtype = _encode_dtype if to_wire else _decode_dtype
-    return {
-        name: {**field, "dtype": convert_dtype(field["dtype"])} if "dtype" in field else field
-        for name, field in fields.items()
-    }
+def convert_dtypes(fields: dict[str, dict[str, Any]], *, to_wire: bool) -> dict[str, dict[str, Any]]:
+    """Convert each dtype between its canonical name and Torch dtype."""
+    converted = {}
+    for name, field in fields.items():
+        dtype = field.get("dtype")
+        if dtype is None:
+            converted[name] = field
+            continue
+        torch_dtype = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
+        if not isinstance(torch_dtype, torch.dtype):
+            # Report invalid schemas before the whole-message pickle fallback.
+            raise RuntimeError(f"Invalid Torch dtype {dtype!r} for field {name!r}")
+        converted[name] = {**field, "dtype": str(torch_dtype).removeprefix("torch.") if to_wire else torch_dtype}
+    return converted
 
 
 def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
     wire: dict[str, Any] = {
         "global_indexes": metadata.global_indexes,
         "partition_ids": metadata.partition_ids,
-        "field_schema": convert_field_dtypes(metadata.field_schema, to_wire=True),
+        "field_schema": convert_dtypes(metadata.field_schema, to_wire=True),
         "production_status": metadata.production_status.tobytes(),
     }
     if metadata.extra_info:
@@ -457,7 +442,7 @@ def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
 
 
 def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
-    field_schema = convert_field_dtypes(wire["field_schema"], to_wire=False)
+    field_schema = convert_dtypes(wire["field_schema"], to_wire=False)
     # MessagePack uses arrays for dimensions. BatchMeta exposes each shape as a tuple.
     for field in field_schema.values():
         shape = field.get("shape")
