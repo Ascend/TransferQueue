@@ -1542,7 +1542,7 @@ class AsyncTransferQueueClient:
                 ``async_save_controller_checkpoint``. The caller must ensure
                 this path is readable from the node running the controller.
             socket: ZMQ socket injected by @with_controller_socket.
-            validate_only: Check restored tags without applying the checkpoint.
+            validate_only: Check tags and legacy dtypes without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
@@ -2234,7 +2234,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         Args:
             path: Absolute path to a .pkl file previously written by
                 ``save_controller_checkpoint``.
-            validate_only: Check restored tags without applying the checkpoint.
+            validate_only: Check tags and legacy dtypes without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.

@@ -424,7 +424,8 @@ def decode_metadata_blob(blob: Sequence[Any] | dict[str, Any] | None) -> Any:
     raise ValueError(f"Unsupported metadata codec: {codec!r}")
 
 
-def _parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
+def parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
+    """Resolve a Torch dtype or a name used in a schema or checkpoint."""
     resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
     if not isinstance(resolved, torch.dtype):
         # Report invalid schemas before the whole-message pickle fallback.
@@ -441,7 +442,7 @@ def encode_field_schema(
         field = dict(field)
         dtype = field.get("dtype")
         if dtype is not None:
-            field["dtype"] = str(_parse_torch_dtype(dtype, name)).removeprefix("torch.")
+            field["dtype"] = str(parse_torch_dtype(dtype, name)).removeprefix("torch.")
         per_sample_shapes = field.get("per_sample_shapes")
         if global_indexes is not None and isinstance(per_sample_shapes, list | tuple):
             if len(per_sample_shapes) != len(global_indexes):
@@ -461,7 +462,7 @@ def decode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str
         field = dict(field)
         dtype = field.get("dtype")
         if dtype is not None:
-            field["dtype"] = _parse_torch_dtype(dtype, name)
+            field["dtype"] = parse_torch_dtype(dtype, name)
         shape = field.get("shape")
         if shape is not None:
             field["shape"] = tuple(shape)

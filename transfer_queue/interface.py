@@ -1578,7 +1578,7 @@ def load_checkpoint(
         raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
 
     if meta.get("storage_saved"):
-        # Reject incompatible tags before storage restore replaces live payloads.
+        # Reject incompatible metadata before storage restore replaces live payloads.
         client.load_controller_checkpoint(str(controller_path), validate_only=True)
         client.load_storage_checkpoint(str(checkpoint_dir))
 

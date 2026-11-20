@@ -382,8 +382,11 @@ class TestCheckpointErrors:
         with pytest.raises(FileNotFoundError, match="metadata.json"):
             tq.load_checkpoint(ck)
 
-    def test_invalid_checkpoint_tag_is_rejected_before_storage_restore(self, tq_system, checkpoint_dir):
-        partition_id = "invalid_tag_checkpoint"
+    @pytest.mark.parametrize("invalid_metadata", ["tag", "dtype"])
+    def test_invalid_checkpoint_metadata_is_rejected_before_storage_restore(
+        self, tq_system, checkpoint_dir, invalid_metadata
+    ):
+        partition_id = f"invalid_{invalid_metadata}_checkpoint"
         tq.kv_put("row", partition_id, fields={"ids": torch.tensor([1, 2])}, tag={"score": 1})
         tq.save_checkpoint(checkpoint_dir)
         path = checkpoint_dir / "controller_state.pkl"
@@ -391,13 +394,18 @@ class TestCheckpointErrors:
             state = pickle.load(file)
         partition = state["partitions"][partition_id]
         index = partition.keys_mapping["row"]
-        partition.custom_meta[index]["score"] = (1, 2)
+        if invalid_metadata == "tag":
+            partition.custom_meta[index]["score"] = (1, 2)
+            error = rf"Invalid tag 'score' for {index} in partition '{partition_id}'"
+        else:
+            partition.field_metadata["ids"].dtype = "torch.not_a_dtype"
+            error = r"Invalid Torch dtype 'torch.not_a_dtype'"
         with path.open("wb") as file:
             pickle.dump(state, file)
 
         live = torch.tensor([3, 4])
         tq.kv_put("row", partition_id, fields={"ids": live}, tag={"score": 2})
-        with pytest.raises(RuntimeError, match=rf"Invalid tag 'score' for {index} in partition '{partition_id}'"):
+        with pytest.raises(RuntimeError, match=error):
             tq.load_checkpoint(checkpoint_dir)
 
         _assert_tensor_equal(tq.kv_batch_get(["row"], partition_id)["ids"], live.unsqueeze(0))
