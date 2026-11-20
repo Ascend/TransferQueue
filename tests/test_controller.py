@@ -1576,14 +1576,15 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup, monkeypatch):
         assert batch.is_ready
         assert batch.production_status.flags.writeable
         assert batch.get_dtypes("ids") == [torch.int64, torch.int64]
-        assert batch.get_shapes("ids") == [[2], [4]]
+        assert batch.get_shapes("ids") == [(2,), (4,)]
         assert batch.custom_meta == tags
         assert batch._custom_backend_meta == [{"ids": (5, 6)}, {"ids": {"offset": 20}}]
         assert (await client.async_get_meta(["ids"], 2, partition_id, task_name="train")).size == 0
 
         reversed_batch = await client.async_kv_retrieve_meta(keys[::-1], partition_id)
         assert reversed_batch.global_indexes == [right, left]
-        assert reversed_batch.get_shapes("ids") == [[4], [2]]
+        assert reversed_batch.get_shapes("ids") == [(4,), (2,)]
+        assert reversed_batch.get_shapes("weight") == [(1,), (1,)]
         assert reversed_batch.custom_meta == tags[::-1]
         assert reversed_batch._custom_backend_meta == [
             {"ids": {"offset": 20}},

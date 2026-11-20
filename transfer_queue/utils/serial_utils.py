@@ -457,10 +457,20 @@ def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
 
 
 def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
+    field_schema = convert_field_dtypes(wire["field_schema"], to_wire=False)
+    # MessagePack uses arrays for dimensions. BatchMeta exposes each shape as a tuple.
+    for field in field_schema.values():
+        shape = field.get("shape")
+        if shape is not None:
+            field["shape"] = tuple(shape)
+        per_sample_shapes = field.get("per_sample_shapes")
+        if per_sample_shapes is not None:
+            field["per_sample_shapes"] = [tuple(shape) if shape is not None else None for shape in per_sample_shapes]
+
     return BatchMeta(
         global_indexes=wire["global_indexes"],
         partition_ids=wire["partition_ids"],
-        field_schema=convert_field_dtypes(wire["field_schema"], to_wire=False),
+        field_schema=field_schema,
         production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
         extra_info=decode_metadata_blob(wire["extra_info"]) if "extra_info" in wire else None,
         custom_meta=[decode_metadata_blob(tag) for tag in wire.get("custom_meta", [])],
