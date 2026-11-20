@@ -42,7 +42,7 @@ def test_batch_meta_round_trip_without_rpc():
     """A standard MessagePack decoder can read a populated BatchMeta payload."""
     tags = [{"source": ["rollout", 5, 0.5, False, None], "empty": []}, {}]
     metadata = BatchMeta(
-        global_indexes=[101, 7],
+        global_indexes=[np.int64(101), 7],
         partition_ids=["train", "train"],
         field_schema={
             "scalar": {"dtype": torch.bfloat16, "shape": ()},
@@ -59,6 +59,7 @@ def test_batch_meta_round_trip_without_rpc():
     assert isinstance(extension, msgpack.Ext)
     assert extension.code == CUSTOM_TYPE_BATCH_META
     wire = msgpack.decode(extension.data)
+    assert wire["global_indexes"] == [101, 7]
     assert wire["custom_meta"] == tags
     assert wire["production_status"] == b"\x01\x00"
     assert wire["field_schema"]["scalar"] == {"dtype": "bfloat16", "shape": []}

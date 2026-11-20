@@ -18,6 +18,7 @@
 
 
 import io
+import operator
 import pickle
 import struct
 import warnings
@@ -477,7 +478,7 @@ def decode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str
 
 def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
     wire: dict[str, Any] = {
-        "global_indexes": metadata.global_indexes,
+        "global_indexes": list(map(operator.index, metadata.global_indexes)),
         "partition_ids": metadata.partition_ids,
         "field_schema": encode_field_schema(metadata.field_schema),
         "production_status": metadata.production_status.tobytes(),
