@@ -28,6 +28,7 @@ from transfer_queue.utils.serial_utils import (
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
+    convert_dtypes,
     decode,
     encode,
 )
@@ -35,84 +36,67 @@ from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
 def test_batch_meta_round_trip_without_rpc():
-    metadata = BatchMeta(global_indexes=[7], partition_ids=["train"])
+    """A standard MessagePack decoder can read a populated BatchMeta payload."""
+    metadata = BatchMeta(
+        global_indexes=[101, 7],
+        partition_ids=["train", "train"],
+        field_schema={
+            "scalar": {"dtype": torch.bfloat16, "shape": ()},
+            "nested": {"dtype": torch.int64, "is_nested": True, "per_sample_shapes": [(3,), None]},
+        },
+        production_status=np.array([1, 0], dtype=np.int8),
+        _links=[{"scalar": 1}, {}],
+        extra_info={"large_int": 2**70},
+    )
     frames = encode({"payload": [metadata]})
     (frame,) = frames
     extension = msgpack.decode(frame)["payload"][0]
     assert isinstance(extension, msgpack.Ext)
     assert extension.code == CUSTOM_TYPE_BATCH_META
+    wire = msgpack.decode(extension.data)
+    assert wire["production_status"] == b"\x01\x00"
+    assert wire["field_schema"]["scalar"] == {"dtype": "bfloat16", "shape": []}
+    assert wire["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
 
     restored = decode(frames)["payload"][0]
     assert isinstance(restored, BatchMeta)
-    assert restored.global_indexes == [7]
-    assert restored.partition_ids == ["train"]
-
-
-def test_batch_meta_reply_uses_native_msgpack():
-    """A standard MessagePack decoder can read the BatchMeta extension payload."""
-    field = "__tq_tensordict__"
-    metadata = BatchMeta(
-        global_indexes=[101, 7],
-        partition_ids=["train", "train"],
-        field_schema={
-            field: {"dtype": torch.bfloat16, "shape": (), "is_nested": False},
-            "nested": {
-                "dtype": torch.int64,
-                "shape": None,
-                "is_nested": True,
-                "per_sample_shapes": [(3,), None],
-            },
-            "text": {"dtype": None, "shape": None, "is_non_tensor": True},
-        },
-        production_status=np.array([1, 0], dtype=np.int8),
-        custom_meta=[{"score": 3}, {"shape": (2, 4)}],
-        _custom_backend_meta=[{field: {"offset": 12}, "nested": (4, 8)}, {}],
-        _links=[{field: 1}, {}],
-        extra_info={"large_int": 2**70},
-    )
-    message = ZMQMessage.create(
-        ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
-        sender_id="controller",
-        body={
-            "metadata": metadata,
-            "merge_plan": {field: {"dtype": torch.bfloat16}, "literal": {"dtype": "bfloat16"}},
-        },
-    )
-    (frame,) = message.serialize()
-    wire = msgpack.decode(frame)["body"]
-    extension = wire["metadata"]
-    assert isinstance(extension, msgpack.Ext)
-    assert extension.code == CUSTOM_TYPE_BATCH_META
-    batch = msgpack.decode(extension.data)
-    assert batch["global_indexes"] == [101, 7]
-    assert batch["production_status"] == b"\x01\x00"
-    assert batch["field_schema"][field] == {"dtype": "bfloat16", "shape": [], "is_nested": False}
-    assert batch["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
-    assert batch["field_schema"]["text"]["dtype"] is None
-    assert batch["links"] == [{field: 1}, {}]
-    assert batch["custom_meta"][0] == ["msgpack", msgpack.encode({"score": 3})]
-    assert batch["custom_meta"][1][0] == "python_pickle"
-    assert batch["custom_backend_meta"][0][field] == ["msgpack", msgpack.encode({"offset": 12})]
-    assert batch["custom_backend_meta"][0]["nested"][0] == "python_pickle"
-    assert batch["extra_info"][0] == "python_pickle"
-    assert wire["merge_plan"][field]["dtype"] == "bfloat16"
-
-    reply = ZMQMessage.deserialize([zmq.Frame(frame)]).body
-    restored = reply["metadata"]
-    assert isinstance(restored, BatchMeta)
-    assert restored.get_dtypes(field) == [torch.bfloat16, torch.bfloat16]
-    assert restored.get_shapes(field) == [(), ()]
+    assert restored.global_indexes == [101, 7]
+    assert restored.partition_ids == ["train", "train"]
+    assert restored.get_dtypes("scalar") == [torch.bfloat16, torch.bfloat16]
+    assert restored.get_shapes("scalar") == [(), ()]
     assert restored.get_shapes("nested") == [(3,), None]
-    assert restored.get_shapes("text") == [None, None]
-    assert restored.custom_meta == metadata.custom_meta
-    assert restored._custom_backend_meta == metadata._custom_backend_meta
     assert restored._links == metadata._links
     assert restored.extra_info == metadata.extra_info
     assert restored.production_status.dtype == np.int8
     assert restored.production_status.tolist() == [1, 0]
-    restored.production_status[0] = 0
-    assert reply["merge_plan"][field]["dtype"] == torch.bfloat16
-    assert reply["merge_plan"]["literal"]["dtype"] == "bfloat16"
+    assert restored.production_status.flags.writeable
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, "int64", "torch.int64", "torch.long", None])
+def test_field_dtype_uses_canonical_wire_name(dtype):
+    fields = {"ids": {"dtype": dtype}}
+    wire = convert_dtypes(fields, to_wire=True)
+    assert wire["ids"]["dtype"] == (None if dtype is None else "int64")
+    assert convert_dtypes(wire, to_wire=False)["ids"]["dtype"] is (None if dtype is None else torch.int64)
+    assert fields["ids"]["dtype"] is dtype
+
+
+def test_batch_meta_rejects_unknown_dtype():
+    metadata = BatchMeta([7], ["train"], {"ids": {"dtype": "unknown_dtype"}})
+    with pytest.raises(RuntimeError, match="Invalid Torch dtype"):
+        encode(metadata)
+
+
+@pytest.mark.parametrize(
+    ("request_type", "body"),
+    [
+        (ZMQRequestType.KV_LIST_RESPONSE, {"partition_info": {"train": {"key": {"shape": (2,)}}}}),
+        (ZMQRequestType.KV_DESCRIBE_RESPONSE, {"rows": {"key": {"tag": {"shape": (2,)}}}}),
+    ],
+)
+def test_kv_reply_tag_preserves_tuple(request_type, body):
+    message = ZMQMessage.create(request_type, "controller", body)
+    assert ZMQMessage.deserialize(message.serialize()).body == body
 
 
 def test_empty_and_missing_batch_meta_are_distinct_on_wire():

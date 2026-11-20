@@ -35,6 +35,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -250,20 +251,19 @@ class StorageManager(ABC):
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
             return False
 
-        normalized_field_schema = {}
-        for field_name, field in field_schema.items():
-            field_copy = field.copy()
-            per_sample_shapes = field_copy.get("per_sample_shapes", None)
+        normalized_field_schema = serial_utils.convert_dtypes(field_schema, to_wire=True)
+        for field_name, field in normalized_field_schema.items():
+            per_sample_shapes = field.get("per_sample_shapes")
             if isinstance(per_sample_shapes, list | tuple):
                 if len(per_sample_shapes) != len(global_indexes):
                     raise ValueError(
                         f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
                         f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
                     )
-                field_copy["per_sample_shapes"] = {
-                    global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
+                normalized_field_schema[field_name] = {
+                    **field,
+                    "per_sample_shapes": dict(zip(global_indexes, per_sample_shapes, strict=True)),
                 }
-            normalized_field_schema[field_name] = field_copy
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]

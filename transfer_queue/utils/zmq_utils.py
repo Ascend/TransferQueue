@@ -217,20 +217,15 @@ def describe_frames(frames: Sequence[Any], max_reported: int = 32) -> str:
 
 
 def _convert_controller_body(request_type: ZMQRequestType, body: dict[str, Any], *, to_wire: bool) -> dict[str, Any]:
-    """Convert the standalone schema and user metadata carried as plain dicts."""
+    """Convert standalone user and backend metadata blobs."""
     convert_blob = serial_utils.encode_metadata_blob if to_wire else serial_utils.decode_metadata_blob
 
-    if request_type == ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE:
-        body = {**body, "merge_plan": serial_utils.convert_field_dtypes(body["merge_plan"], to_wire=to_wire)}
-    elif request_type in (ZMQRequestType.NOTIFY_DATA_UPDATE, ZMQRequestType.VALIDATE_DUMP_SCHEMA):
-        if "field_schema" in body:
-            body = {**body, "field_schema": serial_utils.convert_field_dtypes(body["field_schema"], to_wire=to_wire)}
-        if request_type == ZMQRequestType.NOTIFY_DATA_UPDATE and body.get("custom_backend_meta") is not None:
-            backend_meta = {
-                index: {field: convert_blob(value) for field, value in row.items()}
-                for index, row in body["custom_backend_meta"].items()
-            }
-            body = {**body, "custom_backend_meta": backend_meta}
+    if request_type == ZMQRequestType.NOTIFY_DATA_UPDATE and body.get("custom_backend_meta") is not None:
+        backend_meta = {
+            index: {field: convert_blob(value) for field, value in row.items()}
+            for index, row in body["custom_backend_meta"].items()
+        }
+        body = {**body, "custom_backend_meta": backend_meta}
     elif request_type in (ZMQRequestType.SET_CUSTOM_META, ZMQRequestType.KV_LIST_RESPONSE):
         key = "partition_custom_meta" if request_type == ZMQRequestType.SET_CUSTOM_META else "partition_info"
         tags = {

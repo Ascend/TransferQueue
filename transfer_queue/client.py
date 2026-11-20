@@ -28,6 +28,7 @@ from transfer_queue.controller import PUBLIC_PARTITION
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -1085,7 +1086,8 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
-        return response_msg.body["metadata"], response_msg.body["merge_plan"]
+        merge_plan = serial_utils.convert_dtypes(response_msg.body["merge_plan"], to_wire=False)
+        return response_msg.body["metadata"], merge_plan
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
         """Clear fields of existing keys while keeping the keys, tags and consumption status.
@@ -1419,6 +1421,7 @@ class AsyncTransferQueueClient:
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """Reject incompatible destination fields before restoring payloads."""
+        field_schema = serial_utils.convert_dtypes(field_schema, to_wire=True)
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
