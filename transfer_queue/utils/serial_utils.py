@@ -381,10 +381,8 @@ def parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
     return resolved
 
 
-def encode_field_schema(
-    fields: dict[str, dict[str, Any]], *, global_indexes: Sequence[int] | None = None
-) -> dict[str, dict[str, Any]]:
-    """Prepare a field schema with canonical dtype names and optional global-indexed shapes."""
+def encode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Prepare a field schema with canonical dtype names and integer sample keys."""
     encoded = {}
     for name, field in fields.items():
         field = dict(field)
@@ -392,14 +390,7 @@ def encode_field_schema(
         if dtype is not None:
             field["dtype"] = str(parse_torch_dtype(dtype, name)).removeprefix("torch.")
         per_sample_shapes = field.get("per_sample_shapes")
-        if global_indexes is not None and isinstance(per_sample_shapes, list | tuple):
-            if len(per_sample_shapes) != len(global_indexes):
-                raise ValueError(
-                    f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                    f"number of global_indexes ({len(global_indexes)}) for field '{name}'. "
-                )
-            field["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
-        elif isinstance(per_sample_shapes, dict):
+        if isinstance(per_sample_shapes, dict) and any(type(index) is not int for index in per_sample_shapes):
             field["per_sample_shapes"] = {operator.index(index): shape for index, shape in per_sample_shapes.items()}
         encoded[name] = field
     return encoded

@@ -178,11 +178,12 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         >>> metadata = tq.get_meta(...)
         >>> data = tq.get_data(metadata)
     """
+    # TODO(0.2.0): Remove deprecated `controller.polling_mode` config handling.
     controller_conf = conf.get("controller") if conf is not None else None
     has_legacy_polling_mode = controller_conf is not None and "polling_mode" in controller_conf.keys()
     if has_legacy_polling_mode:
         warnings.warn(
-            "`controller.polling_mode` is deprecated and ignored. It will be removed in the next release. "
+            "`controller.polling_mode` is deprecated and ignored, and will be removed in 0.2.0. "
             "Remove this setting. "
             "A metadata fetch returns an empty BatchMeta when no batch is available.",
             FutureWarning,
@@ -199,6 +200,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
+    # TODO(0.2.0): Remove with `controller.polling_mode` deprecation above.
     if has_legacy_polling_mode:
         with open_dict(final_conf.controller):
             del final_conf.controller["polling_mode"]

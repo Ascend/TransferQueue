@@ -1456,7 +1456,7 @@ class TestTransferQueueControllerCheckpoint:
         new_controller = TransferQueueController.remote()
 
         def restore_checkpoint(controller):
-            with pytest.warns(FutureWarning, match="will be removed in the next release") as captured:
+            with pytest.warns(FutureWarning, match=r"will be removed in 0\.2\.0") as captured:
                 controller.load_checkpoint(ckpt_path)
             assert len(captured) == 1
 
@@ -1605,9 +1605,11 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
                 "dtype": "torch.long",
                 "shape": None,
                 "is_nested": True,
-                "per_sample_shapes": {numpy_left: (2,), numpy_right: (4,)},
+                "per_sample_shapes": [(2,), (4,)],
             },
         }
+        with pytest.raises(ValueError, match=r"per_sample_shapes length \(1\) does not match"):
+            await producer.notify_data_update(partition_id, [left, right], {"ids": {"per_sample_shapes": [(2,)]}})
         backend_meta = {numpy_left: {"ids": {"n_chunks": 2}}, numpy_right: {"ids": "npu_tensor"}}
         assert await producer.notify_data_update(partition_id, [numpy_left, numpy_right], schema, backend_meta)
         assert notified_backend_meta[-1] == backend_meta

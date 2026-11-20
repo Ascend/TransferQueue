@@ -97,10 +97,12 @@ def test_field_dtype_uses_canonical_wire_name(dtype):
     assert restored["ids"] is not wire["ids"]
 
 
-def test_encode_field_schema_rejects_mismatched_shape_count():
-    fields = {"ids": {"per_sample_shapes": [(3,), (5,)]}}
-    with pytest.raises(ValueError, match=r"per_sample_shapes length \(2\) does not match"):
-        encode_field_schema(fields, global_indexes=[101])
+def test_encode_field_schema_normalizes_numpy_sample_keys():
+    fields = {"ids": {"dtype": torch.int64, "per_sample_shapes": {np.int64(101): (3,)}}}
+    wire = encode_field_schema(fields)
+    assert wire["ids"]["dtype"] == "int64"
+    assert wire["ids"]["per_sample_shapes"] == {101: (3,)}
+    assert all(type(index) is int for index in wire["ids"]["per_sample_shapes"])
 
 
 def test_batch_meta_encoding_rejects_unknown_dtype():
