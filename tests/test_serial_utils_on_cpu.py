@@ -101,7 +101,9 @@ def test_batch_meta_reply_uses_native_msgpack():
     restored = reply["metadata"]
     assert isinstance(restored, BatchMeta)
     assert restored.get_dtypes(field) == [torch.bfloat16, torch.bfloat16]
-    assert restored.get_shapes("nested") == [[3], None]
+    assert restored.get_shapes(field) == [(), ()]
+    assert restored.get_shapes("nested") == [(3,), None]
+    assert restored.get_shapes("text") == [None, None]
     assert restored.custom_meta == metadata.custom_meta
     assert restored._custom_backend_meta == metadata._custom_backend_meta
     assert restored._links == metadata._links
