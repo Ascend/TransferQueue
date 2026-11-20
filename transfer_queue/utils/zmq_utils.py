@@ -276,17 +276,16 @@ class ZMQMessage:
             result = serial_utils.decode(frames)
             request_type = ZMQRequestType(result["request_type"])
             body = result["body"]
+            return cls(
+                request_type=request_type,
+                sender_id=result["sender_id"],
+                receiver_id=result["receiver_id"],
+                body=body,
+                request_id=result["request_id"],
+                timestamp=result["timestamp"],
+            )
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
-
-        return cls(
-            request_type=request_type,
-            sender_id=result["sender_id"],
-            receiver_id=result["receiver_id"],
-            body=body,
-            request_id=result["request_id"],
-            timestamp=result["timestamp"],
-        )
 
 
 def is_ipv6_address(ip: str) -> bool:
