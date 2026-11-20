@@ -657,7 +657,10 @@ class AsyncSimpleStorageManager(StorageManager):
         try:
             connection = await self.payload_transfer.connect(self._payload_peers[target])
             reply, response_data = await self.payload_transfer.request(
-                connection, RequestHeader(operation, body), send=data, recv=recv,
+                connection,
+                RequestHeader(operation, body),
+                send=data,
+                recv=recv,
             )
         except TransferTimeout as exc:
             verb = operation.name.lower()
@@ -672,7 +675,10 @@ class AsyncSimpleStorageManager(StorageManager):
 
         if data is not None:
             log_heavy_operation(
-                self.storage_manager_id, operation.name.lower(), time.perf_counter() - started, reply.wire_bytes,
+                self.storage_manager_id,
+                operation.name.lower(),
+                time.perf_counter() - started,
+                reply.wire_bytes,
                 f"to {target} at {self._describe_storage_unit(target)} "
                 f"samples={len(body['global_indexes'])} fields={list(data)}",
             )
@@ -686,8 +692,10 @@ class AsyncSimpleStorageManager(StorageManager):
         data_parser: Callable[[Any], Any] | None = None,
     ):
         await self._request_payload(
-            target_storage_unit, Operation.PUT,
-            {"global_indexes": global_indexes, "data_parser": data_parser}, data=storage_data,
+            target_storage_unit,
+            Operation.PUT,
+            {"global_indexes": global_indexes, "data_parser": data_parser},
+            data=storage_data,
         )
 
     async def _update_to_single_storage_unit(
@@ -699,7 +707,8 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
     ) -> dict[str, dict[str, Any]]:
         reply, _ = await self._request_payload(
-            target_storage_unit, Operation.UPDATE,
+            target_storage_unit,
+            Operation.UPDATE,
             {"global_indexes": global_indexes, "merge_fn": merge_fn, "merge_plan": merge_plan},
             data=storage_data,
         )
@@ -880,8 +889,12 @@ class AsyncSimpleStorageManager(StorageManager):
         _, response_data = await self._request_payload(
             target_storage_unit,
             Operation.GET,
-            {"global_indexes": global_indexes, "fields": fields,
-             "data_parser": data_parser, "parser_args": parser_args},
+            {
+                "global_indexes": global_indexes,
+                "fields": fields,
+                "data_parser": data_parser,
+                "parser_args": parser_args
+            },
             recv=None,
         )
         return fields, response_data

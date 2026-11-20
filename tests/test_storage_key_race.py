@@ -80,7 +80,7 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
     transport = ZmqPayloadTransfer(owner_id=unit.storage_unit_id)
     transport.listen(handle=unit._handle_payload)
     with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
-        reply = transport.handle_legacy(request)
+        reply = transport.handle_request(request)
 
     assert reply.request_type == ZMQRequestType.GET_ERROR
     assert KEY_NOT_FOUND_MARKER in reply.body["message"]
