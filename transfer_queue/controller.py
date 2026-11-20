@@ -2825,7 +2825,7 @@ class TransferQueueController:
 
         Args:
             path: Absolute path to a .pkl file previously written by save_checkpoint().
-            validate_only: Check restored tags without applying the checkpoint.
+            validate_only: Check tags and legacy dtypes without applying the checkpoint.
 
         Raises:
             Exception: If deserialization or file I/O fails.
@@ -2835,27 +2835,24 @@ class TransferQueueController:
                 state = pickle.load(f)
 
             partitions = state["partitions"]
-            for partition_id, partition in partitions.items():
-                for index, tag in partition.custom_meta.items():
-                    validate_tag(tag, partition_id=partition_id, sample=index)
-            if validate_only:
-                return
-
             # Normalize legacy dtype names and shape arrays before comparing
             # restored fields with subsequent writes.
             converted_legacy_dtype = False
-            for partition in partitions.values():
-                for field_meta in partition.field_metadata.values():
+            for partition_id, partition in partitions.items():
+                for index, tag in partition.custom_meta.items():
+                    validate_tag(tag, partition_id=partition_id, sample=index)
+                for name, field_meta in partition.field_metadata.items():
                     if isinstance(field_meta.shape, list):
                         field_meta.shape = tuple(field_meta.shape)
                     for index, shape in (field_meta.per_sample_shapes or {}).items():
                         if isinstance(shape, list):
                             field_meta.per_sample_shapes[index] = tuple(shape)
                     if isinstance(field_meta.dtype, str):
-                        dtype = getattr(torch, field_meta.dtype.removeprefix("torch."), None)
-                        if isinstance(dtype, torch.dtype):
-                            field_meta.dtype = dtype
-                            converted_legacy_dtype = True
+                        field_meta.dtype = serial_utils.parse_torch_dtype(field_meta.dtype, f"{partition_id}.{name}")
+                        converted_legacy_dtype = True
+            if validate_only:
+                return
+
             if converted_legacy_dtype:
                 warnings.warn(
                     "String dtypes in Controller checkpoints are deprecated. "
