@@ -62,7 +62,7 @@ def test_dump_excludes_unselected_tensor_storage(unit, tmp_path, row_count):
     assert unit.storage_data.field_data["x"][0].untyped_storage().nbytes() == batch.numel() * batch.element_size()
 
 
-def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
+def test_legacy_dump_with_tensor_tag_is_rejected_on_restore(monkeypatch, tmp_path):
     batch = torch.arange(64 * 4096).reshape(64, 4096)
     tag = {"nested": [SimpleNamespace(value=batch[0])]}
     client = SimpleNamespace(
@@ -77,6 +77,8 @@ def test_row_index_compacts_tensors_inside_tags(monkeypatch, tmp_path):
     restored = data_dump._read_row_index(tmp_path / "dump")["rows"]["key"]["tag"]["nested"][0].value
     torch.testing.assert_close(restored, batch[0])
     assert restored.untyped_storage().nbytes() == restored.numel() * restored.element_size()
+    with pytest.raises(ValueError, match=r"Invalid tag 'nested'\[0\] for 'key' in partition 'p'"):
+        data_dump.read_dump(tmp_path / "dump")
 
 
 @pytest.fixture

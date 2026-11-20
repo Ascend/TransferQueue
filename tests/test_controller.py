@@ -1559,6 +1559,7 @@ class TestControllerSocketBudget:
 @pytest.mark.asyncio
 async def test_native_metadata_round_trip_over_zmq(ray_setup):
     """Round-trip tags and producer metadata through a live Controller."""
+    notified_backend_meta = []
 
     class NotifyOnlyStorageManager(StorageManager):
         async def put_data(self, *args, **kwargs):
@@ -1573,10 +1574,8 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         async def _notify_and_wait(self, frames):
             (frame,) = frames
             body = msgpack.decode(frame)["body"]
-            first, second = body["global_indexes"]
             assert body["field_schema"]["ids"]["dtype"] == "int64"
-            assert body["custom_backend_meta"][first]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
-            assert body["custom_backend_meta"][second]["ids"][0] == "python_pickle"
+            notified_backend_meta.append(body["custom_backend_meta"])
             return await super()._notify_and_wait(frames)
 
     controller = TransferQueueController.remote()
@@ -1588,9 +1587,18 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         keys = ["left", "right"]
         inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
         left, right = inserted.global_indexes
-        tags = [{"score": 3}, {"source": ("rollout", 5), "__tq_tensordict__": True}]
+        tags = [{"score": 3}, {"source": ["rollout", 5, None], "limits": [-(2**63), 2**63 - 1]}]
         inserted.update_custom_meta(tags)
         await client.async_set_custom_meta(inserted)
+
+        async with client.controller_rpc_pool.alease(info) as socket:
+            with pytest.raises(RuntimeError, match=r"Invalid tag 'source'\[0\]"):
+                await client._request_controller(
+                    socket,
+                    ZMQRequestType.SET_CUSTOM_META,
+                    ZMQRequestType.SET_CUSTOM_META_RESPONSE,
+                    {"partition_custom_meta": {partition_id: {left: {"score": 4}, right: {"source": [["rollout"]]}}}},
+                )
         assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
         rows = (await client.async_kv_describe(keys, partition_id))["rows"]
         assert [rows[key]["tag"] for key in keys] == tags
@@ -1605,6 +1613,8 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         }
         backend_meta = {left: {"ids": {"offset": 10}}, right: {"ids": (5, 6)}}
         assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
+        assert notified_backend_meta[-1][left]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
+        assert notified_backend_meta[-1][right]["ids"][0] == "python_pickle"
         partition = ray.get(controller.get_partition_snapshot.remote(partition_id))
         assert partition.field_metadata["ids"].per_sample_shapes == {left: (2,), right: (4,)}
 
@@ -1615,6 +1625,15 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         assert batch.get_shapes("ids") == [(2,), (4,)]
         assert batch.custom_meta == tags
         assert batch._custom_backend_meta == [backend_meta[left], backend_meta[right]]
+
+        inserted.clear_custom_meta()
+        await client.async_set_custom_meta(inserted)
+        assert await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": None}})
+        assert notified_backend_meta[-1] == {left: {"ids": None}}
+
+        cleared = await client.async_kv_retrieve_meta(keys, partition_id)
+        assert cleared.custom_meta == [{}, {}]
+        assert cleared._custom_backend_meta == [{"ids": None}, backend_meta[right]]
     finally:
         producer.close()
         client.close()

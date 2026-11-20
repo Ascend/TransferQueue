@@ -34,9 +34,7 @@ import zmq
 from omegaconf import DictConfig
 from torch import Tensor
 
-from transfer_queue.metadata import (
-    BatchMeta,
-)
+from transfer_queue.metadata import BatchMeta, Tag, validate_tag
 from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import Role
@@ -395,7 +393,7 @@ class DataPartitionStatus:
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
     # User-defined metadata that may not apply to field level
-    custom_meta: dict[int, dict[str, Any]] = field(default_factory=dict)  # global_idx -> {}
+    custom_meta: dict[int, Tag] = field(default_factory=dict)  # global_idx -> tag
 
     # User-defined Keys
     keys_mapping: dict[str, int] = field(default_factory=dict)  # key -> global_idx
@@ -898,7 +896,7 @@ class DataPartitionStatus:
         """
         return {idx: self.custom_meta[idx] for idx in global_indices if idx in self.custom_meta}
 
-    def set_custom_meta(self, custom_meta: dict[int, dict]) -> None:
+    def set_custom_meta(self, custom_meta: dict[int, Tag]) -> None:
         """
         Set custom_meta for multiple samples.
 
@@ -1354,7 +1352,7 @@ class TransferQueueController:
 
         return partition.get_production_status_for_fields(data_fields, mask=True)
 
-    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
+    def set_custom_meta(self, partition_custom_meta: dict[str, dict[int, Tag]]) -> None:
         """
         Set custom_meta for samples in partitions.
 
@@ -1382,6 +1380,10 @@ class TransferQueueController:
             ...     }
             ... })
         """
+
+        for partition_id, custom_meta in partition_custom_meta.items():
+            for index, tag in custom_meta.items():
+                validate_tag(tag, partition_id=partition_id, sample=index)
 
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
@@ -2567,11 +2569,7 @@ class TransferQueueController:
         )
 
     def _handle_set_custom_meta_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        partition_custom_meta = request_msg.body["partition_custom_meta"]
-        for tags in partition_custom_meta.values():
-            for index, blob in tags.items():
-                tags[index] = serial_utils.decode_metadata_blob(blob)
-        self.set_custom_meta(partition_custom_meta=partition_custom_meta)
+        self.set_custom_meta(partition_custom_meta=request_msg.body["partition_custom_meta"])
         return self._make_response(
             request_msg,
             ZMQRequestType.SET_CUSTOM_META_RESPONSE,
@@ -2685,8 +2683,6 @@ class TransferQueueController:
     def _handle_kv_describe_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         description = self.kv_describe(params["keys"], params["partition_id"])
-        for row in description["rows"].values():
-            row["tag"] = serial_utils.encode_metadata_blob(row["tag"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
 
     def _handle_kv_exists_request(self, request_msg: ZMQMessage) -> ZMQMessage:
@@ -2747,8 +2743,7 @@ class TransferQueueController:
                 message = f"partition {partition_id} does not exist"
                 continue
             partition_info[partition_id] = {
-                key: serial_utils.encode_metadata_blob(partition.custom_meta.get(index, {}))
-                for key, index in partition.keys_mapping.items()
+                key: partition.custom_meta.get(index, {}) for key, index in partition.keys_mapping.items()
             }
 
         return self._make_response(
@@ -2766,7 +2761,7 @@ class TransferQueueController:
         )
 
     def _handle_load_controller_checkpoint_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        self.load_checkpoint(request_msg.body["path"])
+        self.load_checkpoint(request_msg.body["path"], validate_only=request_msg.body.get("validate_only", False))
         return self._make_response(
             request_msg,
             ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
@@ -2825,11 +2820,12 @@ class TransferQueueController:
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
 
-    def load_checkpoint(self, path: str) -> None:
+    def load_checkpoint(self, path: str, *, validate_only: bool = False) -> None:
         """Restore controller state directly from a file.
 
         Args:
             path: Absolute path to a .pkl file previously written by save_checkpoint().
+            validate_only: Check restored tags without applying the checkpoint.
 
         Raises:
             Exception: If deserialization or file I/O fails.
@@ -2839,6 +2835,12 @@ class TransferQueueController:
                 state = pickle.load(f)
 
             partitions = state["partitions"]
+            for partition_id, partition in partitions.items():
+                for index, tag in partition.custom_meta.items():
+                    validate_tag(tag, partition_id=partition_id, sample=index)
+            if validate_only:
+                return
+
             # Normalize legacy dtype names and shape arrays before comparing
             # restored fields with subsequent writes.
             converted_legacy_dtype = False

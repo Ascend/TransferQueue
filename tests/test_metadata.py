@@ -19,7 +19,27 @@ import numpy as np
 import pytest
 import torch
 
-from transfer_queue.metadata import BatchMeta, KVBatchMeta
+from transfer_queue.metadata import BatchMeta, KVBatchMeta, validate_tag
+
+
+@pytest.mark.parametrize(
+    ("tag", "reason"),
+    [
+        ({"score": np.int64(1)}, "got int64"),
+        ({"metric": torch.ones(1)}, "got Tensor"),
+        ({"source": ("rollout", 5)}, "got tuple"),
+        ({"scores": [[1]]}, r"'scores'\[0\].*got list"),
+        ({"value": [2**63]}, "signed 64-bit integer"),
+        ({"value": "\ud800"}, "valid UTF-8"),
+        ({1: "value"}, "expected UTF-8 str"),
+        ({"__tq_tensordict__": True}, "is reserved"),
+    ],
+)
+def test_invalid_tags_have_a_location_and_reason(tag, reason):
+    with pytest.raises(ValueError, match=reason) as error:
+        validate_tag(tag, partition_id="train", sample="key0")
+    assert "'key0' in partition 'train'" in str(error.value)
+
 
 # ==============================================================================
 # Columnar BatchMeta Tests

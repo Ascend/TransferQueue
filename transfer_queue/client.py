@@ -25,7 +25,7 @@ import zmq.asyncio
 from tensordict import TensorDict
 
 from transfer_queue.controller import PUBLIC_PARTITION
-from transfer_queue.metadata import BatchMeta
+from transfer_queue.metadata import BatchMeta, Tag, validate_tag
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils import serial_utils
@@ -60,6 +60,22 @@ with_controller_socket = with_zmq_socket(
     get_peer=lambda self, target: self._controller,
     get_pool=lambda self: self.controller_rpc_pool,
 )
+
+
+def _group_custom_meta(metadata: BatchMeta) -> dict[str, dict[int, Tag]]:
+    """Validate and snapshot the tags before sending or writing the batch."""
+    if not metadata.global_indexes or not metadata.custom_meta:
+        return {}
+
+    partitions: dict[str, dict[int, Tag]] = {pid: {} for pid in set(metadata.partition_ids)}
+    for partition_id, index, tag in zip(
+        metadata.partition_ids, metadata.global_indexes, metadata.custom_meta, strict=True
+    ):
+        validate_tag(tag, partition_id=partition_id, sample=index)
+        partitions[partition_id][index] = {
+            key: value.copy() if type(value) is list else value for key, value in tag.items()
+        }
+    return partitions
 
 
 class AsyncTransferQueueClient:
@@ -317,7 +333,6 @@ class AsyncTransferQueueClient:
         )
         return response_msg.body["metadata"]
 
-    @with_controller_socket
     async def async_set_custom_meta(
         self,
         metadata: BatchMeta,
@@ -337,6 +352,7 @@ class AsyncTransferQueueClient:
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Raises:
+            ValueError: If a tag cannot be stored as native metadata.
             RuntimeError: If communication fails or controller returns error response
 
         Example:
@@ -346,23 +362,17 @@ class AsyncTransferQueueClient:
             ...     batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
             ...     await client.async_set_custom_meta(batch_meta)
         """
-        assert socket is not None
+        await self._send_custom_meta(_group_custom_meta(metadata), socket=socket)
 
-        if not self._controller:
-            raise RuntimeError("No controller registered")
-
-        global_indexes = metadata.global_indexes
-        custom_meta = metadata.get_all_custom_meta()
-
-        if not global_indexes or not custom_meta:
+    @with_controller_socket
+    async def _send_custom_meta(
+        self,
+        partition_custom_meta: dict[str, dict[int, Tag]],
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
+        if not partition_custom_meta:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
-
-        partition_custom_meta: dict[str, dict[int, tuple[str, bytes]]] = {
-            pid: {} for pid in set(metadata.partition_ids)
-        }
-        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
-            partition_custom_meta[partition_id][index] = serial_utils.encode_metadata_blob(tag)
 
         await self._request_controller(
             socket=socket,
@@ -491,6 +501,7 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        partition_custom_meta = _group_custom_meta(metadata)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -511,7 +522,7 @@ class AsyncTransferQueueClient:
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata)
+        await self._send_custom_meta(partition_custom_meta)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -1158,7 +1169,7 @@ class AsyncTransferQueueClient:
         self,
         partition_id: str | None = None,
         socket: zmq.asyncio.Socket | None = None,
-    ) -> dict[str, dict[str, Any]]:
+    ) -> dict[str, dict[str, Tag]]:
         """Asynchronously retrieve keys and custom_meta from the controller for one or all partitions.
 
         Args:
@@ -1189,11 +1200,7 @@ class AsyncTransferQueueClient:
                 response_type=ZMQRequestType.KV_LIST_RESPONSE,
                 body={"partition_id": partition_id},
             )
-            partition_info = response_msg.body.get("partition_info", {})
-            for tags in partition_info.values():
-                for key, blob in tags.items():
-                    tags[key] = serial_utils.decode_metadata_blob(blob)
-            return partition_info
+            return response_msg.body.get("partition_info", {})
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
@@ -1219,10 +1226,7 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id},
         )
-        rows = response.body["rows"]
-        for row in rows.values():
-            row["tag"] = serial_utils.decode_metadata_blob(row["tag"])
-        return {"rows": rows, "field_schema": response.body["field_schema"]}
+        return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
 
     @with_controller_socket
     async def async_kv_exists(
@@ -1475,14 +1479,17 @@ class AsyncTransferQueueClient:
             )
         if not rows:
             return 0
+        for key, row in rows.items():
+            validate_tag(row["tag"], partition_id=partition_id, sample=key)
         metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
+        metadata.update_custom_meta([row["tag"] for row in rows.values()])
+        partition_custom_meta = _group_custom_meta(metadata)
         target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
         for shard in shards:
             for record in shard["records"]:
                 record["target_index"] = target_indexes[record["key"]]
         bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
-        metadata.update_custom_meta([row["tag"] for row in rows.values()])
-        await self.async_set_custom_meta(metadata)
+        await self._send_custom_meta(partition_custom_meta)
         return bytes_read
 
     # ==================== Checkpoint API ====================
@@ -1521,6 +1528,8 @@ class AsyncTransferQueueClient:
         self,
         path: str,
         socket: zmq.asyncio.Socket | None = None,
+        *,
+        validate_only: bool = False,
     ) -> None:
         """Asynchronously restore controller state from a file via ZMQ RPC.
 
@@ -1533,6 +1542,7 @@ class AsyncTransferQueueClient:
                 ``async_save_controller_checkpoint``. The caller must ensure
                 this path is readable from the node running the controller.
             socket: ZMQ socket injected by @with_controller_socket.
+            validate_only: Check restored tags without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
@@ -1542,7 +1552,7 @@ class AsyncTransferQueueClient:
                 socket=socket,
                 request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,
                 response_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
-                body={"path": path},
+                body={"path": path, "validate_only": validate_only},
             )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in load_controller_checkpoint: {str(e)}") from e
@@ -2218,17 +2228,18 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._save_controller_checkpoint(path)
 
-    def load_controller_checkpoint(self, path: str) -> None:
+    def load_controller_checkpoint(self, path: str, *, validate_only: bool = False) -> None:
         """Synchronously restore controller state from a file via ZMQ RPC.
 
         Args:
             path: Absolute path to a .pkl file previously written by
                 ``save_controller_checkpoint``.
+            validate_only: Check restored tags without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
         """
-        return self._load_controller_checkpoint(path)
+        return self._load_controller_checkpoint(path, validate_only=validate_only)
 
     def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
         """Synchronously save storage state to a directory via StorageManager.

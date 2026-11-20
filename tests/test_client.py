@@ -22,11 +22,10 @@ import torch
 import zmq
 from tensordict import NonTensorStack, TensorDict
 
-from transfer_queue import TransferQueueClient
+from transfer_queue import TransferQueueClient, interface
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.enum_utils import Role
-from transfer_queue.utils.serial_utils import encode_metadata_blob
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -241,8 +240,7 @@ class MockController:
         # Return cached keys for this partition
         keys = self._kv_partition_keys.get(partition_id, [])
 
-        empty_tag = encode_metadata_blob({})
-        return {"partition_info": {partition_id: {key: empty_tag for key in keys}}, "message": "success"}
+        return {"partition_info": {partition_id: {key: {} for key in keys}}, "message": "success"}
 
     def _mock_kv_retrieve_keys(self, request_body):
         """Mock KV retrieve indexes response."""
@@ -449,6 +447,32 @@ def client_setup(mock_controller, mock_storage):
         client.storage_manager.clear_data = mock_clear_data
 
     yield client, mock_controller, mock_storage
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batched", [False, True])
+async def test_kv_put_rejects_invalid_tag_before_allocating_keys(monkeypatch, batched):
+    monkeypatch.setattr(interface, "_maybe_create_tq_client", lambda: pytest.fail("Unexpected client creation"))
+    bad_tag = {"score": {"value": 1}}
+    with pytest.raises(ValueError, match="Invalid tag 'score' for 'bad' in partition 'train'"):
+        if batched:
+            fields = TensorDict({"ids": torch.ones(2, 2)}, batch_size=[2])
+            await interface.async_kv_batch_put(["good", "bad"], "train", fields, [{}, bad_tag])
+        else:
+            await interface.async_kv_put("bad", "train", {"ids": torch.ones(2)}, bad_tag)
+
+
+def test_client_put_rejects_invalid_tag_before_storage(client_setup):
+    client, _, _ = client_setup
+    metadata = BatchMeta([0], ["train"], custom_meta=[{"score": (1, 2)}])
+    fields = TensorDict({"ids": torch.ones(1, 2)}, batch_size=[1])
+
+    async def fail_if_called(*args, **kwargs):
+        pytest.fail("Unexpected payload write")
+
+    client.storage_manager.put_data = fail_if_called
+    with pytest.raises(ValueError, match="Invalid tag 'score' for 0 in partition 'train'"):
+        client.put(fields, metadata=metadata)
 
 
 # Test basic functionality
@@ -962,8 +986,8 @@ class TestClientCustomMetaInterface:
         # Set custom_meta on the metadata
         metadata.update_custom_meta(
             [
-                {"input_ids": {"token_count": 100}},
-                {"input_ids": {"token_count": 120}},
+                {"input_ids_token_count": 100},
+                {"input_ids_token_count": 120},
             ]
         )
 
@@ -981,8 +1005,8 @@ class TestClientCustomMetaInterface:
         # Set custom_meta on the metadata
         metadata.update_custom_meta(
             [
-                {"input_ids": {"token_count": 100}},
-                {"input_ids": {"token_count": 120}},
+                {"input_ids_token_count": 100},
+                {"input_ids_token_count": 120},
             ]
         )
 

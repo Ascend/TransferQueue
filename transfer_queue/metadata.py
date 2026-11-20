@@ -29,6 +29,45 @@ from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
+TagScalar = str | int | float | bool | None
+Tag = dict[str, TagScalar | list[TagScalar]]
+
+
+def _tag_scalar_error(value: object) -> str | None:
+    value_type = type(value)
+    if value_type is str:
+        if not value.isascii():
+            try:
+                value.encode("utf-8")
+            except UnicodeEncodeError:
+                return "must be valid UTF-8"
+    elif value_type is int:
+        if not -(2**63) <= value < 2**63:
+            return "must fit in a signed 64-bit integer"
+    elif value is not None and value_type not in (bool, float):
+        return f"expected a str, int, float, bool, or None, got {value_type.__name__}"
+    return None
+
+
+def validate_tag(tag: object, *, partition_id: str, sample: str | int) -> None:
+    """Check a tag before storing it as a native MessagePack map."""
+    if type(tag) is not dict:
+        raise ValueError(f"Invalid tag for {sample!r} in partition {partition_id!r}: expected a dict")
+    for key, value in tag.items():
+        if type(key) is not str or _tag_scalar_error(key):
+            raise ValueError(
+                f"Invalid tag key {key!r} for {sample!r} in partition {partition_id!r}: expected UTF-8 str"
+            )
+        # The ZMQ decoder recognizes this marker before the request reaches a handler.
+        if key == "__tq_tensordict__":
+            raise ValueError(f"Invalid tag for {sample!r} in partition {partition_id!r}: {key!r} is reserved")
+        if type(value) is list:
+            for i, item in enumerate(value):
+                if error := _tag_scalar_error(item):
+                    raise ValueError(f"Invalid tag {key!r}[{i}] for {sample!r} in partition {partition_id!r}: {error}")
+        elif error := _tag_scalar_error(value):
+            raise ValueError(f"Invalid tag {key!r} for {sample!r} in partition {partition_id!r}: {error}")
+
 
 def _extra_info_values_equal(a: Any, b: Any) -> bool:
     """Compare two extra_info values for equality.
@@ -226,7 +265,7 @@ class BatchMeta:
         field_schema: dict[str, dict[str, Any]] | None = None,
         production_status: np.ndarray | None = None,
         extra_info: dict[str, Any] | None = None,
-        custom_meta: list[dict[str, Any]] | None = None,
+        custom_meta: list[Tag] | None = None,
         _custom_backend_meta: list[dict[str, Any]] | None = None,
         _links: list[dict[str, int]] | None = None,
     ) -> None:
@@ -278,7 +317,7 @@ class BatchMeta:
 
         # Validate or initialize columnar custom_meta / _custom_backend_meta
         if not custom_meta:
-            self.custom_meta: list[dict[str, Any]] = [{} for _ in range(batch_size)]
+            self.custom_meta: list[Tag] = [{} for _ in range(batch_size)]
         else:
             self.custom_meta = [dict(d) for d in custom_meta]
             if len(self.custom_meta) != batch_size:
@@ -420,7 +459,7 @@ class BatchMeta:
         return key in self.extra_info
 
     # ==================== Custom Meta Methods (User Layer) ====================
-    def get_all_custom_meta(self) -> list[dict[str, Any]]:
+    def get_all_custom_meta(self) -> list[Tag]:
         """Get all custom_meta as a list of dictionary (one per sample, in global_indexes order).
 
         Returns:
@@ -428,7 +467,7 @@ class BatchMeta:
         """
         return copy.deepcopy(self.custom_meta)
 
-    def update_custom_meta(self, custom_meta: list[dict[str, Any]]):
+    def update_custom_meta(self, custom_meta: list[Tag]):
         """Update custom_meta with a list of dictionary of custom metadata.
 
         Args:
@@ -811,7 +850,7 @@ class BatchMeta:
                         all_shapes.extend([uniform_shape] * chunk.size)
                 all_field_schema[field_name]["per_sample_shapes"] = all_shapes
 
-        all_custom_meta: list[dict[str, Any]] = []
+        all_custom_meta: list[Tag] = []
         all_custom_backend_meta: list[dict[str, Any]] = []
         for chunk in data:
             all_custom_meta.extend(chunk.custom_meta)
@@ -920,7 +959,7 @@ class KVBatchMeta:
     keys: list[str] = dataclasses.field(default_factory=list)
 
     # sample-level tags
-    tags: list[dict] = dataclasses.field(default_factory=list)
+    tags: list[Tag] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch
     partition_id: str | None = None
