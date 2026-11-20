@@ -382,7 +382,7 @@ class TestCheckpointErrors:
         with pytest.raises(FileNotFoundError, match="metadata.json"):
             tq.load_checkpoint(ck)
 
-    @pytest.mark.parametrize("invalid_metadata", ["tag", "dtype"])
+    @pytest.mark.parametrize("invalid_metadata", ["tag", "dtype", "backend_meta"])
     def test_invalid_checkpoint_metadata_is_rejected_before_storage_restore(
         self, tq_system, checkpoint_dir, invalid_metadata
     ):
@@ -397,9 +397,12 @@ class TestCheckpointErrors:
         if invalid_metadata == "tag":
             partition.custom_meta[index]["score"] = (1, 2)
             error = rf"Invalid tag 'score' for {index} in partition '{partition_id}'"
-        else:
+        elif invalid_metadata == "dtype":
             partition.field_metadata["ids"].dtype = "torch.not_a_dtype"
             error = r"Invalid Torch dtype 'torch.not_a_dtype'"
+        else:
+            partition.field_custom_backend_meta[index] = {"ids": (1, 2)}
+            error = rf"Invalid backend metadata for field 'ids', sample {index} in partition '{partition_id}'"
         with path.open("wb") as file:
             pickle.dump(state, file)
 

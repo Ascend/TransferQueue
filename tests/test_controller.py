@@ -17,6 +17,7 @@ import logging
 import pickle
 from uuid import uuid4
 
+import numpy as np
 import pytest
 import ray
 import torch
@@ -25,6 +26,7 @@ from msgspec import msgpack
 
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import StorageManager
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
@@ -1196,7 +1198,7 @@ class TestTransferQueueControllerKvInterface:
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
     @pytest.mark.asyncio
-    async def test_controller_kv_prepare_update_reports_held_rows_from_field_metadata(self, ray_setup, monkeypatch):
+    async def test_kv_prepare_update_returns_native_schema_and_held_rows(self, ray_setup, monkeypatch):
         """Hidden cells count as held; new keys and fields the partition lacks do not."""
         tq_controller = TransferQueueController.remote()
         partition_id = "kv_prepare_update_test"
@@ -1404,8 +1406,7 @@ class TestTransferQueueControllerKvInterface:
 class TestTransferQueueControllerCheckpoint:
     """Tests for TransferQueueController save/load checkpoint functionality."""
 
-    def test_controller_checkpoint_round_trip(self, ray_setup, tmp_path):
-        """Save and load controller state; verify partition data is preserved."""
+    def test_checkpoint_restores_legacy_dtypes_and_shapes(self, ray_setup, tmp_path):
         gbs = 4
         partition_id = "ckpt_partition"
         ckpt_path = str(tmp_path / "controller.pkl")
@@ -1557,7 +1558,7 @@ class TestControllerSocketBudget:
 
 
 @pytest.mark.asyncio
-async def test_native_metadata_round_trip_over_zmq(ray_setup):
+async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
     """Round-trip tags and producer metadata through a live Controller."""
     notified_backend_meta = []
 
@@ -1575,6 +1576,9 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
             (frame,) = frames
             body = msgpack.decode(frame)["body"]
             assert body["field_schema"]["ids"]["dtype"] == "int64"
+            assert all(type(index) is int for index in body["global_indexes"])
+            assert all(type(index) is int for index in body["field_schema"]["ids"]["per_sample_shapes"])
+            assert all(type(index) is int for index in body["custom_backend_meta"])
             notified_backend_meta.append(body["custom_backend_meta"])
             return await super()._notify_and_wait(frames)
 
@@ -1588,7 +1592,8 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
         inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
         left, right = inserted.global_indexes
         tags = [{"score": 3}, {"source": ["rollout", 5, None], "limits": [-(2**63), 2**63 - 1]}]
-        inserted.update_custom_meta(tags)
+        numpy_left, numpy_right = np.int64(left), np.int64(right)
+        inserted = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=tags)
         await client.async_set_custom_meta(inserted)
 
         async with client.controller_rpc_pool.alease(info) as socket:
@@ -1608,13 +1613,16 @@ async def test_native_metadata_round_trip_over_zmq(ray_setup):
                 "dtype": "torch.long",
                 "shape": None,
                 "is_nested": True,
-                "per_sample_shapes": [(2,), (4,)],
+                "per_sample_shapes": {numpy_left: (2,), numpy_right: (4,)},
             },
         }
-        backend_meta = {left: {"ids": {"offset": 10}}, right: {"ids": (5, 6)}}
-        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
-        assert notified_backend_meta[-1][left]["ids"] == ["msgpack", msgpack.encode({"offset": 10})]
-        assert notified_backend_meta[-1][right]["ids"][0] == "python_pickle"
+        with pytest.raises(ValueError, match=r"Invalid backend metadata for field 'ids'.*got tuple"):
+            await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": {"chunks": (1, 2)}}})
+        assert not notified_backend_meta
+
+        backend_meta = {numpy_left: {"ids": {"n_chunks": 2}}, numpy_right: {"ids": "npu_tensor"}}
+        assert await producer.notify_data_update(partition_id, [numpy_left, numpy_right], schema, backend_meta)
+        assert notified_backend_meta[-1] == backend_meta
         partition = ray.get(controller.get_partition_snapshot.remote(partition_id))
         assert partition.field_metadata["ids"].per_sample_shapes == {left: (2,), right: (4,)}
 

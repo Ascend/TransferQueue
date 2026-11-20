@@ -247,7 +247,7 @@ class ZMQMessage:
             timestamp=time.time(),
         )
 
-    def serialize(self) -> list:
+    def serialize(self, *, validate_batch_tags: bool = True) -> list:
         """Serialize using zero-copy msgpack; falls back to pickle for unsupported types."""
         msg_dict = {
             "request_type": self.request_type.value,
@@ -257,7 +257,7 @@ class ZMQMessage:
             "timestamp": self.timestamp,
             "body": self.body,
         }
-        return serial_utils.encode(msg_dict)
+        return serial_utils.encode(msg_dict, validate_batch_tags=validate_batch_tags)
 
     @classmethod
     def deserialize(cls, frames: list) -> "ZMQMessage":

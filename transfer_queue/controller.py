@@ -34,7 +34,7 @@ import zmq
 from omegaconf import DictConfig
 from torch import Tensor
 
-from transfer_queue.metadata import BatchMeta, Tag, validate_tag
+from transfer_queue.metadata import BackendMeta, BatchMeta, Tag, validate_backend_meta, validate_tag
 from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import Role
@@ -389,7 +389,7 @@ class DataPartitionStatus:
     field_name_mapping: dict[str, int] = field(default_factory=dict)  # field_name -> column_index
     # O(F) columnar field metadata: field_name -> FieldMeta
     field_metadata: dict[str, FieldMeta] = field(default_factory=dict)
-    field_custom_backend_meta: dict[int, dict[str, Any]] = field(
+    field_custom_backend_meta: dict[int, dict[str, BackendMeta]] = field(
         default_factory=dict
     )  # global_idx -> {field: custom_backend_meta}
     # User-defined metadata that may not apply to field level
@@ -542,7 +542,7 @@ class DataPartitionStatus:
         global_indices: list[int],
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
         ready: bool = True,
     ) -> bool:
         """
@@ -566,10 +566,11 @@ class DataPartitionStatus:
             True if update was successful, False on error
 
         Raises:
-            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
+            ValueError: If a dtype conflicts with the partition's or backend metadata is invalid.
         """
-        # A dtype conflict must leave controller metadata and readiness unchanged.
+        # Validate before changing controller metadata or readiness.
         # Payloads are already stored, so this check cannot roll back the write.
+        validate_backend_meta(custom_backend_meta, partition_id=self.partition_id)
         for name, incoming in field_schema.items():
             existing = self.field_metadata.get(name)
             dtype = incoming.get("dtype")
@@ -648,7 +649,7 @@ class DataPartitionStatus:
         self,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
     ):
         """Update field metadata from columnar field_schema."""
         if not global_indexes:
@@ -851,7 +852,7 @@ class DataPartitionStatus:
 
     def get_field_custom_backend_meta(
         self, global_indices: list[int], field_names: list[str]
-    ) -> dict[int, dict[str, Any]]:
+    ) -> dict[int, dict[str, BackendMeta]]:
         """
         Get custom_backend_meta for multiple samples and fields.
 
@@ -1268,7 +1269,7 @@ class TransferQueueController:
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
         ready: bool = True,
     ) -> bool:
         """
@@ -1286,7 +1287,7 @@ class TransferQueueController:
             True if update was successful, False otherwise
 
         Raises:
-            ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
+            ValueError: If a dtype conflicts with the partition's or backend metadata is invalid.
         """
         partition = self._get_partition(partition_id)
         if not partition:
@@ -2444,7 +2445,8 @@ class TransferQueueController:
                         receiver_id=request_msg.sender_id,
                         message=f"no handler for request_type {request_msg.request_type}",
                     )
-                response_frames = response_msg.serialize()
+                # Controller tags have already been checked on writes and checkpoint restore.
+                response_frames = response_msg.serialize(validate_batch_tags=False)
             except Exception as e:
                 # Report errors from both the handler and response codec; the caller awaits a reply.
                 logger.exception(
@@ -2545,12 +2547,6 @@ class TransferQueueController:
         params = request_msg.body
         partition_id = params["partition_id"]
         global_indexes = params.get("global_indexes", [])
-        custom_backend_meta = params.get("custom_backend_meta", {})
-        if custom_backend_meta is not None:
-            for row in custom_backend_meta.values():
-                for field, blob in row.items():
-                    row[field] = serial_utils.decode_metadata_blob(blob)
-
         if self._get_partition(partition_id) is None:
             return self._make_response(request_msg, ZMQRequestType.NOTIFY_DATA_UPDATE_ACK, {"success": False})
 
@@ -2558,7 +2554,7 @@ class TransferQueueController:
             partition_id=partition_id,
             global_indexes=global_indexes,
             field_schema=params.get("field_schema", {}),
-            custom_backend_meta=custom_backend_meta,
+            custom_backend_meta=params.get("custom_backend_meta"),
             ready=params.get("ready", True),
         ):
             raise RuntimeError(f"Failed to record data for partition {partition_id!r}; see the controller log")
@@ -2858,6 +2854,7 @@ class TransferQueueController:
             for partition_id, partition in partitions.items():
                 for index, tag in partition.custom_meta.items():
                     validate_tag(tag, partition_id=partition_id, sample=index)
+                validate_backend_meta(partition.field_custom_backend_meta, partition_id=partition_id)
                 for name, field_meta in partition.field_metadata.items():
                     if isinstance(field_meta.shape, list):
                         field_meta.shape = tuple(field_meta.shape)

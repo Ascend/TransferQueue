@@ -47,10 +47,10 @@ from tensordict import TensorDict
 from tensordict.tensorclass import NonTensorStack
 
 from transfer_queue import data_dump
-from transfer_queue.client import TransferQueueClient
+from transfer_queue.client import TransferQueueClient, _group_custom_meta
 from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
-from transfer_queue.metadata import KVBatchMeta, Tag, validate_tag
+from transfer_queue.metadata import KVBatchMeta, Tag, copy_tag, validate_tag
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
@@ -929,6 +929,7 @@ async def async_kv_put(
         raise ValueError("Please provide at least one parameter of fields or tag.")
     if tag is not None:
         validate_tag(tag, partition_id=partition_id, sample=key)
+        tag = copy_tag(tag)
 
     tq_client = _maybe_create_tq_client()
 
@@ -959,10 +960,10 @@ async def async_kv_put(
             raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
+        batch_meta = await tq_client._put_data(fields, batch_meta, data_parser=data_parser, tags_validated=True)
     else:
         # Directly update custom_meta (tag) to controller
-        await tq_client.async_set_custom_meta(batch_meta)
+        await tq_client._send_custom_meta(_group_custom_meta(batch_meta, tags_validated=True))
 
     fields_to_return = batch_meta.field_names
 
@@ -1051,6 +1052,7 @@ async def async_kv_batch_put(
             raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         for key, tag in zip(keys, tags, strict=True):
             validate_tag(tag, partition_id=partition_id, sample=key)
+        tags = [copy_tag(tag) for tag in tags]
 
     tq_client = _maybe_create_tq_client()
 
@@ -1069,10 +1071,10 @@ async def async_kv_batch_put(
     # 3. put data
     if fields is not None:
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
+        batch_meta = await tq_client._put_data(fields, batch_meta, data_parser=data_parser, tags_validated=True)
     else:
         # Directly update custom_meta (tags) to controller
-        await tq_client.async_set_custom_meta(batch_meta)
+        await tq_client._send_custom_meta(_group_custom_meta(batch_meta, tags_validated=True))
 
     fields_to_return = batch_meta.field_names
 
@@ -1728,6 +1730,6 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
             link_groups[tuple(sorted(name for name, k in links.items() if k == public_key))].append((key, public_key))
     for names, pairs in link_groups.items():
         client.kv_link([key for key, _ in pairs], partition_id, [public_key for _, public_key in pairs], list(names))
-    bytes_read = client.load_rows_by_key(partition_id, rows, shards)
+    bytes_read = client._load_rows_by_key(partition_id, rows, shards, tags_validated=True)
     logger.info(f"Restored {len(rows)} keys into partition {partition_id} from {dump_dir}, reading {bytes_read} bytes")
     return {key: row["tag"] for key, row in rows.items()}

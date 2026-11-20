@@ -17,7 +17,6 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
-import io
 import operator
 import pickle
 import struct
@@ -35,7 +34,7 @@ import zmq
 from msgspec import msgpack
 from tensordict import TensorDictBase
 
-from transfer_queue.metadata import BatchMeta
+from transfer_queue.metadata import BatchMeta, TagValidationError
 from transfer_queue.utils.logging_utils import get_logger
 
 CUSTOM_TYPE_PICKLE = 1
@@ -72,7 +71,8 @@ class MsgpackEncoder:
 
     """
 
-    def __init__(self):
+    def __init__(self, *, validate_batch_tags: bool = True):
+        self.validate_batch_tags = validate_batch_tags
         self.encoder = msgpack.Encoder(enc_hook=self.enc_hook)
 
     @property
@@ -125,6 +125,8 @@ class MsgpackEncoder:
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
 
         if isinstance(obj, BatchMeta):
+            if self.validate_batch_tags:
+                obj._validate_custom_meta()
             return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
 
         if callable(obj):
@@ -370,60 +372,6 @@ class MsgpackDecoder:
         raise NotImplementedError(f"Extension type code {code} is not supported")
 
 
-def _is_native_tree(value: Any, seen: set[int]) -> bool:
-    value_type = type(value)
-    if value_type in (type(None), bool, int, float, str, bytes):
-        return True
-    if value_type not in (list, dict) or id(value) in seen:
-        return False
-    # MessagePack arrays cannot distinguish tuples or preserve shared container references.
-    seen.add(id(value))
-    if value_type is list:
-        return all(_is_native_tree(item, seen) for item in value)
-    return all(type(key) in (str, int) and _is_native_tree(item, seen) for key, item in value.items())
-
-
-class _MetadataPickler(cloudpickle.CloudPickler):
-    """Move accelerator tensors to CPU before a receiver unpickles metadata."""
-
-    def reducer_override(self, value: Any) -> Any:
-        if isinstance(value, torch.Tensor) and value.device.type not in ("cpu", "meta"):
-            return value.cpu().__reduce_ex__(self.proto)
-        return super().reducer_override(value)
-
-
-def _pickle_metadata(value: Any) -> bytes:
-    buffer = io.BytesIO()
-    _MetadataPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
-    return buffer.getvalue()
-
-
-def encode_metadata_blob(value: Any) -> tuple[str, bytes] | dict[str, Any] | None:
-    """Encode metadata with a codec name, or pass through an empty value."""
-    if value is None or (type(value) is dict and not value):
-        return value
-    try:
-        if _is_native_tree(value, set()):
-            return "msgpack", msgpack.encode(value)
-    except (OverflowError, RecursionError, UnicodeError, msgspec.MsgspecError):
-        pass
-    return "python_pickle", _pickle_metadata(value)
-
-
-def decode_metadata_blob(blob: Sequence[Any] | dict[str, Any] | None) -> Any:
-    """Decode an empty value or use the blob's declared codec."""
-    if blob is None or (type(blob) is dict and not blob):
-        return blob
-    codec, payload = blob
-    if not isinstance(payload, bytes):
-        raise TypeError("Expected a binary metadata blob")
-    if codec == "msgpack":
-        return msgpack.decode(payload)
-    if codec == "python_pickle":
-        return pickle.loads(payload)
-    raise ValueError(f"Unsupported metadata codec: {codec!r}")
-
-
 def parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
     """Resolve a Torch dtype or a name used in a schema or checkpoint."""
     resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
@@ -450,7 +398,9 @@ def encode_field_schema(
                     f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
                     f"number of global_indexes ({len(global_indexes)}) for field '{name}'. "
                 )
-            field["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
+            field["per_sample_shapes"] = dict(zip(map(operator.index, global_indexes), per_sample_shapes, strict=True))
+        elif isinstance(per_sample_shapes, dict):
+            field["per_sample_shapes"] = {operator.index(index): shape for index, shape in per_sample_shapes.items()}
         encoded[name] = field
     return encoded
 
@@ -479,20 +429,15 @@ def decode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str
 
 def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
     wire: dict[str, Any] = {
-        "global_indexes": list(map(operator.index, metadata.global_indexes)),
+        "global_indexes": metadata.global_indexes,
         "partition_ids": metadata.partition_ids,
         "field_schema": encode_field_schema(metadata.field_schema),
         "production_status": metadata.production_status.tobytes(),
     }
-    if metadata.extra_info:
-        wire["extra_info"] = encode_metadata_blob(metadata.extra_info)
     if any(metadata.custom_meta):
         wire["custom_meta"] = metadata.custom_meta
     if any(metadata._custom_backend_meta):
-        wire["custom_backend_meta"] = [
-            {field: encode_metadata_blob(value) for field, value in row.items()}
-            for row in metadata._custom_backend_meta
-        ]
+        wire["custom_backend_meta"] = metadata._custom_backend_meta
     if any(metadata._links):
         wire["links"] = metadata._links
     return wire
@@ -504,17 +449,14 @@ def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
         partition_ids=wire["partition_ids"],
         field_schema=decode_field_schema(wire["field_schema"]),
         production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
-        extra_info=decode_metadata_blob(wire["extra_info"]) if "extra_info" in wire else None,
         custom_meta=wire.get("custom_meta"),
-        _custom_backend_meta=[
-            {field: decode_metadata_blob(value) for field, value in row.items()}
-            for row in wire.get("custom_backend_meta", [])
-        ],
+        _custom_backend_meta=wire.get("custom_backend_meta"),
         _links=wire.get("links"),
     )
 
 
 _encoder = MsgpackEncoder()
+_controller_encoder = MsgpackEncoder(validate_batch_tags=False)
 _decoder = MsgpackDecoder()
 
 
@@ -546,31 +488,23 @@ def _is_pickle_fallback(frame: bytestr) -> bool:
     return view.nbytes == _PICKLE_FALLBACK_SENTINEL_SIZE and view.tobytes() == _PICKLE_FALLBACK_SENTINEL
 
 
-class _MessageFallbackPickler(pickle.Pickler):
-    """Keep BatchMeta tensors CPU-safe when a message falls back to pickle."""
-
-    def reducer_override(self, value: Any) -> Any:
-        if isinstance(value, BatchMeta):
-            return pickle.loads, (_pickle_metadata(value),)
-        return NotImplemented
-
-
-def encode(obj: Any) -> list[bytestr]:
+def encode(obj: Any, *, validate_batch_tags: bool = True) -> list[bytestr]:
     """Encode an object via msgpack zero-copy; falls back to pickle on failure.
 
     The pickle path is a normal degradation path (e.g. body contains torch.dtype
     objects). Use this as the single entry point for all ZMQ message serialization.
     """
+    encoder = _encoder if validate_batch_tags else _controller_encoder
     try:
-        return list(_encoder.encode(obj))
+        return list(encoder.encode(obj))
+    except TagValidationError:
+        raise
     except _ENCODE_FALLBACK_ERRORS as e:
         logger.warning(
             "encode: msgpack failed (%s), falling back to pickle.",
             type(e).__name__,
         )
-        buffer = io.BytesIO()
-        _MessageFallbackPickler(buffer, protocol=pickle.HIGHEST_PROTOCOL).dump(obj)
-        return [_PICKLE_FALLBACK_SENTINEL, buffer.getvalue()]
+        return [_PICKLE_FALLBACK_SENTINEL, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)]
 
 
 def decode(frames: list) -> Any:

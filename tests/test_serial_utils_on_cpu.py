@@ -30,17 +30,16 @@ from transfer_queue.utils.serial_utils import (
     _is_pickle_fallback,
     decode,
     decode_field_schema,
-    decode_metadata_blob,
     encode,
     encode_field_schema,
-    encode_metadata_blob,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZMQRequestType
 
 
-def test_batch_meta_round_trip_without_rpc():
+def test_batch_meta_round_trips_through_native_msgpack():
     """A standard MessagePack decoder can read a populated BatchMeta payload."""
     tags = [{"source": ["rollout", 5, 0.5, False, None], "empty": []}, {}]
+    backend_meta = [{"scalar": None, "nested": {"n_chunks": 2}}, {"scalar": "strategy"}]
     metadata = BatchMeta(
         global_indexes=[np.int64(101), 7],
         partition_ids=["train", "train"],
@@ -50,9 +49,11 @@ def test_batch_meta_round_trip_without_rpc():
         },
         production_status=np.array([1, 0], dtype=np.int8),
         custom_meta=tags,
+        _custom_backend_meta=backend_meta,
         _links=[{"scalar": 1}, {}],
         extra_info={"large_int": 2**70},
     )
+    assert all(type(index) is int for index in metadata.global_indexes)
     frames = encode({"payload": [metadata]})
     (frame,) = frames
     extension = msgpack.decode(frame)["payload"][0]
@@ -61,6 +62,8 @@ def test_batch_meta_round_trip_without_rpc():
     wire = msgpack.decode(extension.data)
     assert wire["global_indexes"] == [101, 7]
     assert wire["custom_meta"] == tags
+    assert wire["custom_backend_meta"] == backend_meta
+    assert "extra_info" not in wire
     assert wire["production_status"] == b"\x01\x00"
     assert wire["field_schema"]["scalar"] == {"dtype": "bfloat16", "shape": []}
     assert wire["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
@@ -73,8 +76,10 @@ def test_batch_meta_round_trip_without_rpc():
     assert restored.get_shapes("scalar") == [(), ()]
     assert restored.get_shapes("nested") == [(3,), None]
     assert restored.custom_meta == tags
+    assert restored._custom_backend_meta == backend_meta
     assert restored._links == metadata._links
-    assert restored.extra_info == metadata.extra_info
+    assert restored.extra_info == {}
+    assert metadata.extra_info == {"large_int": 2**70}
     assert restored.production_status.dtype == np.int8
     assert restored.production_status.tolist() == [1, 0]
     assert restored.production_status.flags.writeable
@@ -92,76 +97,33 @@ def test_field_dtype_uses_canonical_wire_name(dtype):
     assert restored["ids"] is not wire["ids"]
 
 
-def test_field_schema_requires_one_shape_per_global_index():
+def test_encode_field_schema_rejects_mismatched_shape_count():
     fields = {"ids": {"per_sample_shapes": [(3,), (5,)]}}
     with pytest.raises(ValueError, match=r"per_sample_shapes length \(2\) does not match"):
         encode_field_schema(fields, global_indexes=[101])
 
 
-def test_batch_meta_rejects_unknown_dtype():
+def test_batch_meta_encoding_rejects_unknown_dtype():
     metadata = BatchMeta([7], ["train"], {"ids": {"dtype": "unknown_dtype"}})
     with pytest.raises(RuntimeError, match="Invalid Torch dtype"):
         encode(metadata)
 
 
-@pytest.mark.parametrize(
-    ("value", "codec"),
-    [
-        ({"__tq_tensordict__": True, "score": 3}, "msgpack"),
-        ({"__tq_tensordict__": True, "shape": (2,)}, "python_pickle"),
-    ],
-)
-def test_metadata_blob_round_trip_without_rpc(value, codec):
-    blob = encode_metadata_blob(value)
-    wire_codec, payload = blob
-    assert wire_codec == codec
-    assert isinstance(payload, bytes)
-    assert decode_metadata_blob(blob) == value
+@pytest.mark.parametrize("value", [(1, 2), np.int64(1), 2**70], ids=["tuple", "numpy-int", "large-int"])
+def test_batch_meta_encoding_rejects_invalid_tags(value):
+    metadata = BatchMeta([7], ["train"], custom_meta=[{"value": value}])
+    with pytest.raises(ValueError, match="Invalid tag 'value' for 7 in partition 'train'"):
+        encode(metadata)
 
-
-@pytest.mark.parametrize(("value", "wire"), [({}, b"\x80"), (None, b"\xc0")])
-def test_empty_metadata_uses_native_msgpack(value, wire):
-    assert msgpack.encode(encode_metadata_blob(value)) == wire
-    assert decode_metadata_blob(msgpack.decode(wire)) == value
-
-
-@pytest.mark.parametrize("route", ["blob", "batch_meta", "message_fallback"])
-def test_metadata_serializes_accelerator_tensors_on_cpu(route):
-    class AcceleratorTensor(torch.Tensor):
-        @property
-        def device(self) -> torch.device:
-            return torch.device("cuda")
-
-        def cpu(self) -> torch.Tensor:
-            return self.as_subclass(torch.Tensor)
-
-    class Metric:
-        def __init__(self, tensor):
-            self.values = (tensor, [tensor])
-
-    tensor = torch.arange(4)
-    metadata_value = {"metric": Metric(tensor.as_subclass(AcceleratorTensor))}
-    if route == "blob":
-        restored_values = [decode_metadata_blob(encode_metadata_blob(metadata_value))]
-    else:
-        metadata = BatchMeta([7], ["train"], extra_info=metadata_value, _custom_backend_meta=[{"ids": metadata_value}])
-        body = {"metadata": metadata}
-        if route == "message_fallback":
-            body["offset"] = 2**70
-        frames = encode(body)
-        assert _is_pickle_fallback(frames[0]) is (route == "message_fallback")
-        restored = decode(frames)["metadata"]
-        restored_values = [restored.extra_info, restored._custom_backend_meta[0]["ids"]]
-
-    for value in restored_values:
-        result, repeated = value["metric"].values
-        assert result.device.type == "cpu"
-        assert torch.equal(result, tensor)
-        assert result is repeated[0]
+    metadata.clear_custom_meta()
+    metadata.update_custom_meta([{"value": value}])
+    # Even if an earlier field selects the envelope's pickle fallback, reject the tag.
+    with pytest.raises(ValueError, match="Invalid tag 'value' for 7 in partition 'train'"):
+        encode({"large_int": 2**70, "metadata": metadata})
 
 
 @pytest.mark.parametrize("field", ["sender_id", "receiver_id", "request_id", "timestamp"])
-def test_zmq_reports_missing_envelope_fields(field):
+def test_zmq_decode_error_reports_missing_field_and_frame_count(field):
     message = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": None})
     (frame,) = message.serialize()
     envelope = msgpack.decode(frame)
@@ -1315,15 +1277,13 @@ class TestPickleFallback:
 
     def test_fallback_round_trips_through_zmq_frames(self):
         """The core regression: the marker must still be recognised inside a zmq.Frame."""
-        tag = {"shape": (2,)}
-        obj = {"offset": 2**70, "indexes": torch.arange(8), "tag": encode_metadata_blob(tag)}
+        obj = {"offset": 2**70, "indexes": torch.arange(8)}
 
         frames = self._as_received(encode(obj))
         decoded = decode(frames)
 
         assert decoded["offset"] == 2**70
         assert torch.equal(decoded["indexes"], obj["indexes"])
-        assert decode_metadata_blob(decoded["tag"]) == tag
 
     @pytest.mark.parametrize(
         "wrap",
