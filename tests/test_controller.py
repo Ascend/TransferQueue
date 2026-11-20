@@ -20,8 +20,11 @@ import pytest
 import ray
 import torch
 import zmq
+from msgspec import msgpack
 
+from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
+from transfer_queue.storage.managers.base import StorageManager
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1507,6 +1510,96 @@ class TestControllerSocketBudget:
 
         assert budget > 1023, "the controller kept libzmq's default socket ceiling"
         assert budget == TQ_CONTROLLER_ZMQ_MAX_SOCKETS
+
+
+@pytest.mark.asyncio
+async def test_native_metadata_round_trip_over_zmq(ray_setup, monkeypatch):
+    """Exercise the client and producer metadata RPCs with a live Controller."""
+
+    class NotifyOnlyStorageManager(StorageManager):
+        async def put_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload write")
+
+        async def get_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload read")
+
+        async def clear_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload deletion")
+
+    controller = TransferQueueController.remote()
+    info = ray.get(controller.get_zmq_server_info.remote())
+    client = AsyncTransferQueueClient("wire-test", info)
+    producer = NotifyOnlyStorageManager(info, {})
+    try:
+        send_notification = producer._notify_and_wait
+
+        async def check_wire_and_send(frames):
+            (frame,) = frames
+            body = msgpack.decode(frame)["body"]
+            assert body["field_schema"]["ids"]["dtype"] == "int64"
+            assert all(
+                len(blob) == 2 and isinstance(blob[1], bytes)
+                for row in body["custom_backend_meta"].values()
+                for blob in row.values()
+            )
+            return await send_notification(frames)
+
+        monkeypatch.setattr(producer, "_notify_and_wait", check_wire_and_send)
+        partition_id = "native-wire"
+        keys = ["left", "right"]
+        inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
+        left, right = inserted.global_indexes
+        tags = [{"score": 3}, {"source": ("rollout", 5), "__tq_tensordict__": True}]
+        inserted.update_custom_meta(tags)
+        await client.async_set_custom_meta(inserted)
+
+        schema = {
+            "ids": {
+                "dtype": torch.int64,
+                "shape": None,
+                "is_nested": True,
+                "per_sample_shapes": [(2,), (4,)],
+            },
+            "weight": {"dtype": torch.float32, "shape": (1,)},
+        }
+        backend_meta = {
+            left: {"ids": (1, 2), "weight": {"offset": 10}},
+            right: {"ids": {"offset": 20}},
+        }
+        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta, ready=False)
+        pending = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
+        assert pending.size == 0
+
+        assert await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": (5, 6)}})
+        batch = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
+        assert batch.global_indexes == [left, right]
+        assert batch.is_ready
+        assert batch.production_status.flags.writeable
+        assert batch.get_dtypes("ids") == [torch.int64, torch.int64]
+        assert batch.get_shapes("ids") == [[2], [4]]
+        assert batch.custom_meta == tags
+        assert batch._custom_backend_meta == [{"ids": (5, 6)}, {"ids": {"offset": 20}}]
+        assert (await client.async_get_meta(["ids"], 2, partition_id, task_name="train")).size == 0
+
+        reversed_batch = await client.async_kv_retrieve_meta(keys[::-1], partition_id)
+        assert reversed_batch.global_indexes == [right, left]
+        assert reversed_batch.get_shapes("ids") == [[4], [2]]
+        assert reversed_batch.custom_meta == tags[::-1]
+        assert reversed_batch._custom_backend_meta == [
+            {"ids": {"offset": 20}},
+            {"ids": (5, 6), "weight": {"offset": 10}},
+        ]
+        _, plan = await client.async_kv_prepare_update(keys, partition_id, ["weight"])
+        assert plan["weight"]["dtype"] == torch.float32
+        assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
+        assert (await client.async_kv_describe(keys, partition_id))["rows"]["right"]["tag"] == tags[1]
+
+        await client._kv_clear_fields_in_controller(["left"], partition_id, ["weight"])
+        assert (await client.async_kv_retrieve_meta(["left"], partition_id))._custom_backend_meta == [{"ids": (5, 6)}]
+    finally:
+        producer.close()
+        client.close()
+        ray.kill(controller)
 
 
 class TestTransferQueueControllerBadRequests:
