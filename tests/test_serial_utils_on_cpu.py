@@ -35,7 +35,7 @@ from transfer_queue.utils.serial_utils import (
     encode_field_schema,
     encode_metadata_blob,
 )
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZMQRequestType
 
 
 def test_batch_meta_round_trip_without_rpc():
@@ -147,6 +147,18 @@ def test_metadata_serializes_accelerator_tensors_on_cpu(route):
         assert result.device.type == "cpu"
         assert torch.equal(result, tensor)
         assert result is repeated[0]
+
+
+@pytest.mark.parametrize("field", ["sender_id", "receiver_id", "request_id", "timestamp"])
+def test_zmq_reports_missing_envelope_fields(field):
+    message = ZMQMessage.create(ZMQRequestType.GET_META_RESPONSE, "controller", {"metadata": None})
+    (frame,) = message.serialize()
+    envelope = msgpack.decode(frame)
+    del envelope[field]
+    received = zmq.Frame(msgpack.encode(envelope))
+
+    with pytest.raises(ZMQMessageDecodeError, match=rf"KeyError: '{field}'.*num_frames=1"):
+        ZMQMessage.deserialize([received])
 
 
 def test_empty_and_missing_batch_meta_are_distinct_on_wire():
