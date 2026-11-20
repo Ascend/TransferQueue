@@ -2526,6 +2526,12 @@ class TransferQueueController:
         params = request_msg.body
         partition_id = params["partition_id"]
         global_indexes = params.get("global_indexes", [])
+        custom_backend_meta = params.get("custom_backend_meta", {})
+        if custom_backend_meta is not None:
+            for row in custom_backend_meta.values():
+                for field, blob in row.items():
+                    row[field] = serial_utils.decode_metadata_blob(blob)
+
         if self._get_partition(partition_id) is None:
             return self._make_response(request_msg, ZMQRequestType.NOTIFY_DATA_UPDATE_ACK, {"success": False})
 
@@ -2533,7 +2539,7 @@ class TransferQueueController:
             partition_id=partition_id,
             global_indexes=global_indexes,
             field_schema=params.get("field_schema", {}),
-            custom_backend_meta=params.get("custom_backend_meta", {}),
+            custom_backend_meta=custom_backend_meta,
             ready=params.get("ready", True),
         ):
             raise RuntimeError(f"Failed to record data for partition {partition_id!r}; see the controller log")
@@ -2561,7 +2567,11 @@ class TransferQueueController:
         )
 
     def _handle_set_custom_meta_request(self, request_msg: ZMQMessage) -> ZMQMessage:
-        self.set_custom_meta(partition_custom_meta=request_msg.body["partition_custom_meta"])
+        partition_custom_meta = request_msg.body["partition_custom_meta"]
+        for tags in partition_custom_meta.values():
+            for index, blob in tags.items():
+                tags[index] = serial_utils.decode_metadata_blob(blob)
+        self.set_custom_meta(partition_custom_meta=partition_custom_meta)
         return self._make_response(
             request_msg,
             ZMQRequestType.SET_CUSTOM_META_RESPONSE,
@@ -2676,7 +2686,7 @@ class TransferQueueController:
         params = request_msg.body
         description = self.kv_describe(params["keys"], params["partition_id"])
         for row in description["rows"].values():
-            row["tag"] = serial_utils.MetadataBlob(row["tag"])
+            row["tag"] = serial_utils.encode_metadata_blob(row["tag"])
         return self._make_response(request_msg, ZMQRequestType.KV_DESCRIBE_RESPONSE, description)
 
     def _handle_kv_exists_request(self, request_msg: ZMQMessage) -> ZMQMessage:
@@ -2737,7 +2747,7 @@ class TransferQueueController:
                 message = f"partition {partition_id} does not exist"
                 continue
             partition_info[partition_id] = {
-                key: serial_utils.MetadataBlob(partition.custom_meta.get(index, {}))
+                key: serial_utils.encode_metadata_blob(partition.custom_meta.get(index, {}))
                 for key, index in partition.keys_mapping.items()
             }
 

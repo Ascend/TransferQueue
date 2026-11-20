@@ -25,14 +25,14 @@ from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.serial_utils import (
     _PICKLE_FALLBACK_SENTINEL,
     CUSTOM_TYPE_BATCH_META,
-    CUSTOM_TYPE_METADATA_BLOB,
-    MetadataBlob,
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
     convert_dtypes,
     decode,
+    decode_metadata_blob,
     encode,
+    encode_metadata_blob,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -97,15 +97,11 @@ def test_batch_meta_rejects_unknown_dtype():
     ],
 )
 def test_metadata_blob_round_trip_without_rpc(tag, codec):
-    frames = encode({"tag": MetadataBlob(tag)})
-    (frame,) = frames
-    extension = msgpack.decode(frame)["tag"]
-    assert isinstance(extension, msgpack.Ext)
-    assert extension.code == CUSTOM_TYPE_METADATA_BLOB
-    wire_codec, payload = msgpack.decode(extension.data)
+    blob = encode_metadata_blob(tag)
+    wire_codec, payload = blob
     assert wire_codec == codec
     assert isinstance(payload, bytes)
-    assert decode(frames) == {"tag": tag}
+    assert decode_metadata_blob(blob) == tag
 
 
 def test_empty_and_missing_batch_meta_are_distinct_on_wire():
@@ -1252,14 +1248,14 @@ class TestPickleFallback:
     def test_fallback_round_trips_through_zmq_frames(self):
         """The core regression: the marker must still be recognised inside a zmq.Frame."""
         tag = {"shape": (2,)}
-        obj = {"offset": 2**70, "indexes": torch.arange(8), "tag": MetadataBlob(tag)}
+        obj = {"offset": 2**70, "indexes": torch.arange(8), "tag": encode_metadata_blob(tag)}
 
         frames = self._as_received(encode(obj))
         decoded = decode(frames)
 
         assert decoded["offset"] == 2**70
         assert torch.equal(decoded["indexes"], obj["indexes"])
-        assert decoded["tag"] == tag
+        assert decode_metadata_blob(decoded["tag"]) == tag
 
     @pytest.mark.parametrize(
         "wrap",

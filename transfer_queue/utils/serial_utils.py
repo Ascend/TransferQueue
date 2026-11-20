@@ -42,7 +42,6 @@ CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
 CUSTOM_TYPE_BATCH_META = 6  # Plain MessagePack metadata in the extension payload
-CUSTOM_TYPE_METADATA_BLOB = 7  # Codec name and payload for standalone metadata
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
@@ -125,9 +124,6 @@ class MsgpackEncoder:
 
         if isinstance(obj, BatchMeta):
             return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
-
-        if isinstance(obj, MetadataBlob):
-            return msgpack.Ext(CUSTOM_TYPE_METADATA_BLOB, msgpack.encode(encode_metadata_blob(obj.value)))
 
         if callable(obj):
             # cloudpickle for arbitrary callables (functions, lambdas, functools.partial,
@@ -277,7 +273,7 @@ class MsgpackDecoder:
         return self._reconstruct_special_types(result)
 
     def _reconstruct_special_types(self, obj: Any) -> Any:
-        """Restore TensorDict markers and unwrap standalone metadata blobs."""
+        """Recursively restore TensorDict from its marked dict representation."""
         if isinstance(obj, dict):
             # Check if this is a TensorDict marker
             if obj.get("__tq_tensordict__") is True:
@@ -288,9 +284,6 @@ class MsgpackDecoder:
             return [self._reconstruct_special_types(item) for item in obj]
         elif isinstance(obj, tuple):
             return tuple(self._reconstruct_special_types(item) for item in obj)
-        elif isinstance(obj, MetadataBlob):
-            # User metadata can contain keys that look like TensorDict markers.
-            return obj.value
         return obj
 
     def _reconstruct_tensordict(self, obj: dict) -> Any:
@@ -371,8 +364,6 @@ class MsgpackDecoder:
             return self._decode_numpy(meta)
         if code == CUSTOM_TYPE_BATCH_META:
             return _batch_meta_from_wire(msgpack.decode(data))
-        if code == CUSTOM_TYPE_METADATA_BLOB:
-            return MetadataBlob(decode_metadata_blob(msgpack.decode(data)))
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
 
@@ -410,19 +401,6 @@ def decode_metadata_blob(blob: Sequence[Any]) -> Any:
     if codec == "python_pickle":
         return pickle.loads(payload)
     raise ValueError(f"Unsupported metadata codec: {codec!r}")
-
-
-class MetadataBlob:
-    """Mark a standalone value for serialization as an opaque metadata blob."""
-
-    __slots__ = ("value",)
-
-    def __init__(self, value: Any):
-        self.value = value
-
-    def __reduce__(self):
-        # Restore the original value even when the entire message falls back to pickle.
-        return decode_metadata_blob, (encode_metadata_blob(self.value),)
 
 
 def convert_dtypes(fields: dict[str, dict[str, Any]], *, to_wire: bool) -> dict[str, dict[str, Any]]:

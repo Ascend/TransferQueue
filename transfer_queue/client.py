@@ -358,11 +358,11 @@ class AsyncTransferQueueClient:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
-        partition_custom_meta: dict[str, dict[int, serial_utils.MetadataBlob]] = {
+        partition_custom_meta: dict[str, dict[int, tuple[str, bytes]]] = {
             pid: {} for pid in set(metadata.partition_ids)
         }
         for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
-            partition_custom_meta[partition_id][index] = serial_utils.MetadataBlob(tag)
+            partition_custom_meta[partition_id][index] = serial_utils.encode_metadata_blob(tag)
 
         await self._request_controller(
             socket=socket,
@@ -1189,7 +1189,11 @@ class AsyncTransferQueueClient:
                 response_type=ZMQRequestType.KV_LIST_RESPONSE,
                 body={"partition_id": partition_id},
             )
-            return response_msg.body.get("partition_info", {})
+            partition_info = response_msg.body.get("partition_info", {})
+            for tags in partition_info.values():
+                for key, blob in tags.items():
+                    tags[key] = serial_utils.decode_metadata_blob(blob)
+            return partition_info
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
@@ -1215,7 +1219,10 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id},
         )
-        return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
+        rows = response.body["rows"]
+        for row in rows.values():
+            row["tag"] = serial_utils.decode_metadata_blob(row["tag"])
+        return {"rows": rows, "field_schema": response.body["field_schema"]}
 
     @with_controller_socket
     async def async_kv_exists(

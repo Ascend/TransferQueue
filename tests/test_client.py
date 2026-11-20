@@ -26,6 +26,7 @@ from transfer_queue import TransferQueueClient
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.serial_utils import encode_metadata_blob
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -240,7 +241,8 @@ class MockController:
         # Return cached keys for this partition
         keys = self._kv_partition_keys.get(partition_id, [])
 
-        return {"partition_info": {partition_id: {k: {} for k in keys}}, "message": "success"}
+        empty_tag = encode_metadata_blob({})
+        return {"partition_info": {partition_id: {key: empty_tag for key in keys}}, "message": "success"}
 
     def _mock_kv_retrieve_keys(self, request_body):
         """Mock KV retrieve indexes response."""
