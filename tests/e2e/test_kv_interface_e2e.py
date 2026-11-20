@@ -650,7 +650,7 @@ class TestKVGetE2E:
     """End-to-end tests for kv_batch_get functionality."""
 
     def test_kv_batch_get_nested_tensor(self, controller, tq_api):
-        # test put a regular tensor with batch size 1 and get it back as a nested tensor
+        """Read varying shapes and keep the field regular after clearing the larger shapes."""
         partition_id = "test_partition"
         keys = []
         data_list = []
@@ -666,6 +666,13 @@ class TestKVGetE2E:
         retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
 
         assert_nested_tensor_equal(retrieved["data"], torch.nested.as_nested_tensor(data_list, layout=torch.jagged))
+
+        tq_api.kv_clear(keys=keys[1:], partition_id=partition_id)
+        tq_api.kv_put(key=keys[1], partition_id=partition_id, fields={"data": data_list[0]})
+        field_meta = get_controller_partition(controller, partition_id).field_metadata["data"]
+        assert field_meta.is_nested is False
+        assert field_meta.shape == (1,)
+
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
 
     def test_kv_batch_get_single_key(self, controller, tq_api):

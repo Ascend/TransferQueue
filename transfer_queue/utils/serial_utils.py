@@ -403,27 +403,63 @@ def decode_metadata_blob(blob: Sequence[Any]) -> Any:
     raise ValueError(f"Unsupported metadata codec: {codec!r}")
 
 
-def convert_dtypes(fields: dict[str, dict[str, Any]], *, to_wire: bool) -> dict[str, dict[str, Any]]:
-    """Convert each dtype between its canonical name and Torch dtype."""
-    converted = {}
+def _parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
+    resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
+    if not isinstance(resolved, torch.dtype):
+        # Report invalid schemas before the whole-message pickle fallback.
+        raise RuntimeError(f"Invalid Torch dtype {dtype!r} for field {field_name!r}")
+    return resolved
+
+
+def encode_field_schema(
+    fields: dict[str, dict[str, Any]], *, global_indexes: Sequence[int] | None = None
+) -> dict[str, dict[str, Any]]:
+    """Prepare a field schema with canonical dtype names and optional global-indexed shapes."""
+    encoded = {}
     for name, field in fields.items():
+        field = dict(field)
         dtype = field.get("dtype")
-        if dtype is None:
-            converted[name] = field
-            continue
-        torch_dtype = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
-        if not isinstance(torch_dtype, torch.dtype):
-            # Report invalid schemas before the whole-message pickle fallback.
-            raise RuntimeError(f"Invalid Torch dtype {dtype!r} for field {name!r}")
-        converted[name] = {**field, "dtype": str(torch_dtype).removeprefix("torch.") if to_wire else torch_dtype}
-    return converted
+        if dtype is not None:
+            field["dtype"] = str(_parse_torch_dtype(dtype, name)).removeprefix("torch.")
+        per_sample_shapes = field.get("per_sample_shapes")
+        if global_indexes is not None and isinstance(per_sample_shapes, list | tuple):
+            if len(per_sample_shapes) != len(global_indexes):
+                raise ValueError(
+                    f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
+                    f"number of global_indexes ({len(global_indexes)}) for field '{name}'. "
+                )
+            field["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
+        encoded[name] = field
+    return encoded
+
+
+def decode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Restore Torch dtypes and shape tuples while preserving per-sample indexing."""
+    decoded = {}
+    for name, field in fields.items():
+        field = dict(field)
+        dtype = field.get("dtype")
+        if dtype is not None:
+            field["dtype"] = _parse_torch_dtype(dtype, name)
+        shape = field.get("shape")
+        if shape is not None:
+            field["shape"] = tuple(shape)
+        per_sample_shapes = field.get("per_sample_shapes")
+        if isinstance(per_sample_shapes, dict):
+            field["per_sample_shapes"] = {
+                index: tuple(shape) if shape is not None else None for index, shape in per_sample_shapes.items()
+            }
+        elif per_sample_shapes is not None:
+            field["per_sample_shapes"] = [tuple(shape) if shape is not None else None for shape in per_sample_shapes]
+        decoded[name] = field
+    return decoded
 
 
 def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
     wire: dict[str, Any] = {
         "global_indexes": metadata.global_indexes,
         "partition_ids": metadata.partition_ids,
-        "field_schema": convert_dtypes(metadata.field_schema, to_wire=True),
+        "field_schema": encode_field_schema(metadata.field_schema),
         "production_status": metadata.production_status.tobytes(),
     }
     if metadata.extra_info:
@@ -441,20 +477,10 @@ def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
 
 
 def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
-    field_schema = convert_dtypes(wire["field_schema"], to_wire=False)
-    # MessagePack uses arrays for dimensions. BatchMeta exposes each shape as a tuple.
-    for field in field_schema.values():
-        shape = field.get("shape")
-        if shape is not None:
-            field["shape"] = tuple(shape)
-        per_sample_shapes = field.get("per_sample_shapes")
-        if per_sample_shapes is not None:
-            field["per_sample_shapes"] = [tuple(shape) if shape is not None else None for shape in per_sample_shapes]
-
     return BatchMeta(
         global_indexes=wire["global_indexes"],
         partition_ids=wire["partition_ids"],
-        field_schema=field_schema,
+        field_schema=decode_field_schema(wire["field_schema"]),
         production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
         extra_info=decode_metadata_blob(wire["extra_info"]) if "extra_info" in wire else None,
         custom_meta=[decode_metadata_blob(tag) for tag in wire.get("custom_meta", [])],

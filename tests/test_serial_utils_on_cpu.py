@@ -28,10 +28,11 @@ from transfer_queue.utils.serial_utils import (
     MsgpackDecoder,
     MsgpackEncoder,
     _is_pickle_fallback,
-    convert_dtypes,
     decode,
+    decode_field_schema,
     decode_metadata_blob,
     encode,
+    encode_field_schema,
     encode_metadata_blob,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
@@ -77,10 +78,19 @@ def test_batch_meta_round_trip_without_rpc():
 @pytest.mark.parametrize("dtype", [torch.int64, "int64", "torch.int64", "torch.long", None])
 def test_field_dtype_uses_canonical_wire_name(dtype):
     fields = {"ids": {"dtype": dtype}}
-    wire = convert_dtypes(fields, to_wire=True)
+    wire = encode_field_schema(fields)
+    restored = decode_field_schema(wire)
     assert wire["ids"]["dtype"] == (None if dtype is None else "int64")
-    assert convert_dtypes(wire, to_wire=False)["ids"]["dtype"] is (None if dtype is None else torch.int64)
+    assert restored["ids"]["dtype"] is (None if dtype is None else torch.int64)
     assert fields["ids"]["dtype"] is dtype
+    assert wire["ids"] is not fields["ids"]
+    assert restored["ids"] is not wire["ids"]
+
+
+def test_field_schema_requires_one_shape_per_global_index():
+    fields = {"ids": {"per_sample_shapes": [(3,), (5,)]}}
+    with pytest.raises(ValueError, match=r"per_sample_shapes length \(2\) does not match"):
+        encode_field_schema(fields, global_indexes=[101])
 
 
 def test_batch_meta_rejects_unknown_dtype():

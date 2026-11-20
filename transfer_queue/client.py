@@ -1080,7 +1080,7 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
-        merge_plan = serial_utils.convert_dtypes(response_msg.body["merge_plan"], to_wire=False)
+        merge_plan = serial_utils.decode_field_schema(response_msg.body["merge_plan"])
         return response_msg.body["metadata"], merge_plan
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
@@ -1422,7 +1422,7 @@ class AsyncTransferQueueClient:
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """Reject incompatible destination fields before restoring payloads."""
-        field_schema = serial_utils.convert_dtypes(field_schema, to_wire=True)
+        field_schema = serial_utils.encode_field_schema(field_schema)
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,

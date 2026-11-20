@@ -1293,7 +1293,7 @@ class TransferQueueController:
             logger.error(f"Partition {partition_id} not found")
             return False
 
-        field_schema = serial_utils.convert_dtypes(field_schema, to_wire=False)
+        field_schema = serial_utils.decode_field_schema(field_schema)
         field_names = list(field_schema.keys())
         success = partition.update_production_status(
             global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
@@ -2697,7 +2697,7 @@ class TransferQueueController:
     def _handle_kv_prepare_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         metadata, merge_plan = self.kv_prepare_update(params["keys"], params["partition_id"], params["fields"])
-        merge_plan = serial_utils.convert_dtypes(merge_plan, to_wire=True)
+        merge_plan = serial_utils.encode_field_schema(merge_plan)
         return self._make_response(
             request_msg, ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE, {"metadata": metadata, "merge_plan": merge_plan}
         )
@@ -2777,7 +2777,7 @@ class TransferQueueController:
         params = request_msg.body
         partition = self._get_partition(params["partition_id"])
         if partition is not None:
-            field_schema = serial_utils.convert_dtypes(params["field_schema"], to_wire=False)
+            field_schema = serial_utils.decode_field_schema(params["field_schema"])
             partition.validate_field_schema(field_schema)
         return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
@@ -2839,11 +2839,16 @@ class TransferQueueController:
                 state = pickle.load(f)
 
             partitions = state["partitions"]
-            # Normalize legacy dtype names so schema checks can compare them
-            # with the Torch dtypes from subsequent writes.
+            # Normalize legacy dtype names and shape arrays before comparing
+            # restored fields with subsequent writes.
             converted_legacy_dtype = False
             for partition in partitions.values():
                 for field_meta in partition.field_metadata.values():
+                    if isinstance(field_meta.shape, list):
+                        field_meta.shape = tuple(field_meta.shape)
+                    for index, shape in (field_meta.per_sample_shapes or {}).items():
+                        if isinstance(shape, list):
+                            field_meta.per_sample_shapes[index] = tuple(shape)
                     if isinstance(field_meta.dtype, str):
                         dtype = getattr(torch, field_meta.dtype.removeprefix("torch."), None)
                         if isinstance(dtype, torch.dtype):

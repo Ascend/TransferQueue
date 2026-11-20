@@ -251,19 +251,7 @@ class StorageManager(ABC):
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
             return False
 
-        normalized_field_schema = serial_utils.convert_dtypes(field_schema, to_wire=True)
-        for field_name, field in normalized_field_schema.items():
-            per_sample_shapes = field.get("per_sample_shapes")
-            if isinstance(per_sample_shapes, list | tuple):
-                if len(per_sample_shapes) != len(global_indexes):
-                    raise ValueError(
-                        f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
-                        f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
-                    )
-                normalized_field_schema[field_name] = {
-                    **field,
-                    "per_sample_shapes": dict(zip(global_indexes, per_sample_shapes, strict=True)),
-                }
+        field_schema = serial_utils.encode_field_schema(field_schema, global_indexes=global_indexes)
 
         if custom_backend_meta is not None:
             custom_backend_meta = {
@@ -277,7 +265,7 @@ class StorageManager(ABC):
             body={
                 "partition_id": partition_id,
                 "global_indexes": global_indexes,
-                "field_schema": normalized_field_schema,
+                "field_schema": field_schema,
                 "custom_backend_meta": custom_backend_meta,
                 "ready": ready,
             },
