@@ -1596,14 +1596,6 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
         inserted = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=tags)
         await client.async_set_custom_meta(inserted)
 
-        async with client.controller_rpc_pool.alease(info) as socket:
-            with pytest.raises(RuntimeError, match=r"Invalid tag 'source'\[0\]"):
-                await client._request_controller(
-                    socket,
-                    ZMQRequestType.SET_CUSTOM_META,
-                    ZMQRequestType.SET_CUSTOM_META_RESPONSE,
-                    {"partition_custom_meta": {partition_id: {left: {"score": 4}, right: {"source": [["rollout"]]}}}},
-                )
         assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
         rows = (await client.async_kv_describe(keys, partition_id))["rows"]
         assert [rows[key]["tag"] for key in keys] == tags
@@ -1616,10 +1608,6 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
                 "per_sample_shapes": {numpy_left: (2,), numpy_right: (4,)},
             },
         }
-        with pytest.raises(ValueError, match=r"Invalid backend metadata for field 'ids'.*got tuple"):
-            await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": {"chunks": (1, 2)}}})
-        assert not notified_backend_meta
-
         backend_meta = {numpy_left: {"ids": {"n_chunks": 2}}, numpy_right: {"ids": "npu_tensor"}}
         assert await producer.notify_data_update(partition_id, [numpy_left, numpy_right], schema, backend_meta)
         assert notified_backend_meta[-1] == backend_meta

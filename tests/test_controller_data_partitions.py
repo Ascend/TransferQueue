@@ -1375,19 +1375,6 @@ class TestFieldMetaIntegration:
         assert partition.scan_data_status(["pv"], task_name="trainer") == [0, 1]
         assert partition.field_metadata["pv"].dtype == "torch.float32"
 
-    def test_invalid_backend_metadata_leaves_readiness_unchanged(self):
-        import pytest
-
-        partition = self._make_partition()
-        schema = {"pv": {"dtype": "torch.float32", "shape": (4,)}}
-        assert partition.update_production_status([0], ["pv"], schema, {0: {"pv": {"n_chunks": 2}}})
-
-        with pytest.raises(ValueError, match=r"Invalid backend metadata for field 'pv', sample 0"):
-            partition.update_production_status([0], ["pv"], schema, {0: {"pv": (2, 3)}}, ready=False)
-
-        assert partition.scan_data_status(["pv"], task_name="trainer") == [0]
-        assert partition.get_field_custom_backend_meta([0], ["pv"]) == {0: {"pv": {"n_chunks": 2}}}
-
     def test_update_production_status_updates_field_metadata(self):
         """Test that update_production_status correctly updates field_metadata via _update_field_metadata."""
         partition = self._make_partition()

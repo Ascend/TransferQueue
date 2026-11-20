@@ -160,11 +160,15 @@ See [Save Order and Consistency](#save-order-and-consistency) above. Concurrent 
 
 ### 2. Load is not transactional — partial restore has no rollback
 
-1. The Controller reads and validates its checkpoint once.
-2. If the checkpoint includes storage data, the client restores the storage units.
-3. The Controller applies the validated snapshot.
+The load sequence is:
 
-Run one restore at a time. If storage restore fails after replacing some units, those units hold checkpoint data while the Controller still reflects its pre-restore state.
+```python
+if meta.get("storage_saved"):
+    client.load_storage_checkpoint(...)   # (1) storage restored first
+client.load_controller_checkpoint(...)    # (2) controller restored second
+```
+
+If step (1) partially succeeds and step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
 
 **Workaround**: If `load_checkpoint` raises, call `tq.init()` again to reset the system to a clean state before retrying.
 
