@@ -1438,14 +1438,21 @@ class TestTransferQueueControllerCheckpoint:
         ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
         with open(ckpt_path, "rb") as f:
             state = pickle.load(f)
-        # Older checkpoints could contain strings alongside Torch dtype objects.
+        # Older checkpoints could contain dtype names with or without the Torch prefix.
         state["partitions"][partition_id].field_metadata["prompt_ids"].dtype = "torch.long"
+        state["partitions"][partition_id].field_metadata["attention_mask"].dtype = "bool"
         with open(ckpt_path, "wb") as f:
             pickle.dump(state, f)
 
         # Create a fresh controller and restore
         new_controller = TransferQueueController.remote()
-        ray.get(new_controller.load_checkpoint.remote(ckpt_path))
+
+        def restore_checkpoint(controller):
+            with pytest.warns(FutureWarning, match="will be removed in the next release") as captured:
+                controller.load_checkpoint(ckpt_path)
+            assert len(captured) == 1
+
+        ray.get(new_controller.__ray_call__.remote(restore_checkpoint))
 
         # Verify partition state was restored
         partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))
