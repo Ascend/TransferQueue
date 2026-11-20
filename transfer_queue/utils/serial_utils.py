@@ -397,8 +397,10 @@ def _pickle_metadata(value: Any) -> bytes:
     return buffer.getvalue()
 
 
-def encode_metadata_blob(value: Any) -> tuple[str, bytes]:
-    """Encode one user metadata value with its codec name."""
+def encode_metadata_blob(value: Any) -> tuple[str, bytes] | dict[str, Any] | None:
+    """Encode metadata with a codec name, or pass through an empty value."""
+    if value is None or (type(value) is dict and not value):
+        return value
     try:
         if _is_native_tree(value, set()):
             return "msgpack", msgpack.encode(value)
@@ -407,8 +409,10 @@ def encode_metadata_blob(value: Any) -> tuple[str, bytes]:
     return "python_pickle", _pickle_metadata(value)
 
 
-def decode_metadata_blob(blob: Sequence[Any]) -> Any:
-    """Decode one user metadata value using its declared codec."""
+def decode_metadata_blob(blob: Sequence[Any] | dict[str, Any] | None) -> Any:
+    """Decode an empty value or use the blob's declared codec."""
+    if blob is None or (type(blob) is dict and not blob):
+        return blob
     codec, payload = blob
     if not isinstance(payload, bytes):
         raise TypeError("Expected a binary metadata blob")
@@ -481,7 +485,7 @@ def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
     if metadata.extra_info:
         wire["extra_info"] = encode_metadata_blob(metadata.extra_info)
     if any(metadata.custom_meta):
-        wire["custom_meta"] = [encode_metadata_blob(tag) for tag in metadata.custom_meta]
+        wire["custom_meta"] = metadata.custom_meta
     if any(metadata._custom_backend_meta):
         wire["custom_backend_meta"] = [
             {field: encode_metadata_blob(value) for field, value in row.items()}
@@ -499,7 +503,7 @@ def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
         field_schema=decode_field_schema(wire["field_schema"]),
         production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
         extra_info=decode_metadata_blob(wire["extra_info"]) if "extra_info" in wire else None,
-        custom_meta=[decode_metadata_blob(tag) for tag in wire.get("custom_meta", [])],
+        custom_meta=wire.get("custom_meta"),
         _custom_backend_meta=[
             {field: decode_metadata_blob(value) for field, value in row.items()}
             for row in wire.get("custom_backend_meta", [])

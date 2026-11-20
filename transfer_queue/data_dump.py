@@ -37,6 +37,7 @@ from typing import Any
 
 import torch
 
+from transfer_queue.metadata import validate_tag
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -122,8 +123,7 @@ def publish_dump(tmp_dir: Path, dump_dir: Path, row_index: dict[str, Any], shard
     # directory entries were created here, on this node.
     _fsync_directory(shard_dir)
 
-    # torch.save rather than json: a tag is an arbitrary picklable dict, and this
-    # path must not fail on a tag that happens to hold a tensor.
+    # Keep the row index in the existing torch format so older dumps stay readable.
     with open(tmp_dir / _ROW_INDEX_FILE, "wb") as f:
         torch.save(row_index, f, pickle_module=compact_pickle)
         _fsync_file(f)
@@ -193,7 +193,11 @@ def read_dump(dump_dir: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         or row_index["partition_id"] != dump_info["partition_id"]
     ):
         raise ValueError("Dump manifest disagrees with the row index")
-    keys_by_index = {row["global_index"]: key for key, row in rows.items() if row["fields"]}
+    keys_by_index = {}
+    for key, row in rows.items():
+        validate_tag(row["tag"], partition_id=row_index["partition_id"], sample=key)
+        if row["fields"]:
+            keys_by_index[row["global_index"]] = key
     if len(keys_by_index) != dump_info["num_rows_with_data"]:
         raise ValueError("Dump row count disagrees with the row index")
     shards = []

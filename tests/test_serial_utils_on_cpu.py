@@ -40,6 +40,7 @@ from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZM
 
 def test_batch_meta_round_trip_without_rpc():
     """A standard MessagePack decoder can read a populated BatchMeta payload."""
+    tags = [{"source": ["rollout", 5, 0.5, False, None], "empty": []}, {}]
     metadata = BatchMeta(
         global_indexes=[101, 7],
         partition_ids=["train", "train"],
@@ -48,6 +49,7 @@ def test_batch_meta_round_trip_without_rpc():
             "nested": {"dtype": torch.int64, "is_nested": True, "per_sample_shapes": [(3,), None]},
         },
         production_status=np.array([1, 0], dtype=np.int8),
+        custom_meta=tags,
         _links=[{"scalar": 1}, {}],
         extra_info={"large_int": 2**70},
     )
@@ -57,6 +59,7 @@ def test_batch_meta_round_trip_without_rpc():
     assert isinstance(extension, msgpack.Ext)
     assert extension.code == CUSTOM_TYPE_BATCH_META
     wire = msgpack.decode(extension.data)
+    assert wire["custom_meta"] == tags
     assert wire["production_status"] == b"\x01\x00"
     assert wire["field_schema"]["scalar"] == {"dtype": "bfloat16", "shape": []}
     assert wire["field_schema"]["nested"]["per_sample_shapes"] == [[3], None]
@@ -68,6 +71,7 @@ def test_batch_meta_round_trip_without_rpc():
     assert restored.get_dtypes("scalar") == [torch.bfloat16, torch.bfloat16]
     assert restored.get_shapes("scalar") == [(), ()]
     assert restored.get_shapes("nested") == [(3,), None]
+    assert restored.custom_meta == tags
     assert restored._links == metadata._links
     assert restored.extra_info == metadata.extra_info
     assert restored.production_status.dtype == np.int8
@@ -100,18 +104,24 @@ def test_batch_meta_rejects_unknown_dtype():
 
 
 @pytest.mark.parametrize(
-    ("tag", "codec"),
+    ("value", "codec"),
     [
         ({"__tq_tensordict__": True, "score": 3}, "msgpack"),
         ({"__tq_tensordict__": True, "shape": (2,)}, "python_pickle"),
     ],
 )
-def test_metadata_blob_round_trip_without_rpc(tag, codec):
-    blob = encode_metadata_blob(tag)
+def test_metadata_blob_round_trip_without_rpc(value, codec):
+    blob = encode_metadata_blob(value)
     wire_codec, payload = blob
     assert wire_codec == codec
     assert isinstance(payload, bytes)
-    assert decode_metadata_blob(blob) == tag
+    assert decode_metadata_blob(blob) == value
+
+
+@pytest.mark.parametrize(("value", "wire"), [({}, b"\x80"), (None, b"\xc0")])
+def test_empty_metadata_uses_native_msgpack(value, wire):
+    assert msgpack.encode(encode_metadata_blob(value)) == wire
+    assert decode_metadata_blob(msgpack.decode(wire)) == value
 
 
 @pytest.mark.parametrize("route", ["blob", "batch_meta", "message_fallback"])
@@ -133,14 +143,14 @@ def test_metadata_serializes_accelerator_tensors_on_cpu(route):
     if route == "blob":
         restored_values = [decode_metadata_blob(encode_metadata_blob(metadata_value))]
     else:
-        metadata = BatchMeta([7], ["train"], extra_info=metadata_value, custom_meta=[metadata_value])
+        metadata = BatchMeta([7], ["train"], extra_info=metadata_value, _custom_backend_meta=[{"ids": metadata_value}])
         body = {"metadata": metadata}
         if route == "message_fallback":
             body["offset"] = 2**70
         frames = encode(body)
         assert _is_pickle_fallback(frames[0]) is (route == "message_fallback")
         restored = decode(frames)["metadata"]
-        restored_values = [restored.extra_info, restored.custom_meta[0]]
+        restored_values = [restored.extra_info, restored._custom_backend_meta[0]["ids"]]
 
     for value in restored_values:
         result, repeated = value["metric"].values

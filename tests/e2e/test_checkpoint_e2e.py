@@ -21,6 +21,7 @@ Run with:
 
 import json
 import os
+import pickle
 
 import pytest
 import ray
@@ -380,6 +381,27 @@ class TestCheckpointErrors:
         ck.mkdir()
         with pytest.raises(FileNotFoundError, match="metadata.json"):
             tq.load_checkpoint(ck)
+
+    def test_invalid_checkpoint_tag_is_rejected_before_storage_restore(self, tq_system, checkpoint_dir):
+        partition_id = "invalid_tag_checkpoint"
+        tq.kv_put("row", partition_id, fields={"ids": torch.tensor([1, 2])}, tag={"score": 1})
+        tq.save_checkpoint(checkpoint_dir)
+        path = checkpoint_dir / "controller_state.pkl"
+        with path.open("rb") as file:
+            state = pickle.load(file)
+        partition = state["partitions"][partition_id]
+        index = partition.keys_mapping["row"]
+        partition.custom_meta[index]["score"] = (1, 2)
+        with path.open("wb") as file:
+            pickle.dump(state, file)
+
+        live = torch.tensor([3, 4])
+        tq.kv_put("row", partition_id, fields={"ids": live}, tag={"score": 2})
+        with pytest.raises(RuntimeError, match=rf"Invalid tag 'score' for {index} in partition '{partition_id}'"):
+            tq.load_checkpoint(checkpoint_dir)
+
+        _assert_tensor_equal(tq.kv_batch_get(["row"], partition_id)["ids"], live.unsqueeze(0))
+        assert tq.kv_list(partition_id)[partition_id] == {"row": {"score": 2}}
 
     def test_load_raises_on_storage_unit_count_mismatch(self, tq_system, tmp_path, checkpoint_dir):
         # Define test data + Put + Save
