@@ -14,7 +14,10 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from typing import Any
+
+from transfer_queue.metadata import BackendMeta
 
 
 class StorageKVClient(ABC):
@@ -32,14 +35,15 @@ class StorageKVClient(ABC):
         self.config = config
 
     @abstractmethod
-    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
+    def put(self, keys: list[str], values: list[Any]) -> Sequence[BackendMeta] | None:
         """
         Store key-value pairs in the storage backend.
         Args:
             keys (list[str]): List of keys to store.
             values (list[Any]): List of any type to store.
         Returns:
-            Optional[list[Any]]: Optional list of custom metadata from each storage backend.
+            Optional metadata aligned with the keys. Each entry is a string,
+            a map with the same value types as a tag, or None.
         """
         raise NotImplementedError("Subclasses must implement put")
 

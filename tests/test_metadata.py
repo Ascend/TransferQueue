@@ -25,17 +25,17 @@ from transfer_queue.metadata import BatchMeta, KVBatchMeta, validate_tag
 @pytest.mark.parametrize(
     ("tag", "reason"),
     [
-        ({"score": np.int64(1)}, "got int64"),
-        ({"metric": torch.ones(1)}, "got Tensor"),
-        ({"source": ("rollout", 5)}, "got tuple"),
-        ({"scores": [[1]]}, r"'scores'\[0\].*got list"),
-        ({"value": [2**63]}, "signed 64-bit integer"),
-        ({"value": "\ud800"}, "valid UTF-8"),
-        ({1: "value"}, "expected UTF-8 str"),
-        ({"__tq_tensordict__": True}, "is reserved"),
+        pytest.param({"score": np.int64(1)}, "got int64", id="numpy-scalar"),
+        pytest.param({"metric": torch.ones(1)}, "got Tensor", id="tensor"),
+        pytest.param({"source": ("rollout", 5)}, "got tuple", id="tuple"),
+        pytest.param({"scores": [[1]]}, r"'scores'\[0\].*got list", id="nested-list"),
+        pytest.param({"value": [2**63]}, "signed 64-bit integer", id="integer-overflow"),
+        pytest.param({"value": "\ud800"}, "valid UTF-8", id="invalid-utf8"),
+        pytest.param({1: "value"}, "expected UTF-8 str", id="non-string-key"),
+        pytest.param({"__tq_tensordict__": True}, "is reserved", id="reserved-key"),
     ],
 )
-def test_invalid_tags_have_a_location_and_reason(tag, reason):
+def test_validate_tag_reports_sample_and_reason(tag, reason):
     with pytest.raises(ValueError, match=reason) as error:
         validate_tag(tag, partition_id="train", sample="key0")
     assert "'key0' in partition 'train'" in str(error.value)

@@ -25,7 +25,7 @@ import zmq.asyncio
 from tensordict import TensorDict
 
 from transfer_queue.controller import PUBLIC_PARTITION
-from transfer_queue.metadata import BatchMeta, Tag, validate_tag
+from transfer_queue.metadata import BatchMeta, Tag, copy_tag, validate_tag
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils import serial_utils
@@ -62,8 +62,8 @@ with_controller_socket = with_zmq_socket(
 )
 
 
-def _group_custom_meta(metadata: BatchMeta) -> dict[str, dict[int, Tag]]:
-    """Validate and snapshot the tags before sending or writing the batch."""
+def _group_custom_meta(metadata: BatchMeta, *, tags_validated: bool = False) -> dict[str, dict[int, Tag]]:
+    """Group and snapshot tags before an asynchronous write can modify the batch."""
     if not metadata.global_indexes or not metadata.custom_meta:
         return {}
 
@@ -71,10 +71,9 @@ def _group_custom_meta(metadata: BatchMeta) -> dict[str, dict[int, Tag]]:
     for partition_id, index, tag in zip(
         metadata.partition_ids, metadata.global_indexes, metadata.custom_meta, strict=True
     ):
-        validate_tag(tag, partition_id=partition_id, sample=index)
-        partitions[partition_id][index] = {
-            key: value.copy() if type(value) is list else value for key, value in tag.items()
-        }
+        if not tags_validated:
+            validate_tag(tag, partition_id=partition_id, sample=index)
+        partitions[partition_id][index] = copy_tag(tag)
     return partitions
 
 
@@ -474,6 +473,17 @@ class AsyncTransferQueueClient:
             ...     )
         """
 
+        return await self._put_data(data, metadata, partition_id, data_parser)
+
+    async def _put_data(
+        self,
+        data: TensorDict,
+        metadata: BatchMeta | None = None,
+        partition_id: str | None = None,
+        data_parser: Callable[[Any], Any] | None = None,
+        *,
+        tags_validated: bool = False,
+    ) -> BatchMeta:
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -501,7 +511,7 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
-        partition_custom_meta = _group_custom_meta(metadata)
+        partition_custom_meta = _group_custom_meta(metadata, tags_validated=tags_validated)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -1472,6 +1482,16 @@ class AsyncTransferQueueClient:
             RuntimeError: If the storage manager is not initialized, or a unit fails.
             NotImplementedError: If the storage backend does not support selective loads.
         """
+        return await self._restore_rows_by_key(partition_id, rows, shards)
+
+    async def _restore_rows_by_key(
+        self,
+        partition_id: str,
+        rows: dict[str, dict[str, Any]],
+        shards: list[dict[str, Any]],
+        *,
+        tags_validated: bool = False,
+    ) -> int:
         if not hasattr(self, "storage_manager") or self.storage_manager is None:
             raise RuntimeError(
                 f"[{self.client_id}]: Storage manager not initialized. "
@@ -1479,11 +1499,16 @@ class AsyncTransferQueueClient:
             )
         if not rows:
             return 0
+        tags = []
         for key, row in rows.items():
-            validate_tag(row["tag"], partition_id=partition_id, sample=key)
+            tag = row["tag"]
+            if not tags_validated:
+                validate_tag(tag, partition_id=partition_id, sample=key)
+                tag = copy_tag(tag)
+            tags.append(tag)
         metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
-        metadata.update_custom_meta([row["tag"] for row in rows.values()])
-        partition_custom_meta = _group_custom_meta(metadata)
+        metadata.update_custom_meta(tags)
+        partition_custom_meta = _group_custom_meta(metadata, tags_validated=True)
         target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
         for shard in shards:
             for record in shard["records"]:
@@ -1687,7 +1712,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._link = _make_sync(self.async_link)
         self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
-        self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
+        self._load_rows_by_key = _make_sync(self._restore_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
         self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)

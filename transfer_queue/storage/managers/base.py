@@ -16,6 +16,7 @@
 import asyncio
 import inspect
 import itertools
+import operator
 import os
 import threading
 import time
@@ -33,7 +34,7 @@ from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 from torch import Tensor
 
-from transfer_queue.metadata import BatchMeta, extract_field_schema
+from transfer_queue.metadata import BackendMeta, BatchMeta, extract_field_schema, validate_backend_meta
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
@@ -226,7 +227,7 @@ class StorageManager(ABC):
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
+        custom_backend_meta: dict[int, dict[str, BackendMeta]] | None = None,
         ready: bool = True,
     ) -> bool:
         """
@@ -236,7 +237,7 @@ class StorageManager(ABC):
             partition_id: Current data partition id.
             global_indexes: Data update related global_indexes.
             field_schema: Columnar field schema {field_name: {dtype, shape, is_nested, ...}}.
-            custom_backend_meta: Per-field custom_meta for each sample, in {global_index: {field: custom_meta}} format.
+            custom_backend_meta: Backend values by sample index and field name.
             ready: Whether consumers may see the data now; False for a kv_update with finalize=False.
 
         Returns:
@@ -251,13 +252,12 @@ class StorageManager(ABC):
             logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
             return False
 
+        global_indexes = list(map(operator.index, global_indexes))
         field_schema = serial_utils.encode_field_schema(field_schema, global_indexes=global_indexes)
 
-        if custom_backend_meta is not None:
-            custom_backend_meta = {
-                index: {field: serial_utils.encode_metadata_blob(value) for field, value in row.items()}
-                for index, row in custom_backend_meta.items()
-            }
+        validate_backend_meta(custom_backend_meta, partition_id=partition_id)
+        if custom_backend_meta and any(type(index) is not int for index in custom_backend_meta):
+            custom_backend_meta = {operator.index(index): row for index, row in custom_backend_meta.items()}
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
@@ -822,7 +822,7 @@ class KVStorageManager(StorageManager):
 
         field_schema = extract_field_schema(data)
 
-        per_field_custom_backend_meta: dict[int, dict[str, Any]] = {}
+        per_field_custom_backend_meta: dict[int, dict[str, BackendMeta]] = {}
         if custom_backend_meta:
             if len(custom_backend_meta) != len(keys):
                 raise ValueError(

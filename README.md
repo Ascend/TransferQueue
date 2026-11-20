@@ -118,6 +118,12 @@ reserved. Convert NumPy or Torch scalars with `.item()` and store tensors and ar
 in sample fields. Migrate tags outside this contract before restoring older
 checkpoints or dumps.
 
+`BatchMeta.extra_info` is preserved by Python pickle and Ray RPC. The
+Controller's MessagePack format omits it. Storage backends can publish
+per-field metadata as `None`, a UTF-8 string, or a map with the same key and
+value types as a tag. Migrate unsupported backend values in older checkpoints
+before restoring them.
+
 | API | Behavior |
 |---|---|
 | `(async_)kv_put`, `(async_)kv_batch_put` | Store samples or add/replace fields, with optional metadata tags |
