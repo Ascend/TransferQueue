@@ -1548,13 +1548,10 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in save_controller_checkpoint: {str(e)}") from e
 
-    @with_controller_socket
     async def async_load_controller_checkpoint(
         self,
         path: str,
         socket: zmq.asyncio.Socket | None = None,
-        *,
-        validate_only: bool = False,
     ) -> None:
         """Asynchronously restore controller state from a file via ZMQ RPC.
 
@@ -1567,17 +1564,27 @@ class AsyncTransferQueueClient:
                 ``async_save_controller_checkpoint``. The caller must ensure
                 this path is readable from the node running the controller.
             socket: ZMQ socket injected by @with_controller_socket.
-            validate_only: Check tags and legacy dtypes without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
         """
+        await self._request_checkpoint_load(path, socket=socket)
+
+    @with_controller_socket
+    async def _request_checkpoint_load(
+        self,
+        path: str,
+        *,
+        phase: str = "load",
+        restore_id: str | None = None,
+        socket: zmq.asyncio.Socket | None = None,
+    ) -> None:
         try:
             await self._request_controller(
                 socket=socket,
                 request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,
                 response_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
-                body={"path": path, "validate_only": validate_only},
+                body={"path": path, "phase": phase, "restore_id": restore_id},
             )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in load_controller_checkpoint: {str(e)}") from e
@@ -1714,7 +1721,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
         self._load_rows_by_key = _make_sync(self._restore_rows_by_key)
         self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
-        self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
+        self._load_controller_checkpoint = _make_sync(self._request_checkpoint_load)
         self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
         self._load_storage_checkpoint = _make_sync(self.async_load_storage_checkpoint)
 
@@ -2253,18 +2260,17 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
         return self._save_controller_checkpoint(path)
 
-    def load_controller_checkpoint(self, path: str, *, validate_only: bool = False) -> None:
+    def load_controller_checkpoint(self, path: str) -> None:
         """Synchronously restore controller state from a file via ZMQ RPC.
 
         Args:
             path: Absolute path to a .pkl file previously written by
                 ``save_controller_checkpoint``.
-            validate_only: Check tags and legacy dtypes without applying the checkpoint.
 
         Raises:
             RuntimeError: If the RPC fails or an unexpected response is received.
         """
-        return self._load_controller_checkpoint(path, validate_only=validate_only)
+        return self._load_controller_checkpoint(path)
 
     def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
         """Synchronously save storage state to a directory via StorageManager.
