@@ -47,8 +47,10 @@ async def test_payload_failure_discards_socket_and_releases_permit(monkeypatch, 
     failed.send_multipart = AsyncMock()
     failed.recv_multipart = AsyncMock()
     error = {
-        "send_timeout": zmq.Again(), "receive_timeout": zmq.Again(),
-        "disconnect": zmq.ZMQError(zmq.ENOTSOCK), "cancel": asyncio.CancelledError(),
+        "send_timeout": zmq.Again(),
+        "receive_timeout": zmq.Again(),
+        "disconnect": zmq.ZMQError(zmq.ENOTSOCK),
+        "cancel": asyncio.CancelledError(),
         "receive_error": ValueError("invalid response"),
     }[failure]
     if failure == "send_timeout":
@@ -57,9 +59,13 @@ async def test_payload_failure_discards_socket_and_releases_permit(monkeypatch, 
         failed.recv_multipart.side_effect = error
     healthy = MagicMock(closed=False)
     healthy.send_multipart = AsyncMock()
-    healthy.recv_multipart = AsyncMock(return_value=ZMQMessage.create(
-        request_type=ZMQRequestType.GET_DATA_RESPONSE, sender_id="unit", body={"data": {"text": ["next"]}},
-    ).serialize())
+    healthy.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA_RESPONSE,
+            sender_id="unit",
+            body={"data": {"text": ["next"]}},
+        ).serialize()
+    )
     pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
     connect = MagicMock(side_effect=[failed, healthy])
     monkeypatch.setattr(pool, "_connect", connect)
@@ -69,7 +75,8 @@ async def test_payload_failure_discards_socket_and_releases_permit(monkeypatch, 
         expected = TransferTimeout if isinstance(error, zmq.Again) else type(error)
         with pytest.raises(expected) as caught:
             await client.request(
-                peer, RequestHeader(operation, header.body),
+                peer,
+                RequestHeader(operation, header.body),
                 send=None if operation == Operation.GET else {"text": ["input"]},
                 recv=None if operation == Operation.GET else (),
             )
@@ -98,7 +105,7 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     applied = []
 
     async def send(frames, **kwargs):
-        applied.append(unit.payload_transfer.handle_legacy(ZMQMessage.deserialize(frames)))
+        applied.append(unit.payload_transfer.handle_request(ZMQMessage.deserialize(frames)))
 
     socket.send_multipart = AsyncMock(side_effect=send)
     socket.recv_multipart = AsyncMock(side_effect=zmq.Again())
@@ -114,8 +121,11 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     try:
         with pytest.raises(StorageUnitTimeout):
             await manager._update_to_single_storage_unit(
-                [0], {"value": [torch.tensor([2])]}, merge,
-                {"value": {"held": [True], "dtype": torch.int64, "is_non_tensor": False}}, peer.id,
+                [0],
+                {"value": [torch.tensor([2])]},
+                merge,
+                {"value": {"held": [True], "dtype": torch.int64, "is_non_tensor": False}},
+                peer.id,
             )
         assert len(applied) == 1
         assert applied[0].request_type == ZMQRequestType.UPDATE_DATA_RESPONSE

@@ -90,8 +90,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
             return ReplyHeader(body, wire_bytes), data
         return ReplyHeader(body, wire_bytes), None
 
-    def handle_legacy(self, message):
-        """Translate the legacy wire message at the storage boundary."""
+    def handle_request(self, message):
+        """Dispatch a ZMQ payload request and build its response."""
         operation = Operation(message.request_type.name)
         body = dict(message.body)
         data = body.pop("data", None)

@@ -981,7 +981,8 @@ class SimpleStorageUnit:
         self._init_zmq_socket()
         unit = weakref.proxy(self)
         self.payload_transfer.listen(
-            address=self.zmq_server_info, handle=lambda header, data: unit._handle_payload(header, data),
+            address=self.zmq_server_info,
+            handle=lambda header, data: unit._handle_payload(header, data),
         )
         self._start_process_put_get()
 
@@ -1228,7 +1229,7 @@ class SimpleStorageUnit:
 
             if operation in REQUEST_TYPES.values():
                 with monitor.measure(op_type=operation.name):
-                    response_msg = self.payload_transfer.handle_legacy(request_msg)
+                    response_msg = self.payload_transfer.handle_request(request_msg)
             elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="CLEAR_DATA"):
                     response_msg = self._handle_clear(request_msg)
