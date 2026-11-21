@@ -16,6 +16,7 @@
 """Storage-unit retry and timeout-diagnosis tests."""
 
 import asyncio
+import errno
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,6 +29,8 @@ from tensordict import TensorDict
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
+from transfer_queue.storage.payload_transfer.base import Operation, StorageRejected, TransferError, TransferTimeout
+from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
@@ -67,6 +70,52 @@ class _SocketLease:
 
     async def __aexit__(self, *_args):
         return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", list(Operation))
+@pytest.mark.parametrize("phase", ["connect", "request"])
+@pytest.mark.parametrize("failure", ["transport", "zmq", "decode", "timeout", "rejection", "missing_key", "cancel"])
+async def test_payload_failure_preserves_target_and_exception_category(operation, phase, failure):
+    manager = _manager()
+    manager._payload_peers = {"unit_a": {"backend": "test"}}
+    manager.payload_transfer = MagicMock()
+    manager.payload_transfer.connect = AsyncMock(return_value="connection")
+    manager.payload_transfer.request = AsyncMock()
+    error = {
+        "transport": TransferError("backend failed"),
+        "zmq": zmq.ZMQError(errno.EMFILE),
+        "decode": ValueError("invalid frame"),
+        "timeout": TransferTimeout("timed out", wire_bytes=1024),
+        "rejection": StorageRejected("write rejected"),
+        "missing_key": StorageRejected("key missing", missing_key=True),
+        "cancel": asyncio.CancelledError(),
+    }[failure]
+    getattr(manager.payload_transfer, phase).side_effect = error
+    expected = {
+        "timeout": StorageUnitTimeout,
+        "missing_key": StorageKeyNotFoundError if operation == Operation.GET else RuntimeError,
+        "cancel": asyncio.CancelledError,
+    }.get(failure, RuntimeError)
+    with pytest.raises(expected) as caught:
+        await manager._request_payload(
+            "unit_a", operation, {"global_indexes": [0]},
+            data=None if operation == Operation.GET else {"value": [1]},
+            recv=None if operation == Operation.GET else (),
+        )
+    assert type(caught.value) is expected
+    if failure != "cancel":
+        assert "unit_a" in str(caught.value)
+        assert "10.0.0.7:5555" in str(caught.value)
+        assert operation.name.lower() in str(caught.value)
+        assert caught.value.__cause__ is error
+        if failure in ("transport", "zmq", "decode"):
+            assert type(error).__name__ in str(caught.value)
+            assert str(error) in str(caught.value)
+    else:
+        assert caught.value is error
+    if phase == "connect":
+        manager.payload_transfer.request.assert_not_awaited()
 
 
 @pytest.mark.asyncio

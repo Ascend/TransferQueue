@@ -13,7 +13,14 @@ from transfer_queue.storage.payload_transfer.base import (
     TransferError,
     TransferTimeout,
 )
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, ZMQSocketPool, frame_nbytes
+from transfer_queue.utils.zmq_utils import (
+    ZMQMessage,
+    ZMQMessageDecodeError,
+    ZMQRequestType,
+    ZMQServerInfo,
+    ZMQSocketPool,
+    frame_nbytes,
+)
 
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
@@ -76,19 +83,26 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
                 await socket.send_multipart(frames, copy=False)
                 reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+                if reply.request_type not in (RESPONSE_TYPES[header.operation], ERROR_TYPES[header.operation]):
+                    raise TransferError(f"unexpected response {reply.request_type}")
+                body = dict(reply.body)
+                data = None
+                if reply.request_type == RESPONSE_TYPES[header.operation] and header.operation == Operation.GET:
+                    data = body.pop("data", None)
+                    if not isinstance(data, dict):
+                        raise TransferError("GET response must contain field data")
         except zmq.error.Again as exc:
             raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes) from exc
+        except (zmq.ZMQError, ZMQMessageDecodeError) as exc:
+            raise TransferError(f"ZMQ storage request failed: {type(exc).__name__}: {exc}") from exc
 
-        if reply.request_type != RESPONSE_TYPES[header.operation]:
-            message = reply.body.get("message", f"unexpected response {reply.request_type}")
-            raise StorageRejected(message, missing_key=KEY_NOT_FOUND_MARKER in message)
-        body = dict(reply.body)
-        if header.operation == Operation.GET:
-            data = body.pop("data", None)
-            if not isinstance(data, dict):
-                raise TransferError("GET response must contain field data")
-            return ReplyHeader(body, wire_bytes), data
-        return ReplyHeader(body, wire_bytes), None
+        # A valid storage rejection completes the exchange and leaves the socket reusable.
+        if reply.request_type == ERROR_TYPES[header.operation]:
+            message = body.get("message", "storage request rejected")
+            raise StorageRejected(
+                message, missing_key=header.operation == Operation.GET and KEY_NOT_FOUND_MARKER in message,
+            )
+        return ReplyHeader(body, wire_bytes), data
 
     def handle_request(self, message):
         """Dispatch a ZMQ payload request and build its response."""

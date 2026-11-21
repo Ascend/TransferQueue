@@ -40,6 +40,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Callable
@@ -902,6 +903,54 @@ def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., An
     return parsed
 
 
+def handle_storage_request(
+    storage_unit_id: str,
+    storage_data: StorageUnitData,
+    header: RequestHeader,
+    data: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Apply storage semantics on the unit worker for every payload backend."""
+    body = header.body
+    operation = header.operation
+    try:
+        indexes = body["global_indexes"]
+        with limit_pytorch_auto_parallel_threads(
+            target_num_threads=TQ_NUM_THREADS, info=f"[{storage_unit_id}] {operation.value}"
+        ):
+            if operation == Operation.GET:
+                result = storage_data.get_data(body["fields"], indexes)
+                if (parser := body.get("data_parser")) is not None:
+                    result = _apply_data_parser(result, parser, body.get("parser_args"))
+                return {}, result
+            if operation == Operation.PUT:
+                if data is None:
+                    raise TypeError("PUT requires field data")
+                if (parser := body.get("data_parser")) is not None:
+                    data = _apply_data_parser(data, parser)
+                storage_data.put_data(data, indexes)
+                return {}, None
+
+            merge_fn = body.get("merge_fn")
+            merge_plan = body.get("merge_plan")
+            if not callable(merge_fn):
+                raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+            if not isinstance(data, dict) or not data:
+                raise TypeError("update data must be a non-empty dict")
+            if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
+                raise ValueError("merge_plan must describe every update field")
+            stored_shapes = storage_data.apply_update(indexes, data, merge_fn, merge_plan)
+            return {"stored_shapes": stored_shapes}, None
+    except Exception as exc:
+        missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
+        if operation == Operation.GET:
+            log = logger.debug if missing_key else logger.error
+            log(
+                f"[{storage_unit_id}]: GET error, fields={body.get('fields')}, "
+                f"global_indexes={body.get('global_indexes')}: {type(exc).__name__}: {exc}"
+            )
+        raise StorageRejected(str(exc), missing_key=missing_key) from exc
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -979,10 +1028,9 @@ class SimpleStorageUnit:
 
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_unit_id)
         self._init_zmq_socket()
-        unit = weakref.proxy(self)
         self.payload_transfer.listen(
             address=self.zmq_server_info,
-            handle=lambda header, data: unit._handle_payload(header, data),
+            handle=partial(handle_storage_request, self.storage_unit_id, self.storage_data),
         )
         self._start_process_put_get()
 
@@ -1294,49 +1342,6 @@ class SimpleStorageUnit:
                     f"fields={list(request_msg.body.get('fields', []))}",
                 )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
-
-    def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None):
-        """Apply storage semantics on the unit worker for every payload backend."""
-        body = header.body
-        operation = header.operation
-        try:
-            indexes = body["global_indexes"]
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] {operation.value}"
-            ):
-                if operation == Operation.GET:
-                    result = self.storage_data.get_data(body["fields"], indexes)
-                    if (parser := body.get("data_parser")) is not None:
-                        result = _apply_data_parser(result, parser, body.get("parser_args"))
-                    return {}, result
-                if operation == Operation.PUT:
-                    if (parser := body.get("data_parser")) is not None:
-                        data = _apply_data_parser(data, parser)
-                    self.storage_data.put_data(data, indexes)
-                    return {}, None
-
-                merge_fn = body.get("merge_fn")
-                merge_plan = body.get("merge_plan")
-                if not callable(merge_fn):
-                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
-                if not isinstance(data, dict) or not data:
-                    raise TypeError("update data must be a non-empty dict")
-                if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
-                    raise ValueError("merge_plan must describe every update field")
-                stored_shapes = self.storage_data.apply_update(indexes, data, merge_fn, merge_plan)
-                return {"stored_shapes": stored_shapes}, None
-        except Exception as exc:
-            missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
-            if operation == Operation.GET:
-                log = logger.debug if missing_key else logger.error
-                log(
-                    f"[{self.storage_unit_id}]: GET error, fields={body.get('fields')}, "
-                    f"global_indexes={body.get('global_indexes')}: {type(exc).__name__}: {exc}"
-                )
-            raise StorageRejected(
-                f"Failed to {operation.name.lower()} data on storage unit {self.storage_unit_id}: {exc}",
-                missing_key=missing_key,
-            ) from exc
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
