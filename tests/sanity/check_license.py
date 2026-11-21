@@ -18,11 +18,13 @@ from typing import Iterable
 
 # Add license headers below
 license_head_huawei = "Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved."
-license_head_tq = "Copyright 2025 The TransferQueue Team"
+license_head_tq_2025 = "Copyright 2025 The TransferQueue Team"
+license_head_tq_2026 = "Copyright 2026 The TransferQueue Team"
 
 license_headers = [
     license_head_huawei,
-    license_head_tq,
+    license_head_tq_2025,
+    license_head_tq_2026,
 ]
 
 
