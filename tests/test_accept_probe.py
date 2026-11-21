@@ -186,24 +186,40 @@ def test_sampling_an_unused_port_returns_none():
 
 
 def test_unit_shutdown_stops_the_probe():
-    """Nothing else calls stop(), so the sampling thread would outlive the unit."""
-    from unittest.mock import MagicMock
+    """Stop request processing before releasing transport and storage resources."""
+    from unittest.mock import MagicMock, call
 
     from transfer_queue.storage.simple_storage import SimpleStorageUnit
 
     unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
-    probe = MagicMock()
+    resources = MagicMock()
+    resources.worker.is_alive.return_value = True
+    resources.proxy.is_alive.return_value = True
+    shutdown_event = threading.Event()
 
     unit_class._shutdown_resources(
-        shutdown_event=threading.Event(),
-        worker_thread=None,
-        proxy_thread=None,
-        zmq_context=None,
-        put_get_socket=None,
-        accept_probe=probe,
+        shutdown_event=shutdown_event,
+        worker_thread=resources.worker,
+        proxy_thread=resources.proxy,
+        zmq_context=resources.context,
+        put_get_socket=resources.front,
+        accept_probe=resources.probe,
+        worker_socket=resources.back,
+        storage_data=resources.storage,
+        payload_transfer=resources.transport,
     )
 
-    probe.stop.assert_called_once()
+    assert shutdown_event.is_set()
+    assert resources.method_calls == [
+        call.probe.stop(),
+        call.worker.is_alive(), call.worker.join(),
+        call.proxy.is_alive(), call.proxy.join(),
+        call.front.close(linger=0),
+        call.back.close(linger=0),
+        call.context.term(),
+        call.transport.shutdown(),
+        call.storage.close(),
+    ]
 
 
 def test_shutdown_without_a_probe_is_a_no_op():

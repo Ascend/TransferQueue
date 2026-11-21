@@ -670,8 +670,16 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"{target} ({self._describe_storage_unit(target)}){size}"
             ) from exc
         except StorageRejected as exc:
-            error = StorageKeyNotFoundError if exc.missing_key else RuntimeError
-            raise error(f"Failed to {operation.name.lower()} data on storage unit {target}: {exc}") from exc
+            error = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
+            raise error(
+                f"Failed to {operation.name.lower()} data on storage unit "
+                f"{target} ({self._describe_storage_unit(target)}): {exc}"
+            ) from exc
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to {operation.name.lower()} data on storage unit "
+                f"{target} ({self._describe_storage_unit(target)}): {type(exc).__name__}: {exc}"
+            ) from exc
 
         if data is not None:
             log_heavy_operation(

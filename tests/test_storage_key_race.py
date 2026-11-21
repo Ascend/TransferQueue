@@ -16,6 +16,7 @@
 """A key removed by a concurrent ``clear`` must stay distinguishable from a real storage fault."""
 
 import logging
+from functools import partial
 
 import pytest
 import torch
@@ -23,9 +24,9 @@ import torch
 from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
-    SimpleStorageUnit,
     StorageKeyNotFoundError,
     StorageUnitData,
+    handle_storage_request,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
@@ -67,18 +68,14 @@ def test_surviving_key_is_unaffected(storage_data):
 def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
     # The reply crosses ZMQ as text, so the marker is what lets the caller rebuild the type.
     storage_data.clear([1])
-    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
-    unit = unit_class.__new__(unit_class)
-    unit.storage_unit_id = "storage_unit_0"
-    unit.storage_data = storage_data
     request = ZMQMessage.create(
         request_type=ZMQRequestType.GET_DATA,
         sender_id="client_0",
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
-    transport = ZmqPayloadTransfer(owner_id=unit.storage_unit_id)
-    transport.listen(handle=unit._handle_payload)
+    transport = ZmqPayloadTransfer(owner_id="storage_unit_0")
+    transport.listen(handle=partial(handle_storage_request, "storage_unit_0", storage_data))
     with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
         reply = transport.handle_request(request)
 
