@@ -29,7 +29,13 @@ from tensordict import TensorDict
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
-from transfer_queue.storage.payload_transfer.base import Operation, StorageRejected, TransferError, TransferTimeout
+from transfer_queue.storage.payload_transfer.base import (
+    Operation,
+    ReplyHeader,
+    StorageRejected,
+    TransferError,
+    TransferTimeout,
+)
 from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
@@ -40,6 +46,9 @@ def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
     manager.storage_manager_id = "TQ_STORAGE_test"
     manager.storage_unit_infos = {}
+    manager.config = {}
+    manager._payload_connections = {}
+    manager._payload_connect_locks = {}
     if with_unit:
         manager.storage_unit_infos["unit_a"] = ZMQServerInfo(
             role=Role.STORAGE,
@@ -73,12 +82,127 @@ class _SocketLease:
 
 
 @pytest.mark.asyncio
+async def test_payload_concurrent_requests_share_one_handshake():
+    manager = _manager()
+    peer = {"backend": "test", "token": "opaque"}
+    manager.config = {"payload_peers": {"unit_a": peer}}
+    started, release = asyncio.Event(), asyncio.Event()
+    connection = object()
+
+    async def connect(info):
+        assert info is peer
+        started.set()
+        await release.wait()
+        return connection
+
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=connect),
+        request=AsyncMock(return_value=(ReplyHeader({}), {"value": [1]})),
+    )
+    calls = [asyncio.create_task(manager._request_payload(
+        "unit_a", Operation.GET, {"global_indexes": [i]}, recv=None,
+    )) for i in range(8)]
+    await started.wait()
+    release.set()
+    await asyncio.wait_for(asyncio.gather(*calls), timeout=2)
+    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    manager.payload_transfer.connect.assert_awaited_once()
+    assert manager.payload_transfer.request.await_count == 9
+    assert all(call.args[0] is connection for call in manager.payload_transfer.request.await_args_list)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [TransferTimeout("lost"), TransferError("broken"),
+                                    asyncio.CancelledError(), StorageRejected("denied")])
+async def test_payload_connection_eviction_and_storage_rejection(failure):
+    manager = _manager()
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=[object(), object()]),
+        request=AsyncMock(side_effect=[failure, (ReplyHeader({}), {"value": [1]})]),
+    )
+    expected = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else RuntimeError
+    with pytest.raises(expected):
+        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    assert manager.payload_transfer.connect.await_count == (1 if isinstance(failure, StorageRejected) else 2)
+
+
+@pytest.mark.asyncio
+async def test_payload_connect_timeout_is_bounded_and_can_reconnect(monkeypatch):
+    manager = _manager()
+    cancelled = asyncio.Event()
+
+    async def stalled_connect(_):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=stalled_connect),
+        request=AsyncMock(return_value=(ReplyHeader({}), {})),
+    )
+    monkeypatch.setattr(ssm, "TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 0.01)
+    with pytest.raises(StorageUnitTimeout):
+        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    assert cancelled.is_set()
+    manager.payload_transfer.request.assert_not_awaited()
+    manager.payload_transfer.connect.side_effect = None
+    manager.payload_transfer.connect.return_value = object()
+    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    assert manager.payload_transfer.connect.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_late_failure_does_not_evict_replacement_connection():
+    manager = _manager()
+    old, new = object(), object()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def request(connection, header, **_):
+        if header.body.get("slow"):
+            entered.set()
+            await release.wait()
+            raise TransferTimeout("late failure")
+        if connection is old:
+            raise TransferTimeout("first failure")
+        return ReplyHeader({}), {}
+
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=[old, new]), request=AsyncMock(side_effect=request),
+    )
+    late = asyncio.create_task(manager._request_payload("unit_a", Operation.GET, {"slow": True}, recv=None))
+    await entered.wait()
+    try:
+        with pytest.raises(StorageUnitTimeout):
+            await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    finally:
+        release.set()
+        with pytest.raises(StorageUnitTimeout):
+            await late
+    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    assert manager.payload_transfer.connect.await_count == 2
+
+
+def test_payload_connections_do_not_cross_event_loops():
+    manager = _manager()
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=[object(), object()]),
+        request=AsyncMock(return_value=(ReplyHeader({}), {})),
+    )
+    for _ in range(2):
+        asyncio.run(manager._request_payload("unit_a", Operation.GET, {}, recv=None))
+    assert manager.payload_transfer.connect.await_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("operation", list(Operation))
 @pytest.mark.parametrize("phase", ["connect", "request"])
 @pytest.mark.parametrize("failure", ["transport", "zmq", "decode", "timeout", "rejection", "missing_key", "cancel"])
 async def test_payload_failure_preserves_target_and_exception_category(operation, phase, failure):
     manager = _manager()
-    manager._payload_peers = {"unit_a": {"backend": "test"}}
+    manager.config = {"payload_peers": {"unit_a": {"backend": "test"}}}
     manager.payload_transfer = MagicMock()
     manager.payload_transfer.connect = AsyncMock(return_value="connection")
     manager.payload_transfer.request = AsyncMock()

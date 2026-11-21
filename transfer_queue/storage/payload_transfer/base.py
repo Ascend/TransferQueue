@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -10,9 +9,9 @@ from typing import Any, Callable
 
 
 class Operation(str, Enum):
-    PUT = "PUT_DATA"
-    GET = "GET_DATA"
-    UPDATE = "UPDATE_DATA"
+    PUT = "PUT"
+    GET = "GET"
+    UPDATE = "UPDATE"
 
 
 class TransferError(RuntimeError):
@@ -58,7 +57,12 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     async def connect(self, peer_info: PeerInfo) -> Any:
-        """Resolve an opaque connection usable by this backend."""
+        """Handshake and return a connection supporting concurrent requests on its owning loop.
+
+        The manager caches connections per loop and peer. A failed or cancelled
+        connect must release partial resources. The backend owns connection resources
+        until shutdown, including handles evicted by the manager after request failure.
+        """
 
     @abstractmethod
     async def request(
@@ -70,10 +74,10 @@ class PayloadTransfer(ABC):
         owning their backing memory. With recv=(), return only an acknowledgement.
         A nonempty recv is reserved for writing into caller-owned output ranges.
         On failure, retain any memory still accessible to the transport.
+        A transport failure or cancellation evicts the manager's cached connection;
+        existing requests may finish, and a subsequent connect must be safe to use.
+        StorageRejected completes the exchange without invalidating the connection.
         """
-
-    async def close(self) -> None:
-        await asyncio.to_thread(self.shutdown)
 
     @abstractmethod
     def shutdown(self) -> None:

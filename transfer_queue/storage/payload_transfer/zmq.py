@@ -29,6 +29,7 @@ REQUEST_TYPES = {
     Operation.GET: ZMQRequestType.GET_DATA,
     Operation.UPDATE: ZMQRequestType.UPDATE_DATA,
 }
+OPERATIONS = {request_type: operation for operation, request_type in REQUEST_TYPES.items()}
 RESPONSE_TYPES = {
     Operation.PUT: ZMQRequestType.PUT_DATA_RESPONSE,
     Operation.GET: ZMQRequestType.GET_DATA_RESPONSE,
@@ -106,7 +107,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
 
     def handle_request(self, message):
         """Dispatch a ZMQ payload request and build its response."""
-        operation = Operation(message.request_type.name)
+        operation = OPERATIONS[message.request_type]
         body = dict(message.body)
         data = body.pop("data", None)
         try:

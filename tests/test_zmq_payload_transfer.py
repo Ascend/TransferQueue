@@ -18,6 +18,8 @@
 
 import asyncio
 import errno
+import gc
+import weakref
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -49,6 +51,51 @@ from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     ZMQSocketPool,
 )
+
+
+@pytest.mark.parametrize("metrics_enabled", [False, True])
+def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled):
+    from transfer_queue.metrics import TQMetricsExporter
+
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
+    heavy = MagicMock()
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.log_heavy_operation", heavy)
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    if metrics_enabled:
+        unit._metrics = TQMetricsExporter(role="storage")
+    try:
+        # A non-ZMQ backend invokes exactly this listen callback, without the worker loop.
+        handle = unit.payload_transfer._handle
+        handle(RequestHeader(Operation.PUT, {"global_indexes": [0]}), {"value": [torch.tensor([1])]})
+        _, data = handle(RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["value"]}), None)
+        torch.testing.assert_close(data["value"][0], torch.tensor([1]))
+        with pytest.raises(StorageRejected):
+            handle(RequestHeader(Operation.GET, {"global_indexes": [99], "fields": ["value"]}), None)
+        assert unit._requests_arrived == 3
+        assert unit._arrivals_by_op == {"PUT_DATA": 1, "GET_DATA": 2}
+        assert heavy.call_count == 2
+        assert all(call.args[3] is None and "phase=storage" in call.args[4] for call in heavy.call_args_list)
+        if metrics_enabled:
+            assert unit._metrics.request_total.labels(op_type="GET_DATA")._value.get() == 2
+            assert unit._metrics.request_errors_total.labels(op_type="GET_DATA")._value.get() == 1
+            hist = unit._metrics.request_duration.labels(op_type="GET_DATA")
+            assert sum(bucket.get() for bucket in hist._buckets) == 2
+        else:
+            assert unit._perf_monitor.success_counts["GET_DATA"] == 2
+    finally:
+        unit.shutdown()
+
+
+def test_storage_listen_callback_does_not_retain_owner(monkeypatch):
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    # Stop threads first, then check the finalizer's retained transport and callback.
+    unit.shutdown()
+    transfer, ref = unit.payload_transfer, weakref.ref(unit)
+    del unit
+    gc.collect()
+    assert ref() is None
+    assert transfer is not None
 
 
 @pytest.mark.asyncio
@@ -268,7 +315,9 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
     manager.storage_manager_id = "manager"
     manager.storage_unit_infos = {peer.id: peer}
-    manager._payload_peers = {peer.id: {"backend": "zmq", "address": peer}}
+    manager.config = {}
+    manager._payload_connections = {}
+    manager._payload_connect_locks = {}
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     manager.close = lambda: None
     merge = MagicMock(side_effect=lambda old, new: torch.cat([old, new]))
@@ -300,7 +349,7 @@ async def test_zmq_field_data_roundtrip(monkeypatch):
     pool = ZMQSocketPool(context, f"{STORAGE_MANAGER_IDENTITY_PREFIX}{uuid4().hex[:8]}", "put_get_socket", timeout=3)
     client = ZmqPayloadTransfer(owner_id="test-manager", pool=pool)
     try:
-        connection = await client.connect({"backend": "zmq", "address": unit.get_zmq_server_info()})
+        connection = await client.connect(unit.get_payload_peer_info())
         put = RequestHeader(Operation.PUT, {"global_indexes": [0]})
         _, ack = await client.request(connection, put, send={"value": [torch.tensor([1, 2])], "text": ["first"]})
         assert ack is None
@@ -326,7 +375,7 @@ async def test_zmq_field_data_roundtrip(monkeypatch):
             await client.request(connection, get, recv=(memoryview(bytearray(24)),))
         assert unit._arrivals_by_op["GET_DATA"] == 1
     finally:
-        await client.close()
+        client.shutdown()
         pool.close()
         context.term()
         unit.shutdown()

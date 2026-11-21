@@ -76,6 +76,7 @@ def test_unhandled_worker_exception_triggers_the_exit():
     """The whole point: a dead worker must take the process down, not linger unreachable."""
     unit = _unit()
     unit._metrics = None
+    unit._perf_monitor = MagicMock()
     unit._node_ip = "127.0.0.1"
     unit._inproc_addr = "inproc://worker_death_test"
     unit.zmq_context = MagicMock()
