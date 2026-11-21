@@ -54,8 +54,8 @@ logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
-# Attempts per storage-unit request, including the first. Each one must use a new connection: a
-# DEALER silently queues messages for a peer it never reached, so no timeout can catch that.
+# Attempts per storage-unit request, including the first. A timed-out payload
+# connection is evicted; ZMQ also discards the affected socket before retrying.
 TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3))
 
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
@@ -241,9 +241,8 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
-        self._payload_peers = {
-            unit_id: {"backend": "zmq", "address": info} for unit_id, info in self.storage_unit_infos.items()
-        }
+        self._payload_connections = {}
+        self._payload_connect_locks = {}
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
 
@@ -387,8 +386,8 @@ class AsyncSimpleStorageManager(StorageManager):
             operation: Operation name for logs, e.g. ``get`` or ``put``.
             target_storage_unit: Unit this request is routed to.
             request_context: Request shape, so both ends of a failure can be correlated.
-            make_request: Zero-arg callable returning a coroutine for one attempt. Must build a
-                new socket per call, which ``with_storage_unit_socket`` does.
+            make_request: Zero-arg callable returning a coroutine for one attempt. Payload
+                failures evict the connection; administrative RPC leases discard failed sockets.
             max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
                 for a request that must not be replayed.
         """
@@ -652,39 +651,68 @@ class AsyncSimpleStorageManager(StorageManager):
             )
         return field_schema
 
+    async def _get_payload_connection(self, key):
+        """Reuse a connection, serializing only the first handshake for each loop/peer."""
+        entry = self._payload_connections.get(key)
+        if entry is not None:
+            return entry
+        lock = self._payload_connect_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            entry = self._payload_connections.get(key)
+            if entry is not None:
+                return entry
+            _, target = key
+            peers = self.config.get("payload_peers")
+            peer = peers[target] if peers is not None else {
+                "backend": "zmq", "address": self.storage_unit_infos[target],
+            }
+            try:
+                connection = await asyncio.wait_for(
+                    self.payload_transfer.connect(peer), timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+                )
+            except asyncio.TimeoutError as exc:
+                raise TransferTimeout("payload connection timed out") from exc
+            # A new entry distinguishes reconnects even if the backend returns the same handle.
+            entry = (connection,)
+            self._payload_connections[key] = entry
+            return entry
+
     async def _request_payload(self, target, operation, body, *, data=None, recv=()):
         started = time.perf_counter()
+        key = (asyncio.get_running_loop(), target)
+        entry = None
         try:
-            connection = await self.payload_transfer.connect(self._payload_peers[target])
+            entry = await self._get_payload_connection(key)
             reply, response_data = await self.payload_transfer.request(
-                connection,
-                RequestHeader(operation, body),
-                send=data,
-                recv=recv,
+                entry[0], RequestHeader(operation, body), send=data, recv=recv,
             )
-        except TransferTimeout as exc:
-            verb = operation.name.lower()
-            size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {verb} at storage unit "
-                f"{target} ({self._describe_storage_unit(target)}){size}"
-            ) from exc
         except StorageRejected as exc:
             error = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
             raise error(
-                f"Failed to {operation.name.lower()} data on storage unit "
+                f"Failed to {operation.value.lower()} data on storage unit "
                 f"{target} ({self._describe_storage_unit(target)}): {exc}"
             ) from exc
-        except Exception as exc:
+        except BaseException as exc:
+            # A late failure must not evict a newer connection for the same peer.
+            if self._payload_connections.get(key) is entry:
+                self._payload_connections.pop(key, None)
+            if isinstance(exc, TransferTimeout):
+                size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+                raise StorageUnitTimeout(
+                    f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {operation.value.lower()} "
+                    f"at storage unit {target} ({self._describe_storage_unit(target)}){size}"
+                ) from exc
+            if not isinstance(exc, Exception):
+                raise
             raise RuntimeError(
-                f"Failed to {operation.name.lower()} data on storage unit "
+                f"Failed to {operation.value.lower()} data on storage unit "
                 f"{target} ({self._describe_storage_unit(target)}): {type(exc).__name__}: {exc}"
             ) from exc
 
         if data is not None:
             log_heavy_operation(
                 self.storage_manager_id,
-                operation.name.lower(),
+                operation.value.lower(),
                 time.perf_counter() - started,
                 reply.wire_bytes,
                 f"to {target} at {self._describe_storage_unit(target)} "
@@ -1258,6 +1286,8 @@ class AsyncSimpleStorageManager(StorageManager):
         transfer = getattr(self, "payload_transfer", None)
         if transfer is not None:
             transfer.shutdown()
+        getattr(self, "_payload_connections", {}).clear()
+        getattr(self, "_payload_connect_locks", {}).clear()
         # Before super(), which may destroy the context these sockets live on. Absent when
         # the base constructor raised (a failed handshake does), and __del__ still calls this.
         pool = getattr(self, "storage_rpc_pool", None)

@@ -1025,12 +1025,16 @@ class SimpleStorageUnit:
         self.worker_thread: Thread | None = None
 
         self._metrics: TQMetricsExporter | None = None
+        self._perf_monitor = IntervalPerfMonitor(caller_name=self.storage_unit_id)
 
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_unit_id)
+        # The existing ZMQ worker needs a wire adapter, not a PayloadTransfer API.
+        self._handle_zmq_payload = self.payload_transfer.handle_request
         self._init_zmq_socket()
-        self.payload_transfer.listen(
+        self.payload_peer_info = self.payload_transfer.listen(
             address=self.zmq_server_info,
-            handle=partial(handle_storage_request, self.storage_unit_id, self.storage_data),
+            # The finalizer retains the transfer, so its handler must not retain this unit.
+            handle=partial(type(self)._handle_payload, weakref.proxy(self)),
         )
         self._start_process_put_get()
 
@@ -1164,10 +1168,8 @@ class SimpleStorageUnit:
     def _worker_routine(self) -> None:
         """Worker thread for processing requests."""
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
-        perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
-
         try:
-            self._worker_loop(perf_monitor)
+            self._worker_loop(self._perf_monitor)
         except BaseException:
             logger.critical(
                 f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception.", exc_info=True
@@ -1243,6 +1245,29 @@ class SimpleStorageUnit:
         finally:
             worker_socket.close(linger=0)
 
+    def _record_arrival(self, operation: str) -> None:
+        self._requests_arrived += 1
+        self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
+
+    def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None):
+        """Observe local storage work regardless of the selected wire protocol."""
+        operation = header.operation
+        op_type = f"{operation.value}_DATA"
+        self._record_arrival(op_type)
+        monitor = self._metrics if self._metrics is not None else self._perf_monitor
+        started = time.perf_counter()
+        try:
+            with monitor.measure(op_type=op_type):
+                return handle_storage_request(self.storage_unit_id, self.storage_data, header, data)
+        finally:
+            if operation == Operation.GET:
+                # Wire size and serialization time remain the backend's responsibility.
+                log_heavy_operation(
+                    self.storage_unit_id, "get", time.perf_counter() - started, None,
+                    f"phase=storage samples={len(header.body.get('global_indexes', []))} "
+                    f"fields={list(header.body.get('fields', []))}",
+                )
+
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
         # Messages received from proxy: [identity, serialized_msg_frame1, ...]
@@ -1268,16 +1293,14 @@ class SimpleStorageUnit:
             return
 
         operation = request_msg.request_type
-        started = time.perf_counter()
 
         try:
-            self._requests_arrived += 1
-            self._arrivals_by_op[operation.name] = self._arrivals_by_op.get(operation.name, 0) + 1
+            if operation not in REQUEST_TYPES.values():
+                self._record_arrival(operation.name)
             logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
             if operation in REQUEST_TYPES.values():
-                with monitor.measure(op_type=operation.name):
-                    response_msg = self.payload_transfer.handle_request(request_msg)
+                response_msg = self._handle_zmq_payload(request_msg)
             elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="CLEAR_DATA"):
                     response_msg = self._handle_clear(request_msg)
@@ -1316,6 +1339,7 @@ class SimpleStorageUnit:
             )
 
         # A get data_parser can return a value that fails to encode; reply with an error so the sole worker lives.
+        started = time.perf_counter()
         try:
             response_frames = response_msg.serialize()
         except Exception as e:
@@ -1338,7 +1362,7 @@ class SimpleStorageUnit:
                     "get",
                     time.perf_counter() - started,
                     sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                    f"samples={len(request_msg.body.get('global_indexes', []))} "
+                    f"phase=serialize samples={len(request_msg.body.get('global_indexes', []))} "
                     f"fields={list(request_msg.body.get('fields', []))}",
                 )
         worker_socket.send_multipart([identity] + response_frames, copy=False)
@@ -1714,6 +1738,10 @@ class SimpleStorageUnit:
         endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
         logger.info(f"[{self.storage_unit_id}]: Prometheus metrics exporter started on {endpoint}")
         return endpoint
+
+    def get_payload_peer_info(self):
+        """Publish the selected backend's discovery information unchanged."""
+        return self.payload_peer_info
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get the ZMQ server information for this storage unit.
