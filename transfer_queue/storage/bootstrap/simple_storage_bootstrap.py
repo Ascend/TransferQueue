@@ -31,6 +31,7 @@
 from typing import Any
 from uuid import uuid4
 
+import ray
 from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
@@ -85,5 +86,9 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
+    peer_infos = ray.get([unit.get_payload_peer_info.remote() for unit in simple_storage_handles.values()])
+    conf.backend[backend_name].payload_peers = {
+        storage_zmq_info[name].id: peer for name, peer in zip(simple_storage_handles, peer_infos, strict=True)
+    }
 
     return simple_storage_handles

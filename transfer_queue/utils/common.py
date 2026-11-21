@@ -150,19 +150,22 @@ TQ_STORAGE_SLOW_REQUEST_SECONDS = float(os.environ.get("TQ_STORAGE_SLOW_REQUEST_
 TQ_STORAGE_LARGE_PAYLOAD_MB = float(os.environ.get("TQ_STORAGE_LARGE_PAYLOAD_MB", 256))
 
 
-def log_heavy_operation(component_id: str, operation: str, elapsed: float, payload_bytes: int, detail: str) -> None:
+def log_heavy_operation(
+    component_id: str, operation: str, elapsed: float, payload_bytes: int | None, detail: str,
+) -> None:
     """Warn about one slow or unusually large request; stay silent otherwise.
 
     Args:
         component_id: Storage manager or storage unit reporting the request.
         operation: Operation name, e.g. ``put`` or ``get``.
         elapsed: Wall time spent on the request, in seconds.
-        payload_bytes: Serialized size of the payload on the wire.
+        payload_bytes: Serialized wire size, or None when only storage work is observed.
         detail: Request shape, appended to the message verbatim.
     """
-    payload_mb = payload_bytes / 2**20
-    if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB:
+    payload_mb = payload_bytes / 2**20 if payload_bytes is not None else None
+    if elapsed < TQ_STORAGE_SLOW_REQUEST_SECONDS and (payload_mb is None or payload_mb < TQ_STORAGE_LARGE_PAYLOAD_MB):
         return
+    size = f" serialized_mb={payload_mb:.1f}" if payload_mb is not None else ""
     logger.warning(
-        f"[{component_id}]: heavy {operation} {detail} serialized_mb={payload_mb:.1f} elapsed={elapsed:.2f}s"
+        f"[{component_id}]: heavy {operation} {detail}{size} elapsed={elapsed:.2f}s"
     )
