@@ -1462,6 +1462,13 @@ class TestTransferQueueControllerCheckpoint:
 
         ray.get(new_controller.__ray_call__.remote(restore_checkpoint))
 
+        bad_ckpt_path = str(tmp_path / "bad_controller.pkl")
+        state["partitions"][partition_id].custom_meta = {metadata.global_indexes[0]: {"bad": torch.ones(1)}}
+        with open(bad_ckpt_path, "wb") as f:
+            pickle.dump(state, f)
+        with pytest.raises(RuntimeError, match="native MessagePack"):
+            ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
+
         # Verify partition state was restored
         partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))
         assert partition is not None
@@ -1593,6 +1600,10 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
         left, right = inserted.global_indexes
         tags = [{"score": 3}, {"source": ["rollout", 5, None], "limits": [-(2**63), 2**63 - 1]}]
         numpy_left, numpy_right = np.int64(left), np.int64(right)
+        for invalid in (torch.ones(1), np.int64(1), 2**70, range(2)):
+            bad = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=[{"bad": invalid}, {}])
+            with pytest.raises(ValueError, match="native MessagePack"):
+                await client.async_set_custom_meta(bad)
         inserted = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=tags)
         await client.async_set_custom_meta(inserted)
 

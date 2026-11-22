@@ -416,6 +416,7 @@ def kv_put(
     Raises:
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
+        ValueError: If `tag` is not a dict or contains values not serializable as native MessagePack
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
             Storage changes are not rolled back; overwrites of ready fields may remain visible.
@@ -477,6 +478,7 @@ def kv_batch_put(
         ValueError: When both ``fields`` and ``tags`` are empty.
         ValueError: When ``fields`` batch size mismatches key count.
         ValueError: When ``tags`` length mismatches key count.
+        ValueError: When ``tags`` contains non-dict entries or values not serializable as native MessagePack.
         ValueError: When ``keys`` contains duplicates.
         RuntimeError: When retrieved metadata size mismatches input key count.
         RuntimeError: When the controller fails to record the written data, e.g. on a dtype conflict.
@@ -909,6 +911,7 @@ async def async_kv_put(
     Raises:
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
+        ValueError: If `tag` is not a dict or contains values not serializable as native MessagePack
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
             Storage changes are not rolled back; overwrites of ready fields may remain visible.
@@ -931,6 +934,8 @@ async def async_kv_put(
         raise ValueError("Please provide at least one parameter of fields or tag.")
 
     tq_client = _maybe_create_tq_client()
+    if tag is not None:
+        tq_client.validate_tags([tag])
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -1019,6 +1024,7 @@ async def async_kv_batch_put(
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
         ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
+        ValueError: If `tags` contains non-dict entries or values not serializable as native MessagePack
         ValueError: If `keys` contains duplicates
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
@@ -1048,6 +1054,10 @@ async def async_kv_batch_put(
     _check_unique_keys(keys)
 
     tq_client = _maybe_create_tq_client()
+    if tags is not None:
+        if len(tags) != len(keys):
+            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
+        tq_client.validate_tags(tags)
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
@@ -1059,8 +1069,6 @@ async def async_kv_batch_put(
 
     # 2. register the user-specified tags to BatchMeta
     if tags is not None:
-        if len(tags) != len(keys):
-            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         batch_meta.update_custom_meta(tags)
 
     # 3. put data
@@ -1684,8 +1692,8 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
             linked to ``PUBLIC_PARTITION`` names a public key that does not exist.
         NotImplementedError: The storage backend is not SimpleStorage.
         FileNotFoundError: The dump is incomplete.
-        ValueError: The manifest or a row disagrees with the row index, or a linked public
-            field is not ready.
+        ValueError: The manifest or a row disagrees with the row index, a linked public
+            field is not ready, or a restored tag is not a dict of native MessagePack values.
     """
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")

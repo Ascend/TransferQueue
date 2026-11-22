@@ -463,6 +463,14 @@ _ENCODE_FALLBACK_ERRORS = (
 )
 
 
+def require_native_metadata(metadata: Any) -> None:
+    """Raise ``ValueError`` if ``metadata`` cannot be encoded as native MessagePack without custom hooks."""
+    try:
+        msgpack.encode(metadata)
+    except _ENCODE_FALLBACK_ERRORS as error:
+        raise ValueError(f"Controller metadata must be native MessagePack: {error}") from error
+
+
 def _is_pickle_fallback(frame: bytestr) -> bool:
     """Whether ``frame`` is the pickle fallback marker.
 

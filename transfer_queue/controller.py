@@ -2843,6 +2843,10 @@ class TransferQueueController:
             with open(path, "rb") as f:
                 state = pickle.load(f)
 
+            for partition in state["partitions"].values():
+                if partition.custom_meta:
+                    serial_utils.require_native_metadata(list(partition.custom_meta.values()))
+
             # TODO(0.2.0): Remove legacy checkpoint migration for list shapes and string dtypes.
             migrated_legacy_fields = False
             for partition_id, partition in state["partitions"].items():

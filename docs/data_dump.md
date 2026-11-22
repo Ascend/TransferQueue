@@ -23,7 +23,7 @@ read-only location.
 On export, the storage manager groups source indexes by their current storage
 owner and concurrently asks those units to write their records. Only units holding
 selected rows participate. Tensor storage is compacted during serialization, so a
-row view cannot include the rest of its original batch, including inside tags.
+row view cannot include the rest of its original batch.
 
 On SimpleStorage restore:
 

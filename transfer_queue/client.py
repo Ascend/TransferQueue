@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import asyncio
-import copy
 import os
 import threading
 import weakref
@@ -241,6 +240,13 @@ class AsyncTransferQueueClient:
         return response_msg
 
     # ==================== Basic API ====================
+    def validate_tags(self, tags: list[dict[str, Any]]) -> None:
+        """Validate that custom per-sample tags are dicts serializable as native MessagePack."""
+        if any(not isinstance(tag, dict) for tag in tags):
+            raise ValueError("Controller tags must be dicts")
+        if any(tags):
+            serial_utils.require_native_metadata(tags)
+
     @with_controller_socket
     async def async_get_meta(
         self,
@@ -338,6 +344,8 @@ class AsyncTransferQueueClient:
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
@@ -359,10 +367,11 @@ class AsyncTransferQueueClient:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
+        self.validate_tags(custom_meta)
         # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
         partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
         for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
-            partition_custom_meta[partition_id][index] = copy.deepcopy(tag) if tag else {}
+            partition_custom_meta[partition_id][index] = tag if tag else {}
 
         await self._request_controller(
             socket=socket,
@@ -426,7 +435,8 @@ class AsyncTransferQueueClient:
 
         Raises:
             ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
                 other rows link to: those stay read-only until no row links to them
 
@@ -491,6 +501,7 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        self.validate_tags(metadata.custom_meta)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -1458,6 +1469,7 @@ class AsyncTransferQueueClient:
         writes may be partial, and retrying is idempotent because keys keep their indexes.
 
         Raises:
+            ValueError: If restored tags contain non-dict entries or values not serializable as native MessagePack.
             RuntimeError: If the storage manager is not initialized, or a unit fails.
             NotImplementedError: If the storage backend does not support selective loads.
         """
@@ -1468,13 +1480,15 @@ class AsyncTransferQueueClient:
             )
         if not rows:
             return 0
+        tags = [row["tag"] for row in rows.values()]
+        self.validate_tags(tags)
         metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
         target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
         for shard in shards:
             for record in shard["records"]:
                 record["target_index"] = target_indexes[record["key"]]
         bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
-        metadata.update_custom_meta([row["tag"] for row in rows.values()])
+        metadata.update_custom_meta(tags)
         await self.async_set_custom_meta(metadata)
         return bytes_read
 
@@ -1758,6 +1772,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
                      before calling this method.
 
         Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
@@ -1822,7 +1838,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         Raises:
             ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
                 other rows link to: those stay read-only until no row links to them
 
