@@ -1566,3 +1566,34 @@ class TestFieldLinks:
 
         partition.link_fields([1], self._public(), 0, ["x"])
         assert partition.linked_by == {0: {1}}
+
+
+class TestMetadataInvariants:
+    """Regression tests for FieldMeta nested-schema collapse invariants."""
+
+    def test_remove_samples_keeps_nested_when_non_tensor_or_none_shape_remains(self):
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="mixed_nested")
+        t4 = {"dtype": "torch.float32", "shape": (4,), "is_nested": False, "is_non_tensor": False}
+        t8 = {"dtype": "torch.float32", "shape": (8,), "is_nested": False, "is_non_tensor": False}
+        non_tensor = {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}
+
+        assert partition.update_production_status([0], ["col"], {"col": t4})
+        assert partition.update_production_status([1], ["col"], {"col": t8})
+        assert partition.update_production_status([2], ["col"], {"col": non_tensor})
+        assert partition.field_metadata["col"].is_nested is True
+
+        partition.clear_data([1])
+        assert partition.field_metadata["col"].is_nested is True
+        assert partition.field_metadata["col"].shape is None
+
+        # Also ensure a nested column with None per-sample shape never collapses into regular shape=None.
+        none_nested = DataPartitionStatus(partition_id="none_nested")
+        assert none_nested.update_production_status(
+            [0],
+            ["col"],
+            {"col": {"dtype": None, "shape": None, "is_nested": True, "per_sample_shapes": {0: None}}},
+        )
+        none_nested.clear_data([99])
+        assert none_nested.field_metadata["col"].is_nested is True

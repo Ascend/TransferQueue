@@ -1630,3 +1630,95 @@ class TestTransferQueueControllerBadRequests:
             if sock is not None and not sock.closed:
                 sock.close(linger=0)
             ctx.term()
+
+    def test_controller_metadata_and_slot_ownership_invariants(self, ray_setup):
+        """Verify force_fetch unregistered fields, slot ownership, and duplicate KV keys."""
+        from transfer_queue.controller import PUBLIC_PARTITION
+
+        tq_controller = TransferQueueController.remote()
+
+        # 1. force_fetch and link return status 0 when requested fields include an unregistered column,
+        #    matching a previously registered-then-cleared column (history independence).
+        dst = ray.get(tq_controller.get_metadata.remote(["a", "missing"], "p_force", mode="insert", batch_size=1))
+        assert ray.get(
+            tq_controller.update_production_status.remote(
+                "p_force", dst.global_indexes, {"a": {"dtype": "torch.int64", "shape": (2,)}}
+            )
+        )
+        partial = ray.get(tq_controller.get_metadata.remote(["a", "missing"], "p_force", mode="force_fetch"))
+        assert partial.production_status.tolist() == [0]
+
+        pub = ray.get(tq_controller.kv_retrieve_meta.remote(["pub0"], PUBLIC_PARTITION, create=True))
+        assert ray.get(
+            tq_controller.update_production_status.remote(
+                PUBLIC_PARTITION, pub.global_indexes, {"shared": {"dtype": "torch.int64", "shape": (2,)}}
+            )
+        )
+        linked = ray.get(
+            tq_controller.link.remote(
+                dst.global_indexes, "p_force", pub.global_indexes, ["shared"], ["a", "shared", "missing"]
+            )
+        )
+        assert linked.production_status.tolist() == [0]
+
+        # 2. Clearing a slot rejects stale update_production_status / set_custom_meta so recycled
+        #    samples neither alias across partitions nor inherit ghost custom_meta.
+        p1 = ray.get(tq_controller.get_metadata.remote(["v"], "p1", mode="insert", batch_size=1))
+        recycled_idx = p1.global_indexes[0]
+        ray.get(tq_controller.clear_meta.remote([recycled_idx], ["p1"]))
+        ray.get(tq_controller.set_custom_meta.remote({"p1": {recycled_idx: {"ghost": True}}}))
+
+        p2 = ray.get(tq_controller.get_metadata.remote(["v"], "p2", mode="insert", batch_size=1))
+        assert p2.global_indexes == [recycled_idx]
+        assert (
+            ray.get(
+                tq_controller.update_production_status.remote(
+                    "p1", [recycled_idx], {"v": {"dtype": "torch.int64", "shape": (1,)}}
+                )
+            )
+            is False
+        )
+        assert recycled_idx not in ray.get(tq_controller.get_partition_snapshot.remote("p1")).global_indexes
+
+        ray.get(tq_controller.clear_meta.remote([recycled_idx], ["p2"]))
+        reused_p1 = ray.get(tq_controller.get_metadata.remote(["v"], "p1", mode="insert", batch_size=1))
+        assert reused_p1.global_indexes == [recycled_idx]
+        assert reused_p1.custom_meta == [{}]
+
+        # 3. Duplicate keys in kv_retrieve_meta(create=True) deduplicate; kv_link rejects duplicates.
+        dup = ray.get(tq_controller.kv_retrieve_meta.remote(["dup", "dup"], "p_dup", create=True))
+        assert dup.global_indexes[0] == dup.global_indexes[1]
+        assert len(ray.get(tq_controller.get_partition_index_range.remote("p_dup"))) == 1
+
+        pub_pair = ray.get(tq_controller.kv_retrieve_meta.remote(["pub1", "pub2"], PUBLIC_PARTITION, create=True))
+        assert ray.get(
+            tq_controller.update_production_status.remote(
+                PUBLIC_PARTITION, pub_pair.global_indexes, {"shared": {"dtype": "torch.int64", "shape": (2,)}}
+            )
+        )
+        with pytest.raises(ValueError, match="unique"):
+            ray.get(tq_controller.kv_link.remote(["dup", "dup"], "p_dup", ["pub1", "pub2"], ["shared"]))
+        assert ray.get(tq_controller.get_partition_snapshot.remote(PUBLIC_PARTITION)).linked_by == {}
+
+        # 4. Pre-allocated (reserved) rows returned by force_fetch accept set_custom_meta and
+        #    update_production_status, and once written are promoted out of pre_allocated_global_indexes.
+        pre_controller = TransferQueueController.options(
+            runtime_env={"env_vars": {"TQ_PRE_ALLOC_SAMPLE_NUM": "3"}}
+        ).remote()
+        inserted = ray.get(pre_controller.get_metadata.remote(["v"], "p_pre", mode="insert", batch_size=1))
+        ff = ray.get(pre_controller.get_metadata.remote(["v"], "p_pre", mode="force_fetch"))
+        assert ff.size == 3 and set(inserted.global_indexes).issubset(ff.global_indexes)
+
+        ray.get(pre_controller.set_custom_meta.remote({"p_pre": {idx: {"slot": idx} for idx in ff.global_indexes}}))
+        ff_tagged = ray.get(pre_controller.get_metadata.remote(["v"], "p_pre", mode="force_fetch"))
+        assert ff_tagged.custom_meta == [{"slot": idx} for idx in ff_tagged.global_indexes]
+
+        assert ray.get(
+            pre_controller.update_production_status.remote(
+                "p_pre", ff.global_indexes, {"v": {"dtype": "torch.int64", "shape": (1,)}}
+            )
+        )
+        snap = ray.get(pre_controller.get_partition_snapshot.remote("p_pre"))
+        assert snap.pre_allocated_global_indexes == set()
+        next_insert = ray.get(pre_controller.get_metadata.remote(["v"], "p_pre", mode="insert", batch_size=1))
+        assert set(next_insert.global_indexes).isdisjoint(ff.global_indexes)
