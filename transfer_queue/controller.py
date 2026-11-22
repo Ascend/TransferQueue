@@ -1135,12 +1135,12 @@ class TransferQueueController:
                     - Defaults to SequentialSampler for simple sequential sampling
                     - Example: sampler=GRPOGroupNSampler() (instance)
                     - Example: sampler=SequentialSampler (class)
-            polling_mode: Deprecated (removed in 0.2.0). Metadata fetches return an empty batch when unavailable.
+            polling_mode: Deprecated (removed in 0.2.1). Metadata fetches return an empty batch when unavailable.
         """
-        # TODO(0.2.0): Remove deprecated `polling_mode` parameter.
+        # TODO(0.2.1): Remove deprecated `polling_mode` parameter.
         if polling_mode is not None:
             warnings.warn(
-                "The `polling_mode` argument is deprecated and ignored, and will be removed in 0.2.0. "
+                "The `polling_mode` argument is deprecated and ignored, and will be removed in 0.2.1. "
                 "Remove it when creating the controller. "
                 "A metadata fetch returns an empty BatchMeta when no batch is available.",
                 FutureWarning,
@@ -2847,7 +2847,7 @@ class TransferQueueController:
                 if partition.custom_meta:
                     serial_utils.require_native_metadata(list(partition.custom_meta.values()))
 
-            # TODO(0.2.0): Remove legacy checkpoint migration for list shapes and string dtypes.
+            # TODO(0.2.1): Remove legacy checkpoint migration for list shapes and string dtypes.
             migrated_legacy_fields = False
             for partition_id, partition in state["partitions"].items():
                 for name, field_meta in partition.field_metadata.items():
@@ -2867,7 +2867,7 @@ class TransferQueueController:
                     f"Controller checkpoint {path!r} uses legacy FieldMeta formats "
                     "(dtype stored as str such as 'torch.int64' instead of torch.dtype, "
                     "or shape stored as list instead of tuple). Automatic migration is "
-                    "deprecated and will be removed in 0.2.0; "
+                    "deprecated and will be removed in 0.2.1; "
                     "call save_checkpoint() to re-save it in the current format.",
                     FutureWarning,
                     stacklevel=2,

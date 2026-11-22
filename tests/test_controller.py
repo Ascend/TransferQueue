@@ -1456,7 +1456,7 @@ class TestTransferQueueControllerCheckpoint:
         new_controller = TransferQueueController.remote()
 
         def restore_checkpoint(controller):
-            with pytest.warns(FutureWarning, match=r"will be removed in 0\.2\.0") as captured:
+            with pytest.warns(FutureWarning, match=r"will be removed in 0\.2\.1") as captured:
                 controller.load_checkpoint(ckpt_path)
             assert len(captured) == 1
 
