@@ -326,12 +326,12 @@ class FieldMeta:
             self.dtype = None
             self.per_sample_shapes.clear()
         else:
-            if self.is_nested:
+            if self.is_nested and not self.is_non_tensor and len(self.per_sample_shapes) == len(self.global_indexes):
                 # Check if all remaining shapes are the same
                 remaining_shapes = set(
                     tuple(shape) if isinstance(shape, list) else shape for shape in self.per_sample_shapes.values()
                 )
-                if len(remaining_shapes) == 1:
+                if len(remaining_shapes) == 1 and None not in remaining_shapes:
                     # All remaining samples have the same shape - update to non-nested
                     self.is_nested = False
                     self.shape = next(iter(remaining_shapes))
@@ -606,8 +606,10 @@ class DataPartitionStatus:
             # Update field metadata
             self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
 
-            # Save these global_indexes
+            # Save these global_indexes and promote any pre-allocated slots now holding data.
             self.global_indexes.update(global_indices)
+            if self.pre_allocated_global_indexes:
+                self.pre_allocated_global_indexes.difference_update(global_indices)
 
             # A written value replaces the link it lands on; KV puts refuse linked fields up front.
             self._drop_links(global_indices, field_names)
@@ -1292,6 +1294,16 @@ class TransferQueueController:
         if not partition:
             logger.error(f"Partition {partition_id} not found")
             return False
+        active = partition.global_indexes
+        if not active.issuperset(global_indexes):
+            reserved = partition.pre_allocated_global_indexes
+            unallocated = [idx for idx in global_indexes if idx not in active and idx not in reserved]
+            if unallocated:
+                logger.error(
+                    f"[{self.controller_id}]: Error updating production status for partition {partition_id}: "
+                    f"unallocated global_indexes {unallocated}"
+                )
+                return False
 
         success = partition.update_production_status(
             global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
@@ -1384,7 +1396,14 @@ class TransferQueueController:
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
             if partition:
-                partition.set_custom_meta(custom_meta)
+                active = partition.global_indexes
+                if custom_meta.keys() <= active:
+                    partition.set_custom_meta(custom_meta)
+                else:
+                    reserved = partition.pre_allocated_global_indexes
+                    owned_meta = {idx: meta for idx, meta in custom_meta.items() if idx in active or idx in reserved}
+                    if owned_meta:
+                        partition.set_custom_meta(owned_meta)
             else:
                 logger.warning(
                     f"set_custom_meta: partition {partition_id}' not found; "
@@ -1590,25 +1609,21 @@ class TransferQueueController:
             production_status = np.zeros(batch_size, dtype=np.int8)
         else:  # force_fetch
             production_status = np.zeros(batch_size, dtype=np.int8)
-            if partition.production_status is not None and data_fields:
-                field_indices = [
-                    partition.field_name_mapping.get(field_name)
-                    for field_name in data_fields
-                    if field_name in partition.field_name_mapping
-                ]
-                if field_indices:
-                    rows = np.fromiter(batch_global_indexes, dtype=np.int64, count=batch_size)
-                    in_range = rows < partition.production_status.shape[0]
-                    if in_range.any():
-                        row_idx = torch.from_numpy(rows[in_range])
-                        col_idx = torch.as_tensor(field_indices, dtype=torch.long)
-                        ready = (
-                            (partition.production_status[row_idx[:, None], col_idx] == 1)
-                            .all(dim=1)
-                            .to(torch.int8)
-                            .numpy()
-                        )
-                        production_status[in_range] = ready
+            if (
+                partition.production_status is not None
+                and data_fields
+                and all(field_name in partition.field_name_mapping for field_name in data_fields)
+            ):
+                field_indices = [partition.field_name_mapping[field_name] for field_name in data_fields]
+                rows = np.fromiter(batch_global_indexes, dtype=np.int64, count=batch_size)
+                in_range = rows < partition.production_status.shape[0]
+                if in_range.any():
+                    row_idx = torch.from_numpy(rows[in_range])
+                    col_idx = torch.as_tensor(field_indices, dtype=torch.long)
+                    ready = (
+                        (partition.production_status[row_idx[:, None], col_idx] == 1).all(dim=1).to(torch.int8).numpy()
+                    )
+                    production_status[in_range] = ready
 
         custom_meta_dict = partition.get_custom_meta(batch_global_indexes)
         custom_backend_meta = partition.get_field_custom_backend_meta(batch_global_indexes, data_fields)
@@ -1864,23 +1879,23 @@ class TransferQueueController:
                     f"They will be excluded from the retrieved BatchMeta."
                 )
             else:
-                # create non-exist keys
-                batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
+                # Deduplicate missing keys so duplicate entries in `keys` do not leak orphan slots.
+                unique_missing = list(dict.fromkeys(keys[i] for i in none_indexes))
+                batch_global_indexes = partition.activate_pre_allocated_indexes(len(unique_missing))
 
-                if len(batch_global_indexes) < len(none_indexes):
+                if len(batch_global_indexes) < len(unique_missing):
                     new_global_indexes = self.index_manager.allocate_indexes(
-                        partition_id, count=(len(none_indexes) - len(batch_global_indexes))
+                        partition_id, count=(len(unique_missing) - len(batch_global_indexes))
                     )
                     batch_global_indexes.extend(new_global_indexes)
 
-                # register global_indexes in partition
                 partition.global_indexes.update(batch_global_indexes)
 
-                # register key-global_indexes mapping in partition
-                for i in range(len(none_indexes)):
-                    global_indexes[none_indexes[i]] = batch_global_indexes[i]
-                    partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
-                    partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+                for key, global_idx in zip(unique_missing, batch_global_indexes, strict=True):
+                    partition.keys_mapping[key] = global_idx
+                    partition.revert_keys_mapping[global_idx] = key
+                for i in none_indexes:
+                    global_indexes[i] = partition.keys_mapping[keys[i]]
 
                 partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
@@ -2091,6 +2106,8 @@ class TransferQueueController:
             raise ValueError("keys must not be empty")
         if len(public_keys) != len(keys):
             raise ValueError(f"{len(public_keys)} public keys for {len(keys)} keys")
+        if len(set(keys)) != len(keys):
+            raise ValueError(f"keys must be unique, got {len(keys) - len(set(keys))} repeats")
         public = self._get_partition(PUBLIC_PARTITION)
         absent = sorted({k for k in public_keys if public is None or k not in public.keys_mapping})
         if absent:
