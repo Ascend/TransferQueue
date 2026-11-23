@@ -72,28 +72,38 @@ def initialize_mooncake_storage(conf: DictConfig) -> subprocess.Popen | dict | N
         return None
 
     # Try to kill existing mooncake_master processes before starting a new one to avoid potential conflicts
-    check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
-    if check.returncode == 0:
-        pids = check.stdout.strip().replace("\n", ", ")
+    masters = [
+        process
+        for process in psutil.process_iter(["name"])
+        if process.info["name"] == "mooncake_master" and process.pid != os.getpid()
+    ]
+    if masters:
+        pids = ", ".join(str(master.pid) for master in masters)
         logger.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
 
-        masters = []
-        for pid in check.stdout.split():
+        terminating = []
+        denied_pids = []
+        for master in masters:
             try:
-                master = psutil.Process(int(pid))
                 master.terminate()
-                masters.append(master)
+                terminating.append(master)
             except psutil.NoSuchProcess:
                 pass
+            except psutil.AccessDenied:
+                denied_pids.append(master.pid)
         # Sending SIGTERM is asynchronous; the new master must not race the old
         # HTTP metadata listener for its port. Escalate only these captured PIDs.
-        alive = _wait_for_master_exit(masters, timeout=10)
+        alive = _wait_for_master_exit(terminating, timeout=10)
         for master in alive:
             try:
                 master.kill()
             except psutil.NoSuchProcess:
                 pass
+            except psutil.AccessDenied:
+                denied_pids.append(master.pid)
         alive = _wait_for_master_exit(alive, timeout=5)
+        if denied_pids:
+            raise RuntimeError(f"Permission denied stopping existing mooncake_master processes (PIDs: {denied_pids}).")
         if alive:
             raise RuntimeError(f"Existing mooncake_master processes did not exit: {[p.pid for p in alive]}")
         logger.info("Existing mooncake_master processes have exited.")

@@ -3,10 +3,12 @@
 
 """A replacement master must wait for the previous listener to release its port."""
 
+import os
 import socket
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock, call
 
 import psutil
 import pytest
@@ -15,9 +17,69 @@ from omegaconf import OmegaConf
 from transfer_queue.storage.bootstrap import mooncake_bootstrap
 
 
+@pytest.fixture
+def config():
+    return OmegaConf.load(Path(__file__).resolve().parents[1] / "transfer_queue" / "config.yaml")
+
+
+@pytest.mark.parametrize("has_master", [False, True])
+def test_replacement_only_stops_named_masters(monkeypatch, config, has_master):
+    unrelated = Mock(pid=101, info={"name": "tail", "cmdline": ["tail", "-f", "/tmp/mooncake_master.log"]})
+    similarly_named = Mock(pid=102, info={"name": "mooncake_master_helper"})
+    current = Mock(pid=os.getpid(), info={"name": "mooncake_master"})
+    master = Mock(pid=103, info={"name": "mooncake_master"})
+    processes = [unrelated, similarly_named, current] + ([master] if has_master else [])
+    monkeypatch.setattr(mooncake_bootstrap.psutil, "process_iter", lambda attrs: iter(processes))
+    wait = Mock(return_value=[])
+    monkeypatch.setattr(mooncake_bootstrap, "_wait_for_master_exit", wait)
+    launch = Mock(side_effect=RuntimeError("Replacement boundary reached"))
+    monkeypatch.setattr(mooncake_bootstrap.subprocess, "Popen", launch)
+
+    with pytest.raises(RuntimeError, match="Replacement boundary reached"):
+        mooncake_bootstrap.initialize_mooncake_storage(config)
+
+    for process in [unrelated, similarly_named, current]:
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+    if has_master:
+        master.terminate.assert_called_once_with()
+        master.kill.assert_not_called()
+    else:
+        wait.assert_not_called()
+    launch.assert_called_once()
+
+
+@pytest.mark.parametrize("denied_signal", ["terminate", "kill"])
+@pytest.mark.parametrize("denied_first", [False, True])
+def test_access_denied_waits_for_signalled_masters(monkeypatch, config, denied_signal, denied_first):
+    master = Mock(pid=101, info={"name": "mooncake_master"})
+    denied = Mock(pid=102, info={"name": "mooncake_master"})
+    getattr(denied, denied_signal).side_effect = psutil.AccessDenied(pid=denied.pid)
+    masters = [denied, master] if denied_first else [master, denied]
+    monkeypatch.setattr(mooncake_bootstrap.psutil, "process_iter", lambda attrs: iter(masters))
+    signalled = [master] if denied_signal == "terminate" else masters
+    wait = Mock(side_effect=[signalled, [] if denied_signal == "terminate" else [denied]])
+    monkeypatch.setattr(mooncake_bootstrap, "_wait_for_master_exit", wait)
+    launch = Mock()
+    monkeypatch.setattr(mooncake_bootstrap.subprocess, "Popen", launch)
+
+    with pytest.raises(RuntimeError, match=f"Permission denied.*{denied.pid}"):
+        mooncake_bootstrap.initialize_mooncake_storage(config)
+
+    master.terminate.assert_called_once_with()
+    master.kill.assert_called_once_with()
+    denied.terminate.assert_called_once_with()
+    if denied_signal == "kill":
+        denied.kill.assert_called_once_with()
+    else:
+        denied.kill.assert_not_called()
+    assert wait.call_args_list == [call(signalled, timeout=10), call(signalled, timeout=5)]
+    launch.assert_not_called()
+
+
 @pytest.mark.parametrize("non_child", [False, True], ids=["own-child", "other-parent"])
 @pytest.mark.parametrize("ignore_term", [False, True], ids=["delayed-exit", "forced-exit"])
-def test_replacement_waits_for_old_listener(monkeypatch, ignore_term, non_child):
+def test_replacement_waits_for_old_listener(monkeypatch, config, ignore_term, non_child):
     if non_child and sys.platform != "linux":
         pytest.skip("Non-child zombie regression requires Linux")
     script = """
@@ -56,11 +118,8 @@ finally:
         else:
             master_pid, port = old.pid, int(old.stdout.readline())
         master = psutil.Process(master_pid)
-        monkeypatch.setattr(
-            mooncake_bootstrap.subprocess,
-            "run",
-            lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, stdout=f"{master_pid}\n"),
-        )
+        master.info = {"name": "mooncake_master"}
+        monkeypatch.setattr(mooncake_bootstrap.psutil, "process_iter", lambda attrs: iter([master]))
 
         def launch_replacement(*args, **kwargs):
             if non_child:
@@ -74,7 +133,6 @@ finally:
 
         monkeypatch.setattr(mooncake_bootstrap.subprocess, "Popen", launch_replacement)
         with pytest.raises(RuntimeError, match="Replacement boundary reached"):
-            config = OmegaConf.load(Path(__file__).resolve().parents[1] / "transfer_queue" / "config.yaml")
             mooncake_bootstrap.initialize_mooncake_storage(config)
     finally:
         old.stdin.close()
