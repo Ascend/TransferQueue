@@ -178,11 +178,12 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         >>> metadata = tq.get_meta(...)
         >>> data = tq.get_data(metadata)
     """
+    # TODO(0.2.1): Remove deprecated `controller.polling_mode` config handling.
     controller_conf = conf.get("controller") if conf is not None else None
     has_legacy_polling_mode = controller_conf is not None and "polling_mode" in controller_conf.keys()
     if has_legacy_polling_mode:
         warnings.warn(
-            "`controller.polling_mode` is deprecated and ignored. It will be removed in the next release. "
+            "`controller.polling_mode` is deprecated and ignored, and will be removed in 0.2.1. "
             "Remove this setting. "
             "A metadata fetch returns an empty BatchMeta when no batch is available.",
             FutureWarning,
@@ -199,6 +200,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
+    # TODO(0.2.1): Remove with `controller.polling_mode` deprecation above.
     if has_legacy_polling_mode:
         with open_dict(final_conf.controller):
             del final_conf.controller["polling_mode"]
@@ -394,7 +396,10 @@ def kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Optional metadata tag to associate with the key
+        tag: Optional ``str``-keyed metadata ``dict`` to associate with the key. Values
+             may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
+             ``list``, or nested ``str``-keyed ``dict``s; tensors, NumPy arrays or scalars,
+             tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -414,6 +419,7 @@ def kv_put(
     Raises:
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
+        ValueError: If `tag` is not a dict or contains values not serializable as native MessagePack
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
             Storage changes are not rolled back; overwrites of ready fields may remain visible.
@@ -460,7 +466,10 @@ def kv_batch_put(
         partition_id: Logical partition where the data will be stored.
         fields: TensorDict containing batched data for all keys. Must have ``batch_size == len(keys)``.
             If not provided, only the associated tags will be updated.
-        tags: List of metadata dictionaries, one per key.  Length must match the number of keys.
+        tags: List of ``str``-keyed metadata dictionaries, one per key (length must match
+            ``len(keys)``). Values may be ``None``, ``bool``, 64-bit ``int``, ``float``,
+            ``str``, ``bytes``, ``list``, or nested ``str``-keyed ``dict``s; tensors,
+            NumPy arrays or scalars, tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse raw reference data (e.g., URLs) into real content
             before storage. The input is a plain dict (not TensorDict) mapping field names to
             batched values. The parser  **must modify data in-place** without adding/removing
@@ -475,6 +484,7 @@ def kv_batch_put(
         ValueError: When both ``fields`` and ``tags`` are empty.
         ValueError: When ``fields`` batch size mismatches key count.
         ValueError: When ``tags`` length mismatches key count.
+        ValueError: When ``tags`` contains non-dict entries or values not serializable as native MessagePack.
         ValueError: When ``keys`` contains duplicates.
         RuntimeError: When retrieved metadata size mismatches input key count.
         RuntimeError: When the controller fails to record the written data, e.g. on a dtype conflict.
@@ -887,7 +897,10 @@ async def async_kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Optional metadata tag to associate with the key
+        tag: Optional ``str``-keyed metadata ``dict`` to associate with the key. Values
+             may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
+             ``list``, or nested ``str``-keyed ``dict``s; tensors, NumPy arrays or scalars,
+             tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -907,6 +920,7 @@ async def async_kv_put(
     Raises:
         ValueError: If neither fields nor tag is provided
         ValueError: If nested tensors are provided (use kv_batch_put instead)
+        ValueError: If `tag` is not a dict or contains values not serializable as native MessagePack
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
             Storage changes are not rolled back; overwrites of ready fields may remain visible.
@@ -929,6 +943,8 @@ async def async_kv_put(
         raise ValueError("Please provide at least one parameter of fields or tag.")
 
     tq_client = _maybe_create_tq_client()
+    if tag is not None:
+        tq_client.validate_tags([tag])
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -957,10 +973,10 @@ async def async_kv_put(
             raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
+        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
     else:
         # Directly update custom_meta (tag) to controller
-        await tq_client.async_set_custom_meta(batch_meta)
+        await tq_client.async_set_custom_meta(batch_meta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
@@ -997,7 +1013,10 @@ async def async_kv_batch_put(
         partition_id: Logical partition to store the data in
         fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
                 If not provided, will only update the newly given tags to the keys.
-        tags: List of metadata tags, one for each key
+        tags: List of ``str``-keyed metadata ``dict``s, one per key (length must match
+              ``len(keys)``). Values may be ``None``, ``bool``, 64-bit ``int``, ``float``,
+              ``str``, ``bytes``, ``list``, or nested ``str``-keyed ``dict``s; tensors,
+              NumPy arrays or scalars, tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -1017,6 +1036,7 @@ async def async_kv_batch_put(
     Raises:
         ValueError: If neither `fields` nor `tags` is provided
         ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
+        ValueError: If `tags` contains non-dict entries or values not serializable as native MessagePack
         ValueError: If `keys` contains duplicates
         RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
         RuntimeError: If the controller fails to record the written data, e.g. on a dtype conflict.
@@ -1046,6 +1066,10 @@ async def async_kv_batch_put(
     _check_unique_keys(keys)
 
     tq_client = _maybe_create_tq_client()
+    if tags is not None:
+        if len(tags) != len(keys):
+            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
+        tq_client.validate_tags(tags)
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
@@ -1057,17 +1081,15 @@ async def async_kv_batch_put(
 
     # 2. register the user-specified tags to BatchMeta
     if tags is not None:
-        if len(tags) != len(keys):
-            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
         batch_meta.update_custom_meta(tags)
 
     # 3. put data
     if fields is not None:
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser)
+        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
     else:
         # Directly update custom_meta (tags) to controller
-        await tq_client.async_set_custom_meta(batch_meta)
+        await tq_client.async_set_custom_meta(batch_meta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
@@ -1682,8 +1704,8 @@ def load_data_by_key(dump_dir: str | Path) -> dict[str, dict]:
             linked to ``PUBLIC_PARTITION`` names a public key that does not exist.
         NotImplementedError: The storage backend is not SimpleStorage.
         FileNotFoundError: The dump is incomplete.
-        ValueError: The manifest or a row disagrees with the row index, or a linked public
-            field is not ready.
+        ValueError: The manifest or a row disagrees with the row index, a linked public
+            field is not ready, or a restored tag is not a dict of native MessagePack values.
     """
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")

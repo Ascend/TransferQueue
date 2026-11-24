@@ -274,17 +274,16 @@ class ZMQMessage:
 
         try:
             result = decode(frames)
+            return cls(
+                request_type=ZMQRequestType(result["request_type"]),
+                sender_id=result["sender_id"],
+                receiver_id=result["receiver_id"],
+                body=result["body"],
+                request_id=result["request_id"],
+                timestamp=result["timestamp"],
+            )
         except Exception as e:
             raise ZMQMessageDecodeError(f"{type(e).__name__}: {e}; {describe_frames(frames)}") from e
-
-        return cls(
-            request_type=ZMQRequestType(result["request_type"]),
-            sender_id=result["sender_id"],
-            receiver_id=result["receiver_id"],
-            body=result["body"],
-            request_id=result["request_id"],
-            timestamp=result["timestamp"],
-        )
 
 
 def is_ipv6_address(ip: str) -> bool:

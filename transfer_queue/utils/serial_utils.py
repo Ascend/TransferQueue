@@ -20,7 +20,7 @@
 import pickle
 import struct
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from typing import Any, TypeAlias
@@ -33,6 +33,7 @@ import zmq
 from msgspec import msgpack
 from tensordict import TensorDictBase
 
+from transfer_queue.metadata import BatchMeta
 from transfer_queue.utils.logging_utils import get_logger
 
 CUSTOM_TYPE_PICKLE = 1
@@ -40,6 +41,7 @@ CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_TENSOR = 3  # For tensor with buffer reference
 CUSTOM_TYPE_NESTED_TENSOR = 4  # For nested tensor (strided or jagged)
 CUSTOM_TYPE_NUMPY = 5  # For numpy ndarray with buffer reference
+CUSTOM_TYPE_BATCH_META = 6  # Plain MessagePack metadata in the extension payload
 
 # 0xC1 is permanently reserved (invalid) in msgpack spec — safe to use as pickle fallback sentinel.
 _PICKLE_FALLBACK_SENTINEL = b"\xc1\xfe\xed"
@@ -60,7 +62,7 @@ _decoder_aux_buffers: ContextVar[Sequence[bytestr] | None] = ContextVar("decoder
 
 
 class MsgpackEncoder:
-    """Encoder with custom torch tensor and numpy array serialization.
+    """Encoder with custom tensor, NumPy array, and BatchMeta serialization.
 
     This implementation uses ContextVar for thread-safe buffer storage,
     allowing the global encoder instance to be safely used across multiple
@@ -119,6 +121,12 @@ class MsgpackEncoder:
                     pass
             # Only true object arrays (or structured dtypes with object fields) reach here
             return msgpack.Ext(CUSTOM_TYPE_PICKLE, pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL))
+
+        if isinstance(obj, BatchMeta):
+            try:
+                return msgpack.Ext(CUSTOM_TYPE_BATCH_META, msgpack.encode(_batch_meta_to_wire(obj)))
+            except _ENCODE_FALLBACK_ERRORS as e:
+                raise RuntimeError(f"Failed to encode BatchMeta as native MessagePack: {e}") from e
 
         if callable(obj):
             # cloudpickle for arbitrary callables (functions, lambdas, functools.partial,
@@ -237,7 +245,7 @@ class MsgpackEncoder:
 
 
 class MsgpackDecoder:
-    """Decoder with custom torch tensor and numpy array serialization.
+    """Decoder with custom tensor, NumPy array, and BatchMeta serialization.
 
     This implementation uses ContextVar for thread-safe buffer storage,
     allowing the global decoder instance to be safely used across multiple
@@ -265,14 +273,13 @@ class MsgpackDecoder:
             finally:
                 _decoder_aux_buffers.reset(token)
 
-        # Post-process to reconstruct TensorDict from marked dicts
         return self._reconstruct_special_types(result)
 
     def _reconstruct_special_types(self, obj: Any) -> Any:
-        """Recursively reconstruct special types (TensorDict) from their dict representation."""
+        """Recursively restore TensorDict from its marked dict representation."""
         if isinstance(obj, dict):
             # Check if this is a TensorDict marker
-            if obj.get("__tq_tensordict__"):
+            if obj.get("__tq_tensordict__") is True:
                 return self._reconstruct_tensordict(obj)
             # Recursively process dict values
             return {k: self._reconstruct_special_types(v) for k, v in obj.items()}
@@ -358,8 +365,81 @@ class MsgpackDecoder:
         if code == CUSTOM_TYPE_NUMPY:
             meta = pickle.loads(data)
             return self._decode_numpy(meta)
+        if code == CUSTOM_TYPE_BATCH_META:
+            return _batch_meta_from_wire(msgpack.decode(data))
 
         raise NotImplementedError(f"Extension type code {code} is not supported")
+
+
+def parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
+    """Resolve a Torch dtype or a name used in a schema or checkpoint."""
+    resolved = getattr(torch, dtype.removeprefix("torch."), None) if isinstance(dtype, str) else dtype
+    if not isinstance(resolved, torch.dtype):
+        # Report invalid schemas before the whole-message pickle fallback.
+        raise RuntimeError(f"Invalid Torch dtype {dtype!r} for field {field_name!r}")
+    return resolved
+
+
+def encode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Prepare a field schema with canonical dtype names."""
+    encoded = {}
+    for name, field in fields.items():
+        field = dict(field)
+        dtype = field.get("dtype")
+        if dtype is not None:
+            field["dtype"] = str(parse_torch_dtype(dtype, name)).removeprefix("torch.")
+        encoded[name] = field
+    return encoded
+
+
+def decode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Restore Torch dtypes and shape tuples while preserving per-sample indexing."""
+    decoded = {}
+    for name, field in fields.items():
+        field = dict(field)
+        dtype = field.get("dtype")
+        if dtype is not None:
+            field["dtype"] = parse_torch_dtype(dtype, name)
+        shape = field.get("shape")
+        if shape is not None:
+            field["shape"] = tuple(shape)
+        per_sample_shapes = field.get("per_sample_shapes")
+        if isinstance(per_sample_shapes, dict):
+            field["per_sample_shapes"] = {
+                index: tuple(shape) if shape is not None else None for index, shape in per_sample_shapes.items()
+            }
+        elif per_sample_shapes is not None:
+            field["per_sample_shapes"] = [tuple(shape) if shape is not None else None for shape in per_sample_shapes]
+        decoded[name] = field
+    return decoded
+
+
+def _batch_meta_to_wire(metadata: BatchMeta) -> dict[str, Any]:
+    wire: dict[str, Any] = {
+        "global_indexes": metadata.global_indexes,
+        "partition_ids": metadata.partition_ids,
+        "field_schema": encode_field_schema(metadata.field_schema),
+        "production_status": metadata.production_status.tobytes(),
+    }
+    if any(metadata.custom_meta):
+        wire["custom_meta"] = metadata.custom_meta
+    if any(metadata._custom_backend_meta):
+        wire["custom_backend_meta"] = metadata._custom_backend_meta
+    if any(metadata._links):
+        wire["links"] = metadata._links
+    return wire
+
+
+def _batch_meta_from_wire(wire: dict[str, Any]) -> BatchMeta:
+    return BatchMeta(
+        global_indexes=wire["global_indexes"],
+        partition_ids=wire["partition_ids"],
+        field_schema=decode_field_schema(wire["field_schema"]),
+        production_status=np.frombuffer(wire["production_status"], dtype=np.int8),
+        custom_meta=wire.get("custom_meta"),
+        _custom_backend_meta=wire.get("custom_backend_meta"),
+        _links=wire.get("links"),
+    )
 
 
 _encoder = MsgpackEncoder()
@@ -377,6 +457,65 @@ _ENCODE_FALLBACK_ERRORS = (
     RecursionError,
     msgspec.MsgspecError,
 )
+
+
+_SCALAR_METADATA_TYPES = {type(None), bool, float, str, bytes}
+
+
+def validate_metadata_dicts(rows: Iterable[Any], name: str = "metadata") -> None:
+    """Validate that ``rows`` are ``str``-keyed ``dict``s of lossless native MessagePack values."""
+    non_empty: list[dict[str, Any]] = []
+    stack: list[tuple[Any, bool]] = []
+    active: set[int] = set()
+    for row in rows:
+        if type(row) is not dict:
+            raise ValueError(f"{name} entries must be dicts, got {type(row).__name__}")
+        if not row:
+            continue
+        non_empty.append(row)
+        stack.append((row, True))
+        while stack:
+            cur, entering = stack.pop()
+            obj_id = id(cur)
+            if not entering:
+                active.remove(obj_id)
+                continue
+            if obj_id in active:
+                raise ValueError(f"{name} cannot contain circular references for native MessagePack")
+            if type(cur) is dict:
+                if cur.get("__tq_tensordict__") is True:
+                    raise ValueError(f"{name} dicts cannot set reserved marker '__tq_tensordict__': True")
+                for key in cur:
+                    if type(key) is not str:
+                        raise ValueError(
+                            f"{name} dict keys must be str for native MessagePack, got {type(key).__name__}"
+                        )
+                values: Iterable[Any] = cur.values()
+            else:
+                values = cur
+            has_nested = False
+            for value in values:
+                value_type = type(value)
+                if value_type in _SCALAR_METADATA_TYPES:
+                    continue
+                if value_type is int:
+                    if -(1 << 63) <= value < (1 << 64):
+                        continue
+                    raise ValueError(f"{name} int out of 64-bit native MessagePack range: {value}")
+                if value_type is list or value_type is dict:
+                    if value:
+                        if not has_nested:
+                            active.add(obj_id)
+                            stack.append((cur, False))
+                            has_nested = True
+                        stack.append((value, True))
+                    continue
+                raise ValueError(f"{name} values must be native MessagePack types, got {value_type.__name__}")
+    if non_empty:
+        try:
+            msgpack.encode(non_empty)
+        except _ENCODE_FALLBACK_ERRORS as error:
+            raise ValueError(f"{name} must be native MessagePack: {error}") from error
 
 
 def _is_pickle_fallback(frame: bytestr) -> bool:

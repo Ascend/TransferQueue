@@ -14,14 +14,20 @@
 # limitations under the License.
 
 import logging
+import pickle
 from uuid import uuid4
 
+import numpy as np
 import pytest
 import ray
 import torch
 import zmq
+from msgspec import msgpack
 
+from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.base import StorageManager
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1191,7 +1197,8 @@ class TestTransferQueueControllerKvInterface:
         # Clean up
         ray.get(tq_controller.clear_partition.remote(partition_id))
 
-    def test_controller_kv_prepare_update_reports_held_rows_from_field_metadata(self, ray_setup):
+    @pytest.mark.asyncio
+    async def test_kv_prepare_update_returns_native_schema_and_held_rows(self, ray_setup, monkeypatch):
         """Hidden cells count as held; new keys and fields the partition lacks do not."""
         tq_controller = TransferQueueController.remote()
         partition_id = "kv_prepare_update_test"
@@ -1199,17 +1206,31 @@ class TestTransferQueueControllerKvInterface:
             tq_controller.kv_retrieve_meta.remote(keys=["s0", "s1"], partition_id=partition_id, create=True)
         )
         s0, s1 = existing.global_indexes
-        response = {"response": {"dtype": torch.int64, "shape": (2,), "is_nested": False, "is_non_tensor": False}}
+        field_name = "__tq_tensordict__"
+        response = {field_name: {"dtype": "torch.long", "shape": (2,), "is_nested": False, "is_non_tensor": False}}
         prompt = {"prompt": {"dtype": torch.int64, "shape": (1,), "is_nested": False, "is_non_tensor": False}}
         ray.get(tq_controller.update_production_status.remote(partition_id, [s0], response, ready=False))
         ray.get(tq_controller.update_production_status.remote(partition_id, [s1], prompt))
 
-        metadata, merge_plan = ray.get(
-            tq_controller.kv_prepare_update.remote(["s0", "s1", "s2"], partition_id, ["response", "fresh"])
-        )
+        info = ray.get(tq_controller.get_zmq_server_info.remote())
+        client = AsyncTransferQueueClient("merge-plan-test", info)
+        request_controller = client._request_controller
+
+        async def check_wire_plan(*args, **kwargs):
+            reply = await request_controller(*args, **kwargs)
+            assert reply.body["merge_plan"][field_name]["dtype"] == "int64"
+            return reply
+
+        monkeypatch.setattr(client, "_request_controller", check_wire_plan)
+        try:
+            metadata, merge_plan = await client.async_kv_prepare_update(
+                ["s0", "s1", "s2"], partition_id, [field_name, "fresh"]
+            )
+        finally:
+            client.close()
 
         assert metadata.global_indexes[:2] == [s0, s1]
-        assert merge_plan["response"] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
+        assert merge_plan[field_name] == {"dtype": torch.int64, "is_non_tensor": False, "held": [True, False, False]}
         assert merge_plan["fresh"] == {"dtype": None, "is_non_tensor": None, "held": [False, False, False]}
 
         ray.get(tq_controller.clear_partition.remote(partition_id))
@@ -1385,8 +1406,7 @@ class TestTransferQueueControllerKvInterface:
 class TestTransferQueueControllerCheckpoint:
     """Tests for TransferQueueController save/load checkpoint functionality."""
 
-    def test_controller_checkpoint_round_trip(self, ray_setup, tmp_path):
-        """Save and load controller state; verify partition data is preserved."""
+    def test_controller_checkpoint_roundtrip(self, ray_setup, tmp_path):
         gbs = 4
         partition_id = "ckpt_partition"
         ckpt_path = str(tmp_path / "controller.pkl")
@@ -1405,7 +1425,11 @@ class TestTransferQueueControllerCheckpoint:
         )
         field_schema = {
             "prompt_ids": {"dtype": "torch.int64", "shape": (32,)},
-            "attention_mask": {"dtype": "torch.bool", "shape": (32,)},
+            "attention_mask": {
+                "dtype": "torch.bool",
+                "is_nested": True,
+                "per_sample_shapes": dict.fromkeys(metadata.global_indexes, (32,)),
+            },
         }
         ray.get(
             tq_controller.update_production_status.remote(
@@ -1415,19 +1439,43 @@ class TestTransferQueueControllerCheckpoint:
             )
         )
 
-        # Save checkpoint
+        # Save checkpoint and restore into a fresh controller
         ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
-        assert (tmp_path / "controller.pkl").exists()
-
-        # Create a fresh controller and restore
         new_controller = TransferQueueController.remote()
         ray.get(new_controller.load_checkpoint.remote(ckpt_path))
+
+        with open(ckpt_path, "rb") as f:
+            state = pickle.load(f)
+        bad_ckpt_path = str(tmp_path / "bad_controller.pkl")
+        gidx = metadata.global_indexes[0]
+        for attr, bad_entry in (
+            ("custom_meta", {gidx: {"bad": torch.ones(1)}}),
+            ("field_custom_backend_meta", {gidx: {"prompt_ids": {"bad": torch.ones(1)}}}),
+            ("links", {gidx: {"prompt_ids": np.int64(0)}}),
+        ):
+            state["partitions"][partition_id].custom_meta = {}
+            state["partitions"][partition_id].field_custom_backend_meta = {}
+            state["partitions"][partition_id].links = {}
+            setattr(state["partitions"][partition_id], attr, bad_entry)
+            with open(bad_ckpt_path, "wb") as f:
+                pickle.dump(state, f)
+            with pytest.raises(RuntimeError, match="native MessagePack"):
+                ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
 
         # Verify partition state was restored
         partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))
         assert partition is not None
         assert set(partition.global_indexes) == set(metadata.global_indexes)
         assert partition.production_status is not None
+        prompt_ids = partition.field_metadata["prompt_ids"]
+        attention_mask = partition.field_metadata["attention_mask"]
+        assert prompt_ids.dtype is torch.int64
+        assert prompt_ids.shape == (32,)
+        assert attention_mask.dtype is torch.bool
+        assert attention_mask.per_sample_shapes == dict.fromkeys(metadata.global_indexes, (32,))
+        assert ray.get(
+            new_controller.update_production_status.remote(partition_id, metadata.global_indexes, field_schema)
+        )
 
         index_range = ray.get(new_controller.get_partition_index_range.remote(partition_id))
         assert sorted(index_range) == sorted(metadata.global_indexes)
@@ -1507,6 +1555,95 @@ class TestControllerSocketBudget:
 
         assert budget > 1023, "the controller kept libzmq's default socket ceiling"
         assert budget == TQ_CONTROLLER_ZMQ_MAX_SOCKETS
+
+
+@pytest.mark.asyncio
+async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
+    """Round-trip tags and producer metadata through a live Controller."""
+    notified_backend_meta = []
+
+    class NotifyOnlyStorageManager(StorageManager):
+        async def put_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload write")
+
+        async def get_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload read")
+
+        async def clear_data(self, *args, **kwargs):
+            pytest.fail("Unexpected payload deletion")
+
+        async def _notify_and_wait(self, frames):
+            (frame,) = frames
+            body = msgpack.decode(frame)["body"]
+            assert body["field_schema"]["ids"]["dtype"] == "int64"
+            assert all(type(index) is int for index in body["global_indexes"])
+            assert all(type(index) is int for index in body["field_schema"]["ids"]["per_sample_shapes"])
+            assert all(type(index) is int for index in body["custom_backend_meta"])
+            notified_backend_meta.append(body["custom_backend_meta"])
+            return await super()._notify_and_wait(frames)
+
+    controller = TransferQueueController.remote()
+    info = ray.get(controller.get_zmq_server_info.remote())
+    client = AsyncTransferQueueClient("wire-test", info)
+    producer = NotifyOnlyStorageManager(info, {})
+    try:
+        partition_id = "native-wire"
+        keys = ["left", "right"]
+        inserted = await client.async_kv_retrieve_meta(keys, partition_id, create=True)
+        left, right = inserted.global_indexes
+        tags = [{"score": 3}, {"source": ["rollout", 5, None], "limits": [-(2**63), 2**63 - 1]}]
+        numpy_left, numpy_right = np.int64(left), np.int64(right)
+        for invalid in (torch.ones(1), np.int64(1), 2**70, range(2), {1, 2}, (1, 2)):
+            bad = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=[{"bad": invalid}, {}])
+            with pytest.raises(ValueError, match="native MessagePack"):
+                await client.async_set_custom_meta(bad)
+        with pytest.raises(ValueError, match="native MessagePack"):
+            await client.async_set_custom_meta(
+                BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=[{1: "a"}, {}])
+            )
+        inserted = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=tags)
+        await client.async_set_custom_meta(inserted)
+
+        assert (await client.async_kv_list(partition_id))[partition_id] == dict(zip(keys, tags, strict=True))
+        rows = (await client.async_kv_describe(keys, partition_id))["rows"]
+        assert [rows[key]["tag"] for key in keys] == tags
+
+        schema = {
+            "ids": {
+                "dtype": "torch.long",
+                "shape": None,
+                "is_nested": True,
+                "per_sample_shapes": [(2,), (4,)],
+            },
+        }
+        with pytest.raises(ValueError, match=r"per_sample_shapes length \(1\) does not match"):
+            await producer.notify_data_update(partition_id, [left, right], {"ids": {"per_sample_shapes": [(2,)]}})
+        backend_meta = {left: {"ids": {"n_chunks": 2}}, right: {"ids": "npu_tensor"}}
+        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
+        assert notified_backend_meta[-1] == backend_meta
+        partition = ray.get(controller.get_partition_snapshot.remote(partition_id))
+        assert partition.field_metadata["ids"].per_sample_shapes == {left: (2,), right: (4,)}
+
+        batch = await client.async_get_meta(["ids"], 2, partition_id, task_name="train")
+        assert batch.global_indexes == [left, right]
+        assert batch.is_ready
+        assert batch.get_dtypes("ids") == [torch.int64, torch.int64]
+        assert batch.get_shapes("ids") == [(2,), (4,)]
+        assert batch.custom_meta == tags
+        assert batch._custom_backend_meta == [backend_meta[left], backend_meta[right]]
+
+        inserted.clear_custom_meta()
+        await client.async_set_custom_meta(inserted)
+        assert await producer.notify_data_update(partition_id, [left, right], schema, {left: {"ids": None}})
+        assert notified_backend_meta[-1] == {left: {"ids": None}}
+
+        cleared = await client.async_kv_retrieve_meta(keys, partition_id)
+        assert cleared.custom_meta == [{}, {}]
+        assert cleared._custom_backend_meta == [{"ids": None}, backend_meta[right]]
+    finally:
+        producer.close()
+        client.close()
+        ray.kill(controller)
 
 
 class TestTransferQueueControllerBadRequests:
@@ -1699,6 +1836,16 @@ class TestTransferQueueControllerBadRequests:
         with pytest.raises(ValueError, match="unique"):
             ray.get(tq_controller.kv_link.remote(["dup", "dup"], "p_dup", ["pub1", "pub2"], ["shared"]))
         assert ray.get(tq_controller.get_partition_snapshot.remote(PUBLIC_PARTITION)).linked_by == {}
+        linked_dup = ray.get(
+            tq_controller.link.remote(
+                [np.int64(dup.global_indexes[0])],
+                "p_dup",
+                [np.int64(pub_pair.global_indexes[0])],
+                ["shared"],
+                ["shared"],
+            )
+        )
+        assert type(linked_dup._links[0]["shared"]) is int
 
         # 4. Pre-allocated (reserved) rows returned by force_fetch accept set_custom_meta and
         #    update_production_status, and once written are promoted out of pre_allocated_global_indexes.

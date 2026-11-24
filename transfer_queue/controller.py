@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import operator
 import os
 import pickle
 import time
@@ -38,6 +39,7 @@ from transfer_queue.metadata import (
     BatchMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -1134,11 +1136,12 @@ class TransferQueueController:
                     - Defaults to SequentialSampler for simple sequential sampling
                     - Example: sampler=GRPOGroupNSampler() (instance)
                     - Example: sampler=SequentialSampler (class)
-            polling_mode: Deprecated. A metadata fetch returns an empty batch when no batch is available.
+            polling_mode: Deprecated (removed in 0.2.1). Metadata fetches return an empty batch when unavailable.
         """
+        # TODO(0.2.1): Remove deprecated `polling_mode` parameter.
         if polling_mode is not None:
             warnings.warn(
-                "The `polling_mode` argument is deprecated and ignored. It will be removed in the next release. "
+                "The `polling_mode` argument is deprecated and ignored, and will be removed in 0.2.1. "
                 "Remove it when creating the controller. "
                 "A metadata fetch returns an empty BatchMeta when no batch is available.",
                 FutureWarning,
@@ -1289,7 +1292,6 @@ class TransferQueueController:
         Raises:
             ValueError: If a field's dtype conflicts with the partition's; metadata and readiness are unchanged.
         """
-        field_names = list(field_schema.keys())
         partition = self._get_partition(partition_id)
         if not partition:
             logger.error(f"Partition {partition_id} not found")
@@ -1305,6 +1307,8 @@ class TransferQueueController:
                 )
                 return False
 
+        field_schema = serial_utils.decode_field_schema(field_schema)
+        field_names = list(field_schema.keys())
         success = partition.update_production_status(
             global_indexes, field_names, field_schema, custom_backend_meta, ready=ready
         )
@@ -2155,6 +2159,8 @@ class TransferQueueController:
             raise ValueError(f"rows of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
         if not global_indexes:
             raise ValueError("rows must not be empty")
+        global_indexes = list(map(operator.index, global_indexes))
+        public_indexes = list(map(operator.index, public_indexes))
         if len(public_indexes) != len(global_indexes):
             raise ValueError(f"{len(public_indexes)} public rows for {len(global_indexes)} rows")
         if len(set(global_indexes)) != len(global_indexes):
@@ -2431,31 +2437,29 @@ class TransferQueueController:
 
             try:
                 response_msg: ZMQMessage | None = self._handle_request(request_msg, monitor)
+                if response_msg is None:
+                    logger.error(
+                        f"[{self.controller_id}]: no handler for request_type={request_msg.request_type} "
+                        f"from sender={request_msg.sender_id}; request {request_msg.request_id}"
+                    )
+                    response_msg = self._make_error_response(
+                        receiver_id=request_msg.sender_id,
+                        message=f"no handler for request_type {request_msg.request_type}",
+                    )
+                response_frames = response_msg.serialize()
             except Exception as e:
-                # A failing handler must not kill the loop (it used to terminate this
-                # thread) nor hang the requester, so report the failure back.
+                # Report errors from both the handler and response codec; the caller awaits a reply.
                 logger.exception(
-                    f"[{self.controller_id}]: handler for request_type={request_msg.request_type} "
+                    f"[{self.controller_id}]: request_type={request_msg.request_type} "
                     f"from sender={request_msg.sender_id} raised {type(e).__name__}: {e}"
                 )
                 response_msg = self._make_error_response(
                     receiver_id=request_msg.sender_id,
                     message=f"{request_msg.request_type} failed: {type(e).__name__}: {e}",
                 )
+                response_frames = response_msg.serialize()
 
-            if response_msg is None:
-                # No branch matched. Without this guard the reply below would send the
-                # previous iteration's response to an unrelated requester.
-                logger.error(
-                    f"[{self.controller_id}]: no handler for request_type={request_msg.request_type} "
-                    f"from sender={request_msg.sender_id}; request {request_msg.request_id}"
-                )
-                response_msg = self._make_error_response(
-                    receiver_id=request_msg.sender_id,
-                    message=f"no handler for request_type {request_msg.request_type}",
-                )
-
-            self.request_handle_socket.send_multipart([identity, *response_msg.serialize()])
+            self.request_handle_socket.send_multipart([identity, *response_frames])
 
     def _make_error_response(self, receiver_id: str | None, message: str) -> ZMQMessage:
         """Build a generic error reply so the requester raises instead of hanging on recv."""
@@ -2550,7 +2554,7 @@ class TransferQueueController:
             partition_id=partition_id,
             global_indexes=global_indexes,
             field_schema=params.get("field_schema", {}),
-            custom_backend_meta=params.get("custom_backend_meta", {}),
+            custom_backend_meta=params.get("custom_backend_meta"),
             ready=params.get("ready", True),
         ):
             raise RuntimeError(f"Failed to record data for partition {partition_id!r}; see the controller log")
@@ -2702,6 +2706,7 @@ class TransferQueueController:
     def _handle_kv_prepare_update_request(self, request_msg: ZMQMessage) -> ZMQMessage:
         params = request_msg.body
         metadata, merge_plan = self.kv_prepare_update(params["keys"], params["partition_id"], params["fields"])
+        merge_plan = serial_utils.encode_field_schema(merge_plan)
         return self._make_response(
             request_msg, ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE, {"metadata": metadata, "merge_plan": merge_plan}
         )
@@ -2780,7 +2785,8 @@ class TransferQueueController:
         params = request_msg.body
         partition = self._get_partition(params["partition_id"])
         if partition is not None:
-            partition.validate_field_schema(params["field_schema"])
+            field_schema = serial_utils.decode_field_schema(params["field_schema"])
+            partition.validate_field_schema(field_schema)
         return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
@@ -2839,6 +2845,16 @@ class TransferQueueController:
         try:
             with open(path, "rb") as f:
                 state = pickle.load(f)
+
+            for partition in state["partitions"].values():
+                if partition.custom_meta:
+                    serial_utils.validate_metadata_dicts(partition.custom_meta.values(), "custom_meta")
+                if partition.field_custom_backend_meta:
+                    serial_utils.validate_metadata_dicts(
+                        partition.field_custom_backend_meta.values(), "custom_backend_meta"
+                    )
+                if partition.links:
+                    serial_utils.validate_metadata_dicts(partition.links.values(), "links")
 
             self.controller_id = state["controller_id"]
             self.partitions = state["partitions"]

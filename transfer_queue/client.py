@@ -28,6 +28,7 @@ from transfer_queue.controller import PUBLIC_PARTITION
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -239,6 +240,10 @@ class AsyncTransferQueueClient:
         return response_msg
 
     # ==================== Basic API ====================
+    def validate_tags(self, tags: list[dict[str, Any]]) -> None:
+        """Validate that custom per-sample tags are ``str``-keyed ``dict``s of native MessagePack values."""
+        serial_utils.validate_metadata_dicts(tags, "tags")
+
     @with_controller_socket
     async def async_get_meta(
         self,
@@ -321,6 +326,8 @@ class AsyncTransferQueueClient:
         self,
         metadata: BatchMeta,
         socket: zmq.asyncio.Socket | None = None,
+        *,
+        _validate_tags: bool = True,
     ) -> None:
         """
         Asynchronously send custom metadata to the controller.
@@ -336,6 +343,8 @@ class AsyncTransferQueueClient:
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
@@ -351,23 +360,18 @@ class AsyncTransferQueueClient:
             raise RuntimeError("No controller registered")
 
         global_indexes = metadata.global_indexes
-        custom_meta = metadata.get_all_custom_meta()
+        custom_meta = metadata.custom_meta
 
-        if len(global_indexes) == 0 or len(custom_meta) == 0:
+        if not global_indexes or not custom_meta:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
-        # chunk metadata according to partition_ids
-        metadata_chunks = metadata.chunk_by_partition()
-
+        if _validate_tags:
+            self.validate_tags(custom_meta)
         # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
-        partition_custom_meta: dict[str, dict[int, dict]] = {pid: {} for pid in set(metadata.partition_ids)}
-
-        for meta in metadata_chunks:
-            custom_meta = meta.get_all_custom_meta()
-            partition_custom_meta[meta.partition_ids[0]].update(
-                {meta.global_indexes[i]: custom_meta[i] for i in range(len(custom_meta))}
-            )
+        partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
+        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
+            partition_custom_meta[partition_id][index] = tag if tag else {}
 
         await self._request_controller(
             socket=socket,
@@ -384,6 +388,8 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
+        *,
+        _validate_tags: bool = True,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
 
@@ -431,7 +437,8 @@ class AsyncTransferQueueClient:
 
         Raises:
             ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
                 other rows link to: those stay read-only until no row links to them
 
@@ -496,6 +503,8 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
+        if _validate_tags and not inserted:
+            self.validate_tags(metadata.custom_meta)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -516,7 +525,7 @@ class AsyncTransferQueueClient:
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata)
+        await self.async_set_custom_meta(metadata, _validate_tags=False)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -1085,7 +1094,8 @@ class AsyncTransferQueueClient:
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
-        return response_msg.body["metadata"], response_msg.body["merge_plan"]
+        merge_plan = serial_utils.decode_field_schema(response_msg.body["merge_plan"])
+        return response_msg.body["metadata"], merge_plan
 
     async def async_kv_clear_fields(self, keys: list[str], partition_id: str, fields: list[str]) -> None:
         """Clear fields of existing keys while keeping the keys, tags and consumption status.
@@ -1419,6 +1429,7 @@ class AsyncTransferQueueClient:
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
         """Reject incompatible destination fields before restoring payloads."""
+        field_schema = serial_utils.encode_field_schema(field_schema)
         await self._request_controller(
             socket=socket,
             request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
@@ -1461,6 +1472,7 @@ class AsyncTransferQueueClient:
         writes may be partial, and retrying is idempotent because keys keep their indexes.
 
         Raises:
+            ValueError: If restored tags contain non-dict entries or values not serializable as native MessagePack.
             RuntimeError: If the storage manager is not initialized, or a unit fails.
             NotImplementedError: If the storage backend does not support selective loads.
         """
@@ -1471,14 +1483,16 @@ class AsyncTransferQueueClient:
             )
         if not rows:
             return 0
+        tags = [row["tag"] for row in rows.values()]
+        self.validate_tags(tags)
         metadata = await self.async_kv_retrieve_meta(list(rows), partition_id, create=True)
         target_indexes = dict(zip(rows, metadata.global_indexes, strict=True))
         for shard in shards:
             for record in shard["records"]:
                 record["target_index"] = target_indexes[record["key"]]
         bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
-        metadata.update_custom_meta([row["tag"] for row in rows.values()])
-        await self.async_set_custom_meta(metadata)
+        metadata.update_custom_meta(tags)
+        await self.async_set_custom_meta(metadata, _validate_tags=False)
         return bytes_read
 
     # ==================== Checkpoint API ====================
@@ -1761,6 +1775,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
                      before calling this method.
 
         Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
@@ -1825,7 +1841,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         Raises:
             ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
+                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
             RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
                 other rows link to: those stay read-only until no row links to them
 

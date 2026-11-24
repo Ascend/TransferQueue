@@ -16,6 +16,7 @@
 import copy
 import dataclasses
 import itertools
+import operator
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -199,8 +200,11 @@ class BatchMeta:
         partition_ids: List of partition IDs corresponding to each sample.
         field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}.
         production_status: Vectorized production status, shape (B,) where B is batch size.
-        extra_info: Additional batch-level information.
-        custom_meta: Per-sample user-defined metadata, list aligned with global_indexes.
+        extra_info: Additional batch information omitted from the Controller's MessagePack payload.
+        custom_meta: Per-sample user-defined ``str``-keyed metadata ``dict``s aligned with
+            ``global_indexes``. Values sent to the Controller must be native MessagePack types
+            (``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``, ``list``, or
+            nested ``str``-keyed ``dict``s).
         _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
         _links: Per-sample {field: source global_index} for linked fields, list aligned with global_indexes.
     """
@@ -239,7 +243,7 @@ class BatchMeta:
         if _custom_backend_meta is None:
             _custom_backend_meta = []
 
-        self.global_indexes = list(global_indexes)
+        self.global_indexes = list(map(operator.index, global_indexes))
         self.partition_ids = list(partition_ids)
         self.field_schema = {k: dict(v) for k, v in field_schema.items()}
         self.extra_info = dict(extra_info)
@@ -432,7 +436,10 @@ class BatchMeta:
         """Update custom_meta with a list of dictionary of custom metadata.
 
         Args:
-            custom_meta: list of custom_meta dictionary (one per sample, in global_indexes order)
+            custom_meta: List of per-sample ``str``-keyed metadata ``dict``s (in
+                ``global_indexes`` order) containing native MessagePack values (``None``,
+                ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``, ``list``, or
+                nested ``str``-keyed ``dict``s).
 
         Raises:
             ValueError: If the length of custom_meta does not match the batch size
@@ -919,7 +926,8 @@ class KVBatchMeta:
     # keys of each sample
     keys: list[str] = dataclasses.field(default_factory=list)
 
-    # sample-level tags
+    # sample-level str-keyed metadata dicts of native MessagePack values
+    # (None, bool, 64-bit int, float, str, bytes, list, or nested str-keyed dicts)
     tags: list[dict] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch

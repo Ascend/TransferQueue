@@ -35,6 +35,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
+from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -260,10 +261,9 @@ class StorageManager(ABC):
                         f"per_sample_shapes length ({len(per_sample_shapes)}) does not match "
                         f"number of global_indexes ({len(global_indexes)}) for field '{field_name}'. "
                     )
-                field_copy["per_sample_shapes"] = {
-                    global_indexes[i]: per_sample_shapes[i] for i in range(len(global_indexes))
-                }
+                field_copy["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
             normalized_field_schema[field_name] = field_copy
+        normalized_field_schema = serial_utils.encode_field_schema(normalized_field_schema)
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
