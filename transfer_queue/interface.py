@@ -55,6 +55,7 @@ from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
+from transfer_queue.utils.checkpoint_utils import validate_checkpoint
 from transfer_queue.utils.common import ray_namespace
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
@@ -1585,8 +1586,13 @@ def load_checkpoint(
     if not metadata_path.exists():
         raise FileNotFoundError(f"{_METADATA_FILE} not found in {checkpoint_dir}")
 
-    with open(metadata_path) as f:
-        meta = json.load(f)
+    try:
+        with open(metadata_path) as f:
+            meta = json.load(f)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Invalid checkpoint metadata: {metadata_path}") from e
+    if not isinstance(meta, dict) or not isinstance(meta.get("storage_saved"), bool):
+        raise RuntimeError(f"Invalid checkpoint metadata: {metadata_path}")
 
     client = _maybe_create_tq_client()
 
@@ -1594,7 +1600,11 @@ def load_checkpoint(
     if not controller_path.exists():
         raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
 
-    if meta.get("storage_saved"):
+    if not meta["storage_saved"] and isinstance(client.storage_manager, AsyncSimpleStorageManager):
+        raise RuntimeError(f"SimpleStorage requires storage_saved=True in {metadata_path}")
+    if not validate_checkpoint(checkpoint_dir):
+        raise RuntimeError(f"Invalid controller checkpoint: {controller_path}")
+    if meta["storage_saved"]:
         client.load_storage_checkpoint(str(checkpoint_dir))
 
     client.load_controller_checkpoint(str(controller_path))

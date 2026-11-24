@@ -28,6 +28,7 @@ from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.controller import TQ_CONTROLLER_ZMQ_MAX_SOCKETS, TransferQueueController
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import StorageManager
+from transfer_queue.utils.checkpoint_utils import validate_checkpoint
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
@@ -1444,10 +1445,21 @@ class TestTransferQueueControllerCheckpoint:
         new_controller = TransferQueueController.remote()
         ray.get(new_controller.load_checkpoint.remote(ckpt_path))
 
-        with open(ckpt_path, "rb") as f:
+        bad_ckpt_dir = tmp_path / "bad_ckpt_dir"
+        bad_ckpt_dir.mkdir()
+        bad_ckpt_path = str(bad_ckpt_dir / "controller_state.pkl")
+        ray.get(tq_controller.clear_meta.remote([metadata.global_indexes[0]], [partition_id]))
+        ray.get(tq_controller.save_checkpoint.remote(bad_ckpt_path))
+        assert validate_checkpoint(bad_ckpt_dir) is False
+        for bad_meta in ("[]", "{}", '{"storage_saved": "true"}', '{"storage_saved": 1}', "{bad"):
+            (bad_ckpt_dir / "metadata.json").write_text(bad_meta)
+            assert validate_checkpoint(bad_ckpt_dir) is False
+        (bad_ckpt_dir / "metadata.json").write_text('{"storage_saved": true, "user_metadata": {}}')
+        assert validate_checkpoint(bad_ckpt_dir) is True
+
+        with open(bad_ckpt_path, "rb") as f:
             state = pickle.load(f)
-        bad_ckpt_path = str(tmp_path / "bad_controller.pkl")
-        gidx = metadata.global_indexes[0]
+        gidx = metadata.global_indexes[1]
         for attr, bad_entry in (
             ("custom_meta", {gidx: {"bad": torch.ones(1)}}),
             ("field_custom_backend_meta", {gidx: {"prompt_ids": {"bad": torch.ones(1)}}}),
@@ -1459,8 +1471,25 @@ class TestTransferQueueControllerCheckpoint:
             setattr(state["partitions"][partition_id], attr, bad_entry)
             with open(bad_ckpt_path, "wb") as f:
                 pickle.dump(state, f)
-            with pytest.raises(RuntimeError, match="native MessagePack"):
-                ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
+            assert validate_checkpoint(bad_ckpt_dir) is False
+
+        state["partitions"][partition_id].links = {}
+        fields = state["partitions"][partition_id].field_metadata
+        fields["prompt_ids"].dtype = "torch.int64"
+        with open(bad_ckpt_path, "wb") as f:
+            pickle.dump(state, f)
+        assert validate_checkpoint(bad_ckpt_dir) is False
+        fields["prompt_ids"].dtype = torch.int64
+        fields["prompt_ids"].shape = [32]
+        with open(bad_ckpt_path, "wb") as f:
+            pickle.dump(state, f)
+        assert validate_checkpoint(bad_ckpt_dir) is False
+        fields["prompt_ids"].shape = (32,)
+
+        state["sampler"] = "not_a_dict"
+        with open(bad_ckpt_path, "wb") as f:
+            pickle.dump(state, f)
+        assert validate_checkpoint(bad_ckpt_dir) is False
 
         # Verify partition state was restored
         partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))

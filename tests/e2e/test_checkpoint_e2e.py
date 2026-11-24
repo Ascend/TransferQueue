@@ -21,6 +21,7 @@ Run with:
 
 import json
 import os
+import pickle
 
 import pytest
 import ray
@@ -401,6 +402,49 @@ class TestCheckpointErrors:
 
         with pytest.raises(ValueError, match="count mismatch"):
             tq.load_checkpoint(checkpoint_dir)
+
+    def test_no_storage_overwrite_on_invalid_controller_checkpoint(self, tq_system, checkpoint_dir):
+        partition_id = "p_invalid_ctrl"
+        tq.kv_batch_put(
+            keys=["k0"],
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)}, batch_size=1),
+            tags=[{"step": 1}],
+        )
+        tq.save_checkpoint(checkpoint_dir)
+
+        live_ids = torch.tensor([[9, 9]])
+        tq.kv_batch_put(
+            keys=["k0"],
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": live_ids, "attention_mask": torch.ones(1, 2)}, batch_size=1),
+            tags=[{"step": 2}],
+        )
+
+        ctrl_path = checkpoint_dir / "controller_state.pkl"
+        with open(ctrl_path, "rb") as f:
+            state = pickle.load(f)
+        valid_custom_meta = dict(state["partitions"][partition_id].custom_meta)
+        gidx = next(iter(state["partitions"][partition_id].global_indexes))
+        state["partitions"][partition_id].custom_meta = {gidx: {"bad": torch.ones(1)}}
+        with open(ctrl_path, "wb") as f:
+            pickle.dump(state, f)
+        with pytest.raises(RuntimeError, match="Invalid controller checkpoint"):
+            tq.load_checkpoint(checkpoint_dir)
+        retrieved = tq.kv_batch_get(keys=["k0"], partition_id=partition_id, select_fields=["input_ids"])
+        _assert_tensor_equal(retrieved["input_ids"], live_ids)
+
+        # Restore valid controller_state.pkl and verify tampered metadata.json never skips storage restore.
+        state["partitions"][partition_id].custom_meta = valid_custom_meta
+        with open(ctrl_path, "wb") as f:
+            pickle.dump(state, f)
+        meta_path = checkpoint_dir / "metadata.json"
+        for bad_meta in ("{}", '{"storage_saved": false}'):
+            meta_path.write_text(bad_meta)
+            with pytest.raises(RuntimeError):
+                tq.load_checkpoint(checkpoint_dir)
+            retrieved = tq.kv_batch_get(keys=["k0"], partition_id=partition_id, select_fields=["input_ids"])
+            _assert_tensor_equal(retrieved["input_ids"], live_ids)
 
     def test_no_partial_state_on_failed_save(self, tq_system, tmp_path):
         # Define test data + Put

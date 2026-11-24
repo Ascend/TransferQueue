@@ -2846,16 +2846,6 @@ class TransferQueueController:
             with open(path, "rb") as f:
                 state = pickle.load(f)
 
-            for partition in state["partitions"].values():
-                if partition.custom_meta:
-                    serial_utils.validate_metadata_dicts(partition.custom_meta.values(), "custom_meta")
-                if partition.field_custom_backend_meta:
-                    serial_utils.validate_metadata_dicts(
-                        partition.field_custom_backend_meta.values(), "custom_backend_meta"
-                    )
-                if partition.links:
-                    serial_utils.validate_metadata_dicts(partition.links.values(), "links")
-
             self.controller_id = state["controller_id"]
             self.partitions = state["partitions"]
 

@@ -163,14 +163,16 @@ See [Save Order and Consistency](#save-order-and-consistency) above. Concurrent 
 The load sequence is:
 
 ```python
-if meta.get("storage_saved"):
-    client.load_storage_checkpoint(...)   # (1) storage restored first
-client.load_controller_checkpoint(...)    # (2) controller restored second
+if not validate_checkpoint(checkpoint_dir):          # (1) controller validated first
+    raise RuntimeError(...)
+if meta["storage_saved"]:
+    client.load_storage_checkpoint(...)              # (2) storage restored second
+client.load_controller_checkpoint(...)               # (3) controller restored third
 ```
 
-If step (1) partially succeeds and step (2) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
+If step (2) partially succeeds and step (3) fails, the system is left in a mixed state: some storage units hold checkpoint data while the controller still reflects its pre-restore state. There is no rollback path.
 
-**Workaround**: If `load_checkpoint` raises, call `tq.init()` again to reset the system to a clean state before retrying.
+**Workaround**: If `load_checkpoint` raises, call `tq.close()` and then `tq.init(config)` from the initializing process to recreate the actors in a clean state before retrying.
 
 ## Exporting selected keys
 
