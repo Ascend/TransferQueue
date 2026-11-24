@@ -459,60 +459,58 @@ _ENCODE_FALLBACK_ERRORS = (
 )
 
 
-_SCALAR_METADATA_TYPES = (type(None), bool, float, str, bytes)
-
-
-def _check_metadata_value(value: Any, name: str, active: set[int]) -> None:
-    value_type = type(value)
-    if value_type in _SCALAR_METADATA_TYPES:
-        return
-    if value_type is int:
-        if -(1 << 63) <= value < (1 << 64):
-            return
-        raise ValueError(f"{name} int out of 64-bit native MessagePack range: {value}")
-    if value_type is list:
-        obj_id = id(value)
-        if obj_id in active:
-            raise ValueError(f"{name} cannot contain circular references for native MessagePack")
-        active.add(obj_id)
-        try:
-            for item in value:
-                _check_metadata_value(item, name, active)
-        finally:
-            active.remove(obj_id)
-        return
-    if value_type is dict:
-        _check_metadata_dict(value, name, active)
-        return
-    raise ValueError(f"{name} values must be native MessagePack types, got {value_type.__name__}")
-
-
-def _check_metadata_dict(mapping: dict[Any, Any], name: str, active: set[int]) -> None:
-    if mapping.get("__tq_tensordict__") is True:
-        raise ValueError(f"{name} dicts cannot set reserved marker '__tq_tensordict__': True")
-    obj_id = id(mapping)
-    if obj_id in active:
-        raise ValueError(f"{name} cannot contain circular references for native MessagePack")
-    active.add(obj_id)
-    try:
-        for key, value in mapping.items():
-            if type(key) is not str:
-                raise ValueError(f"{name} dict keys must be str for native MessagePack, got {type(key).__name__}")
-            _check_metadata_value(value, name, active)
-    finally:
-        active.remove(obj_id)
+_SCALAR_METADATA_TYPES = {type(None), bool, float, str, bytes}
 
 
 def validate_metadata_dicts(rows: Iterable[Any], name: str = "metadata") -> None:
     """Validate that ``rows`` are ``str``-keyed ``dict``s of lossless native MessagePack values."""
-    active: set[int] = set()
     non_empty: list[dict[str, Any]] = []
+    stack: list[tuple[Any, bool]] = []
+    active: set[int] = set()
     for row in rows:
         if type(row) is not dict:
             raise ValueError(f"{name} entries must be dicts, got {type(row).__name__}")
-        if row:
-            _check_metadata_dict(row, name, active)
-            non_empty.append(row)
+        if not row:
+            continue
+        non_empty.append(row)
+        stack.append((row, True))
+        while stack:
+            cur, entering = stack.pop()
+            obj_id = id(cur)
+            if not entering:
+                active.remove(obj_id)
+                continue
+            if obj_id in active:
+                raise ValueError(f"{name} cannot contain circular references for native MessagePack")
+            if type(cur) is dict:
+                if cur.get("__tq_tensordict__") is True:
+                    raise ValueError(f"{name} dicts cannot set reserved marker '__tq_tensordict__': True")
+                for key in cur:
+                    if type(key) is not str:
+                        raise ValueError(
+                            f"{name} dict keys must be str for native MessagePack, got {type(key).__name__}"
+                        )
+                values: Iterable[Any] = cur.values()
+            else:
+                values = cur
+            has_nested = False
+            for value in values:
+                value_type = type(value)
+                if value_type in _SCALAR_METADATA_TYPES:
+                    continue
+                if value_type is int:
+                    if -(1 << 63) <= value < (1 << 64):
+                        continue
+                    raise ValueError(f"{name} int out of 64-bit native MessagePack range: {value}")
+                if value_type is list or value_type is dict:
+                    if value:
+                        if not has_nested:
+                            active.add(obj_id)
+                            stack.append((cur, False))
+                            has_nested = True
+                        stack.append((value, True))
+                    continue
+                raise ValueError(f"{name} values must be native MessagePack types, got {value_type.__name__}")
     if non_empty:
         try:
             msgpack.encode(non_empty)

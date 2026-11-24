@@ -326,6 +326,8 @@ class AsyncTransferQueueClient:
         self,
         metadata: BatchMeta,
         socket: zmq.asyncio.Socket | None = None,
+        *,
+        _validate_tags: bool = True,
     ) -> None:
         """
         Asynchronously send custom metadata to the controller.
@@ -364,7 +366,8 @@ class AsyncTransferQueueClient:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
 
-        self.validate_tags(custom_meta)
+        if _validate_tags:
+            self.validate_tags(custom_meta)
         # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
         partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
         for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
@@ -385,6 +388,8 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
+        *,
+        _validate_tags: bool = True,
     ) -> BatchMeta:
         """Asynchronously write data to storage units based on metadata.
 
@@ -498,7 +503,8 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
-        self.validate_tags(metadata.custom_meta)
+        if _validate_tags and not inserted:
+            self.validate_tags(metadata.custom_meta)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -519,7 +525,7 @@ class AsyncTransferQueueClient:
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata)
+        await self.async_set_custom_meta(metadata, _validate_tags=False)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -1486,7 +1492,7 @@ class AsyncTransferQueueClient:
                 record["target_index"] = target_indexes[record["key"]]
         bytes_read = await self.storage_manager.load_rows_by_index(partition_id, shards)
         metadata.update_custom_meta(tags)
-        await self.async_set_custom_meta(metadata)
+        await self.async_set_custom_meta(metadata, _validate_tags=False)
         return bytes_read
 
     # ==================== Checkpoint API ====================

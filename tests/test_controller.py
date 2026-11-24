@@ -953,18 +953,6 @@ class TestTransferQueueControllerCustomMeta:
 
         print("✓ Controller set custom_backend_meta via update_production_status correct")
 
-        with pytest.raises(ValueError, match="native MessagePack"):
-            ray.get(
-                tq_controller.update_production_status.remote(
-                    partition_id=partition_id,
-                    global_indexes=[0],
-                    field_schema=field_schema,
-                    custom_backend_meta={0: {"prompt_ids": {"bad": torch.ones(1)}}},
-                )
-            )
-        with pytest.raises(ValueError, match="native MessagePack"):
-            ray.get(tq_controller.set_custom_meta.remote({partition_id: {0: {"bad": torch.ones(1)}}}))
-
         # Now set custom_meta (per-sample metadata)
         # Format: {partition_id: {global_index: custom_meta_dict}}
         custom_meta = {

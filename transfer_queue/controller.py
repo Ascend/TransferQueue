@@ -1307,8 +1307,6 @@ class TransferQueueController:
                 )
                 return False
 
-        if custom_backend_meta:
-            serial_utils.validate_metadata_dicts(custom_backend_meta.values(), "custom_backend_meta")
         field_schema = serial_utils.decode_field_schema(field_schema)
         field_names = list(field_schema.keys())
         success = partition.update_production_status(
@@ -1398,9 +1396,6 @@ class TransferQueueController:
             ...     }
             ... })
         """
-
-        for custom_meta in partition_custom_meta.values():
-            serial_utils.validate_metadata_dicts(custom_meta.values(), "custom_meta")
 
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
