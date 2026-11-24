@@ -14,8 +14,8 @@ struct ControllerEngine {
     engine: Engine,
 }
 
-// Release the GIL via `py.detach` around worker startup/shutdown, snapshot serialization,
-// and checkpoint file I/O; fast in-memory metadata calls stay synchronous on the actor thread.
+// Release the GIL via `py.detach` before acquiring the controller state mutex or performing
+// worker lifecycle / checkpoint I/O so actor calls never block metrics or HTTP threads on the GIL.
 #[pymethods]
 impl ControllerEngine {
     #[new]
@@ -42,14 +42,14 @@ impl ControllerEngine {
         self.engine.ports()
     }
 
-    fn set_num_storage_units(&self, units: usize) -> PyResult<()> {
-        self.engine
-            .set_num_storage_units(units)
+    fn set_num_storage_units(&self, py: Python<'_>, units: usize) -> PyResult<()> {
+        py.detach(|| self.engine.set_num_storage_units(units))
             .map_err(runtime_err)
     }
 
-    fn list_partitions(&self) -> Vec<String> {
-        self.engine.list_partitions()
+    fn list_partitions(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        py.detach(|| self.engine.list_partitions())
+            .map_err(runtime_err)
     }
 
     fn partition_snapshot<'py>(
@@ -63,24 +63,34 @@ impl ControllerEngine {
         Ok(snapshot.map(|bytes| PyBytes::new(py, &bytes)))
     }
 
-    fn partition_index_range(&self, partition_id: &str) -> Vec<u64> {
-        self.engine.partition_index_range(partition_id)
-    }
-
-    fn mark_clearing(&self, global_indexes: Vec<u64>, partition_ids: Vec<String>) -> PyResult<()> {
-        self.engine
-            .mark_clearing(&global_indexes, &partition_ids)
+    fn partition_index_range(&self, py: Python<'_>, partition_id: &str) -> PyResult<Vec<u64>> {
+        py.detach(|| self.engine.partition_index_range(partition_id))
             .map_err(runtime_err)
     }
 
-    fn clear_meta(&self, global_indexes: Vec<u64>, partition_ids: Vec<String>) -> PyResult<()> {
-        self.engine
-            .clear_meta(&global_indexes, &partition_ids)
+    fn mark_clearing(
+        &self,
+        py: Python<'_>,
+        global_indexes: Vec<u64>,
+        partition_ids: Vec<String>,
+    ) -> PyResult<()> {
+        py.detach(|| self.engine.mark_clearing(&global_indexes, &partition_ids))
             .map_err(runtime_err)
     }
 
-    fn clear_partition(&self, partition_id: &str) {
-        self.engine.clear_partition(partition_id);
+    fn clear_meta(
+        &self,
+        py: Python<'_>,
+        global_indexes: Vec<u64>,
+        partition_ids: Vec<String>,
+    ) -> PyResult<()> {
+        py.detach(|| self.engine.clear_meta(&global_indexes, &partition_ids))
+            .map_err(runtime_err)
+    }
+
+    fn clear_partition(&self, py: Python<'_>, partition_id: &str) -> PyResult<()> {
+        py.detach(|| self.engine.clear_partition(partition_id))
+            .map_err(runtime_err)
     }
 
     #[pyo3(signature = (stale_keys=None))]
@@ -108,8 +118,9 @@ impl ControllerEngine {
             .map_err(runtime_err)
     }
 
-    fn enable_metrics(&self, buckets: Vec<f64>) {
-        self.engine.enable_metrics(buckets);
+    fn enable_metrics(&self, py: Python<'_>, buckets: Vec<f64>) -> PyResult<()> {
+        py.detach(|| self.engine.enable_metrics(buckets))
+            .map_err(runtime_err)
     }
 
     fn metrics_snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {

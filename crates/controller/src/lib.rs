@@ -4,6 +4,7 @@
 //! Native metadata request engine for TransferQueue.
 
 mod engine;
+mod log;
 mod state;
 mod transport;
 mod wire;

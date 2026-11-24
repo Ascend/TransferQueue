@@ -726,13 +726,14 @@ mod tests {
         );
         let refreshed = state.kv_retrieve_meta("train", &["s0"], false).unwrap();
         assert_eq!(refreshed.status, vec![1]);
-        let prompt_schema = field(&refreshed.schema, "prompt")
-            .unwrap()
-            .as_map()
+        let (_, prompt_schema) = refreshed
+            .schema
+            .iter()
+            .find(|(name, _)| name == "prompt")
             .unwrap();
         assert_eq!(
-            field(prompt_schema, "per_sample_shapes").unwrap(),
-            &Value::Array(vec![Value::Array(vec![6.into()])])
+            prompt_schema.sample_shapes.as_ref().unwrap(),
+            &vec![Some(vec![6])]
         );
 
         // `mark_unlinked_public` skips active links and never-linked `pub_staged`, reclaims orphaned `pub_used`

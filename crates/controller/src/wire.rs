@@ -1,14 +1,61 @@
 // Copyright 2026 The TransferQueue Team
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rmp::encode as msgpack;
 use rmpv::Value;
-use uuid::Uuid;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Result;
 
+// Matches `CUSTOM_TYPE_BATCH_META = 6` in `transfer_queue/utils/serial_utils.py`.
+pub(crate) const BATCH_META_EXT_CODE: i8 = 6;
+
+static NEXT_REPLY_ID: AtomicU64 = AtomicU64::new(1);
+
 pub(crate) type Map = Vec<(Value, Value)>;
+
+/// Pre-encoded native MessagePack value stored as an immutable reference-counted byte slice,
+/// avoiding recursive `rmpv::Value` clones under the state mutex and re-serialization on replies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RawMsgpack(Arc<[u8]>);
+
+impl RawMsgpack {
+    pub(crate) fn encode(value: &Value) -> std::result::Result<Self, String> {
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, value).map_err(|error| error.to_string())?;
+        Ok(Self(bytes.into()))
+    }
+
+    pub(crate) fn decode(&self) -> std::result::Result<Value, String> {
+        let mut slice = self.0.as_ref();
+        let value = rmpv::decode::read_value(&mut slice).map_err(|error| error.to_string())?;
+        if !slice.is_empty() {
+            return Err("trailing bytes in stored MessagePack metadata".into());
+        }
+        Ok(value)
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Serialize for RawMsgpack {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        serde_bytes::Bytes::new(&self.0).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawMsgpack {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        let bytes = serde_bytes::ByteBuf::deserialize(deserializer)?;
+        Ok(Self(bytes.into_vec().into()))
+    }
+}
 
 pub(crate) struct Request {
     pub(crate) request_type: String,
@@ -74,48 +121,140 @@ pub(crate) fn decode(frames: &[Vec<u8>]) -> std::result::Result<Request, String>
     })
 }
 
+pub(crate) struct FieldSchemaWire {
+    pub(crate) dtype: Option<String>,
+    pub(crate) shape: Option<Vec<u64>>,
+    pub(crate) nested: bool,
+    pub(crate) non_tensor: bool,
+    pub(crate) sample_shapes: Option<Vec<Option<Vec<u64>>>>,
+}
+
 #[derive(Default)]
 pub(crate) struct BatchMeta {
     pub(crate) partition_id: String,
     pub(crate) indexes: Vec<u64>,
-    pub(crate) schema: Map,
+    pub(crate) schema: Vec<(String, FieldSchemaWire)>,
     pub(crate) status: Vec<u8>,
-    pub(crate) backend_meta: Vec<Value>,
-    pub(crate) custom_meta: Vec<Value>,
-    pub(crate) links: Vec<Value>,
+    pub(crate) backend_meta: Vec<Vec<(String, RawMsgpack)>>,
+    pub(crate) custom_meta: Vec<Option<RawMsgpack>>,
+    pub(crate) links: Vec<Vec<(String, u64)>>,
 }
 
 impl BatchMeta {
-    pub(crate) fn encode(self) -> Result<Value> {
-        let mut metadata = vec![
-            (
-                "partition_ids".into(),
-                Value::Array(vec![self.partition_id.into(); self.indexes.len()]),
-            ),
-            (
-                "global_indexes".into(),
-                Value::Array(self.indexes.into_iter().map(Value::from).collect()),
-            ),
-            ("field_schema".into(), Value::Map(self.schema)),
-            ("production_status".into(), Value::Binary(self.status)),
-        ];
-        for (name, rows) in [
-            ("custom_meta", self.custom_meta),
-            ("custom_backend_meta", self.backend_meta),
-            ("links", self.links),
-        ] {
-            if rows
-                .iter()
-                .any(|row| row.as_map().is_some_and(|map| !map.is_empty()))
-            {
-                metadata.push((name.into(), Value::Array(rows)));
+    /// Stream this `BatchMeta` directly into `buf` as a MessagePack `Ext(6, ...)` frame without
+    /// allocating repeated `partition_id` strings or an intermediate payload `Vec<u8>`.
+    pub(crate) fn encode_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+        let header_pos = buf.len();
+        buf.extend_from_slice(&[0xc9, 0, 0, 0, 0, BATCH_META_EXT_CODE as u8]);
+        let payload_start = buf.len();
+
+        let has_custom = self.custom_meta.iter().any(Option::is_some);
+        let has_backend = self.backend_meta.iter().any(|row| !row.is_empty());
+        let has_links = self.links.iter().any(|row| !row.is_empty());
+        let map_len = 4 + u32::from(has_custom) + u32::from(has_backend) + u32::from(has_links);
+        msgpack::write_map_len(buf, map_len)?;
+
+        let row_count = u32::try_from(self.indexes.len())?;
+        msgpack::write_str(buf, "partition_ids")?;
+        msgpack::write_array_len(buf, row_count)?;
+        for _ in 0..self.indexes.len() {
+            msgpack::write_str(buf, &self.partition_id)?;
+        }
+
+        msgpack::write_str(buf, "global_indexes")?;
+        msgpack::write_array_len(buf, row_count)?;
+        for &index in &self.indexes {
+            msgpack::write_uint(buf, index)?;
+        }
+
+        msgpack::write_str(buf, "field_schema")?;
+        msgpack::write_map_len(buf, u32::try_from(self.schema.len())?)?;
+        for (name, schema) in &self.schema {
+            msgpack::write_str(buf, name)?;
+            let schema_len = 4 + u32::from(schema.sample_shapes.is_some());
+            msgpack::write_map_len(buf, schema_len)?;
+
+            msgpack::write_str(buf, "dtype")?;
+            match &schema.dtype {
+                Some(dtype) => msgpack::write_str(buf, dtype)?,
+                None => msgpack::write_nil(buf)?,
+            }
+
+            msgpack::write_str(buf, "shape")?;
+            write_shape(buf, schema.shape.as_deref())?;
+
+            msgpack::write_str(buf, "is_nested")?;
+            msgpack::write_bool(buf, schema.nested)?;
+
+            msgpack::write_str(buf, "is_non_tensor")?;
+            msgpack::write_bool(buf, schema.non_tensor)?;
+
+            if let Some(shapes) = &schema.sample_shapes {
+                msgpack::write_str(buf, "per_sample_shapes")?;
+                msgpack::write_array_len(buf, u32::try_from(shapes.len())?)?;
+                for shape in shapes {
+                    write_shape(buf, shape.as_deref())?;
+                }
             }
         }
-        let mut payload = Vec::new();
-        rmpv::encode::write_value(&mut payload, &Value::Map(metadata))?;
-        // The Python client uses extension 6 for native MessagePack BatchMeta.
-        Ok(Value::Ext(6, payload))
+
+        msgpack::write_str(buf, "production_status")?;
+        msgpack::write_bin(buf, &self.status)?;
+
+        if has_custom {
+            msgpack::write_str(buf, "custom_meta")?;
+            msgpack::write_array_len(buf, u32::try_from(self.custom_meta.len())?)?;
+            for entry in &self.custom_meta {
+                match entry {
+                    Some(raw) => buf.extend_from_slice(raw.as_bytes()),
+                    None => {
+                        msgpack::write_map_len(buf, 0)?;
+                    }
+                }
+            }
+        }
+
+        if has_backend {
+            msgpack::write_str(buf, "custom_backend_meta")?;
+            msgpack::write_array_len(buf, u32::try_from(self.backend_meta.len())?)?;
+            for row in &self.backend_meta {
+                msgpack::write_map_len(buf, u32::try_from(row.len())?)?;
+                for (name, raw) in row {
+                    msgpack::write_str(buf, name)?;
+                    buf.extend_from_slice(raw.as_bytes());
+                }
+            }
+        }
+
+        if has_links {
+            msgpack::write_str(buf, "links")?;
+            msgpack::write_array_len(buf, u32::try_from(self.links.len())?)?;
+            for row in &self.links {
+                msgpack::write_map_len(buf, u32::try_from(row.len())?)?;
+                for (name, source) in row {
+                    msgpack::write_str(buf, name)?;
+                    msgpack::write_uint(buf, *source)?;
+                }
+            }
+        }
+
+        let payload_len = u32::try_from(buf.len() - payload_start)?;
+        buf[header_pos + 1..header_pos + 5].copy_from_slice(&payload_len.to_be_bytes());
+        Ok(())
     }
+}
+
+fn write_shape(buf: &mut Vec<u8>, shape: Option<&[u64]>) -> Result<()> {
+    match shape {
+        Some(dims) => {
+            msgpack::write_array_len(buf, u32::try_from(dims.len())?)?;
+            for &dim in dims {
+                msgpack::write_uint(buf, dim)?;
+            }
+        }
+        None => msgpack::write_nil(buf)?,
+    }
+    Ok(())
 }
 
 pub(crate) enum Body {
@@ -142,30 +281,62 @@ impl Reply {
     }
 
     pub(crate) fn encode(self, controller_id: &str) -> Result<Vec<u8>> {
-        let body = match self.body {
-            Body::Fields(fields) => fields,
-            Body::Metadata(batch, mut fields) => {
-                fields.push(("metadata".into(), batch.encode()?));
-                fields
-            }
-        };
-        let request_id = Uuid::new_v4().simple().to_string();
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs_f64();
-        let message = Value::Map(vec![
-            ("request_type".into(), self.kind.into()),
-            ("sender_id".into(), controller_id.into()),
-            (
-                "receiver_id".into(),
-                self.receiver.map_or(Value::Nil, Value::from),
-            ),
-            ("request_id".into(), request_id[..8].into()),
-            ("timestamp".into(), timestamp.into()),
-            ("body".into(), Value::Map(body)),
-        ]);
-        let mut frame = Vec::new();
-        rmpv::encode::write_value(&mut frame, &message)?;
+        let request_id = next_reply_id();
+        let mut frame = Vec::with_capacity(256);
+
+        msgpack::write_map_len(&mut frame, 6)?;
+        msgpack::write_str(&mut frame, "request_type")?;
+        msgpack::write_str(&mut frame, self.kind)?;
+
+        msgpack::write_str(&mut frame, "sender_id")?;
+        msgpack::write_str(&mut frame, controller_id)?;
+
+        msgpack::write_str(&mut frame, "receiver_id")?;
+        match &self.receiver {
+            Some(receiver) => msgpack::write_str(&mut frame, receiver)?,
+            None => msgpack::write_nil(&mut frame)?,
+        }
+
+        msgpack::write_str(&mut frame, "request_id")?;
+        let id_str = std::str::from_utf8(&request_id).expect("hex digits are ASCII");
+        msgpack::write_str(&mut frame, id_str)?;
+
+        msgpack::write_str(&mut frame, "timestamp")?;
+        msgpack::write_f64(&mut frame, timestamp)?;
+
+        msgpack::write_str(&mut frame, "body")?;
+        match self.body {
+            Body::Fields(fields) => {
+                msgpack::write_map_len(&mut frame, u32::try_from(fields.len())?)?;
+                for (key, value) in fields {
+                    rmpv::encode::write_value(&mut frame, &key)?;
+                    rmpv::encode::write_value(&mut frame, &value)?;
+                }
+            }
+            Body::Metadata(batch, extra) => {
+                msgpack::write_map_len(&mut frame, u32::try_from(extra.len() + 1)?)?;
+                msgpack::write_str(&mut frame, "metadata")?;
+                batch.encode_into(&mut frame)?;
+                for (key, value) in extra {
+                    rmpv::encode::write_value(&mut frame, &key)?;
+                    rmpv::encode::write_value(&mut frame, &value)?;
+                }
+            }
+        }
         Ok(frame)
     }
+}
+
+fn next_reply_id() -> [u8; 8] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let seq = NEXT_REPLY_ID.fetch_add(1, Ordering::Relaxed) as u32;
+    let mut out = [0u8; 8];
+    for (idx, slot) in out.iter_mut().enumerate() {
+        let shift = (7 - idx) * 4;
+        *slot = HEX[((seq >> shift) & 0x0f) as usize];
+    }
+    out
 }
 
 pub(crate) fn handshake(frames: &[Vec<u8>]) -> Reply {
@@ -179,7 +350,7 @@ pub(crate) fn handshake(frames: &[Vec<u8>]) -> Reply {
             Some(request.sender_id),
             format!("no handler for request type {}", request.request_type),
         ),
-        Err(error) => Reply::error(None, error),
+        Err(error) => Reply::error(None, format!("undecodable request: {error}")),
     }
 }
 
@@ -271,20 +442,23 @@ mod tests {
     }
 
     #[test]
-    fn batch_meta_ext6_omits_empty_maps_and_encodes_non_empty_rows() {
+    fn batch_meta_ext6_omits_empty_maps_and_streams_non_empty_rows() {
         let empty_rows = BatchMeta {
             partition_id: "train".into(),
             indexes: vec![7],
             schema: vec![],
             status: vec![1],
-            backend_meta: vec![Value::Map(vec![])],
-            custom_meta: vec![Value::Map(vec![])],
-            links: vec![Value::Map(vec![])],
+            backend_meta: vec![vec![]],
+            custom_meta: vec![None],
+            links: vec![vec![]],
         };
-        let Value::Ext(code, payload) = empty_rows.encode().unwrap() else {
+        let mut raw_ext = Vec::new();
+        empty_rows.encode_into(&mut raw_ext).unwrap();
+        let mut ext_reader = raw_ext.as_slice();
+        let Value::Ext(code, payload) = rmpv::decode::read_value(&mut ext_reader).unwrap() else {
             panic!("expected Ext");
         };
-        assert_eq!(code, 6);
+        assert_eq!(code, BATCH_META_EXT_CODE);
         let mut slice = payload.as_slice();
         let Value::Map(fields) = rmpv::decode::read_value(&mut slice).unwrap() else {
             panic!("expected map");
@@ -295,12 +469,24 @@ mod tests {
 
         let populated = BatchMeta {
             partition_id: "train".into(),
-            indexes: vec![7],
-            schema: vec![],
-            status: vec![1],
+            indexes: vec![7, 9],
+            schema: vec![(
+                "ids".into(),
+                FieldSchemaWire {
+                    dtype: Some("int64".into()),
+                    shape: Some(vec![4]),
+                    nested: false,
+                    non_tensor: false,
+                    sample_shapes: None,
+                },
+            )],
+            status: vec![1, 1],
             backend_meta: vec![],
-            custom_meta: vec![Value::Map(vec![("step".into(), 3.into())])],
-            links: vec![Value::Map(vec![("prompt".into(), 0.into())])],
+            custom_meta: vec![
+                Some(RawMsgpack::encode(&Value::Map(vec![("step".into(), 3.into())])).unwrap()),
+                None,
+            ],
+            links: vec![vec![("prompt".into(), 0)], vec![]],
         };
         let reply = Reply {
             receiver: Some("client-1".into()),
@@ -312,6 +498,7 @@ mod tests {
         let Value::Map(envelope) = rmpv::decode::read_value(&mut frame_slice).unwrap() else {
             panic!("expected reply map");
         };
+        assert_eq!(text(&envelope, "request_id").unwrap().len(), 8);
         let body = field(&envelope, "body").unwrap().as_map().unwrap();
         let Some(Value::Ext(6, ext_bytes)) = field(body, "metadata") else {
             panic!("expected metadata Ext(6)");
@@ -320,8 +507,14 @@ mod tests {
         let Value::Map(meta_map) = rmpv::decode::read_value(&mut ext_slice).unwrap() else {
             panic!("expected metadata map");
         };
-        assert_eq!(list(&meta_map, "custom_meta").unwrap().len(), 1);
-        assert_eq!(list(&meta_map, "links").unwrap().len(), 1);
+        assert_eq!(
+            list(&meta_map, "partition_ids").unwrap(),
+            &[Value::from("train"), Value::from("train")]
+        );
+        let custom = list(&meta_map, "custom_meta").unwrap();
+        assert_eq!(custom.len(), 2);
+        assert_eq!(custom[1], Value::Map(vec![]));
+        assert_eq!(list(&meta_map, "links").unwrap().len(), 2);
         assert!(field(&meta_map, "custom_backend_meta").is_none());
     }
 }

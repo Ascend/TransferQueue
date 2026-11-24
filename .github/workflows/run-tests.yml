@@ -37,6 +37,7 @@ jobs:
         pip install "mooncake-transfer-engine-non-cuda>=0.3.13"
     - name: Run Unit Tests
       run: |
+        ulimit -n 65536 || true
         pytest tests --ignore=tests/e2e
 
   e2e-tests:
@@ -65,6 +66,7 @@ jobs:
         pip install "mooncake-transfer-engine-non-cuda>=0.3.13"
     - name: Run SimpleStorage E2E Tests
       run: |
+        ulimit -n 65536 || true
         pytest tests/e2e
     - name: Run MooncakeStore Backend Specific E2E Tests
       run: |

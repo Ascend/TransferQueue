@@ -13,6 +13,14 @@ use crate::Result;
 use crate::state::ControllerState;
 use crate::transport::Sockets;
 
+pub(crate) fn lock_state(
+    state: &Mutex<ControllerState>,
+) -> std::result::Result<MutexGuard<'_, ControllerState>, String> {
+    state
+        .lock()
+        .map_err(|_| "Controller state poisoned after an internal panic".to_owned())
+}
+
 pub struct ControllerEngine {
     ports: (u16, u16),
     state: Arc<Mutex<ControllerState>>,
@@ -34,7 +42,7 @@ impl ControllerEngine {
         let worker_state = Arc::clone(&state);
         let stopping = Arc::new(AtomicBool::new(false));
         let worker_stopping = Arc::clone(&stopping);
-        let (ready, ports) = mpsc::sync_channel(1);
+        let (ready, started) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name("tq-controller".into())
             .spawn(move || {
@@ -42,7 +50,7 @@ impl ControllerEngine {
                 ready.send(sockets.ports())?;
                 sockets.run(&worker_stopping, &controller_id, &worker_state)
             })?;
-        let Ok(ports) = ports.recv() else {
+        let Ok(ports) = started.recv() else {
             join(worker)?;
             return Err(io::Error::other("Controller exited before reporting its ports").into());
         };
@@ -60,43 +68,44 @@ impl ControllerEngine {
     }
 
     pub fn set_num_storage_units(&self, units: usize) -> Result<()> {
-        self.lock_state()
+        self.state_guard()?
             .set_num_storage_units(units)
             .map_err(io::Error::other)
             .map_err(Into::into)
     }
 
-    pub fn list_partitions(&self) -> Vec<String> {
-        self.lock_state().list_partitions()
+    pub fn list_partitions(&self) -> Result<Vec<String>> {
+        Ok(self.state_guard()?.list_partitions())
     }
 
     pub fn partition_snapshot(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.lock_state()
+        self.state_guard()?
             .partition_snapshot(name)
             .map_err(io::Error::other)
             .map_err(Into::into)
     }
 
-    pub fn partition_index_range(&self, name: &str) -> Vec<u64> {
-        self.lock_state().partition_index_range(name)
+    pub fn partition_index_range(&self, name: &str) -> Result<Vec<u64>> {
+        Ok(self.state_guard()?.partition_index_range(name))
     }
 
     pub fn mark_clearing(&self, indexes: &[u64], partitions: &[String]) -> Result<()> {
-        self.lock_state()
+        self.state_guard()?
             .mark_clearing_rows(indexes, partitions)
             .map_err(io::Error::other)
             .map_err(Into::into)
     }
 
     pub fn clear_meta(&self, indexes: &[u64], partitions: &[String]) -> Result<()> {
-        self.lock_state()
+        self.state_guard()?
             .clear_meta_rows(indexes, partitions)
             .map_err(io::Error::other)
             .map_err(Into::into)
     }
 
-    pub fn clear_partition(&self, name: &str) {
-        self.lock_state().clear_partition(name);
+    pub fn clear_partition(&self, name: &str) -> Result<()> {
+        self.state_guard()?.clear_partition(name);
+        Ok(())
     }
 
     pub fn mark_unlinked_public_clearing(
@@ -105,15 +114,14 @@ impl ControllerEngine {
     ) -> Result<(Vec<u8>, Vec<String>)> {
         let stale: Option<Vec<&str>> =
             stale_keys.map(|keys| keys.iter().map(String::as_str).collect());
-        let (metadata, keys) = self.lock_state().mark_unlinked_public(stale.as_deref());
+        let (metadata, keys) = self.state_guard()?.mark_unlinked_public(stale.as_deref());
         let mut frame = Vec::new();
-        rmpv::encode::write_value(&mut frame, &metadata.encode()?)?;
+        metadata.encode_into(&mut frame)?;
         Ok((frame, keys))
     }
 
     pub fn save_checkpoint(&self, path: &str) -> Result<()> {
-        self.lock_state()
-            .save_checkpoint(path)
+        ControllerState::save_checkpoint_unlocked(&self.state, path)
             .map_err(io::Error::other)
             .map_err(Into::into)
     }
@@ -126,26 +134,18 @@ impl ControllerEngine {
     }
 
     pub fn load_checkpoint(&self, path: &str) -> Result<()> {
-        let units = self.lock_state().num_storage_units();
-        let restored =
-            ControllerState::read_checkpoint(path, Some(units)).map_err(io::Error::other)?;
-        let mut state = self.lock_state();
-        if state.num_storage_units() != units {
-            return Err(io::Error::other(
-                "Rust Controller checkpoint has a different number of storage units",
-            )
-            .into());
-        }
-        state.install_checkpoint(restored);
+        ControllerState::load_checkpoint_unlocked(&self.state, path)
+            .map_err(io::Error::other)
+            .map_err(Into::into)
+    }
+
+    pub fn enable_metrics(&self, buckets: Vec<f64>) -> Result<()> {
+        self.state_guard()?.enable_metrics(buckets);
         Ok(())
     }
 
-    pub fn enable_metrics(&self, buckets: Vec<f64>) {
-        self.lock_state().enable_metrics(buckets);
-    }
-
     pub fn metrics_snapshot(&self) -> Result<Vec<u8>> {
-        let snapshot = Value::Map(self.lock_state().metrics_snapshot());
+        let snapshot = Value::Map(self.state_guard()?.metrics_snapshot());
         let mut frame = Vec::new();
         rmpv::encode::write_value(&mut frame, &snapshot)?;
         Ok(frame)
@@ -153,14 +153,16 @@ impl ControllerEngine {
 
     pub fn close(&mut self) -> Result<()> {
         if let Some(worker) = self.worker.take() {
-            self.stopping.store(true, Ordering::Relaxed);
+            self.stopping.store(true, Ordering::Release);
             join(worker)?;
         }
         Ok(())
     }
 
-    fn lock_state(&self) -> MutexGuard<'_, ControllerState> {
-        self.state.lock().expect("controller state poisoned")
+    fn state_guard(&self) -> Result<MutexGuard<'_, ControllerState>> {
+        lock_state(&self.state)
+            .map_err(io::Error::other)
+            .map_err(Into::into)
     }
 }
 

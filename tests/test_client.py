@@ -447,7 +447,10 @@ def client_setup(mock_controller, mock_storage):
         client.storage_manager.get_data = mock_get_data
         client.storage_manager.clear_data = mock_clear_data
 
-    yield client, mock_controller, mock_storage
+    try:
+        yield client, mock_controller, mock_storage
+    finally:
+        client.close()
 
 
 # Test basic functionality

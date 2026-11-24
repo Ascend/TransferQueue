@@ -32,6 +32,9 @@ impl PartitionState {
                 for &name in fields {
                     backend.remove(name);
                 }
+                if backend.is_empty() {
+                    self.backend_meta.remove(&index);
+                }
             }
         }
         for name in fields {
@@ -103,17 +106,16 @@ impl ControllerState {
                     .keys
                     .iter()
                     .map(|(key, index)| {
-                        let tag = partition
-                            .custom_meta
-                            .get(index)
-                            .cloned()
-                            .unwrap_or_else(|| Value::Map(Vec::new()));
-                        (key.as_str().into(), tag)
+                        let tag = match partition.custom_meta.get(index) {
+                            Some(raw) => raw.decode()?,
+                            None => Value::Map(Vec::new()),
+                        };
+                        Ok((key.as_str().into(), tag))
                     })
-                    .collect();
-                (name.as_str().into(), Value::Map(keys))
+                    .collect::<StateResult<Vec<_>>>()?;
+                Ok((name.as_str().into(), Value::Map(keys)))
             })
-            .collect();
+            .collect::<StateResult<Vec<_>>>()?;
         let message = match requested {
             Some(name) if !self.partitions.contains_key(name) => {
                 format!("partition {name} does not exist")
@@ -202,11 +204,10 @@ impl ControllerState {
                 }
                 None => Vec::new(),
             };
-            let tag = partition
-                .custom_meta
-                .get(&index)
-                .cloned()
-                .unwrap_or_else(|| Value::Map(Vec::new()));
+            let tag = match partition.custom_meta.get(&index) {
+                Some(raw) => raw.decode()?,
+                None => Value::Map(Vec::new()),
+            };
             let unfinalized = present
                 .iter()
                 .filter(|(_, ready)| !ready)

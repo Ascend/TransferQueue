@@ -8,7 +8,7 @@ metrics:
   port: 0
 
 controller:
-  # Select python or rust. The Rust controller uses SequentialSampler.
+  # Select python or rust. The Rust controller uses built-in FIFO sampling and ignores controller.sampler.
   backend: python
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
   sampler: SequentialSampler

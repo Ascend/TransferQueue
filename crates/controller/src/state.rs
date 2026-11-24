@@ -1,7 +1,7 @@
 // Copyright 2026 The TransferQueue Team
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 use indexmap::IndexMap;
 use rmpv::Value;
@@ -15,11 +15,13 @@ mod metrics;
 
 use links::PUBLIC_PARTITION;
 
-use crate::wire::{BatchMeta, Body, Map, Request, field, list, text};
+use crate::wire::{BatchMeta, Body, FieldSchemaWire, Map, RawMsgpack, Request, field, list, text};
 
 type GlobalIndex = u64;
 type LocalRow = usize;
 type StateResult<T> = Result<T, String>;
+
+const UNASSIGNED_SEQ: u64 = u64::MAX;
 
 // Dense bitset indexed by partition-local row (`row / 64`, bit `row % 64`) rather than sparse
 // `GlobalIndex`, enabling 64-way bitwise readiness/consumption scans without tensor allocations.
@@ -33,6 +35,13 @@ impl Bitmap {
 
     fn get(&self, row: LocalRow) -> bool {
         self.word(row / 64) & (1 << (row % 64)) != 0
+    }
+
+    fn highest_set(&self) -> Option<LocalRow> {
+        self.0
+            .iter()
+            .rposition(|&word| word != 0)
+            .map(|word_idx| word_idx * 64 + 63 - self.0[word_idx].leading_zeros() as usize)
     }
 
     fn swap_remove(&mut self, row: LocalRow, last: LocalRow) {
@@ -142,30 +151,20 @@ impl FieldSchema {
         })
     }
 
-    fn snapshot(&self, indexes: &[GlobalIndex]) -> Value {
-        let mut schema = vec![
-            (
-                "dtype".into(),
-                self.dtype.as_deref().map_or(Value::Nil, Value::from),
-            ),
-            ("shape".into(), shape_value(self.shape.as_ref())),
-            ("is_nested".into(), self.nested.into()),
-            ("is_non_tensor".into(), self.non_tensor.into()),
-        ];
-        if self.nested && !self.sample_shapes.is_empty() {
-            schema.push((
-                "per_sample_shapes".into(),
-                Value::Array(
-                    indexes
-                        .iter()
-                        .map(|index| {
-                            shape_value(self.sample_shapes.get(index).and_then(Option::as_ref))
-                        })
-                        .collect(),
-                ),
-            ));
+    fn wire_snapshot(&self, indexes: &[GlobalIndex]) -> FieldSchemaWire {
+        let sample_shapes = (self.nested && !self.sample_shapes.is_empty()).then(|| {
+            indexes
+                .iter()
+                .map(|index| self.sample_shapes.get(index).cloned().flatten())
+                .collect()
+        });
+        FieldSchemaWire {
+            dtype: self.dtype.clone(),
+            shape: self.shape.clone(),
+            nested: self.nested,
+            non_tensor: self.non_tensor,
+            sample_shapes,
         }
-        Value::Map(schema)
     }
 }
 
@@ -179,12 +178,6 @@ fn parse_shape(value: &Value) -> StateResult<Option<Vec<u64>>> {
             .map(Some),
         _ => Err("shape must be an array".into()),
     }
-}
-
-fn shape_value(shape: Option<&Vec<u64>>) -> Value {
-    shape.map_or(Value::Nil, |dims| {
-        Value::Array(dims.iter().copied().map(Value::from).collect())
-    })
 }
 
 // `present` tracks rows holding any stored value (including unfinalized `kv_update` writes), while
@@ -265,23 +258,30 @@ impl FieldState {
 }
 
 // Maps cluster-wide `GlobalIndex` slots onto dense partition-local rows (`0..indexes.len()`) so
-// bitmaps stay compact even when global indexes are sparse. `clear_data` compacts freed rows in
-// O(1) via `swap_remove`, while `fetch` and `sorted_rows` order by `GlobalIndex` so swap order
-// never leaks to callers.
+// bitmaps stay compact even when global indexes are sparse. Each activated sample receives a
+// strictly monotonic `seqs[row]` ordinal so built-in `fetch` always consumes in true insertion FIFO
+// order rather than recycled physical `GlobalIndex` order.
 #[derive(Deserialize, Serialize)]
 struct PartitionState {
     created_at: f64,
     indexes: Vec<GlobalIndex>,
+    seqs: Vec<u64>,
+    next_seq: u64,
+    #[serde(skip)]
+    seq_sorted: bool,
     rows: HashMap<GlobalIndex, LocalRow>,
     active: Bitmap,
-    reserved: VecDeque<GlobalIndex>,
+    reserved: BTreeSet<GlobalIndex>,
+    #[serde(skip)]
     loads: Vec<usize>,
     fields: IndexMap<String, FieldState>,
     keys: IndexMap<String, GlobalIndex>,
     index_keys: HashMap<GlobalIndex, String>,
     consumed: HashMap<String, Bitmap>,
-    backend_meta: HashMap<GlobalIndex, HashMap<String, Value>>,
-    custom_meta: HashMap<GlobalIndex, Value>,
+    #[serde(skip)]
+    consumed_cursor: HashMap<String, usize>,
+    backend_meta: HashMap<GlobalIndex, HashMap<String, RawMsgpack>>,
+    custom_meta: HashMap<GlobalIndex, RawMsgpack>,
     links: HashMap<GlobalIndex, HashMap<String, GlobalIndex>>,
     #[serde(skip)]
     linked_by: HashMap<GlobalIndex, HashSet<GlobalIndex>>,
@@ -296,14 +296,18 @@ impl PartitionState {
                 .unwrap_or_default()
                 .as_secs_f64(),
             indexes: Vec::new(),
+            seqs: Vec::new(),
+            next_seq: 0,
+            seq_sorted: true,
             rows: HashMap::new(),
             active: Bitmap::default(),
-            reserved: VecDeque::new(),
+            reserved: BTreeSet::new(),
             loads: vec![0; units],
             fields: IndexMap::new(),
             keys: IndexMap::new(),
             index_keys: HashMap::new(),
             consumed: HashMap::new(),
+            consumed_cursor: HashMap::new(),
             backend_meta: HashMap::new(),
             custom_meta: HashMap::new(),
             links: HashMap::new(),
@@ -316,18 +320,37 @@ impl PartitionState {
         let index = allocator.allocate(&mut self.loads);
         let row = self.indexes.len();
         self.indexes.push(index);
+        self.seqs.push(UNASSIGNED_SEQ);
         self.rows.insert(index, row);
         row
+    }
+
+    fn activate_row(&mut self, row: LocalRow) -> bool {
+        if self.active.get(row) {
+            return false;
+        }
+        if self.seq_sorted
+            && self
+                .active
+                .highest_set()
+                .is_some_and(|highest| row < highest)
+        {
+            self.seq_sorted = false;
+        }
+        self.active.set(row, true);
+        self.seqs[row] = self.next_seq;
+        self.next_seq += 1;
+        true
     }
 
     fn insert(&mut self, count: usize, allocator: &mut IndexAllocator) -> Vec<LocalRow> {
         (0..count)
             .map(|_| {
-                let row = match self.reserved.pop_front() {
+                let row = match self.reserved.pop_first() {
                     Some(index) => self.rows[&index],
                     None => self.add_row(allocator),
                 };
-                self.active.set(row, true);
+                self.activate_row(row);
                 row
             })
             .collect()
@@ -342,30 +365,83 @@ impl PartitionState {
             return Vec::new();
         };
         let consumed = self.consumed.entry(task.to_owned()).or_default();
-        let mut rows = Vec::new();
-        for word in 0..self.active.0.len() {
-            let mut candidates = self.active.word(word) & !consumed.word(word);
-            for field in &ready {
-                candidates &= field.word(word);
-            }
-            while candidates != 0 {
-                rows.push(word * 64 + candidates.trailing_zeros() as usize);
-                candidates &= candidates - 1;
-            }
-        }
-        if rows.len() < count {
+        if count == 0 || count > self.indexes.len() {
             return Vec::new();
         }
-        // Partition-select the lowest `count` GlobalIndex values (`SequentialSampler` order)
-        // before sorting just the selected prefix.
-        if rows.len() > count {
-            rows.select_nth_unstable_by_key(count, |row| self.indexes[*row]);
-            rows.truncate(count);
+        let mut cursor = self.consumed_cursor.get(task).copied().unwrap_or(0);
+        while cursor < self.active.0.len() && consumed.word(cursor) == u64::MAX {
+            cursor += 1;
         }
-        rows.sort_unstable_by_key(|row| self.indexes[*row]);
+        let start_word = cursor;
+
+        let rows = if self.seq_sorted {
+            // Fast path: active rows are strictly ordered by insertion sequence, so scanning from
+            // `start_word` can stop immediately once `count` ready samples are collected.
+            let mut selected = Vec::with_capacity(count);
+            for word in start_word..self.active.0.len() {
+                let mut candidates = self.active.word(word) & !consumed.word(word);
+                for field in &ready {
+                    candidates &= field.word(word);
+                }
+                while candidates != 0 {
+                    selected.push(word * 64 + candidates.trailing_zeros() as usize);
+                    if selected.len() == count {
+                        break;
+                    }
+                    candidates &= candidates - 1;
+                }
+                if selected.len() == count {
+                    break;
+                }
+            }
+            if selected.len() < count {
+                self.consumed_cursor.insert(task.to_owned(), cursor);
+                return Vec::new();
+            }
+            selected
+        } else {
+            // General path after mid-partition `swap_remove`: maintain the lowest `count` insertion
+            // sequence numbers in a bounded max-heap instead of materializing all ready candidates.
+            let mut total_candidates = 0usize;
+            let mut smallest = BinaryHeap::with_capacity(count + 1);
+            for word in start_word..self.active.0.len() {
+                let mut candidates = self.active.word(word) & !consumed.word(word);
+                for field in &ready {
+                    candidates &= field.word(word);
+                }
+                while candidates != 0 {
+                    let row = word * 64 + candidates.trailing_zeros() as usize;
+                    candidates &= candidates - 1;
+                    total_candidates += 1;
+                    let seq = self.seqs[row];
+                    if smallest.len() < count {
+                        smallest.push((seq, row));
+                    } else if let Some(&(max_seq, _)) = smallest.peek()
+                        && seq < max_seq
+                    {
+                        smallest.pop();
+                        smallest.push((seq, row));
+                    }
+                }
+            }
+            if total_candidates < count {
+                self.consumed_cursor.insert(task.to_owned(), cursor);
+                return Vec::new();
+            }
+            smallest
+                .into_sorted_vec()
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect()
+        };
+
         for &row in &rows {
             consumed.set(row, true);
         }
+        while cursor < self.active.0.len() && consumed.word(cursor) == u64::MAX {
+            cursor += 1;
+        }
+        self.consumed_cursor.insert(task.to_owned(), cursor);
         rows
     }
 
@@ -377,14 +453,17 @@ impl PartitionState {
         mode: &str,
     ) -> BatchMeta {
         let indexes: Vec<_> = rows.iter().map(|row| self.indexes[*row]).collect();
-        let mut schema = Vec::new();
-        let mut selected_fields = Vec::new();
+        let mut schema = Vec::with_capacity(fields.len());
+        let mut selected_fields = Vec::with_capacity(fields.len());
         for &name in fields {
             let field = self.fields.get(name);
             if let Some(value) = field.and_then(|field| field.schema.as_ref()) {
-                schema.push((name.into(), value.snapshot(&indexes)));
+                schema.push((name.to_owned(), value.wire_snapshot(&indexes)));
             } else if mode == "insert" {
-                schema.push((name.into(), FieldSchema::default().snapshot(&indexes)));
+                schema.push((
+                    name.to_owned(),
+                    FieldSchema::default().wire_snapshot(&indexes),
+                ));
             }
             if let Some(field) = field {
                 selected_fields.push(field);
@@ -410,17 +489,15 @@ impl PartitionState {
             indexes
                 .iter()
                 .map(|index| {
-                    let values = self.backend_meta.get(index);
-                    Value::Map(
-                        fields
-                            .iter()
-                            .filter_map(|name| {
-                                values?
-                                    .get(*name)
-                                    .map(|value| ((*name).into(), value.clone()))
-                            })
-                            .collect(),
-                    )
+                    let Some(values) = self.backend_meta.get(index) else {
+                        return Vec::new();
+                    };
+                    fields
+                        .iter()
+                        .filter_map(|&name| {
+                            values.get(name).map(|raw| (name.to_owned(), raw.clone()))
+                        })
+                        .collect()
                 })
                 .collect()
         };
@@ -429,12 +506,7 @@ impl PartitionState {
         } else {
             indexes
                 .iter()
-                .map(|index| {
-                    self.custom_meta
-                        .get(index)
-                        .cloned()
-                        .unwrap_or_else(|| Value::Map(Vec::new()))
-                })
+                .map(|index| self.custom_meta.get(index).cloned())
                 .collect()
         };
         let links = if self.links.is_empty() {
@@ -443,17 +515,15 @@ impl PartitionState {
             indexes
                 .iter()
                 .map(|index| {
-                    Value::Map(
-                        fields
-                            .iter()
-                            .filter_map(|&name| {
-                                self.links
-                                    .get(index)?
-                                    .get(name)
-                                    .map(|&source| (name.into(), source.into()))
-                            })
-                            .collect(),
-                    )
+                    let Some(row_links) = self.links.get(index) else {
+                        return Vec::new();
+                    };
+                    fields
+                        .iter()
+                        .filter_map(|&name| {
+                            row_links.get(name).map(|&source| (name.to_owned(), source))
+                        })
+                        .collect()
                 })
                 .collect()
         };
@@ -493,12 +563,25 @@ impl PartitionState {
             let last = self.indexes.len() - 1;
             self.rows.remove(&index);
             self.indexes.swap_remove(row);
+            self.seqs.swap_remove(row);
             if row != last {
                 self.rows.insert(self.indexes[row], row);
             }
             self.active.swap_remove(row, last);
+            if row != last
+                && self.active.get(row)
+                && self
+                    .active
+                    .highest_set()
+                    .is_some_and(|highest| highest > row)
+            {
+                self.seq_sorted = false;
+            }
             for consumed in self.consumed.values_mut() {
                 consumed.swap_remove(row, last);
+            }
+            for cursor in self.consumed_cursor.values_mut() {
+                *cursor = (*cursor).min(row / 64);
             }
             for field in self.fields.values_mut() {
                 field.ready.swap_remove(row, last);
@@ -515,8 +598,13 @@ impl PartitionState {
             self.drop_links(index, None);
             self.ever_linked.remove(&index);
             let unit = (index % self.loads.len() as u64) as usize;
-            self.loads[unit] -= 1;
+            self.loads[unit] = self.loads[unit].saturating_sub(1);
             allocator.release(index);
+        }
+        if self.active.highest_set().is_none() {
+            self.next_seq = 0;
+            self.seq_sorted = true;
+            self.consumed_cursor.clear();
         }
         for field in self.fields.values_mut() {
             field.remove_empty_schema();
@@ -571,16 +659,10 @@ impl PartitionState {
                 ready,
             );
         }
-        let mut promoted = false;
-        for row in rows {
-            if !self.active.get(row) {
-                self.active.set(row, true);
-                promoted = true;
+        for (&index, &row) in indexes.iter().zip(&rows) {
+            if self.activate_row(row) {
+                self.reserved.remove(&index);
             }
-        }
-        if promoted {
-            self.reserved
-                .retain(|&reserved| !self.active.get(self.rows[&reserved]));
         }
         if !indexes.is_empty() {
             for (index, values) in backend_meta {
@@ -651,7 +733,7 @@ pub(super) fn parse_dtype(value: &Value, field_name: &str) -> StateResult<&'stat
 
 fn parse_backend_meta(
     value: Option<&Value>,
-) -> StateResult<Vec<(GlobalIndex, HashMap<String, Value>)>> {
+) -> StateResult<Vec<(GlobalIndex, HashMap<String, RawMsgpack>)>> {
     let Some(value) = value.filter(|value| !value.is_nil()) else {
         return Ok(Vec::new());
     };
@@ -669,7 +751,7 @@ fn parse_backend_meta(
                         name.as_str()
                             .ok_or("backend metadata field must be a string")?
                             .to_owned(),
-                        value.clone(),
+                        RawMsgpack::encode(value)?,
                     ))
                 })
                 .collect::<StateResult<_>>()?;
@@ -837,7 +919,13 @@ impl ControllerState {
                         for (index, value) in rows {
                             let index = global_index(index)?;
                             if partition.rows.contains_key(&index) {
-                                partition.custom_meta.insert(index, value.clone());
+                                if value.as_map().is_some_and(Vec::is_empty) {
+                                    partition.custom_meta.remove(&index);
+                                } else {
+                                    partition
+                                        .custom_meta
+                                        .insert(index, RawMsgpack::encode(value)?);
+                                }
                             }
                         }
                     }
@@ -885,10 +973,12 @@ impl ControllerState {
                         if let Some(consumed) = partition.consumed.get_mut(task) {
                             consumed.0.clear();
                         }
+                        partition.consumed_cursor.insert(task.to_owned(), 0);
                     } else {
                         for consumed in partition.consumed.values_mut() {
                             consumed.0.clear();
                         }
+                        partition.consumed_cursor.clear();
                     }
                 }
                 Ok((
@@ -1183,9 +1273,9 @@ impl ControllerState {
                     } else {
                         index
                     };
-                    status
-                        .get(index as usize)
-                        .copied()
+                    usize::try_from(index)
+                        .ok()
+                        .and_then(|pos| status.get(pos).copied())
                         .ok_or("sample_filter index out of range")
                 })
                 .collect::<Result<_, _>>()?,
@@ -1210,14 +1300,18 @@ impl ControllerState {
             return;
         }
         let mut partition = PartitionState::new(self.allocator.reusable.len());
-        let mut reserved: Vec<_> = (0..self.preallocate)
-            .map(|_| {
-                let row = partition.add_row(&mut self.allocator);
-                partition.indexes[row]
-            })
-            .collect();
-        reserved.sort_unstable();
-        partition.reserved = reserved.into();
+        for _ in 0..self.preallocate {
+            let row = partition.add_row(&mut self.allocator);
+            partition.reserved.insert(partition.indexes[row]);
+        }
+        // Keep pre-allocated `indexes` aligned with `reserved.pop_first()` so sequential
+        // activation preserves `LocalRow` order without degrading `seq_sorted`.
+        if partition.indexes.len() > 1 {
+            partition.indexes.sort_unstable();
+            for (row, &index) in partition.indexes.iter().enumerate() {
+                partition.rows.insert(index, row);
+            }
+        }
         self.partitions.insert(name.to_owned(), partition);
     }
 
@@ -1326,6 +1420,7 @@ mod tests {
             bitmap.set(row, true);
         }
         assert_eq!(bitmap.0.len(), 3);
+        assert_eq!(bitmap.highest_set(), Some(128));
         assert!(bitmap.get(63) && bitmap.get(64) && bitmap.get(128));
         assert!(!bitmap.get(65) && !bitmap.get(200));
 
@@ -1342,6 +1437,7 @@ mod tests {
         assert_eq!(bitmap.0.len(), 1);
         bitmap.swap_remove(0, 0);
         assert!(bitmap.0.is_empty());
+        assert_eq!(bitmap.highest_set(), None);
     }
 
     #[test]
@@ -1367,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn partition_sparse_global_indexes_fetch_and_swap_remove_compaction() {
+    fn partition_sparse_global_indexes_insertion_fifo_and_recycled_slot_fairness() {
         let mut allocator = IndexAllocator {
             next: 1_000_000,
             reusable: vec![VecDeque::new(); 2],
@@ -1377,6 +1473,7 @@ mod tests {
         // Allocate 70 rows (spanning two 64-bit bitmap words) starting at a large sparse GlobalIndex.
         let rows = partition.insert(70, &mut allocator);
         assert_eq!(rows.len(), 70);
+        assert!(partition.seq_sorted);
         assert_eq!(partition.active.0.len(), 2);
         let allocated = partition.indexes.clone();
 
@@ -1387,7 +1484,7 @@ mod tests {
             .unwrap();
         assert!(partition.fetch(&["x"], "trainer", 4).is_empty());
 
-        // Publish all 70 rows and consume the first 2 in GlobalIndex order.
+        // Publish all 70 rows and consume the first 2 in insertion order.
         partition
             .update_production_status(&allocated[3..], &schema, None, true)
             .unwrap();
@@ -1395,16 +1492,28 @@ mod tests {
         let fetched_indexes: Vec<_> = fetched.iter().map(|&r| partition.indexes[r]).collect();
         assert_eq!(fetched_indexes, allocated[..2]);
 
-        // Clear the first 6 rows (forcing swap_remove from the second bitmap word into the first).
+        // Clear the first 6 rows (forcing swap_remove from word 1 into word 0).
         partition.clear_data(&allocated[..6], &mut allocator);
         assert_eq!(partition.indexes.len(), 64);
-        assert_eq!(partition.active.0.len(), 1);
+        assert!(!partition.seq_sorted);
         assert_eq!(partition.loads.iter().sum::<usize>(), 64);
 
-        // Every remaining sample keeps its row mapping and remains fetchable without duplicates.
-        let rest = partition.fetch(&["x"], "trainer", 64);
-        let rest_indexes: Vec<_> = rest.iter().map(|&r| partition.indexes[r]).collect();
-        assert_eq!(rest_indexes, allocated[6..]);
+        // Insert 4 brand-new rows that reuse the recycled low `GlobalIndex` slots (`allocated[..4]`).
+        // Built-in insertion FIFO must serve all 64 older unconsumed rows BEFORE the recycled newcomers.
+        let new_rows = partition.insert(4, &mut allocator);
+        let new_indexes: Vec<_> = new_rows.iter().map(|&r| partition.indexes[r]).collect();
+        assert_eq!(new_indexes, allocated[..4]);
+        partition
+            .update_production_status(&new_indexes, &schema, None, true)
+            .unwrap();
+
+        let older_batch = partition.fetch(&["x"], "trainer", 64);
+        let older_indexes: Vec<_> = older_batch.iter().map(|&r| partition.indexes[r]).collect();
+        assert_eq!(older_indexes, allocated[6..]);
+
+        let newer_batch = partition.fetch(&["x"], "trainer", 4);
+        let newer_indexes: Vec<_> = newer_batch.iter().map(|&r| partition.indexes[r]).collect();
+        assert_eq!(newer_indexes, new_indexes);
     }
 
     #[test]
@@ -1531,12 +1640,28 @@ mod tests {
             .unwrap();
         assert!(controller.partitions["pre"].custom_meta.contains_key(&2));
 
+        // Sending an empty map `{}` clears stored custom metadata back to empty.
+        controller
+            .apply(&req(
+                "SET_CUSTOM_META",
+                vec![(
+                    "partition_custom_meta".into(),
+                    Value::Map(vec![(
+                        "pre".into(),
+                        Value::Map(vec![(2.into(), Value::Map(vec![]))]),
+                    )]),
+                )],
+            ))
+            .unwrap();
+        assert!(!controller.partitions["pre"].custom_meta.contains_key(&2));
+
         controller
             .partitions
             .get_mut("pre")
             .unwrap()
             .update_production_status(&ff_meta.indexes, &int64_schema, None, true)
             .unwrap();
+        assert!(controller.partitions["pre"].reserved.is_empty());
         let (_, next_body) = controller
             .apply(&req(
                 "GET_META",
@@ -1584,26 +1709,20 @@ mod tests {
             .unwrap();
 
         let jagged = partition.snapshot("p", &[rows[2], rows[0]], &["x"], "force_fetch");
-        let x_jagged = field(&jagged.schema, "x").unwrap().as_map().unwrap();
-        assert_eq!(field(x_jagged, "is_nested").unwrap().as_bool(), Some(true));
-        assert_eq!(field(x_jagged, "shape"), Some(&Value::Nil));
+        let (_, x_jagged) = jagged.schema.iter().find(|(n, _)| n == "x").unwrap();
+        assert!(x_jagged.nested);
+        assert_eq!(x_jagged.shape, None);
         assert_eq!(
-            field(x_jagged, "per_sample_shapes").unwrap(),
-            &Value::Array(vec![
-                Value::Array(vec![128.into()]),
-                Value::Array(vec![256.into()]),
-            ])
+            x_jagged.sample_shapes.as_ref().unwrap(),
+            &vec![Some(vec![128]), Some(vec![256])]
         );
 
         partition.clear_data(&indexes[2..], &mut allocator);
         let collapsed = partition.snapshot("p", &[0, 1], &["x"], "force_fetch");
-        let x_flat = field(&collapsed.schema, "x").unwrap().as_map().unwrap();
-        assert_eq!(field(x_flat, "is_nested").unwrap().as_bool(), Some(false));
-        assert_eq!(
-            field(x_flat, "shape").unwrap(),
-            &Value::Array(vec![256.into()])
-        );
-        assert!(field(x_flat, "per_sample_shapes").is_none());
+        let (_, x_flat) = collapsed.schema.iter().find(|(n, _)| n == "x").unwrap();
+        assert!(!x_flat.nested);
+        assert_eq!(x_flat.shape, Some(vec![256]));
+        assert!(x_flat.sample_shapes.is_none());
 
         // Rejected dtype mismatch with ready=false must leave existing readiness and dtype intact.
         let bad_int64 = [(
@@ -1805,10 +1924,9 @@ mod tests {
                 panic!("expected metadata");
             };
             assert_eq!(batch.indexes.len(), 2);
-            assert_eq!(
-                batch.backend_meta[0],
-                Value::Map(vec![("v".into(), Value::Nil)])
-            );
+            assert_eq!(batch.backend_meta[0].len(), 1);
+            assert_eq!(batch.backend_meta[0][0].0, "v");
+            assert_eq!(batch.backend_meta[0][0].1.decode().unwrap(), Value::Nil);
         }
 
         state

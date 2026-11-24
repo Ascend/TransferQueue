@@ -44,7 +44,7 @@ jobs:
         export RAY_DEDUP_LOGS=0
         for file in tutorial/*.py; do
           if [[ "$TQ_CONTROLLER_BACKEND" == rust && ( "$file" == tutorial/05_custom_sampler.py || "$file" == tutorial/06_streaming_dataloader.py ) ]]; then
-            echo "Skipping $file because the Rust Controller only supports SequentialSampler."
+            echo "Skipping $file because the Rust Controller does not support custom samplers yet."
             continue
           fi
           python3 "$file"

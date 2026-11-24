@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from concurrent.futures import ThreadPoolExecutor
 from shutil import copytree
 from threading import Barrier
@@ -42,42 +43,37 @@ def ray_cluster(monkeypatch):
         ray.shutdown()
 
 
-def test_rust_controller_init_bridge_and_metrics(monkeypatch, ray_cluster):
+def test_rust_controller_init_bridge_fifo_and_metrics(monkeypatch, ray_cluster, caplog):
     namespace = f"tq-rust-controller-{uuid4().hex}"
     monkeypatch.setenv("TQ_RAY_NAMESPACE", namespace)
     monkeypatch.delenv("TQ_ENABLE_KV_GLOBAL_LOCK", raising=False)
     try:
-        monkeypatch.delenv("TQ_CONTROLLER_BACKEND", raising=False)
-        for unsupported in ("GRPOGroupNSampler", tq.GRPOGroupNSampler, tq.GRPOGroupNSampler()):
-            with pytest.raises(ValueError, match="only supports SequentialSampler"):
-                tq.init(
-                    OmegaConf.create(
-                        {"controller": {"backend": "rust", "sampler": unsupported}},
-                        flags={"allow_objects": True},
-                    )
-                )
-
-        # TQ_CONTROLLER_BACKEND takes precedence over an explicit `controller.backend` in `conf`.
+        # TQ_CONTROLLER_BACKEND takes precedence over an explicit `controller.backend` in `conf`,
+        # and custom sampler configuration logs a warning and falls back to built-in FIFO sampling.
         monkeypatch.setenv("TQ_CONTROLLER_BACKEND", "rust")
-        final_conf = tq.init(
-            OmegaConf.create(
-                {
-                    "controller": {"backend": "python", "sampler": tq.SequentialSampler},
-                    "metrics": {"enabled": True},
-                    "backend": {"SimpleStorage": {"num_data_storage_units": 1, "total_storage_size": 128}},
-                },
-                flags={"allow_objects": True},
+        with caplog.at_level(logging.WARNING, logger="transfer_queue.interface"):
+            final_conf = tq.init(
+                OmegaConf.create(
+                    {
+                        "controller": {"backend": "python", "sampler": tq.GRPOGroupNSampler},
+                        "metrics": {"enabled": True},
+                        "backend": {"SimpleStorage": {"num_data_storage_units": 1, "total_storage_size": 128}},
+                    },
+                    flags={"allow_objects": True},
+                )
             )
-        )
         assert final_conf.controller.backend == "rust"
+        assert any("does not support custom sampler" in record.message for record in caplog.records)
 
         actor = ray.get_actor("TransferQueueController", namespace=namespace)
         assert ray.get(actor.get_config.remote()).controller.backend == "rust"
+
         client = tq.get_client()
         assert client.get_production_status(["sample"], "absent") == (None, None)
         assert client.get_consumption_status("trainer", "absent") == (None, None)
 
         allocated = client.get_meta(["sample"], 64, "train", mode="insert")
+        allocated.update_custom_meta([{"seq": i} for i in range(64)])
         client.put(TensorDict({"sample": torch.arange(64).unsqueeze(1)}, batch_size=[64]), allocated)
         indexes, ready = client.get_production_status(["sample"], "train")
         assert indexes.dtype == torch.long and ready.dtype == torch.int8
@@ -97,8 +93,23 @@ def test_rust_controller_init_bridge_and_metrics(monkeypatch, ray_cluster):
         assert sorted(ray.get(actor.get_partition_index_range.remote("train"))) == allocated.global_indexes
         snapshot = ray.get(actor.get_partition_snapshot.remote("train"))
         assert snapshot.consumption_status["trainer"].all()
+        assert snapshot.custom_meta[allocated.global_indexes[0]] == {"seq": 0}
 
-        _assert_controller_metrics(tq.get_metrics_endpoint(), partition_id="train", samples=64.0)
+        # Verify built-in insertion-order FIFO across recycled low GlobalIndex slots:
+        # clear the first 4 slots, insert 4 brand-new samples (which reuse those low GlobalIndexes),
+        # and verify a fresh consumer task receives the older 60 samples BEFORE the 4 newcomers.
+        early_slice = allocated.select_samples([0, 1, 2, 3])
+        client.clear_samples(early_slice)
+        newcomer_meta = client.get_meta(["sample"], 4, "train", mode="insert")
+        assert newcomer_meta.global_indexes == early_slice.global_indexes
+        client.put(TensorDict({"sample": torch.arange(100, 104).unsqueeze(1)}, batch_size=[4]), newcomer_meta)
+
+        older_fetched = client.get_meta(["sample"], 60, "train", task_name="fifo_reader")
+        assert older_fetched.global_indexes == allocated.global_indexes[4:]
+        newer_fetched = client.get_meta(["sample"], 4, "train", task_name="fifo_reader")
+        assert newer_fetched.global_indexes == newcomer_meta.global_indexes
+
+        _assert_controller_metrics(tq.get_metrics_endpoint(), partition_id="train", samples=64.0, get_meta_total=20.0)
 
         tq.close()
         with pytest.raises(ray.exceptions.RayActorError):
@@ -172,7 +183,9 @@ def test_rust_checkpoint_validation_and_cross_backend_rejection(monkeypatch, ray
             tq.close()
 
 
-def _assert_controller_metrics(endpoint: str | None, *, partition_id: str, samples: float) -> None:
+def _assert_controller_metrics(
+    endpoint: str | None, *, partition_id: str, samples: float, get_meta_total: float
+) -> None:
     assert endpoint is not None
     opener = build_opener(ProxyHandler({}))
     deadline = monotonic() + 12
@@ -180,7 +193,7 @@ def _assert_controller_metrics(endpoint: str | None, *, partition_id: str, sampl
         with opener.open(f"http://{endpoint}/metrics", timeout=3) as response:
             metrics = response.read().decode()
         if f'tq_partition_samples_total{{partition_id="{partition_id}"}} {samples}' in metrics:
-            assert 'tq_controller_request_total{op_type="GET_META"} 17.0' in metrics
+            assert f'tq_controller_request_total{{op_type="GET_META"}} {get_meta_total}' in metrics
             return
         assert monotonic() < deadline, metrics
         sleep(0.2)

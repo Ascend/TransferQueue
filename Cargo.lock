@@ -502,11 +502,14 @@ name = "tq-controller"
 version = "0.2.0"
 dependencies = [
  "indexmap",
+ "rmp",
  "rmp-serde",
  "rmpv",
  "serde",
+ "serde_bytes",
  "uuid",
  "zmq",
+ "zmq-sys",
 ]
 
 [[package]]

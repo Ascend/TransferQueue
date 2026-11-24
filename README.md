@@ -233,7 +233,7 @@ Prebuilt Linux (`x86_64` and `aarch64`) wheels bundle the compiled Rust Controll
    pip install .
    ```
 
-3. Enable the Rust Controller (`SequentialSampler` only):
+3. Enable the Rust Controller (uses built-in FIFO sampling; custom `controller.sampler` is not yet supported):
    ```python
    import transfer_queue as tq
 

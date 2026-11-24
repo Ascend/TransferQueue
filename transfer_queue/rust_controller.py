@@ -24,10 +24,13 @@ from omegaconf import DictConfig
 from transfer_queue.controller import DataPartitionStatus, FieldMeta
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.metrics import REQUEST_LATENCY_BUCKETS, RustControllerMetrics
-from transfer_queue.sampler import BaseSampler, SequentialSampler
+from transfer_queue.sampler import BaseSampler
 from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import decode, parse_torch_dtype
 from transfer_queue.utils.zmq_utils import ZMQServerInfo, get_node_ip_address
+
+logger = get_logger(__name__)
 
 
 def _bitmap_indexes(words: list[int], indexes: list[int]) -> list[int]:
@@ -47,8 +50,11 @@ def _partition_from_snapshot(name: str, snapshot: dict) -> DataPartitionStatus:
     partition.pre_allocated_global_indexes = set(snapshot["reserved"])
     partition.keys_mapping = snapshot["keys"]
     partition.revert_keys_mapping = snapshot["index_keys"]
-    partition.custom_meta = snapshot["custom_meta"]
-    partition.field_custom_backend_meta = snapshot["backend_meta"]
+    partition.custom_meta = {index: msgpack.decode(raw, strict=False) for index, raw in snapshot["custom_meta"].items()}
+    partition.field_custom_backend_meta = {
+        index: {field: msgpack.decode(raw, strict=False) for field, raw in fields.items()}
+        for index, fields in snapshot["backend_meta"].items()
+    }
     partition.links = snapshot["links"]
     partition.ever_linked = set(snapshot["ever_linked"])
     for index, fields in partition.links.items():
@@ -82,9 +88,12 @@ def _partition_from_snapshot(name: str, snapshot: dict) -> DataPartitionStatus:
 class RustControllerActor:
     """Expose discovery and management methods for the in-process Rust Controller."""
 
-    def __init__(self, sampler: BaseSampler | type[BaseSampler] = SequentialSampler) -> None:
-        if sampler is not SequentialSampler and type(sampler) is not SequentialSampler:
-            raise ValueError(f"Rust Controller only supports SequentialSampler, got {sampler!r}")
+    def __init__(self, sampler: BaseSampler | type[BaseSampler] | str | None = None) -> None:
+        if sampler is not None:
+            logger.warning(
+                f"Rust Controller does not support custom sampler configuration (got {sampler!r}); "
+                "using the built-in default FIFO sampling instead."
+            )
         try:
             from transfer_queue._controller_engine import ControllerEngine
         except ImportError as error:

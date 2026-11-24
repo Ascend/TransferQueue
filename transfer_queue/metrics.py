@@ -613,7 +613,6 @@ class RustControllerMetrics(TQMetricsExporter):
     def __init__(self, snapshot: Callable[[], dict[str, Any]], zmq_context: zmq.Context):
         super().__init__(zmq_context=zmq_context)
         self._read_snapshot = snapshot
-        self._requests: dict[str, dict[str, Any]] = {}
         for metric in (
             self.request_total,
             self.request_errors_total,
@@ -625,14 +624,12 @@ class RustControllerMetrics(TQMetricsExporter):
 
     def collect_controller_metrics(self) -> None:
         """Pull the latest metrics snapshot from the Rust engine and update Prometheus gauges."""
-        snapshot = self._read_snapshot()
-        self._requests = snapshot["requests"]
-        self.update_controller_snapshot(snapshot)
+        self.update_controller_snapshot(self._read_snapshot())
         super().collect_controller_metrics()
 
     def collect(self) -> Iterator[CounterMetricFamily | HistogramMetricFamily]:
-        """Yield Prometheus counter and latency histogram families collected by the Rust controller."""
-        requests = self._requests
+        """Yield live Prometheus counter and latency histogram families from the Rust controller."""
+        requests = self._read_snapshot()["requests"]
         labels = ["op_type"]
         for suffix, key, description in (
             ("request", "count", "Total number of requests processed by the controller"),

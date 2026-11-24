@@ -52,7 +52,7 @@ from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
-from transfer_queue.sampler import BaseSampler, SequentialSampler
+from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.checkpoint_utils import validate_checkpoint
@@ -209,29 +209,32 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         with open_dict(final_conf.controller):
             del final_conf.controller["polling_mode"]
 
-    # TODO(hz): support load custom sampler class from external module.
-    try:
-        sampler = final_conf.controller.sampler
-        if isinstance(sampler, BaseSampler):
-            # user pass a pre-initialized sampler instance
-            sampler = sampler
-        elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
-            # user pass a sampler class
-            sampler = sampler()
-        elif isinstance(sampler, str):
-            # user pass a sampler name str
-            # try to convert as sampler class
-            sampler = globals()[final_conf.controller.sampler]
-    except KeyError:
-        raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
-
     controller_backend = final_conf.controller.backend
     controller_cls: Any
+    sampler: Any = final_conf.controller.sampler
     if controller_backend == "python":
+        # TODO(hz): support load custom sampler class from external module.
+        try:
+            if isinstance(sampler, BaseSampler):
+                # user pass a pre-initialized sampler instance
+                sampler = sampler
+            elif isinstance(sampler, type) and issubclass(sampler, BaseSampler):
+                # user pass a sampler class
+                sampler = sampler()
+            elif isinstance(sampler, str):
+                # user pass a sampler name str
+                # try to convert as sampler class
+                sampler = globals()[final_conf.controller.sampler]
+        except KeyError:
+            raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
         controller_cls = TransferQueueController
     elif controller_backend == "rust":
-        if sampler is not SequentialSampler and type(sampler) is not SequentialSampler:
-            raise ValueError(f"Rust Controller only supports SequentialSampler, got {final_conf.controller.sampler!r}")
+        if sampler is not None:
+            logger.warning(
+                f"Rust Controller does not support custom sampler configuration (got {sampler!r}); "
+                "using the built-in default FIFO sampling instead."
+            )
+        sampler = None
         from transfer_queue.rust_controller import RustControllerActor
 
         controller_cls = RustControllerActor

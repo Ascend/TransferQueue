@@ -78,11 +78,13 @@ impl ControllerState {
                 .sum();
             let produced: u32 = (0..partition.active.0.len())
                 .map(|word| {
-                    partition
-                        .fields
-                        .values()
-                        .fold(0, |bits, field| bits | field.ready.word(word))
-                        .count_ones()
+                    let active_bits = partition.active.word(word);
+                    (active_bits
+                        & partition
+                            .fields
+                            .values()
+                            .fold(0, |bits, field| bits | field.ready.word(word)))
+                    .count_ones()
                 })
                 .sum();
             let production_ratio = if active == 0 {
@@ -93,7 +95,9 @@ impl ControllerState {
             let mut production = Vec::new();
             let mut consumption = Vec::new();
             for (name, consumed) in &partition.consumed {
-                let count: u32 = consumed.0.iter().map(|word| word.count_ones()).sum();
+                let count: u32 = (0..partition.active.0.len())
+                    .map(|word| (partition.active.word(word) & consumed.word(word)).count_ones())
+                    .sum();
                 let ratio = if active == 0 {
                     0.0
                 } else {
