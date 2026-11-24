@@ -26,7 +26,7 @@ from typing import Any, Callable, NamedTuple
 
 import torch
 import zmq
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
@@ -35,6 +35,7 @@ from transfer_queue.storage.payload_transfer.base import (
     Operation,
     RequestHeader,
     StorageRejected,
+    TransferError,
     TransferTimeout,
 )
 from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
@@ -242,7 +243,8 @@ class AsyncSimpleStorageManager(StorageManager):
 
         self.storage_unit_infos = self._register_servers(server_infos)
         self._payload_connections = {}
-        self._payload_connect_locks = {}
+        self._payload_connecting = {}
+        self._payload_closed = False
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
 
@@ -652,30 +654,53 @@ class AsyncSimpleStorageManager(StorageManager):
         return field_schema
 
     async def _get_payload_connection(self, key):
-        """Reuse a connection, serializing only the first handshake for each loop/peer."""
+        """Share one handshake and its result per owning loop and peer."""
+        if self._payload_closed:
+            raise TransferError("payload transport is closed")
         entry = self._payload_connections.get(key)
         if entry is not None:
             return entry
-        lock = self._payload_connect_locks.setdefault(key, asyncio.Lock())
-        async with lock:
-            entry = self._payload_connections.get(key)
-            if entry is not None:
-                return entry
-            _, target = key
-            peers = self.config.get("payload_peers")
-            peer = peers[target] if peers is not None else {
-                "backend": "zmq", "address": self.storage_unit_infos[target],
-            }
-            try:
-                connection = await asyncio.wait_for(
-                    self.payload_transfer.connect(peer), timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
-                )
-            except asyncio.TimeoutError as exc:
-                raise TransferTimeout("payload connection timed out") from exc
-            # A new entry distinguishes reconnects even if the backend returns the same handle.
-            entry = (connection,)
-            self._payload_connections[key] = entry
-            return entry
+        # Closed loops cannot reuse their handles; do not retain them across asyncio.run calls.
+        for old_key in list(self._payload_connections):
+            if old_key[0].is_closed():
+                self._payload_connections.pop(old_key, None)
+        task = self._payload_connecting.get(key)
+        if task is None:
+            task = asyncio.create_task(self._connect_payload(key))
+            self._payload_connecting[key] = task
+            task.add_done_callback(partial(self._payload_connect_done, key))
+        return await asyncio.shield(task)
+
+    async def _connect_payload(self, key):
+        _, target = key
+        peers = self.config.get("payload_peers")
+        peer = peers[target] if peers is not None else {
+            "backend": "zmq", "address": self.storage_unit_infos[target],
+        }
+        if isinstance(peer, DictConfig):
+            # Backend metadata is opaque; strings must not be resolved as config expressions.
+            peer = OmegaConf.to_container(peer, resolve=False)
+        try:
+            connection = await asyncio.wait_for(
+                self.payload_transfer.connect(peer), timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TransferTimeout("payload connection timed out") from exc
+        if self._payload_closed:
+            raise TransferError("payload transport closed during connection")
+        # A new entry distinguishes reconnects even if the backend returns the same handle.
+        entry = (connection,)
+        self._payload_connections[key] = entry
+        return entry
+
+    def _payload_connect_done(self, key, task):
+        if self._payload_connecting.get(key) is task:
+            self._payload_connecting.pop(key)
+        # Retrieve failures even when every waiter has cancelled its shielded await.
+        if not task.cancelled():
+            task.exception()
+        if self._payload_closed and not self._payload_connecting:
+            self.payload_transfer.shutdown()
 
     async def _request_payload(self, target, operation, body, *, data=None, recv=()):
         started = time.perf_counter()
@@ -1283,11 +1308,16 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
+        self._payload_closed = True
+        connecting = tuple(getattr(self, "_payload_connecting", {}).values())
+        for task in connecting:
+            if not task.done():
+                task.get_loop().call_soon_threadsafe(task.cancel)
         transfer = getattr(self, "payload_transfer", None)
-        if transfer is not None:
+        if transfer is not None and not connecting:
             transfer.shutdown()
+        # Pending handshakes release the backend through their completion callbacks.
         getattr(self, "_payload_connections", {}).clear()
-        getattr(self, "_payload_connect_locks", {}).clear()
         # Before super(), which may destroy the context these sockets live on. Absent when
         # the base constructor raised (a failed handshake does), and __del__ still calls this.
         pool = getattr(self, "storage_rpc_pool", None)

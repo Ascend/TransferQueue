@@ -73,8 +73,7 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
             handle(RequestHeader(Operation.GET, {"global_indexes": [99], "fields": ["value"]}), None)
         assert unit._requests_arrived == 3
         assert unit._arrivals_by_op == {"PUT_DATA": 1, "GET_DATA": 2}
-        assert heavy.call_count == 2
-        assert all(call.args[3] is None and "phase=storage" in call.args[4] for call in heavy.call_args_list)
+        heavy.assert_not_called()
         if metrics_enabled:
             assert unit._metrics.request_total.labels(op_type="GET_DATA")._value.get() == 2
             assert unit._metrics.request_errors_total.labels(op_type="GET_DATA")._value.get() == 1
@@ -282,7 +281,7 @@ async def test_storage_rejection_keeps_socket_reusable(monkeypatch, operation):
                 send=None if operation == Operation.GET else {"text": ["input"]},
                 recv=None if operation == Operation.GET else (),
             )
-        assert str(caught.value) == message
+        assert str(caught.value) == ("missing" if operation == Operation.GET else message)
         assert caught.value.missing_key == (operation == Operation.GET)
         socket.close.assert_not_called()
         _, data = await asyncio.wait_for(client.request(
@@ -317,7 +316,8 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     manager.storage_unit_infos = {peer.id: peer}
     manager.config = {}
     manager._payload_connections = {}
-    manager._payload_connect_locks = {}
+    manager._payload_connecting = {}
+    manager._payload_closed = False
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     manager.close = lambda: None
     merge = MagicMock(side_effect=lambda old, new: torch.cat([old, new]))

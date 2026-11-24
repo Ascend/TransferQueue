@@ -1250,23 +1250,17 @@ class SimpleStorageUnit:
         self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
     def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None):
-        """Observe local storage work regardless of the selected wire protocol."""
+        """Run storage operations and observability on the StorageUnit worker.
+
+        All payload backends must serialize this handler with administrative operations;
+        the storage state and local performance monitor rely on that ordering.
+        """
         operation = header.operation
         op_type = f"{operation.value}_DATA"
         self._record_arrival(op_type)
         monitor = self._metrics if self._metrics is not None else self._perf_monitor
-        started = time.perf_counter()
-        try:
-            with monitor.measure(op_type=op_type):
-                return handle_storage_request(self.storage_unit_id, self.storage_data, header, data)
-        finally:
-            if operation == Operation.GET:
-                # Wire size and serialization time remain the backend's responsibility.
-                log_heavy_operation(
-                    self.storage_unit_id, "get", time.perf_counter() - started, None,
-                    f"phase=storage samples={len(header.body.get('global_indexes', []))} "
-                    f"fields={list(header.body.get('fields', []))}",
-                )
+        with monitor.measure(op_type=op_type):
+            return handle_storage_request(self.storage_unit_id, self.storage_data, header, data)
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
@@ -1293,6 +1287,7 @@ class SimpleStorageUnit:
             return
 
         operation = request_msg.request_type
+        started = time.perf_counter()
 
         try:
             if operation not in REQUEST_TYPES.values():
@@ -1339,7 +1334,6 @@ class SimpleStorageUnit:
             )
 
         # A get data_parser can return a value that fails to encode; reply with an error so the sole worker lives.
-        started = time.perf_counter()
         try:
             response_frames = response_msg.serialize()
         except Exception as e:
@@ -1362,7 +1356,7 @@ class SimpleStorageUnit:
                     "get",
                     time.perf_counter() - started,
                     sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                    f"phase=serialize samples={len(request_msg.body.get('global_indexes', []))} "
+                    f"samples={len(request_msg.body.get('global_indexes', []))} "
                     f"fields={list(request_msg.body.get('fields', []))}",
                 )
         worker_socket.send_multipart([identity] + response_frames, copy=False)

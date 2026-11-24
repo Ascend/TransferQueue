@@ -53,13 +53,19 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     def listen(self, *, handle: StorageHandler, address: Any = None) -> PeerInfo:
-        """Bind a local storage handler and return the bootstrap information."""
+        """Bind a local storage handler and return the bootstrap information.
+
+        Invoke handle only on the StorageUnit worker, serially with administrative
+        operations. Transport threads must hand requests to that worker rather than
+        invoke handle directly; binding the handler does not provide this dispatch.
+        """
 
     @abstractmethod
     async def connect(self, peer_info: PeerInfo) -> Any:
         """Handshake and return a connection supporting concurrent requests on its owning loop.
 
-        The manager caches connections per loop and peer. A failed or cancelled
+        The manager shares pending handshakes and caches connections per loop and peer.
+        Cancelling one caller does not cancel the shared handshake. A failed or cancelled
         connect must release partial resources. The backend owns connection resources
         until shutdown, including handles evicted by the manager after request failure.
         """
@@ -81,4 +87,9 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Drain local work and close transport resources for synchronous TQ owners."""
+        """Drain local work and close transport resources for synchronous TQ owners.
+
+        The StorageUnit owner and backend must stop admitting requests and finish or
+        reject accepted storage work before stopping the worker. On return, no storage
+        callback may remain active or be invoked later; retain resources until safe.
+        """

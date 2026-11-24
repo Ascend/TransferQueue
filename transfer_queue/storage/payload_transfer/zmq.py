@@ -76,12 +76,10 @@ class ZmqPayloadTransfer(PayloadTransfer):
             receiver_id=connection.id,
             body=body,
         )
-        wire_bytes = 0
+        frames = request.serialize()
+        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames) if send is not None else 0
         try:
             async with self.pool.alease(connection) as socket:
-                frames = request.serialize()
-                if send is not None:
-                    wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
                 await socket.send_multipart(frames, copy=False)
                 reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
                 if reply.request_type not in (RESPONSE_TYPES[header.operation], ERROR_TYPES[header.operation]):
@@ -100,9 +98,11 @@ class ZmqPayloadTransfer(PayloadTransfer):
         # A valid storage rejection completes the exchange and leaves the socket reusable.
         if reply.request_type == ERROR_TYPES[header.operation]:
             message = body.get("message", "storage request rejected")
-            raise StorageRejected(
-                message, missing_key=header.operation == Operation.GET and KEY_NOT_FOUND_MARKER in message,
-            )
+            prefix = f"[{KEY_NOT_FOUND_MARKER}] "
+            missing_key = header.operation == Operation.GET and message.startswith(prefix)
+            if missing_key:
+                message = message.removeprefix(prefix)
+            raise StorageRejected(message, missing_key=missing_key)
         return ReplyHeader(body, wire_bytes), data
 
     def handle_request(self, message):

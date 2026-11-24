@@ -33,6 +33,8 @@ backend:
     required_node_resource: null
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null
+    # Payload backend discovery information (automatically generated during init)
+    payload_peers: null
 
     # SSD offload stores large field values on local SSD to reduce long-lived host-memory use.
     # See docs/ssd_offload.md for configuration and cleanup details.

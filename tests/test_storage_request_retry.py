@@ -48,7 +48,8 @@ def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
     manager.storage_unit_infos = {}
     manager.config = {}
     manager._payload_connections = {}
-    manager._payload_connect_locks = {}
+    manager._payload_connecting = {}
+    manager._payload_closed = False
     if with_unit:
         manager.storage_unit_infos["unit_a"] = ZMQServerInfo(
             role=Role.STORAGE,
@@ -236,7 +237,7 @@ async def test_payload_failure_preserves_target_and_exception_category(operation
         if failure in ("transport", "zmq", "decode"):
             assert type(error).__name__ in str(caught.value)
             assert str(error) in str(caught.value)
-    else:
+    elif phase == "request":
         assert caught.value is error
     if phase == "connect":
         manager.payload_transfer.request.assert_not_awaited()
