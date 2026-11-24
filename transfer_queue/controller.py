@@ -1306,6 +1306,11 @@ class TransferQueueController:
                 )
                 return False
 
+        if custom_backend_meta:
+            if any(not isinstance(meta, dict) for meta in custom_backend_meta.values()):
+                raise ValueError("Controller custom_backend_meta entries must be dicts")
+            if any(custom_backend_meta.values()):
+                serial_utils.require_native_metadata(list(custom_backend_meta.values()))
         field_schema = serial_utils.decode_field_schema(field_schema)
         field_names = list(field_schema.keys())
         success = partition.update_production_status(
@@ -1395,6 +1400,12 @@ class TransferQueueController:
             ...     }
             ... })
         """
+
+        for custom_meta in partition_custom_meta.values():
+            if any(not isinstance(tag, dict) for tag in custom_meta.values()):
+                raise ValueError("Controller tags must be dicts")
+            if any(custom_meta.values()):
+                serial_utils.require_native_metadata(list(custom_meta.values()))
 
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
@@ -2846,6 +2857,8 @@ class TransferQueueController:
             for partition in state["partitions"].values():
                 if partition.custom_meta:
                     serial_utils.require_native_metadata(list(partition.custom_meta.values()))
+                if partition.field_custom_backend_meta:
+                    serial_utils.require_native_metadata(list(partition.field_custom_backend_meta.values()))
 
             # TODO(0.2.1): Remove legacy checkpoint migration for list shapes and string dtypes.
             migrated_legacy_fields = False

@@ -266,8 +266,10 @@ class StorageManager(ABC):
                 field_copy["per_sample_shapes"] = dict(zip(global_indexes, per_sample_shapes, strict=True))
             normalized_field_schema[field_name] = field_copy
         normalized_field_schema = serial_utils.encode_field_schema(normalized_field_schema)
-        if custom_backend_meta and any(type(index) is not int for index in custom_backend_meta):
-            custom_backend_meta = {operator.index(index): row for index, row in custom_backend_meta.items()}
+        if custom_backend_meta:
+            if any(type(index) is not int for index in custom_backend_meta):
+                custom_backend_meta = {operator.index(index): row for index, row in custom_backend_meta.items()}
+            serial_utils.require_native_metadata(custom_backend_meta)
 
         request_msg = ZMQMessage.create(
             request_type=ZMQRequestType.NOTIFY_DATA_UPDATE,  # type: ignore[arg-type]
