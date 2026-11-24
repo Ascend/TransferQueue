@@ -201,7 +201,10 @@ class BatchMeta:
         field_schema: Field-level metadata {field_name: {dtype, shape, is_nested, is_non_tensor, per_sample_shapes}}.
         production_status: Vectorized production status, shape (B,) where B is batch size.
         extra_info: Additional batch information omitted from the Controller's MessagePack payload.
-        custom_meta: Per-sample user-defined metadata, list aligned with global_indexes.
+        custom_meta: Per-sample user-defined metadata ``dict``s aligned with ``global_indexes``.
+            Values sent to the Controller must be native MessagePack types (``None``, ``bool``,
+            64-bit ``int``, ``float``, ``str``, ``bytes``, ``list``, ``tuple`` decoded as ``list``,
+            or nested ``dict``s).
         _custom_backend_meta: Per-sample per-field storage backend metadata, list aligned with global_indexes.
         _links: Per-sample {field: source global_index} for linked fields, list aligned with global_indexes.
     """
@@ -435,7 +438,10 @@ class BatchMeta:
         """Update custom_meta with a list of dictionary of custom metadata.
 
         Args:
-            custom_meta: list of custom_meta dictionary (one per sample, in global_indexes order)
+            custom_meta: List of per-sample metadata ``dict``s (in ``global_indexes`` order)
+                containing native MessagePack values (``None``, ``bool``, 64-bit ``int``,
+                ``float``, ``str``, ``bytes``, ``list``, ``tuple`` decoded as ``list``, or
+                nested ``dict``s).
 
         Raises:
             ValueError: If the length of custom_meta does not match the batch size
@@ -922,7 +928,8 @@ class KVBatchMeta:
     # keys of each sample
     keys: list[str] = dataclasses.field(default_factory=list)
 
-    # sample-level tags
+    # sample-level metadata dicts of native MessagePack values (None, bool, 64-bit int,
+    # float, str, bytes, list, tuple decoded as list, or nested dicts)
     tags: list[dict] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch
