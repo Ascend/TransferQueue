@@ -1418,7 +1418,7 @@ class TestTransferQueueControllerKvInterface:
 class TestTransferQueueControllerCheckpoint:
     """Tests for TransferQueueController save/load checkpoint functionality."""
 
-    def test_checkpoint_restores_legacy_dtypes_and_shapes(self, ray_setup, tmp_path):
+    def test_controller_checkpoint_roundtrip(self, ray_setup, tmp_path):
         gbs = 4
         partition_id = "ckpt_partition"
         ckpt_path = str(tmp_path / "controller.pkl")
@@ -1451,44 +1451,28 @@ class TestTransferQueueControllerCheckpoint:
             )
         )
 
-        # Save checkpoint
+        # Save checkpoint and restore into a fresh controller
         ray.get(tq_controller.save_checkpoint.remote(ckpt_path))
+        new_controller = TransferQueueController.remote()
+        ray.get(new_controller.load_checkpoint.remote(ckpt_path))
+
         with open(ckpt_path, "rb") as f:
             state = pickle.load(f)
-        # Older checkpoints could store dtype names and shapes decoded from MessagePack arrays.
-        fields = state["partitions"][partition_id].field_metadata
-        fields["prompt_ids"].dtype = "torch.long"
-        fields["prompt_ids"].shape = [32]
-        fields["attention_mask"].dtype = "bool"
-        fields["attention_mask"].per_sample_shapes = dict.fromkeys(metadata.global_indexes, [32])
-        with open(ckpt_path, "wb") as f:
-            pickle.dump(state, f)
-
-        # Create a fresh controller and restore
-        new_controller = TransferQueueController.remote()
-
-        def restore_checkpoint(controller):
-            with pytest.warns(FutureWarning, match=r"will be removed in 0\.2\.1") as captured:
-                controller.load_checkpoint(ckpt_path)
-            assert len(captured) == 1
-
-        ray.get(new_controller.__ray_call__.remote(restore_checkpoint))
-
         bad_ckpt_path = str(tmp_path / "bad_controller.pkl")
-        state["partitions"][partition_id].custom_meta = {metadata.global_indexes[0]: {"bad": torch.ones(1)}}
-        with open(bad_ckpt_path, "wb") as f:
-            pickle.dump(state, f)
-        with pytest.raises(RuntimeError, match="native MessagePack"):
-            ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
-
-        state["partitions"][partition_id].custom_meta = {}
-        state["partitions"][partition_id].field_custom_backend_meta = {
-            metadata.global_indexes[0]: {"prompt_ids": {"bad": torch.ones(1)}}
-        }
-        with open(bad_ckpt_path, "wb") as f:
-            pickle.dump(state, f)
-        with pytest.raises(RuntimeError, match="native MessagePack"):
-            ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
+        gidx = metadata.global_indexes[0]
+        for attr, bad_entry in (
+            ("custom_meta", {gidx: {"bad": torch.ones(1)}}),
+            ("field_custom_backend_meta", {gidx: {"prompt_ids": {"bad": torch.ones(1)}}}),
+            ("links", {gidx: {"prompt_ids": np.int64(0)}}),
+        ):
+            state["partitions"][partition_id].custom_meta = {}
+            state["partitions"][partition_id].field_custom_backend_meta = {}
+            state["partitions"][partition_id].links = {}
+            setattr(state["partitions"][partition_id], attr, bad_entry)
+            with open(bad_ckpt_path, "wb") as f:
+                pickle.dump(state, f)
+            with pytest.raises(RuntimeError, match="native MessagePack"):
+                ray.get(new_controller.load_checkpoint.remote(bad_ckpt_path))
 
         # Verify partition state was restored
         partition = ray.get(new_controller.get_partition_snapshot.remote(partition_id))
@@ -1621,10 +1605,14 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
         left, right = inserted.global_indexes
         tags = [{"score": 3}, {"source": ["rollout", 5, None], "limits": [-(2**63), 2**63 - 1]}]
         numpy_left, numpy_right = np.int64(left), np.int64(right)
-        for invalid in (torch.ones(1), np.int64(1), 2**70, range(2)):
+        for invalid in (torch.ones(1), np.int64(1), 2**70, range(2), {1, 2}, (1, 2)):
             bad = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=[{"bad": invalid}, {}])
             with pytest.raises(ValueError, match="native MessagePack"):
                 await client.async_set_custom_meta(bad)
+        with pytest.raises(ValueError, match="native MessagePack"):
+            await client.async_set_custom_meta(
+                BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=[{1: "a"}, {}])
+            )
         inserted = BatchMeta([numpy_left, numpy_right], [partition_id] * 2, custom_meta=tags)
         await client.async_set_custom_meta(inserted)
 
@@ -1642,8 +1630,8 @@ async def test_tags_and_backend_metadata_round_trip_over_zmq(ray_setup):
         }
         with pytest.raises(ValueError, match=r"per_sample_shapes length \(1\) does not match"):
             await producer.notify_data_update(partition_id, [left, right], {"ids": {"per_sample_shapes": [(2,)]}})
-        backend_meta = {numpy_left: {"ids": {"n_chunks": 2}}, numpy_right: {"ids": "npu_tensor"}}
-        assert await producer.notify_data_update(partition_id, [numpy_left, numpy_right], schema, backend_meta)
+        backend_meta = {left: {"ids": {"n_chunks": 2}}, right: {"ids": "npu_tensor"}}
+        assert await producer.notify_data_update(partition_id, [left, right], schema, backend_meta)
         assert notified_backend_meta[-1] == backend_meta
         partition = ray.get(controller.get_partition_snapshot.remote(partition_id))
         assert partition.field_metadata["ids"].per_sample_shapes == {left: (2,), right: (4,)}
@@ -1860,6 +1848,16 @@ class TestTransferQueueControllerBadRequests:
         with pytest.raises(ValueError, match="unique"):
             ray.get(tq_controller.kv_link.remote(["dup", "dup"], "p_dup", ["pub1", "pub2"], ["shared"]))
         assert ray.get(tq_controller.get_partition_snapshot.remote(PUBLIC_PARTITION)).linked_by == {}
+        linked_dup = ray.get(
+            tq_controller.link.remote(
+                [np.int64(dup.global_indexes[0])],
+                "p_dup",
+                [np.int64(pub_pair.global_indexes[0])],
+                ["shared"],
+                ["shared"],
+            )
+        )
+        assert type(linked_dup._links[0]["shared"]) is int
 
         # 4. Pre-allocated (reserved) rows returned by force_fetch accept set_custom_meta and
         #    update_production_status, and once written are promoted out of pre_allocated_global_indexes.

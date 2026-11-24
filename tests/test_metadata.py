@@ -15,28 +15,11 @@
 
 """Unit tests for TransferQueue metadata module - Columnar BatchMeta + KVBatchMeta."""
 
-import copy
-import pickle
-
 import numpy as np
 import pytest
 import torch
 
 from transfer_queue.metadata import BatchMeta, KVBatchMeta
-
-
-def test_batch_meta_normalizes_numpy_indexes_and_deepcopies():
-    metadata = BatchMeta([np.int64(3), np.int32(7)], ["train", "train"], extra_info={"step": 1})
-    assert all(type(index) is int for index in metadata.global_indexes)
-
-    state = list(metadata.__getstate__())
-    state[metadata.__slots__.index("global_indexes")] = [np.int64(11), np.int64(13)]
-    restored = pickle.loads(pickle.dumps(metadata))
-    restored.__setstate__(tuple(state))
-    assert restored.global_indexes == [11, 13]
-    assert all(type(index) is int for index in restored.global_indexes)
-    assert copy.deepcopy(metadata).global_indexes == [3, 7]
-
 
 # ==============================================================================
 # Columnar BatchMeta Tests

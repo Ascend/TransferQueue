@@ -14,6 +14,9 @@
 # limitations under the License.
 
 
+import dataclasses
+import enum
+
 import numpy as np
 import pytest
 import torch
@@ -32,6 +35,7 @@ from transfer_queue.utils.serial_utils import (
     decode_field_schema,
     encode,
     encode_field_schema,
+    validate_metadata_dicts,
 )
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQMessageDecodeError, ZMQRequestType
 
@@ -97,12 +101,51 @@ def test_field_dtype_uses_canonical_wire_name(dtype):
     assert restored["ids"] is not wire["ids"]
 
 
-def test_encode_field_schema_normalizes_numpy_sample_keys():
-    fields = {"ids": {"dtype": torch.int64, "per_sample_shapes": {np.int64(101): (3,)}}}
-    wire = encode_field_schema(fields)
-    assert wire["ids"]["dtype"] == "int64"
-    assert wire["ids"]["per_sample_shapes"] == {101: (3,)}
-    assert all(type(index) is int for index in wire["ids"]["per_sample_shapes"])
+def test_validate_metadata_dicts_enforces_lossless_native_msgpack():
+    @dataclasses.dataclass
+    class SampleTag:
+        step: int = 1
+
+    class Rank(enum.IntEnum):
+        ZERO = 0
+
+    shared = ["a", 1]
+    valid = {
+        "none": None,
+        "bool": True,
+        "ints": [-(2**63), 2**64 - 1],
+        "float": 1.5,
+        "bytes": b"ok",
+        "shared_a": shared,
+        "shared_b": shared,
+        "nested": {"k": "v"},
+    }
+    validate_metadata_dicts([{}, valid], "tags")
+
+    with pytest.raises(ValueError, match="tags entries must be dicts, got list"):
+        validate_metadata_dicts([["not", "dict"]], "tags")
+    with pytest.raises(ValueError, match="tags dict keys must be str for native MessagePack, got int"):
+        validate_metadata_dicts([{1: "a"}], "tags")
+    with pytest.raises(ValueError, match="tags dict keys must be str for native MessagePack, got int"):
+        validate_metadata_dicts([{"nested": {1: "a"}}], "tags")
+    with pytest.raises(ValueError, match="reserved marker '__tq_tensordict__'"):
+        validate_metadata_dicts([{"nested": {"__tq_tensordict__": True}}], "tags")
+
+    for bad in ({1, 2}, frozenset([1]), (1, 2), bytearray(b"a"), SampleTag(), Rank.ZERO, torch.ones(1), np.int64(1)):
+        with pytest.raises(ValueError, match="tags values must be native MessagePack types"):
+            validate_metadata_dicts([{"bad": bad}], "tags")
+
+    for out_of_range in (-(2**63) - 1, 2**64):
+        with pytest.raises(ValueError, match="64-bit native MessagePack range"):
+            validate_metadata_dicts([{"bad": out_of_range}], "tags")
+
+    cycle: list = []
+    cycle.append(cycle)
+    with pytest.raises(ValueError, match="circular references"):
+        validate_metadata_dicts([{"cycle": cycle}], "tags")
+
+    with pytest.raises(ValueError, match="native MessagePack"):
+        validate_metadata_dicts([{"surrogate": "\ud800"}], "tags")
 
 
 def test_batch_meta_encoding_rejects_unknown_dtype():

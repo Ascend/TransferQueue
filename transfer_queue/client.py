@@ -241,11 +241,8 @@ class AsyncTransferQueueClient:
 
     # ==================== Basic API ====================
     def validate_tags(self, tags: list[dict[str, Any]]) -> None:
-        """Validate that custom per-sample tags are dicts serializable as native MessagePack."""
-        if any(not isinstance(tag, dict) for tag in tags):
-            raise ValueError("Controller tags must be dicts")
-        if any(tags):
-            serial_utils.require_native_metadata(tags)
+        """Validate that custom per-sample tags are ``str``-keyed ``dict``s of native MessagePack values."""
+        serial_utils.validate_metadata_dicts(tags, "tags")
 
     @with_controller_socket
     async def async_get_meta(

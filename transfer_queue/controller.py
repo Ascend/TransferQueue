@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import operator
 import os
 import pickle
 import time
@@ -1307,10 +1308,7 @@ class TransferQueueController:
                 return False
 
         if custom_backend_meta:
-            if any(not isinstance(meta, dict) for meta in custom_backend_meta.values()):
-                raise ValueError("Controller custom_backend_meta entries must be dicts")
-            if any(custom_backend_meta.values()):
-                serial_utils.require_native_metadata(list(custom_backend_meta.values()))
+            serial_utils.validate_metadata_dicts(custom_backend_meta.values(), "custom_backend_meta")
         field_schema = serial_utils.decode_field_schema(field_schema)
         field_names = list(field_schema.keys())
         success = partition.update_production_status(
@@ -1402,10 +1400,7 @@ class TransferQueueController:
         """
 
         for custom_meta in partition_custom_meta.values():
-            if any(not isinstance(tag, dict) for tag in custom_meta.values()):
-                raise ValueError("Controller tags must be dicts")
-            if any(custom_meta.values()):
-                serial_utils.require_native_metadata(list(custom_meta.values()))
+            serial_utils.validate_metadata_dicts(custom_meta.values(), "custom_meta")
 
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
@@ -2169,6 +2164,8 @@ class TransferQueueController:
             raise ValueError(f"rows of partition {PUBLIC_PARTITION!r} hold shared payloads and cannot link")
         if not global_indexes:
             raise ValueError("rows must not be empty")
+        global_indexes = list(map(operator.index, global_indexes))
+        public_indexes = list(map(operator.index, public_indexes))
         if len(public_indexes) != len(global_indexes):
             raise ValueError(f"{len(public_indexes)} public rows for {len(global_indexes)} rows")
         if len(set(global_indexes)) != len(global_indexes):
@@ -2856,35 +2853,13 @@ class TransferQueueController:
 
             for partition in state["partitions"].values():
                 if partition.custom_meta:
-                    serial_utils.require_native_metadata(list(partition.custom_meta.values()))
+                    serial_utils.validate_metadata_dicts(partition.custom_meta.values(), "custom_meta")
                 if partition.field_custom_backend_meta:
-                    serial_utils.require_native_metadata(list(partition.field_custom_backend_meta.values()))
-
-            # TODO(0.2.1): Remove legacy checkpoint migration for list shapes and string dtypes.
-            migrated_legacy_fields = False
-            for partition_id, partition in state["partitions"].items():
-                for name, field_meta in partition.field_metadata.items():
-                    if isinstance(field_meta.shape, list):
-                        field_meta.shape = tuple(field_meta.shape)
-                        migrated_legacy_fields = True
-                    for index, shape in (field_meta.per_sample_shapes or {}).items():
-                        if isinstance(shape, list):
-                            field_meta.per_sample_shapes[index] = tuple(shape)
-                            migrated_legacy_fields = True
-                    if isinstance(field_meta.dtype, str):
-                        field_meta.dtype = serial_utils.parse_torch_dtype(field_meta.dtype, f"{partition_id}.{name}")
-                        migrated_legacy_fields = True
-
-            if migrated_legacy_fields:
-                warnings.warn(
-                    f"Controller checkpoint {path!r} uses legacy FieldMeta formats "
-                    "(dtype stored as str such as 'torch.int64' instead of torch.dtype, "
-                    "or shape stored as list instead of tuple). Automatic migration is "
-                    "deprecated and will be removed in 0.2.1; "
-                    "call save_checkpoint() to re-save it in the current format.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
+                    serial_utils.validate_metadata_dicts(
+                        partition.field_custom_backend_meta.values(), "custom_backend_meta"
+                    )
+                if partition.links:
+                    serial_utils.validate_metadata_dicts(partition.links.values(), "links")
 
             self.controller_id = state["controller_id"]
             self.partitions = state["partitions"]

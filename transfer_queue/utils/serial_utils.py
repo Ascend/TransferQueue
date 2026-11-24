@@ -17,11 +17,10 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
-import operator
 import pickle
 import struct
 import warnings
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from typing import Any, TypeAlias
@@ -382,16 +381,13 @@ def parse_torch_dtype(dtype: Any, field_name: str) -> torch.dtype:
 
 
 def encode_field_schema(fields: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """Prepare a field schema with canonical dtype names and integer sample keys."""
+    """Prepare a field schema with canonical dtype names."""
     encoded = {}
     for name, field in fields.items():
         field = dict(field)
         dtype = field.get("dtype")
         if dtype is not None:
             field["dtype"] = str(parse_torch_dtype(dtype, name)).removeprefix("torch.")
-        per_sample_shapes = field.get("per_sample_shapes")
-        if isinstance(per_sample_shapes, dict) and any(type(index) is not int for index in per_sample_shapes):
-            field["per_sample_shapes"] = {operator.index(index): shape for index, shape in per_sample_shapes.items()}
         encoded[name] = field
     return encoded
 
@@ -463,12 +459,65 @@ _ENCODE_FALLBACK_ERRORS = (
 )
 
 
-def require_native_metadata(metadata: Any) -> None:
-    """Raise ``ValueError`` if ``metadata`` cannot be encoded as native MessagePack without custom hooks."""
+_SCALAR_METADATA_TYPES = (type(None), bool, float, str, bytes)
+
+
+def _check_metadata_value(value: Any, name: str, active: set[int]) -> None:
+    value_type = type(value)
+    if value_type in _SCALAR_METADATA_TYPES:
+        return
+    if value_type is int:
+        if -(1 << 63) <= value < (1 << 64):
+            return
+        raise ValueError(f"{name} int out of 64-bit native MessagePack range: {value}")
+    if value_type is list:
+        obj_id = id(value)
+        if obj_id in active:
+            raise ValueError(f"{name} cannot contain circular references for native MessagePack")
+        active.add(obj_id)
+        try:
+            for item in value:
+                _check_metadata_value(item, name, active)
+        finally:
+            active.remove(obj_id)
+        return
+    if value_type is dict:
+        _check_metadata_dict(value, name, active)
+        return
+    raise ValueError(f"{name} values must be native MessagePack types, got {value_type.__name__}")
+
+
+def _check_metadata_dict(mapping: dict[Any, Any], name: str, active: set[int]) -> None:
+    if mapping.get("__tq_tensordict__") is True:
+        raise ValueError(f"{name} dicts cannot set reserved marker '__tq_tensordict__': True")
+    obj_id = id(mapping)
+    if obj_id in active:
+        raise ValueError(f"{name} cannot contain circular references for native MessagePack")
+    active.add(obj_id)
     try:
-        msgpack.encode(metadata)
-    except _ENCODE_FALLBACK_ERRORS as error:
-        raise ValueError(f"Controller metadata must be native MessagePack: {error}") from error
+        for key, value in mapping.items():
+            if type(key) is not str:
+                raise ValueError(f"{name} dict keys must be str for native MessagePack, got {type(key).__name__}")
+            _check_metadata_value(value, name, active)
+    finally:
+        active.remove(obj_id)
+
+
+def validate_metadata_dicts(rows: Iterable[Any], name: str = "metadata") -> None:
+    """Validate that ``rows`` are ``str``-keyed ``dict``s of lossless native MessagePack values."""
+    active: set[int] = set()
+    non_empty: list[dict[str, Any]] = []
+    for row in rows:
+        if type(row) is not dict:
+            raise ValueError(f"{name} entries must be dicts, got {type(row).__name__}")
+        if row:
+            _check_metadata_dict(row, name, active)
+            non_empty.append(row)
+    if non_empty:
+        try:
+            msgpack.encode(non_empty)
+        except _ENCODE_FALLBACK_ERRORS as error:
+            raise ValueError(f"{name} must be native MessagePack: {error}") from error
 
 
 def _is_pickle_fallback(frame: bytestr) -> bool:

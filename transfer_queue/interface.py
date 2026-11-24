@@ -396,10 +396,10 @@ def kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Optional metadata ``dict`` to associate with the key. Values may be
-             ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``, ``list``,
-             ``tuple`` (decoded as ``list``), or nested ``dict``s; tensors, NumPy arrays
-             or scalars, sets, and custom objects are not supported.
+        tag: Optional ``str``-keyed metadata ``dict`` to associate with the key. Values
+             may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
+             ``list``, or nested ``str``-keyed ``dict``s; tensors, NumPy arrays or scalars,
+             tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -466,10 +466,10 @@ def kv_batch_put(
         partition_id: Logical partition where the data will be stored.
         fields: TensorDict containing batched data for all keys. Must have ``batch_size == len(keys)``.
             If not provided, only the associated tags will be updated.
-        tags: List of metadata dictionaries, one per key (length must match ``len(keys)``).
-            Values may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
-            ``list``, ``tuple`` (decoded as ``list``), or nested ``dict``s; tensors, NumPy
-            arrays or scalars, sets, and custom objects are not supported.
+        tags: List of ``str``-keyed metadata dictionaries, one per key (length must match
+            ``len(keys)``). Values may be ``None``, ``bool``, 64-bit ``int``, ``float``,
+            ``str``, ``bytes``, ``list``, or nested ``str``-keyed ``dict``s; tensors,
+            NumPy arrays or scalars, tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse raw reference data (e.g., URLs) into real content
             before storage. The input is a plain dict (not TensorDict) mapping field names to
             batched values. The parser  **must modify data in-place** without adding/removing
@@ -897,10 +897,10 @@ async def async_kv_put(
                 Each key in `fields` will be treated as a column for the data sample.
                 If dict is provided, tensors will be unsqueezed to add batch dimension.
                 If not provided, will only update the newly given tag to the key.
-        tag: Optional metadata ``dict`` to associate with the key. Values may be
-             ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``, ``list``,
-             ``tuple`` (decoded as ``list``), or nested ``dict``s; tensors, NumPy arrays
-             or scalars, sets, and custom objects are not supported.
+        tag: Optional ``str``-keyed metadata ``dict`` to associate with the key. Values
+             may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
+             ``list``, or nested ``str``-keyed ``dict``s; tensors, NumPy arrays or scalars,
+             tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
@@ -1013,10 +1013,10 @@ async def async_kv_batch_put(
         partition_id: Logical partition to store the data in
         fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
                 If not provided, will only update the newly given tags to the keys.
-        tags: List of metadata ``dict``s, one per key (length must match ``len(keys)``).
-              Values may be ``None``, ``bool``, 64-bit ``int``, ``float``, ``str``, ``bytes``,
-              ``list``, ``tuple`` (decoded as ``list``), or nested ``dict``s; tensors, NumPy
-              arrays or scalars, sets, and custom objects are not supported.
+        tags: List of ``str``-keyed metadata ``dict``s, one per key (length must match
+              ``len(keys)``). Values may be ``None``, ``bool``, 64-bit ``int``, ``float``,
+              ``str``, ``bytes``, ``list``, or nested ``str``-keyed ``dict``s; tensors,
+              NumPy arrays or scalars, tuples, sets, and custom objects are not supported.
         data_parser: Optional callable to parse reference data (e.g., URLs) into real
                      content. The input is a slice of the `fields` parameter passed to
                      kv_put / kv_batch_put, in plain dict format (not TensorDict),
