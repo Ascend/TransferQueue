@@ -68,6 +68,8 @@ def load_checkpoint(
 
 **Prerequisite**: `tq.init()` must have been called and the system must be in a clean state (no prior data operations). `load_checkpoint` restores state into a running system; it does not launch components.
 
+Restore with the Controller backend that saved the checkpoint. The experimental Rust Controller writes a versioned `controller_state.msgpack` in place of `controller_state.pkl`. Keep the checkpoint directory stable throughout restore.
+
 ## Checkpoint Directory Layout
 
 ```

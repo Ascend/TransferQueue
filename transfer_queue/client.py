@@ -62,6 +62,12 @@ with_controller_socket = with_zmq_socket(
 )
 
 
+def _status_tensor(raw: bytes, shape: tuple[int, ...]) -> torch.Tensor:
+    if not raw:
+        return torch.zeros(shape, dtype=torch.int8)
+    return torch.frombuffer(bytearray(raw), dtype=torch.int8).reshape(shape)
+
+
 class AsyncTransferQueueClient:
     """Asynchronous client for interacting with TransferQueue controller and storage systems.
 
@@ -834,7 +840,12 @@ class AsyncTransferQueueClient:
             )
             global_index = response_msg.body.get("global_index")
             consumption_status = response_msg.body.get("consumption_status")
-            return global_index, consumption_status
+            if global_index is None or consumption_status is None:
+                return None, None
+            return (
+                torch.tensor(global_index, dtype=torch.long),
+                _status_tensor(consumption_status, (len(consumption_status),)),
+            )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_consumption_status: {str(e)}") from e
 
@@ -880,7 +891,12 @@ class AsyncTransferQueueClient:
             )
             global_index = response_msg.body.get("global_index")
             production_status = response_msg.body.get("production_status")
-            return global_index, production_status
+            if global_index is None or production_status is None:
+                return None, None
+            return (
+                torch.tensor(global_index, dtype=torch.long),
+                _status_tensor(production_status, (len(global_index), len(set(data_fields)))),
+            )
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_data_production_status: {str(e)}") from e
 

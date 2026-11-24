@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
-from threading import Thread
+from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -242,7 +242,7 @@ class FieldMeta:
     is_nested: bool | None = None
     is_non_tensor: bool | None = None
 
-    per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
+    per_sample_shapes: dict[int, tuple | None] = field(default_factory=dict)  # {global_idx: shape}
 
     # TODO: FieldMeta needs to be refactored to prevent these complicated and fragile logics
     def update(self, incoming: dict[str, Any], incoming_global_indexes: list[int]) -> None:
@@ -1175,6 +1175,7 @@ class TransferQueueController:
         # Prometheus metrics exporter (lazy-initialized when enabled)
         self._metrics: TQMetricsExporter | None = None
         self._metrics_endpoint: str = ""
+        self._shutdown_event = Event()
 
         # Start background processing threads
         self._start_process_handshake()
@@ -2319,8 +2320,8 @@ class TransferQueueController:
 
         logger.debug(f"Controller {self.controller_id} started waiting for storage connections...")
 
-        while True:
-            socks = dict(poller.poll(1000))
+        while not self._shutdown_event.is_set():
+            socks = dict(poller.poll(200))
 
             if self.handshake_socket in socks:
                 try:
@@ -2389,7 +2390,7 @@ class TransferQueueController:
 
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 self._process_request_loop(perf_monitor)
             except zmq.ContextTerminated:
@@ -2411,7 +2412,9 @@ class TransferQueueController:
         until a reply arrives, so silently dropping a request would hang the caller.
         """
 
-        while True:
+        while not self._shutdown_event.is_set():
+            if not self.request_handle_socket.poll(200):
+                continue
             monitor = self._metrics if self._metrics is not None else perf_monitor
 
             messages = self.request_handle_socket.recv_multipart(copy=False)
@@ -2631,8 +2634,8 @@ class TransferQueueController:
             ZMQRequestType.CONSUMPTION_RESPONSE,
             {
                 "partition_id": params["partition_id"],
-                "global_index": global_index,
-                "consumption_status": consumption_status,
+                "global_index": None if global_index is None else global_index.tolist(),
+                "consumption_status": None if consumption_status is None else consumption_status.numpy().tobytes(),
             },
         )
 
@@ -2660,8 +2663,8 @@ class TransferQueueController:
             ZMQRequestType.PRODUCTION_RESPONSE,
             {
                 "partition_id": params["partition_id"],
-                "global_index": global_index,
-                "production_status": production_status,
+                "global_index": None if global_index is None else global_index.tolist(),
+                "production_status": None if production_status is None else production_status.numpy().tobytes(),
             },
         )
 
@@ -2969,7 +2972,7 @@ class TransferQueueController:
         """Periodically push a metrics snapshot to the exporter."""
         from transfer_queue.metrics import TQ_METRICS_COLLECT_INTERVAL
 
-        while True:
+        while not self._shutdown_event.is_set():
             self._push_metrics_snapshot()
             time.sleep(TQ_METRICS_COLLECT_INTERVAL)
 
@@ -2981,3 +2984,17 @@ class TransferQueueController:
         """
         if self._metrics is not None:
             self._metrics.register_storage_units(storage_unit_infos)
+
+    def shutdown(self) -> None:
+        """Stop request processing and release controller ZMQ sockets."""
+        self._shutdown_event.set()
+        if self.wait_connection_thread.is_alive():
+            self.wait_connection_thread.join()
+        if self.process_request_thread.is_alive():
+            self.process_request_thread.join()
+        if not self.handshake_socket.closed:
+            self.handshake_socket.close(linger=0)
+        if not self.request_handle_socket.closed:
+            self.request_handle_socket.close(linger=0)
+        if self._metrics is None and not self.zmq_context.closed:
+            self.zmq_context.term()

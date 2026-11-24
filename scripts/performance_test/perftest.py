@@ -290,6 +290,7 @@ class TQThroughputTester:
         num_test_iterations: int,
         head_node_ip: str,
         backend: str | None = None,
+        controller_backend: str | None = None,
         worker_node_ip: str | None = None,
         output_csv: str | None = None,
         use_complex_case: bool = False,
@@ -299,6 +300,7 @@ class TQThroughputTester:
         Args:
             backend_config_path: Path to backend config YAML file
             backend: Override storage_backend in config (e.g. "SimpleStorage")
+            controller_backend: Override controller.backend in config ("python" or "rust")
             device: Device type ("cpu", "npu", "gpu")
             global_batch_size: Global batch size
             field_num: Number of fields
@@ -311,6 +313,7 @@ class TQThroughputTester:
         """
         self.backend_config_path = backend_config_path
         self.backend_override = backend
+        self.controller_backend_override = controller_backend
         self.device = device
         self.global_batch_size = global_batch_size
         self.field_num = field_num
@@ -370,6 +373,10 @@ class TQThroughputTester:
         if self.backend_override is not None:
             config.backend.storage_backend = self.backend_override
             logger.info(f"Overriding storage_backend to: {self.backend_override}")
+
+        if self.controller_backend_override is not None:
+            config.controller.backend = self.controller_backend_override
+            logger.info(f"Overriding controller.backend to: {self.controller_backend_override}")
 
         # If backend.storage_backend is SimpleStorage, override total_storage_size
         total_storage_size = self.global_batch_size * self.num_test_iterations
@@ -553,6 +560,13 @@ def main() -> None:
         help="Override storage_backend in config (e.g. SimpleStorage, Yuanrong, MooncakeStore)",
     )
     parser.add_argument(
+        "--controller_backend",
+        type=str,
+        choices=["python", "rust"],
+        default=None,
+        help="Override controller.backend in config (python or rust)",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default="cpu",
@@ -620,6 +634,7 @@ def main() -> None:
         num_test_iterations=args.num_test_iterations,
         head_node_ip=args.head_node_ip,
         backend=args.backend,
+        controller_backend=args.controller_backend,
         worker_node_ip=args.worker_node_ip,
         output_csv=args.output_csv,
         use_complex_case=args.use_complex_case,

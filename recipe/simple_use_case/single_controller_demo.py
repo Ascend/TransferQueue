@@ -20,7 +20,6 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from importlib import resources
 
 import ray
 import torch
@@ -585,10 +584,7 @@ if __name__ == "__main__":
 
     trainer_config = build_config(args)
 
-    tq_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
-    tq_conf = OmegaConf.merge(
-        tq_conf, {"backend": {"SimpleStorage": {"num_data_storage_units": args.num_data_storage_units}}}
-    )
+    tq_conf = OmegaConf.create({"backend": {"SimpleStorage": {"num_data_storage_units": args.num_data_storage_units}}})
 
     trainer = Trainer(trainer_config, tq_conf)
     trainer.fit()

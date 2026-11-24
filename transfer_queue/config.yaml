@@ -8,6 +8,8 @@ metrics:
   port: 0
 
 controller:
+  # Select python or rust. The Rust controller uses SequentialSampler.
+  backend: python
   # User-defined sampler. User can pass sampler instance to overwrite this string config.
   sampler: SequentialSampler
   # ZMQ Server IP & Ports (automatically generated during init)

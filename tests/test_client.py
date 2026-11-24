@@ -114,16 +114,17 @@ class MockController:
                         # Mock consumption status check - all consumed
                         response_body = {
                             "partition_id": request_msg.body.get("partition_id"),
-                            "global_index": torch.tensor([0, 1, 2]),
-                            "consumption_status": torch.tensor([1, 1, 1]),
+                            "global_index": [0, 1, 2],
+                            "consumption_status": bytes([1, 1, 1]),
                         }
                         response_type = ZMQRequestType.CONSUMPTION_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
                         # Mock production status check - all produced
+                        num_fields = len(set(request_msg.body.get("data_fields", [])))
                         response_body = {
                             "partition_id": request_msg.body.get("partition_id"),
-                            "global_index": torch.tensor([0, 1, 2]),
-                            "production_status": torch.tensor([[1, 1, 1], [1, 1, 1]]),
+                            "global_index": [0, 1, 2],
+                            "production_status": bytes([1] * (3 * num_fields)),
                         }
                         response_type = ZMQRequestType.PRODUCTION_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.GET_LIST_PARTITIONS:
@@ -627,8 +628,8 @@ def test_get_production_status(client_setup):
     # Verify global_index contains expected values
     assert torch.equal(global_index, torch.tensor([0, 1, 2], dtype=torch.long))
 
-    # Verify production_status shape (mock returns 2x3 matrix)
-    expected_status = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.int8)
+    # Verify production_status shape (3 samples x 2 fields)
+    expected_status = torch.ones((3, 2), dtype=torch.int8)
     assert torch.equal(production_status, expected_status)
 
     print("✓ get_production_status returns correct global_index and production_status")
@@ -756,8 +757,8 @@ async def test_async_get_production_status(client_setup):
     # Verify global_index contains expected values
     assert torch.equal(global_index, torch.tensor([0, 1, 2], dtype=torch.long))
 
-    # Verify production_status shape (mock returns 2x3 matrix)
-    expected_status = torch.tensor([[1, 1, 1], [1, 1, 1]], dtype=torch.int8)
+    # Verify production_status shape (3 samples x 2 fields)
+    expected_status = torch.ones((3, 2), dtype=torch.int8)
     assert torch.equal(production_status, expected_status)
 
     print("✓ async_get_production_status returns correct global_index and production_status")

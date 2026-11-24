@@ -1,0 +1,30 @@
+name: Rust Controller CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'v0.*'
+
+permissions:
+  contents: read
+
+jobs:
+  rust-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check the Rust workspace
+        run: |
+          rustup show active-toolchain
+          rustup component add rustfmt clippy
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test -p tq-controller --locked

@@ -287,7 +287,8 @@ def test_lease_renews_and_lost_lease_raises():
 
     with pytest.raises(ValueError, match="body"):  # never masked by LockLostError
         with tq.kv_global_lock("r", P, lease_s=1) as lease:
-            ray.get(manager("r").release.remote(lease._token), timeout=TIMEOUT_S)  # the server drops it
+            lock_manager = manager("r")
+            ray.get(lock_manager.release.remote(lease._token), timeout=TIMEOUT_S)  # the server drops it
             wait_until(lambda: lease._lost)
             raise ValueError("body")
     wait_until(lambda: holders() == set())

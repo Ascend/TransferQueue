@@ -52,7 +52,7 @@ from transfer_queue.controller import PUBLIC_PARTITION, TransferQueueController
 from transfer_queue.kv_lock import _close_lock_managers, _lock_settings, _start_lock_managers
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
-from transfer_queue.sampler import BaseSampler
+from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.checkpoint_utils import validate_checkpoint
@@ -73,6 +73,7 @@ _TQ_IS_OWNER = False
 # Idle workers and proxies observe shutdown within one second; leave time for
 # Ray dispatch, in-flight work, and SSD cleanup before forcing termination.
 _SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S = 15
+_CONTROLLER_SHUTDOWN_TIMEOUT_S = 5
 
 
 def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClient:
@@ -201,6 +202,8 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
+    if env_controller_backend := os.environ.get("TQ_CONTROLLER_BACKEND"):
+        final_conf.controller.backend = env_controller_backend
     # TODO(0.2.1): Remove with `controller.polling_mode` deprecation above.
     if has_legacy_polling_mode:
         with open_dict(final_conf.controller):
@@ -221,11 +224,24 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             sampler = globals()[final_conf.controller.sampler]
     except KeyError:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
+
+    controller_backend = final_conf.controller.backend
+    controller_cls: Any
+    if controller_backend == "python":
+        controller_cls = TransferQueueController
+    elif controller_backend == "rust":
+        if sampler is not SequentialSampler and type(sampler) is not SequentialSampler:
+            raise ValueError(f"Rust Controller only supports SequentialSampler, got {final_conf.controller.sampler!r}")
+        from transfer_queue.rust_controller import RustControllerActor
+
+        controller_cls = RustControllerActor
+    else:
+        raise ValueError(f"Unknown controller.backend {controller_backend!r}; expected 'python' or 'rust'")
     lock_settings = _lock_settings()
 
     try:
         global _TQ_CONTROLLER, _TQ_IS_OWNER
-        _TQ_CONTROLLER = TransferQueueController.options(  # type: ignore[attr-defined]
+        _TQ_CONTROLLER = controller_cls.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace=ray_namespace()
         ).remote(sampler=sampler)
         _TQ_IS_OWNER = True
@@ -236,7 +252,11 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         _init_from_existing()
         return final_conf
 
-    controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
+    try:
+        controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
+    except Exception:
+        close()
+        raise
     final_conf.controller.zmq_info = controller_zmq_info
 
     final_conf = _maybe_create_tq_storage(final_conf)
@@ -344,6 +364,10 @@ def close():
 
     _close_lock_managers()
     if _TQ_IS_OWNER:
+        try:
+            ray.get(_TQ_CONTROLLER.shutdown.remote(), timeout=_CONTROLLER_SHUTDOWN_TIMEOUT_S)
+        except Exception as e:
+            logger.warning(f"Failed to gracefully shut down Controller: {e}")
         try:
             ray.kill(_TQ_CONTROLLER)
         except Exception:
@@ -1459,6 +1483,7 @@ def get_client():
 
 _METADATA_FILE = "metadata.json"
 _CONTROLLER_FILE = "controller_state.pkl"
+_RUST_CONTROLLER_FILE = "controller_state.msgpack"
 
 
 def save_checkpoint(
@@ -1502,8 +1527,10 @@ def save_checkpoint(
 
     try:
         client = _maybe_create_tq_client()
+        controller_backend = ray.get(_TQ_CONTROLLER.get_config.remote()).controller.backend
 
-        controller_path = tmp_dir / _CONTROLLER_FILE
+        controller_file = _RUST_CONTROLLER_FILE if controller_backend == "rust" else _CONTROLLER_FILE
+        controller_path = tmp_dir / controller_file
         client.save_controller_checkpoint(str(controller_path))
         logger.info("Controller state saved.")
 
@@ -1595,14 +1622,24 @@ def load_checkpoint(
         raise RuntimeError(f"Invalid checkpoint metadata: {metadata_path}")
 
     client = _maybe_create_tq_client()
+    conf = ray.get(_TQ_CONTROLLER.get_config.remote())
+    controller_backend = conf.controller.backend
 
-    controller_path = checkpoint_dir / _CONTROLLER_FILE
+    rust = controller_backend == "rust"
+    controller_file = _RUST_CONTROLLER_FILE if rust else _CONTROLLER_FILE
+    controller_path = checkpoint_dir / controller_file
     if not controller_path.exists():
-        raise FileNotFoundError(f"{_CONTROLLER_FILE} not found in {checkpoint_dir}")
+        other_file = _CONTROLLER_FILE if rust else _RUST_CONTROLLER_FILE
+        if (checkpoint_dir / other_file).exists():
+            raise ValueError(f"Controller checkpoint is incompatible with the {controller_backend} backend")
+        raise FileNotFoundError(f"{controller_file} not found in {checkpoint_dir}")
 
     if not meta["storage_saved"] and isinstance(client.storage_manager, AsyncSimpleStorageManager):
         raise RuntimeError(f"SimpleStorage requires storage_saved=True in {metadata_path}")
-    if not validate_checkpoint(checkpoint_dir):
+    storage_units = (
+        int(conf.backend.SimpleStorage.num_data_storage_units) if conf.backend.storage_backend == "SimpleStorage" else 1
+    )
+    if not validate_checkpoint(checkpoint_dir, controller_backend, storage_units=storage_units):
         raise RuntimeError(f"Invalid controller checkpoint: {controller_path}")
     if meta["storage_saved"]:
         client.load_storage_checkpoint(str(checkpoint_dir))

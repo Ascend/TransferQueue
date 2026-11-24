@@ -21,15 +21,19 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
+        controller: [python, rust]
+    env:
+      TQ_CONTROLLER_BACKEND: ${{ matrix.controller }}
 
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        rustup show active-toolchain
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[yuanrong]"
@@ -38,7 +42,13 @@ jobs:
       run: |
         export TQ_NUM_THREADS=2
         export RAY_DEDUP_LOGS=0
-        for file in tutorial/*.py; do python3 "$file"; done
+        for file in tutorial/*.py; do
+          if [[ "$TQ_CONTROLLER_BACKEND" == rust && ( "$file" == tutorial/05_custom_sampler.py || "$file" == tutorial/06_streaming_dataloader.py ) ]]; then
+            echo "Skipping $file because the Rust Controller only supports SequentialSampler."
+            continue
+          fi
+          python3 "$file"
+        done
     - name: Run notebook tutorials
       run: |
         export TQ_NUM_THREADS=2

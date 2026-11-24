@@ -1,0 +1,67 @@
+name: Wheel package
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'v0.*'
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    name: Linux wheel (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build and repair the abi3 wheel
+        uses: pypa/cibuildwheel@v3.3.1
+        env:
+          CIBW_BUILD: cp310-manylinux_${{ matrix.arch }}
+          CIBW_ARCHS_LINUX: ${{ matrix.arch }}
+          CIBW_MANYLINUX_X86_64_IMAGE: manylinux_2_28
+          CIBW_MANYLINUX_AARCH64_IMAGE: manylinux_2_28
+          CIBW_BEFORE_ALL_LINUX: >-
+            curl --proto '=https' --tlsv1.2 -fsSLo /tmp/rustup-init.sh https://sh.rustup.rs &&
+            sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain none &&
+            "$HOME/.cargo/bin/rustup" show active-toolchain
+          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH"
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: auditwheel repair --plat manylinux_2_28_${{ matrix.arch }} -w {dest_dir} {wheel}
+      - name: Test the installed wheel with Ray and ZMQ
+        env:
+          WHEEL_ARCH: ${{ matrix.arch }}
+          OMP_NUM_THREADS: '1'
+          RAY_USAGE_STATS_ENABLED: '0'
+        run: |
+          wheels=(wheelhouse/*.whl)
+          if [[ ${#wheels[@]} != 1 || ! -f "${wheels[0]}" || "${wheels[0]}" != *-cp310-abi3-*manylinux_2_28_"$WHEEL_ARCH"*.whl ]]; then
+            echo 'Expected one repaired cp310-abi3 manylinux wheel for this architecture.' >&2
+            exit 1
+          fi
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "${wheels[0]}[test]"
+          cd "$RUNNER_TEMP"
+          python -c 'from transfer_queue._controller_engine import ControllerEngine'
+          python -m pytest -q --import-mode=importlib "$GITHUB_WORKSPACE/tests/test_rust_controller.py"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
