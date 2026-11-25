@@ -23,3 +23,8 @@ class StorageKeyNotFoundError(KeyError):
     cleared before ``get_data`` reaches the storage unit. Callers that tolerate that race catch this
     instead of matching on message text.
     """
+
+
+# Preserve the historical module path so rolling-upgrade Ray workers and drivers
+# without ``transfer_queue.storage.exceptions`` still unpickle and catch this class.
+StorageKeyNotFoundError.__module__ = "transfer_queue.storage.simple_storage"

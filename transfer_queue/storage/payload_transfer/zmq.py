@@ -51,13 +51,13 @@ _WIRE_TYPES = {
 _OPERATIONS_BY_REQUEST = {req_type: op for op, (req_type, _, _) in _WIRE_TYPES.items()}
 
 
-def is_zmq_payload_request(request_type: ZMQRequestType) -> bool:
-    """Return whether ``request_type`` is a ZMQ data-plane payload operation."""
-    return request_type in _OPERATIONS_BY_REQUEST
-
-
 class ZmqPayloadTransfer(PayloadTransfer):
     """PayloadTransfer adapter over ZMQ multipart frames and pooled DEALER sockets."""
+
+    @staticmethod
+    def can_handle(request_type: ZMQRequestType) -> bool:
+        """Return whether ``request_type`` is a ZMQ payload operation handled by this adapter."""
+        return request_type in _OPERATIONS_BY_REQUEST
 
     def __init__(self, *, owner_id: str, pool: ZMQSocketPool | None = None):
         self.owner_id = owner_id

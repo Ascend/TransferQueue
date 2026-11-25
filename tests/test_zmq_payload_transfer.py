@@ -360,11 +360,9 @@ def test_storage_handler_allows_concurrent_admin_while_parser_runs(monkeypatch):
                     request_type=ZMQRequestType.CLEAR_DATA, sender_id="manager", body={"global_indexes": [1]}
                 ),
             )
-            concurrent_metrics = executor.submit(unit._handle_get_metrics)
-
             concurrent_put.result(timeout=2)
             assert concurrent_clear.result(timeout=2).request_type == ZMQRequestType.CLEAR_DATA_RESPONSE
-            metrics_reply = concurrent_metrics.result(timeout=2)
+            metrics_reply = executor.submit(unit._handle_get_metrics).result(timeout=2)
             assert metrics_reply.body["active_keys"] == 2
 
             release_parser.set()

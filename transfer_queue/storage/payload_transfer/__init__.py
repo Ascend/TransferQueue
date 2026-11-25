@@ -26,7 +26,7 @@ from .base import (
     TransferTimeout,
 )
 from .client import PayloadClient
-from .zmq import ZmqPayloadTransfer, is_zmq_payload_request
+from .zmq import ZmqPayloadTransfer
 
 __all__ = [
     "Operation",
@@ -39,5 +39,4 @@ __all__ = [
     "TransferError",
     "TransferTimeout",
     "ZmqPayloadTransfer",
-    "is_zmq_payload_request",
 ]

@@ -16,6 +16,7 @@
 """A key removed by a concurrent ``clear`` must stay distinguishable from a real storage fault."""
 
 import logging
+import pickle
 from functools import partial
 
 import pytest
@@ -51,6 +52,19 @@ def test_key_not_found_is_a_key_error(storage_data):
 
     with pytest.raises(KeyError):
         storage_data.get_data(["log_probs"], [0])
+
+
+def test_key_not_found_preserves_legacy_pickle_module_path():
+    # Rolling-upgrade Ray peers unpickle by (module, qualname); keep the pre-refactor module path.
+    err = StorageKeyNotFoundError("key 1 not found")
+    encoded = pickle.dumps(err)
+
+    assert StorageKeyNotFoundError.__module__ == "transfer_queue.storage.simple_storage"
+    assert b"transfer_queue.storage.simple_storage" in encoded
+    assert b"transfer_queue.storage.exceptions" not in encoded
+    restored = pickle.loads(encoded)
+    assert isinstance(restored, StorageKeyNotFoundError)
+    assert isinstance(restored, KeyError)
 
 
 def test_unknown_field_still_raises_value_error(storage_data):

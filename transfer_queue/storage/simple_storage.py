@@ -60,7 +60,6 @@ from transfer_queue.storage.payload_transfer import (
     RequestHeader,
     StorageRejected,
     ZmqPayloadTransfer,
-    is_zmq_payload_request,
 )
 from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER as KEY_NOT_FOUND_MARKER
 from transfer_queue.utils import compact_pickle
@@ -1294,7 +1293,9 @@ class SimpleStorageUnit:
         started = time.perf_counter()
 
         try:
-            is_payload = is_zmq_payload_request(operation)
+            is_payload = isinstance(self.payload_transfer, ZmqPayloadTransfer) and self.payload_transfer.can_handle(
+                operation
+            )
             if not is_payload:
                 self._record_arrival(operation.name)
             logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
