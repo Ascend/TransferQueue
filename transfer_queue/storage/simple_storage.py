@@ -1256,7 +1256,10 @@ class SimpleStorageUnit:
         op_type = f"{operation.value}_DATA"
         self._record_arrival(op_type)
         monitor = self._metrics if self._metrics is not None else self._perf_monitor
-        with monitor.measure(op_type=op_type):
+        with monitor.measure(
+            op_type=op_type,
+            count_error=lambda exc: not (isinstance(exc, StorageRejected) and exc.missing_key),
+        ):
             return handle_storage_request(
                 self.storage_unit_id,
                 self.storage_data,

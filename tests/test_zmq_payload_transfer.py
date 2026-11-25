@@ -385,18 +385,27 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
         reply = handle(RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["value"]}), None)
         assert reply.payload is not None
         torch.testing.assert_close(reply.payload["value"][0], torch.tensor([1]))
-        with pytest.raises(StorageRejected):
+        with pytest.raises(StorageRejected) as missing:
             handle(RequestHeader(Operation.GET, {"global_indexes": [99], "fields": ["value"]}), None)
-        assert unit._requests_arrived == 3
-        assert unit._arrivals_by_op == {"PUT_DATA": 1, "GET_DATA": 2}
+        assert missing.value.missing_key is True
+        with pytest.raises(StorageRejected) as real_error:
+            handle(
+                RequestHeader(Operation.PUT, {"global_indexes": [1], "data_parser": MagicMock(side_effect=ValueError)}),
+                {"value": [torch.tensor([2])]},
+            )
+        assert real_error.value.missing_key is False
+        assert unit._requests_arrived == 4
+        assert unit._arrivals_by_op == {"PUT_DATA": 2, "GET_DATA": 2}
         heavy.assert_not_called()
         if metrics_enabled:
             assert unit._metrics.request_total.labels(op_type="GET_DATA")._value.get() == 2
-            assert unit._metrics.request_errors_total.labels(op_type="GET_DATA")._value.get() == 1
+            assert unit._metrics.request_errors_total.labels(op_type="GET_DATA")._value.get() == 0
+            assert unit._metrics.request_errors_total.labels(op_type="PUT_DATA")._value.get() == 1
             hist = unit._metrics.request_duration.labels(op_type="GET_DATA")
             assert sum(bucket.get() for bucket in hist._buckets) == 2
         else:
             assert unit._perf_monitor.success_counts["GET_DATA"] == 2
+            assert unit._perf_monitor.success_counts["PUT_DATA"] == 2
     finally:
         unit.shutdown()
 
