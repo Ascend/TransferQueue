@@ -33,6 +33,7 @@ from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.payload_transfer import (
+    DeliveryState,
     Operation,
     PayloadPeerInfo,
     PayloadReply,
@@ -94,8 +95,13 @@ def _parser_arg_identity(parser_arg: Any, pos: int) -> tuple:
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
 
-    Distinct from an error the unit reported: only a missing answer is worth a new connection.
+    Distinct from an error the unit reported: ``delivery`` indicates whether the
+    timed-out request may already have been executed by the StorageUnit.
     """
+
+    def __init__(self, message: str, *, delivery: DeliveryState = DeliveryState.IN_DOUBT):
+        super().__init__(message)
+        self.delivery = delivery
 
 
 def _describe_unit_state(body: dict[str, Any]) -> str:
@@ -389,10 +395,23 @@ class AsyncSimpleStorageManager(StorageManager):
 
         return f"{tcp} {_describe_unit_state(body)}"
 
-    def _is_retryable_payload_error(self, exc: RuntimeError) -> bool:
+    def _is_retryable_payload_error(self, operation: str, exc: RuntimeError) -> bool:
         if getattr(self, "_payload_closed", False):
             return False
-        return isinstance(exc, StorageUnitTimeout) or isinstance(exc.__cause__, TransferError)
+        cause = exc.__cause__
+        if isinstance(exc, StorageUnitTimeout):
+            transient = True
+            delivery = exc.delivery
+        elif isinstance(cause, TransferError):
+            transient = cause.transient
+            delivery = cause.delivery
+        else:
+            return False
+        if not transient:
+            return False
+        # Only idempotent reads may replay an in-doubt request; writes require UNSENT so a
+        # committed write with a lost reply never overwrites a newer concurrent write.
+        return operation == "get" or delivery == DeliveryState.UNSENT
 
     async def _request_with_retry(
         self,
@@ -402,10 +421,10 @@ class AsyncSimpleStorageManager(StorageManager):
         make_request: Callable[[], Any],
         max_attempts: int | None = None,
     ):
-        """Run one storage-unit request, retrying transport failures on a fresh connection.
+        """Run one storage-unit request, retrying safe transient failures on a fresh connection.
 
         Args:
-            operation: Operation name for logs, e.g. ``get`` or ``put``.
+            operation: Operation name for logs and retry safety, e.g. ``get`` or ``put``.
             target_storage_unit: Unit this request is routed to.
             request_context: Request shape, so both ends of a failure can be correlated.
             make_request: Zero-arg callable returning a coroutine for one attempt.
@@ -419,20 +438,20 @@ class AsyncSimpleStorageManager(StorageManager):
             try:
                 return await make_request()
             except RuntimeError as e:
-                if not self._is_retryable_payload_error(e):
-                    raise
+                can_retry = self._is_retryable_payload_error(operation, e)
                 # The exception already names the unit, its endpoint and the failure, so these
                 # lines only add what it cannot know: which attempt this was, and the shape.
-                if attempt < attempts_allowed:
+                if can_retry and attempt < attempts_allowed:
                     logger.warning(
                         f"[{self.storage_manager_id}]: {operation} retry {attempt + 1}/{attempts_allowed} "
                         f"on a new connection. {request_context} {e}"
                     )
                     continue
-                logger.error(
-                    f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
-                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
-                )
+                if can_retry or isinstance(e, StorageUnitTimeout):
+                    logger.error(
+                        f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
+                        f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
+                    )
                 raise
 
     @staticmethod
@@ -705,9 +724,25 @@ class AsyncSimpleStorageManager(StorageManager):
             ) from exc
         except TransferTimeout as exc:
             size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+            note = (
+                "; write outcome in doubt after send, not retried"
+                if operation != Operation.GET and exc.delivery == DeliveryState.IN_DOUBT
+                else ""
+            )
             raise StorageUnitTimeout(
                 f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {operation.value.lower()} "
-                f"at storage unit {target} ({self._describe_storage_unit(target)}){size}"
+                f"at storage unit {target} ({self._describe_storage_unit(target)}){size}{note}",
+                delivery=exc.delivery,
+            ) from exc
+        except TransferError as exc:
+            note = (
+                " (write outcome in doubt after send; not retried)"
+                if operation != Operation.GET and exc.delivery == DeliveryState.IN_DOUBT
+                else ""
+            )
+            raise RuntimeError(
+                f"Failed to {operation.value.lower()} data on storage unit "
+                f"{target} ({self._describe_storage_unit(target)}): {type(exc).__name__}: {exc}{note}"
             ) from exc
         except Exception as exc:
             raise RuntimeError(

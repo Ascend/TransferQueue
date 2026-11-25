@@ -59,15 +59,46 @@ class PayloadPeerInfo:
     __str__ = __repr__
 
 
+class DeliveryState(str, Enum):
+    """Whether a failed payload request may have been executed by the StorageUnit."""
+
+    UNSENT = "unsent"
+    REJECTED = "rejected"
+    IN_DOUBT = "in_doubt"
+
+
 class TransferError(RuntimeError):
-    """Transport or protocol failure."""
+    """Transport, protocol, or peer-configuration failure.
+
+    ``transient`` indicates whether retrying on a fresh connection could recover.
+    ``delivery`` distinguishes failures before sending (``UNSENT``), ingress rejections
+    before storage execution (``REJECTED``), and post-send failures whose server-side
+    execution is uncertain (``IN_DOUBT``).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        transient: bool = False,
+        delivery: DeliveryState = DeliveryState.IN_DOUBT,
+    ):
+        super().__init__(message)
+        self.transient = transient
+        self.delivery = delivery
 
 
 class TransferTimeout(TransferError):
     """Transport request timed out."""
 
-    def __init__(self, message: str, *, wire_bytes: int = 0):
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        wire_bytes: int = 0,
+        delivery: DeliveryState = DeliveryState.IN_DOUBT,
+    ):
+        super().__init__(message, transient=True, delivery=delivery)
         self.wire_bytes = wire_bytes
 
 
@@ -151,8 +182,10 @@ class PayloadTransfer(ABC):
 
         Errors and in-flight memory:
             - ``StorageRejected``: StorageUnit rejected a delivered request; peer state stays usable.
-            - ``TransferTimeout`` / ``TransferError``: retain any ``send``/``recv`` memory still
-              accessed by in-flight native operations until safe.
+            - ``TransferTimeout`` / ``TransferError``: set ``transient=True`` only when a retry over
+              a healthy connection may succeed, and set ``delivery`` to ``UNSENT`` / ``REJECTED`` /
+              ``IN_DOUBT`` so callers never replay in-doubt writes over concurrent updates. Retain any
+              ``send``/``recv`` memory still accessed by in-flight native operations until safe.
         """
 
     # ==================== Shared Lifecycle ====================

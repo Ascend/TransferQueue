@@ -16,6 +16,7 @@
 """SimpleStorage payload transport contracts and backend implementations."""
 
 from .base import (
+    DeliveryState,
     Operation,
     PayloadPeerInfo,
     PayloadReply,
@@ -29,6 +30,7 @@ from .base import (
 from .zmq import ZmqPayloadTransfer
 
 __all__ = [
+    "DeliveryState",
     "Operation",
     "PayloadPeerInfo",
     "PayloadReply",

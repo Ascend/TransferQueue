@@ -25,13 +25,18 @@ from threading import Event
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+import numpy as np
 import pytest
 import torch
 import zmq.asyncio
 from omegaconf import OmegaConf
+from tensordict import TensorDict
 
+from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.storage.payload_transfer import (
+    DeliveryState,
     Operation,
     PayloadPeerInfo,
     PayloadReply,
@@ -503,9 +508,83 @@ def test_storage_listen_callback_does_not_retain_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_socket_open_failure_recovers_on_next_request(monkeypatch):
+@pytest.mark.parametrize("ack_failure", ["lost_ack_timeout", "corrupt_ack_decode"])
+async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch, ack_failure):
+    """Once a PUT has been sent and committed, a lost or corrupt ACK must not replay over a newer write."""
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    peer = unit.get_zmq_server_info()
+    socket = MagicMock(closed=False)
+    send_calls = 0
+
+    async def send_and_interleave_newer_write(frames, **_kwargs):
+        nonlocal send_calls
+        send_calls += 1
+        applied = unit.payload_transfer.handle_request(ZMQMessage.deserialize(frames))
+        assert applied.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        unit.storage_data.put_data({"text": ["B"]}, [0])
+
+    socket.send_multipart = AsyncMock(side_effect=send_and_interleave_newer_write)
+    if ack_failure == "lost_ack_timeout":
+        socket.recv_multipart = AsyncMock(side_effect=zmq.Again())
+        expected_exc = StorageUnitTimeout
+        expect_diagnose = True
+    else:
+        socket.recv_multipart = AsyncMock(return_value=[b""])
+        expected_exc = RuntimeError
+        expect_diagnose = False
+
+    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
+    monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "manager"
+    manager.storage_unit_infos = {peer.id: peer}
+    manager._payload_peers = {peer.id: unit.get_payload_peer_info()}
+    manager._payload_closed = False
+    manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    manager.notify_data_update = AsyncMock()
+    manager._diagnose_storage_unit = AsyncMock(return_value="diagnosis")
+
+    metadata = BatchMeta(
+        global_indexes=[0],
+        partition_ids=["0"],
+        field_schema={"text": {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}},
+        production_status=np.ones(1, dtype=np.int8),
+    )
+    data = TensorDict({"text": np.array(["A"], dtype=object)}, batch_size=1)
+    try:
+        with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(expected_exc) as caught:
+            await manager.put_data(data, metadata)
+
+        assert send_calls == 1
+        assert "write outcome in doubt" in str(caught.value)
+        assert unit.storage_data.get_data(["text"], [0])["text"] == ["B"]
+        manager.notify_data_update.assert_not_awaited()
+        assert manager._diagnose_storage_unit.await_count == (1 if expect_diagnose else 0)
+        socket.close.assert_called_once_with(linger=0)
+    finally:
+        manager.payload_transfer.shutdown()
+        pool.close()
+        unit.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_zmq_fault_classification_distinguishes_transient_and_delivery_states(monkeypatch):
     info = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
     peer_info = PayloadPeerInfo("zmq", info)
+
+    ingress_rejected = MagicMock(closed=False)
+    ingress_rejected.send_multipart = AsyncMock()
+    ingress_rejected.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_GET_ERROR,
+            sender_id="unit",
+            body={"message": "undecodable request: AttributeError: custom class"},
+        ).serialize()
+    )
+    corrupt_reply = MagicMock(closed=False)
+    corrupt_reply.send_multipart = AsyncMock()
+    corrupt_reply.recv_multipart = AsyncMock(return_value=[b""])
     healthy = MagicMock(closed=False)
     healthy.send_multipart = AsyncMock()
     healthy.recv_multipart = AsyncMock(
@@ -515,21 +594,45 @@ async def test_socket_open_failure_recovers_on_next_request(monkeypatch):
             body={},
         ).serialize()
     )
-    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
-    monkeypatch.setattr(pool, "_connect", MagicMock(side_effect=[zmq.ZMQError(errno.EMFILE), healthy]))
-    client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
-    try:
-        with pytest.raises(TransferError):
-            await client.request(
-                peer_info,
-                RequestHeader(Operation.PUT, {"global_indexes": [0]}),
-                send={"text": ["input"]},
-            )
 
-        reply = await asyncio.wait_for(
-            client.request(peer_info, RequestHeader(Operation.PUT, {"global_indexes": [0]}), send={"text": ["input"]}),
-            timeout=2,
-        )
+    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
+    monkeypatch.setattr(
+        pool,
+        "_connect",
+        MagicMock(
+            side_effect=[
+                zmq.ZMQError(errno.EMFILE),
+                zmq.ZMQError(zmq.ETERM),
+                ingress_rejected,
+                corrupt_reply,
+                healthy,
+            ]
+        ),
+    )
+    client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    header = RequestHeader(Operation.PUT, {"global_indexes": [0]})
+    try:
+        with pytest.raises(TransferError) as emfile_err:
+            await client.request(peer_info, header, send={"text": ["input"]})
+        assert emfile_err.value.transient is True
+        assert emfile_err.value.delivery == DeliveryState.UNSENT
+
+        with pytest.raises(TransferError) as eterm_err:
+            await client.request(peer_info, header, send={"text": ["input"]})
+        assert eterm_err.value.transient is False
+        assert eterm_err.value.delivery == DeliveryState.UNSENT
+
+        with pytest.raises(TransferError) as rejected_err:
+            await client.request(peer_info, header, send={"text": ["input"]})
+        assert rejected_err.value.transient is False
+        assert rejected_err.value.delivery == DeliveryState.REJECTED
+
+        with pytest.raises(TransferError) as corrupt_err:
+            await client.request(peer_info, header, send={"text": ["input"]})
+        assert corrupt_err.value.transient is False
+        assert corrupt_err.value.delivery == DeliveryState.IN_DOUBT
+
+        reply = await asyncio.wait_for(client.request(peer_info, header, send={"text": ["input"]}), timeout=2)
         assert reply.payload is None
     finally:
         client.shutdown()
@@ -560,7 +663,7 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     merge = MagicMock(side_effect=lambda old, new: torch.cat([old, new]))
     try:
-        with pytest.raises(StorageUnitTimeout):
+        with pytest.raises(StorageUnitTimeout) as caught:
             await manager._update_to_single_storage_unit(
                 [0],
                 {"value": [torch.tensor([2])]},
@@ -568,6 +671,7 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
                 {"value": {"held": [True], "dtype": torch.int64, "is_non_tensor": False}},
                 peer.id,
             )
+        assert caught.value.delivery == DeliveryState.IN_DOUBT
         assert len(applied) == 1
         assert applied[0].request_type == ZMQRequestType.UPDATE_DATA_RESPONSE
         torch.testing.assert_close(unit.storage_data.get_data(["value"], [0])["value"][0], torch.tensor([1, 2]))
