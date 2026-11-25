@@ -26,6 +26,7 @@ import torch
 import zmq
 from tensordict import TensorDict
 
+from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
@@ -195,6 +196,91 @@ def test_payload_connections_do_not_cross_event_loops():
     for _ in range(2):
         asyncio.run(manager._request_payload("unit_a", Operation.GET, {}, recv=None))
     assert manager.payload_transfer.connect.await_count == 2
+
+
+def _client_with_one_unit(client_class, monkeypatch):
+    controller = ZMQServerInfo(Role.CONTROLLER, "controller", "127.0.0.1", {})
+    unit = ZMQServerInfo(Role.STORAGE, "unit", "127.0.0.1", {"put_get_socket": 5555})
+    monkeypatch.setattr(ssm.StorageManager, "_connect_to_controller", lambda self: None)
+    client = client_class("test-client", controller, zmq_io_threads=1)
+    client.initialize_storage_manager("SimpleStorage", {"zmq_info": unit})
+    return client
+
+
+async def _cancel_get_during_handshake(client, monkeypatch):
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def connect(_peer):
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(client.storage_manager.payload_transfer, "connect", connect)
+    _, metadata = _single_sample_batch()
+    read = asyncio.create_task(client.async_get_data(metadata))
+    await asyncio.wait_for(entered.wait(), timeout=5)
+    read.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await read
+    return cancelled
+
+
+def test_sync_client_drains_handshake_left_by_cancelled_get(monkeypatch):
+    client = _client_with_one_unit(TransferQueueClient, monkeypatch)
+    manager = client.storage_manager
+    try:
+        cancelled = client._run_coroutine(_cancel_get_during_handshake(client, monkeypatch))
+    finally:
+        client.close()
+    assert cancelled.is_set()
+    assert not manager._payload_connecting
+    assert not manager._notify_thread.is_alive()
+    assert client.zmq_context.closed
+
+
+@pytest.mark.asyncio
+async def test_running_handshake_releases_transport_after_cancellation(monkeypatch):
+    client = _client_with_one_unit(AsyncTransferQueueClient, monkeypatch)
+    manager = client.storage_manager
+    cancelled = await _cancel_get_during_handshake(client, monkeypatch)
+    (handshake,) = manager._payload_connecting.values()
+    with patch.object(manager.payload_transfer, "shutdown", wraps=manager.payload_transfer.shutdown) as shutdown:
+        client.close()
+        shutdown.assert_not_called()
+        await asyncio.gather(handshake, return_exceptions=True)
+        assert cancelled.is_set()
+        shutdown.assert_called_once_with()
+
+
+@pytest.mark.parametrize("state", ["stopped", "closed", "done_callback_pending"])
+def test_manager_closes_when_external_loop_cannot_finish_handshake(monkeypatch, state):
+    client = _client_with_one_unit(AsyncTransferQueueClient, monkeypatch)
+    manager = client.storage_manager
+    loop = asyncio.new_event_loop()
+    handshake = loop.create_future()
+    key = (loop, "unit")
+    manager._payload_connecting[key] = handshake
+    handshake.add_done_callback(lambda task: manager._payload_connect_done(key, task))
+    if state == "done_callback_pending":
+        handshake.set_result(None)
+    if state != "stopped":
+        loop.close()
+
+    try:
+        with patch.object(manager.payload_transfer, "shutdown", wraps=manager.payload_transfer.shutdown) as shutdown:
+            client.close()
+            shutdown.assert_called_once_with()
+            if state == "stopped":
+                loop.run_until_complete(asyncio.sleep(0))
+                assert handshake.cancelled()
+                shutdown.assert_called_once_with()
+        assert not manager._payload_connecting
+        assert not manager._notify_thread.is_alive()
+        assert client.zmq_context.closed
+    finally:
+        loop.close()
 
 
 @pytest.mark.asyncio

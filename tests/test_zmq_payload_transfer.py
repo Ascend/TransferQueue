@@ -20,6 +20,8 @@ import asyncio
 import errno
 import gc
 import weakref
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
@@ -41,7 +43,7 @@ from transfer_queue.storage.payload_transfer.zmq import (
     RESPONSE_TYPES,
     ZmqPayloadTransfer,
 )
-from transfer_queue.storage.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import SimpleStorageUnit, StorageUnitData, handle_storage_request
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
@@ -51,6 +53,14 @@ from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     ZMQSocketPool,
 )
+
+
+@pytest.mark.parametrize("error", [AssertionError(), KeyError("k")])
+def test_parser_rejection_preserves_exception_type(error):
+    parser = MagicMock(side_effect=error)
+    header = RequestHeader(Operation.PUT, {"global_indexes": [0], "data_parser": parser})
+    with pytest.raises(StorageRejected, match=type(error).__name__):
+        handle_storage_request("unit", StorageUnitData(), header, {"text": ["value"]})
 
 
 @pytest.mark.parametrize("metrics_enabled", [False, True])
@@ -85,16 +95,55 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
         unit.shutdown()
 
 
+def test_unit_drains_dispatched_work_before_stopping_worker():
+    transfer = ZmqPayloadTransfer(owner_id="unit")
+    entered, release, stop_worker = Event(), Event(), Event()
+    storage = MagicMock()
+
+    def handle(header, data):
+        entered.set()
+        assert release.wait(5)
+        return {}, {"text": ["done"]}
+
+    transfer.listen(handle=handle)
+    request = ZMQMessage.create(request_type=ZMQRequestType.GET_DATA, sender_id="manager", body={})
+    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
+    with ThreadPoolExecutor(max_workers=3) as threads:
+        first = threads.submit(transfer.handle_request, request)
+        assert entered.wait(5)
+        shutdown = threads.submit(
+            unit_class._shutdown_resources, stop_worker, None, None, None, None,
+            payload_transfer=transfer, storage_data=storage,
+        )
+        try:
+            assert transfer._closed.wait(5)
+            assert not stop_worker.is_set()
+            storage.close.assert_not_called()
+            late = threads.submit(transfer.handle_request, request)
+        finally:
+            release.set()
+        assert first.result(timeout=5).body["data"] == {"text": ["done"]}
+        assert late.result(timeout=5).request_type == ZMQRequestType.GET_ERROR
+        shutdown.result(timeout=5)
+
+    assert stop_worker.is_set()
+    storage.close.assert_called_once_with()
+    assert transfer.handle_request(request).request_type == ZMQRequestType.GET_ERROR
+
+
 def test_storage_listen_callback_does_not_retain_owner(monkeypatch):
     monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
-    # Stop threads first, then check the finalizer's retained transport and callback.
+    # Keep the callback alive independently of shutdown releasing it.
+    # A bound method here would keep its StorageUnit alive too.
+    transfer = unit.payload_transfer
+    handle = transfer._handle
     unit.shutdown()
-    transfer, ref = unit.payload_transfer, weakref.ref(unit)
+    ref = weakref.ref(unit)
     del unit
     gc.collect()
     assert ref() is None
-    assert transfer is not None
+    assert handle is not None
 
 
 @pytest.mark.asyncio
@@ -206,6 +255,15 @@ async def test_unexpected_response_discards_socket(monkeypatch, operation, respo
     }[response_kind]
     await _check_protocol_failure(
         monkeypatch, operation, response_type, {"data": {"text": ["wrong"]}}, "unexpected response",
+    )
+
+
+@pytest.mark.asyncio
+async def test_worker_error_keeps_reason_and_discards_socket(monkeypatch):
+    await _check_protocol_failure(
+        monkeypatch, Operation.UPDATE, ZMQRequestType.PUT_GET_ERROR,
+        {"message": "failed to serialize response"},
+        "unexpected response .*PUT_GET_ERROR: failed to serialize response",
     )
 
 

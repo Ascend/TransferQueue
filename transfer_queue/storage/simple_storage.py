@@ -948,7 +948,8 @@ def handle_storage_request(
                 f"[{storage_unit_id}]: GET error, fields={body.get('fields')}, "
                 f"global_indexes={body.get('global_indexes')}: {type(exc).__name__}: {exc}"
             )
-        raise StorageRejected(str(exc), missing_key=missing_key) from exc
+        detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
+        raise StorageRejected(detail, missing_key=missing_key) from exc
 
 
 @ray.remote(num_cpus=1)
@@ -1685,6 +1686,10 @@ class SimpleStorageUnit:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")
 
+        # A transport may need the worker to finish or reject admitted work.
+        # Leave it running until the transport has drained its callbacks.
+        if payload_transfer is not None:
+            payload_transfer.shutdown()
         shutdown_event.set()
 
         # Before the ZMQ teardown: the probe runs on its own timer and would outlive the unit.
@@ -1702,8 +1707,6 @@ class SimpleStorageUnit:
             worker_socket.close(linger=0)
         if zmq_context:
             zmq_context.term()
-        if payload_transfer is not None:
-            payload_transfer.shutdown()
         if storage_data is not None:
             try:
                 storage_data.close()

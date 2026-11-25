@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from threading import Event, Lock
+
 import zmq
 
 from transfer_queue.storage.payload_transfer.base import (
@@ -46,7 +48,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
     def __init__(self, *, owner_id: str, pool: ZMQSocketPool | None = None):
         self.owner_id = owner_id
         self.pool = pool
-        self._closed = False
+        self._closed = Event()
+        self._handler_lock = Lock()
 
     def listen(self, *, handle, address=None):
         self._handle = handle
@@ -58,7 +61,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return peer_info["address"]
 
     async def request(self, connection, header, *, send=None, recv=()):
-        if self._closed or self.pool is None:
+        if self._closed.is_set() or self.pool is None:
             raise TransferError("ZMQ payload client is unavailable")
         if recv:
             raise NotImplementedError("ZMQ receive destinations are not implemented")
@@ -83,7 +86,10 @@ class ZmqPayloadTransfer(PayloadTransfer):
                 await socket.send_multipart(frames, copy=False)
                 reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
                 if reply.request_type not in (RESPONSE_TYPES[header.operation], ERROR_TYPES[header.operation]):
-                    raise TransferError(f"unexpected response {reply.request_type}")
+                    reason = f"unexpected response {reply.request_type}"
+                    if isinstance(reply.body, dict) and (detail := reply.body.get("message")):
+                        reason += f": {detail}"
+                    raise TransferError(reason)
                 body = dict(reply.body)
                 data = None
                 if reply.request_type == RESPONSE_TYPES[header.operation] and header.operation == Operation.GET:
@@ -106,12 +112,15 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ReplyHeader(body, wire_bytes), data
 
     def handle_request(self, message):
-        """Dispatch a ZMQ payload request and build its response."""
+        """Admit storage work at worker dispatch. Frames still queued at shutdown may time out."""
         operation = OPERATIONS[message.request_type]
         body = dict(message.body)
         data = body.pop("data", None)
         try:
-            result, payload = self._handle(RequestHeader(operation, body), data)
+            with self._handler_lock:
+                if self._closed.is_set():
+                    raise StorageRejected("storage unit is shutting down")
+                result, payload = self._handle(RequestHeader(operation, body), data)
             if payload is not None:
                 result = {**result, "data": payload}
             response_type = RESPONSE_TYPES[operation]
@@ -122,5 +131,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ZMQMessage.create(request_type=response_type, sender_id=self.owner_id, body=result)
 
     def shutdown(self):
-        # The manager also uses this pool for administrative requests.
-        self._closed = True
+        self._closed.set()
+        # The worker may still be accessing storage when admission closes.
+        # Release its callback only after it has returned.
+        with self._handler_lock:
+            self._handle = None

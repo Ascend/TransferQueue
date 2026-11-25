@@ -22,6 +22,7 @@ from collections.abc import Mapping
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
+from threading import Lock
 from typing import Any, Callable, NamedTuple
 
 import torch
@@ -245,6 +246,8 @@ class AsyncSimpleStorageManager(StorageManager):
         self._payload_connections = {}
         self._payload_connecting = {}
         self._payload_closed = False
+        self._payload_shutdown_lock = Lock()
+        self._payload_shutdown_started = False
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
 
@@ -672,6 +675,8 @@ class AsyncSimpleStorageManager(StorageManager):
         return await asyncio.shield(task)
 
     async def _connect_payload(self, key):
+        if self._payload_closed:
+            raise TransferError("payload transport is closed")
         _, target = key
         peers = self.config.get("payload_peers")
         peer = peers[target] if peers is not None else {
@@ -695,12 +700,21 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def _payload_connect_done(self, key, task):
         if self._payload_connecting.get(key) is task:
-            self._payload_connecting.pop(key)
+            self._payload_connecting.pop(key, None)
         # Retrieve failures even when every waiter has cancelled its shielded await.
         if not task.cancelled():
             task.exception()
-        if self._payload_closed and not self._payload_connecting:
-            self.payload_transfer.shutdown()
+        if self._payload_closed:
+            self._shutdown_idle_payload()
+
+    def _shutdown_idle_payload(self) -> None:
+        # close() and a handshake callback can both observe the last handshake finish.
+        # Only one of their threads should release the transport.
+        with self._payload_shutdown_lock:
+            if self._payload_connecting or self._payload_shutdown_started:
+                return
+            self._payload_shutdown_started = True
+        self.payload_transfer.shutdown()
 
     async def _request_payload(self, target, operation, body, *, data=None, recv=()):
         started = time.perf_counter()
@@ -1306,27 +1320,35 @@ class AsyncSimpleStorageManager(StorageManager):
 
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
-    def close(self) -> None:
-        """Close all ZMQ sockets and context to prevent resource leaks."""
+    def _close_payload(self) -> None:
+        if not hasattr(self, "payload_transfer"):
+            return
         self._payload_closed = True
-        connecting = tuple(getattr(self, "_payload_connecting", {}).values())
-        for task in connecting:
+        self._payload_connections.clear()
+        for key, task in self._payload_connecting.copy().items():
+            loop = task.get_loop()
             if not task.done():
-                task.get_loop().call_soon_threadsafe(task.cancel)
-        transfer = getattr(self, "payload_transfer", None)
-        if transfer is not None and not connecting:
-            transfer.shutdown()
-        # Pending handshakes release the backend through their completion callbacks.
-        getattr(self, "_payload_connections", {}).clear()
-        # Before super(), which may destroy the context these sockets live on. Absent when
-        # the base constructor raised (a failed handshake does), and __del__ still calls this.
-        pool = getattr(self, "storage_rpc_pool", None)
-        if pool is not None:
-            pool.close()
-        probe_pool = getattr(self, "storage_probe_pool", None)
-        if probe_pool is not None:
-            probe_pool.close()
-        dump_pool = getattr(self, "storage_dump_pool", None)
-        if dump_pool is not None:
-            dump_pool.close()
-        super().close()
+                try:
+                    loop.call_soon_threadsafe(task.cancel)
+                except RuntimeError:
+                    if not loop.is_closed():
+                        raise
+                if loop.is_running():
+                    continue
+            elif not task.cancelled():
+                task.exception()
+            # A stopped loop might resume to process cancellation, but shutdown
+            # cannot rely on that loop ever running its completion callbacks.
+            self._payload_connecting.pop(key, None)
+        self._shutdown_idle_payload()
+
+    def close(self) -> None:
+        """Stop pending handshakes and release pools before their shared context."""
+        try:
+            self._close_payload()
+        finally:
+            for name in ("storage_rpc_pool", "storage_probe_pool", "storage_dump_pool"):
+                pool = getattr(self, name, None)
+                if pool is not None:
+                    pool.close()
+            super().close()
