@@ -52,16 +52,17 @@ import ray
 import torch
 import zmq
 
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError as StorageKeyNotFoundError
 from transfer_queue.storage.payload_transfer import (
-    FieldData,
-    HeaderBody,
     Operation,
+    PayloadReply,
     PayloadTransfer,
     RequestHeader,
     StorageRejected,
     ZmqPayloadTransfer,
     is_zmq_payload_request,
 )
+from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER as KEY_NOT_FOUND_MARKER
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import get_env_bool, limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
@@ -168,15 +169,6 @@ def _describe_stored_values(values: list) -> dict[str, Any]:
     if not all(isinstance(v, torch.Tensor) for v in values):
         return {"dtype": None, "shapes": None}
     return {"dtype": values[0].dtype, "shapes": [tuple(v.shape) for v in values]}
-
-
-class StorageKeyNotFoundError(KeyError):
-    """Raised when a requested global index is absent from a storage unit.
-
-    Reads and ``clear`` are concurrent by design, so a key returned by ``kv_retrieve_meta`` can be
-    cleared before ``get_data`` reaches the storage unit. Callers that tolerate that race catch this
-    instead of matching on message text.
-    """
 
 
 class StorageUnitData:
@@ -909,37 +901,37 @@ def handle_storage_request(
     storage_unit_id: str,
     storage_data: StorageUnitData,
     header: RequestHeader,
-    data: FieldData | None,
+    data: dict[str, Any] | None,
     *,
     storage_lock: AbstractContextManager[Any] | None = None,
-) -> tuple[HeaderBody, FieldData | None]:
+) -> PayloadReply:
     """Apply storage semantics for every payload backend, holding ``storage_lock`` only on state access."""
-    body = header.body
+    params = header.params
     operation = header.operation
     guard = storage_lock if storage_lock is not None else nullcontext()
     try:
-        indexes = body["global_indexes"]
+        indexes = params["global_indexes"]
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{storage_unit_id}] {operation.value}"
         ):
             if operation == Operation.GET:
-                fields = body["fields"]
+                fields = params["fields"]
                 with guard:
                     result = storage_data.get_data(fields, indexes)
-                if (parser := body.get("data_parser")) is not None:
-                    result = _apply_data_parser(result, parser, body.get("parser_args"))
-                return {}, result
+                if (parser := params.get("data_parser")) is not None:
+                    result = _apply_data_parser(result, parser, params.get("parser_args"))
+                return PayloadReply(payload=result)
             if operation == Operation.PUT:
                 if data is None:
                     raise TypeError("PUT requires field data")
-                if (parser := body.get("data_parser")) is not None:
+                if (parser := params.get("data_parser")) is not None:
                     data = _apply_data_parser(data, parser)
                 with guard:
                     storage_data.put_data(data, indexes)
-                return {}, None
+                return PayloadReply()
 
-            merge_fn = body.get("merge_fn")
-            merge_plan = body.get("merge_plan")
+            merge_fn = params.get("merge_fn")
+            merge_plan = params.get("merge_plan")
             if not callable(merge_fn):
                 raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
             if not isinstance(data, dict) or not data:
@@ -948,14 +940,14 @@ def handle_storage_request(
                 raise ValueError("merge_plan must describe every update field")
             with guard:
                 stored_shapes = storage_data.apply_update(indexes, data, merge_fn, merge_plan)
-            return {"stored_shapes": stored_shapes}, None
+            return PayloadReply(meta={"stored_shapes": stored_shapes})
     except Exception as exc:
         missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
         if operation == Operation.GET:
             log = logger.debug if missing_key else logger.error
             log(
-                f"[{storage_unit_id}]: GET error, fields={body.get('fields')}, "
-                f"global_indexes={body.get('global_indexes')}: {type(exc).__name__}: {exc}"
+                f"[{storage_unit_id}]: GET error, fields={params.get('fields')}, "
+                f"global_indexes={params.get('global_indexes')}: {type(exc).__name__}: {exc}"
             )
         detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
         raise StorageRejected(detail, missing_key=missing_key) from exc
@@ -1259,7 +1251,7 @@ class SimpleStorageUnit:
             self._requests_arrived += 1
             self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
-    def _handle_payload(self, header: RequestHeader, data: FieldData | None):
+    def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None) -> PayloadReply:
         """Run storage operations and observability with synchronized state access."""
         operation = header.operation
         op_type = f"{operation.value}_DATA"

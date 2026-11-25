@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end contract, concurrency, and fault-isolation tests for ZmqPayloadTransfer."""
+"""End-to-end contract, concurrency, memory-bound, and compatibility tests for ZmqPayloadTransfer."""
 
 import asyncio
 import gc
@@ -21,7 +21,7 @@ import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from threading import Event
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -31,12 +31,14 @@ import zmq.asyncio
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.storage.payload_transfer import (
     Operation,
+    PayloadClient,
     RequestHeader,
     StorageRejected,
     TransferError,
     TransferTimeout,
     ZmqPayloadTransfer,
 )
+from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER
 from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     StorageUnitData,
@@ -79,8 +81,8 @@ async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
             "ragged": [torch.tensor([10, 20]), torch.tensor([30, 40, 50])],
             "text": ["first", "second"],
         }
-        _, ack = await client.request(connection, put, send=payload)
-        assert ack is None
+        put_reply = await client.request(connection, put, send=payload)
+        assert put_reply.payload is None
 
         update = RequestHeader(
             Operation.UPDATE,
@@ -90,16 +92,19 @@ async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
                 "merge_plan": {"ragged": {"held": [True], "dtype": torch.int64, "is_non_tensor": False}},
             },
         )
-        reply, ack = await client.request(connection, update, send={"ragged": [torch.tensor([60])]})
-        assert ack is None
-        assert tuple(reply.body["stored_shapes"]["ragged"]["shapes"][0]) == (4,)
+        update_reply = await client.request(connection, update, send={"ragged": [torch.tensor([60])]})
+        assert update_reply.payload is None
+        assert tuple(update_reply.meta["stored_shapes"]["ragged"]["shapes"][0]) == (4,)
 
         # Read in reversed sample order and verify earlier tensor views survive later writes.
         get = RequestHeader(Operation.GET, {"global_indexes": [2, 10], "fields": ["dense", "ragged", "text"]})
-        _, data = await client.request(connection, get)
+        get_reply = await client.request(connection, get)
+        data = get_reply.payload
+        assert data is not None
         held_view = data["ragged"][0][1:3]
         torch.testing.assert_close(
-            data["dense"], [torch.tensor([4, 5, 6], dtype=torch.int32), torch.tensor([1, 2, 3], dtype=torch.int32)]
+            data["dense"],
+            [torch.tensor([4, 5, 6], dtype=torch.int32), torch.tensor([1, 2, 3], dtype=torch.int32)],
         )
         torch.testing.assert_close(data["ragged"][0], torch.tensor([30, 40, 50, 60]))
         torch.testing.assert_close(data["ragged"][1], torch.tensor([10, 20]))
@@ -136,13 +141,16 @@ async def test_payload_parsers_and_missing_key_preserve_connection_health(monkey
             fields["tokens"] = [t[:n] for t, n in zip(fields["tokens"], limits, strict=True)]
             return fields
 
-        _, parsed = await client.request(
-            connection,
-            RequestHeader(
-                Operation.GET,
-                {"global_indexes": [1, 0], "fields": ["tokens"], "data_parser": slice_get, "parser_args": [2, 1]},
-            ),
-        )
+        parsed = (
+            await client.request(
+                connection,
+                RequestHeader(
+                    Operation.GET,
+                    {"global_indexes": [1, 0], "fields": ["tokens"], "data_parser": slice_get, "parser_args": [2, 1]},
+                ),
+            )
+        ).payload
+        assert parsed is not None
         torch.testing.assert_close(parsed["tokens"][0], torch.tensor([8, 10]))
         torch.testing.assert_close(parsed["tokens"][1], torch.tensor([2]))
 
@@ -165,10 +173,112 @@ async def test_payload_parsers_and_missing_key_preserve_connection_health(monkey
             )
         assert missing.value.missing_key is True
 
-        _, surviving = await client.request(
-            connection, RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["tokens"]})
-        )
+        surviving = (
+            await client.request(
+                connection, RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["tokens"]})
+            )
+        ).payload
+        assert surviving is not None
         torch.testing.assert_close(surviving["tokens"][0], torch.tensor([2, 4, 6]))
+
+
+@pytest.mark.asyncio
+async def test_queued_puts_do_not_serialize_before_socket_lease(monkeypatch):
+    """Queued writers must wait on the pool semaphore before materializing contiguous copies."""
+    peer = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
+    send_entered, release_send = asyncio.Event(), asyncio.Event()
+    serialized_count = 0
+    original_serialize = ZMQMessage.serialize
+
+    def counting_serialize(msg):
+        nonlocal serialized_count
+        serialized_count += 1
+        return original_serialize(msg)
+
+    async def blocked_send(_frames, **_kwargs):
+        send_entered.set()
+        await release_send.wait()
+
+    socket = MagicMock(closed=False)
+    socket.send_multipart = AsyncMock(side_effect=blocked_send)
+    socket.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_RESPONSE, sender_id="unit", body={}
+        ).serialize()
+    )
+    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
+    monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
+    client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+
+    # Strided slice (step=2), matching _select_by_positions across multiple storage units.
+    batch_tensor = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    strided_view = batch_tensor[::2]
+    assert not strided_view.is_contiguous()
+
+    try:
+        with patch.object(ZMQMessage, "serialize", counting_serialize):
+            tasks = [
+                asyncio.create_task(
+                    client.request(
+                        peer,
+                        RequestHeader(Operation.PUT, {"global_indexes": [i]}),
+                        send={"x": strided_view},
+                    )
+                )
+                for i in range(4)
+            ]
+            await asyncio.wait_for(send_entered.wait(), timeout=2)
+            await asyncio.sleep(0.01)
+            # Only the single permit holder may have serialized while the other 3 wait on alease.
+            assert serialized_count == 1
+            release_send.set()
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+            assert serialized_count == 4
+    finally:
+        client.shutdown()
+        pool.close()
+
+
+@pytest.mark.asyncio
+async def test_missing_key_wire_compatibility_both_directions(monkeypatch):
+    """Preserve [TQKeyNotFound] wire compatibility between old and new clients/storage units."""
+    peer = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
+
+    # 1. New storage unit reply still carries KEY_NOT_FOUND_MARKER for old clients.
+    storage = StorageUnitData()
+    storage.put_data({"x": [torch.tensor([1])]}, [99])
+    server_transfer = ZmqPayloadTransfer(owner_id="unit")
+    server_transfer.listen(handle=lambda hdr, data: handle_storage_request("unit", storage, hdr, data))
+    raw_reply = server_transfer.handle_request(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA,
+            sender_id="old-client",
+            body={"fields": ["x"], "global_indexes": [0]},
+        )
+    )
+    assert raw_reply.request_type == ZMQRequestType.GET_ERROR
+    assert raw_reply.body["message"].startswith(f"[{KEY_NOT_FOUND_MARKER}] ")
+
+    # 2. Old storage unit GET_ERROR format (no extra fields) is recognized by new client.
+    legacy_reply = ZMQMessage.create(
+        request_type=ZMQRequestType.GET_ERROR,
+        sender_id="unit",
+        body={"message": f"[{KEY_NOT_FOUND_MARKER}] Failed to get data from storage unit id #unit, detail: key 0"},
+    ).serialize()
+    socket = MagicMock(closed=False)
+    socket.send_multipart = AsyncMock()
+    socket.recv_multipart = AsyncMock(return_value=legacy_reply)
+    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
+    monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
+    client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    try:
+        with pytest.raises(StorageRejected) as caught:
+            await client.request(peer, RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["x"]}))
+        assert caught.value.missing_key is True
+        assert KEY_NOT_FOUND_MARKER not in str(caught.value)
+    finally:
+        client.shutdown()
+        pool.close()
 
 
 @pytest.mark.parametrize("error", [AssertionError(), KeyError("k")])
@@ -190,11 +300,11 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
     if metrics_enabled:
         unit._metrics = TQMetricsExporter(role="storage")
     try:
-        # A non-ZMQ backend invokes this listen callback directly without the ZMQ worker loop.
         handle = unit.payload_transfer._handle
         handle(RequestHeader(Operation.PUT, {"global_indexes": [0]}), {"value": [torch.tensor([1])]})
-        _, data = handle(RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["value"]}), None)
-        torch.testing.assert_close(data["value"][0], torch.tensor([1]))
+        reply = handle(RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["value"]}), None)
+        assert reply.payload is not None
+        torch.testing.assert_close(reply.payload["value"][0], torch.tensor([1]))
         with pytest.raises(StorageRejected):
             handle(RequestHeader(Operation.GET, {"global_indexes": [99], "fields": ["value"]}), None)
         assert unit._requests_arrived == 3
@@ -258,13 +368,16 @@ def test_storage_handler_allows_concurrent_admin_while_parser_runs(monkeypatch):
             assert metrics_reply.body["active_keys"] == 2
 
             release_parser.set()
-            _, parsed = slow_get.result(timeout=2)
+            parsed = slow_get.result(timeout=2).payload
+            assert parsed is not None
             torch.testing.assert_close(parsed["value"][0], torch.tensor([11]))
     finally:
         unit.shutdown()
 
 
 def test_unit_drains_dispatched_work_before_stopping_worker():
+    from transfer_queue.storage.payload_transfer import PayloadReply
+
     transfer = ZmqPayloadTransfer(owner_id="unit")
     entered, release, stop_worker = Event(), Event(), Event()
     storage = MagicMock()
@@ -272,7 +385,7 @@ def test_unit_drains_dispatched_work_before_stopping_worker():
     def handle(header, data):
         entered.set()
         assert release.wait(5)
-        return {}, {"text": ["done"]}
+        return PayloadReply(payload={"text": ["done"]})
 
     transfer.listen(handle=handle)
     request = ZMQMessage.create(request_type=ZMQRequestType.GET_DATA, sender_id="manager", body={})
@@ -374,11 +487,11 @@ async def test_transport_fault_discards_socket_and_releases_permit(monkeypatch, 
         failed.close.assert_called_once_with(linger=0)
 
         # A single permit verifies both poisoned-socket eviction and permit release.
-        _, data = await asyncio.wait_for(
+        reply = await asyncio.wait_for(
             client.request(peer, RequestHeader(Operation.GET, {"global_indexes": [0], "fields": ["text"]})),
             timeout=2,
         )
-        assert data == {"text": ["next"]}
+        assert reply.payload == {"text": ["next"]}
         assert connect.call_count == 2
         healthy.close.assert_not_called()
     finally:
@@ -406,10 +519,11 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     manager.storage_manager_id = "manager"
     manager.storage_unit_infos = {peer.id: peer}
     manager.config = {}
-    manager._payload_connections = {}
-    manager._payload_connecting = {}
-    manager._payload_closed = False
-    manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    manager.payload_client = PayloadClient(
+        transfer=ZmqPayloadTransfer(owner_id="manager", pool=pool),
+        peers={peer.id: {"backend": "zmq", "address": peer}},
+        timeout=5,
+    )
     manager.close = lambda: None
     merge = MagicMock(side_effect=lambda old, new: torch.cat([old, new]))
     try:
@@ -427,7 +541,7 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
         socket.send_multipart.assert_awaited_once()
         socket.close.assert_called_once_with(linger=0)
     finally:
-        manager.payload_transfer.shutdown()
+        manager.payload_client.close()
         pool.close()
         unit.shutdown()
 

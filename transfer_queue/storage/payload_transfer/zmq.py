@@ -1,4 +1,5 @@
-# Copyright 2026 The TransferQueue Team
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,8 +23,8 @@ import zmq
 
 from transfer_queue.storage.payload_transfer.base import (
     Operation,
+    PayloadReply,
     PayloadTransfer,
-    ReplyHeader,
     RequestHeader,
     StorageRejected,
     TransferError,
@@ -37,6 +38,9 @@ from transfer_queue.utils.zmq_utils import (
     ZMQSocketPool,
     frame_nbytes,
 )
+
+# Preserves the existing ZMQ GET_ERROR message convention across rolling upgrades.
+KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
 # Maps each logical Operation to its ZMQ (request, response, error) message types.
 _WIRE_TYPES = {
@@ -85,31 +89,35 @@ class ZmqPayloadTransfer(PayloadTransfer):
             raise ValueError(f"{header.operation.value} requires send field data")
 
         request_type, response_type, error_type = _WIRE_TYPES[header.operation]
-        body = dict(header.body)
-        if send is not None:
-            body["data"] = send
-        request = ZMQMessage.create(
-            request_type=request_type,
-            sender_id=self.owner_id,
-            receiver_id=connection.id,
-            body=body,
-        )
-        frames = request.serialize()
-        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames) if send is not None else 0
+        wire_bytes = 0
         try:
             async with self.pool.alease(connection) as socket:
+                # Serialize only after acquiring a socket permit so queued callers keep zero-copy views.
+                body = dict(header.params)
+                if send is not None:
+                    body["data"] = send
+                request = ZMQMessage.create(
+                    request_type=request_type,
+                    sender_id=self.owner_id,
+                    receiver_id=connection.id,
+                    body=body,
+                )
+                frames = request.serialize()
+                if send is not None:
+                    wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
                 await socket.send_multipart(frames, copy=False)
+                del frames
                 reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
                 if reply.request_type not in (response_type, error_type):
                     reason = f"unexpected response {reply.request_type}"
                     if isinstance(reply.body, dict) and (detail := reply.body.get("message")):
                         reason += f": {detail}"
                     raise TransferError(reason)
-                body = dict(reply.body)
-                data = None
+                reply_meta = dict(reply.body)
+                payload = None
                 if reply.request_type == response_type and header.operation == Operation.GET:
-                    data = body.pop("data", None)
-                    if not isinstance(data, dict):
+                    payload = reply_meta.pop("data", None)
+                    if not isinstance(payload, dict):
                         raise TransferError("GET response must contain field data")
         except zmq.error.Again as exc:
             raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes) from exc
@@ -118,27 +126,32 @@ class ZmqPayloadTransfer(PayloadTransfer):
 
         # A valid storage rejection completes the exchange and leaves the socket reusable.
         if reply.request_type == error_type:
-            message = body.get("message", "storage request rejected")
-            missing_key = header.operation == Operation.GET and bool(body.get("missing_key"))
+            message = reply_meta.get("message", "storage request rejected")
+            prefix = f"[{KEY_NOT_FOUND_MARKER}] "
+            missing_key = header.operation == Operation.GET and message.startswith(prefix)
+            if missing_key:
+                message = message.removeprefix(prefix)
             raise StorageRejected(message, missing_key=missing_key)
-        return ReplyHeader(body, wire_bytes), data
+        return PayloadReply(meta=reply_meta, payload=payload, wire_bytes=wire_bytes)
 
     def handle_request(self, message):
         """Admit storage work at worker dispatch. Frames still queued at shutdown may time out."""
         operation = _OPERATIONS_BY_REQUEST[message.request_type]
         _, response_type, error_type = _WIRE_TYPES[operation]
-        body = dict(message.body)
-        data = body.pop("data", None)
+        params = dict(message.body)
+        data = params.pop("data", None)
         try:
             with self._handler_lock:
                 if self._closed.is_set():
                     raise StorageRejected("storage unit is shutting down")
-                result, payload = self._handle(RequestHeader(operation, body), data)
-            if payload is not None:
-                result = {**result, "data": payload}
+                reply = self._handle(RequestHeader(operation, params), data)
+            result = dict(reply.meta)
+            if reply.payload is not None:
+                result["data"] = reply.payload
             reply_type = response_type
         except StorageRejected as exc:
-            result = {"message": str(exc), "missing_key": exc.missing_key}
+            marker = f"[{KEY_NOT_FOUND_MARKER}] " if exc.missing_key else ""
+            result = {"message": f"{marker}{exc}"}
             reply_type = error_type
         return ZMQMessage.create(request_type=reply_type, sender_id=self.owner_id, body=result)
 

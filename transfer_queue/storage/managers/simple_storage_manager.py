@@ -22,25 +22,26 @@ from collections.abc import Mapping
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
-from threading import Lock
 from typing import Any, Callable, NamedTuple
 
 import torch
 import zmq
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.payload_transfer import (
     Operation,
+    PayloadClient,
+    PayloadReply,
     RequestHeader,
     StorageRejected,
     TransferError,
     TransferTimeout,
     ZmqPayloadTransfer,
 )
-from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -243,12 +244,17 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
-        self._payload_connections: dict[Any, Any] = {}
-        self._payload_connecting: dict[Any, Any] = {}
-        self._payload_closed = False
-        self._payload_shutdown_lock = Lock()
-        self._payload_shutdown_started = False
-        self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
+        raw_peers = config.get("payload_peers")
+        peers = (
+            raw_peers
+            if raw_peers is not None
+            else {su_id: {"backend": "zmq", "address": info} for su_id, info in self.storage_unit_infos.items()}
+        )
+        self.payload_client = PayloadClient(
+            transfer=ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool),
+            peers=peers,
+            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+        )
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
 
     def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
@@ -378,7 +384,8 @@ class AsyncSimpleStorageManager(StorageManager):
         return f"{tcp} {_describe_unit_state(body)}"
 
     def _is_retryable_payload_error(self, exc: RuntimeError) -> bool:
-        if getattr(self, "_payload_closed", False):
+        client = getattr(self, "payload_client", None)
+        if client is not None and client.closed:
             return False
         return isinstance(exc, StorageUnitTimeout) or isinstance(exc.__cause__, TransferError)
 
@@ -663,81 +670,20 @@ class AsyncSimpleStorageManager(StorageManager):
             )
         return field_schema
 
-    async def _get_payload_connection(self, key):
-        """Share one handshake and its result per owning loop and peer."""
-        if self._payload_closed:
-            raise TransferError("payload transport is closed")
-        entry = self._payload_connections.get(key)
-        if entry is not None:
-            return entry
-        # Closed loops cannot reuse their handles; do not retain them across asyncio.run calls.
-        for old_key in list(self._payload_connections):
-            if old_key[0].is_closed():
-                self._payload_connections.pop(old_key, None)
-        task = self._payload_connecting.get(key)
-        if task is None:
-            task = asyncio.create_task(self._connect_payload(key))
-            self._payload_connecting[key] = task
-            task.add_done_callback(partial(self._payload_connect_done, key))
-        return await asyncio.shield(task)
-
-    async def _connect_payload(self, key):
-        if self._payload_closed:
-            raise TransferError("payload transport is closed")
-        _, target = key
-        peers = self.config.get("payload_peers")
-        peer = (
-            peers[target]
-            if peers is not None
-            else {
-                "backend": "zmq",
-                "address": self.storage_unit_infos[target],
-            }
-        )
-        if isinstance(peer, DictConfig):
-            # Backend metadata is opaque; strings must not be resolved as config expressions.
-            peer = OmegaConf.to_container(peer, resolve=False)
-        try:
-            connection = await asyncio.wait_for(
-                self.payload_transfer.connect(peer),
-                timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
-            )
-        except asyncio.TimeoutError as exc:
-            raise TransferTimeout("payload connection timed out") from exc
-        if self._payload_closed:
-            raise TransferError("payload transport closed during connection")
-        # A new entry distinguishes reconnects even if the backend returns the same handle.
-        entry = (connection,)
-        self._payload_connections[key] = entry
-        return entry
-
-    def _payload_connect_done(self, key, task):
-        if self._payload_connecting.get(key) is task:
-            self._payload_connecting.pop(key, None)
-        # Retrieve failures even when every waiter has cancelled its shielded await.
-        if not task.cancelled():
-            task.exception()
-        if self._payload_closed:
-            self._shutdown_idle_payload()
-
-    def _shutdown_idle_payload(self) -> None:
-        # close() and a handshake callback can both observe the last handshake finish.
-        # Only one of their threads should release the transport.
-        with self._payload_shutdown_lock:
-            if self._payload_connecting or self._payload_shutdown_started:
-                return
-            self._payload_shutdown_started = True
-        self.payload_transfer.shutdown()
-
-    async def _request_payload(self, target, operation, body, *, data=None, recv=None):
+    async def _request_payload(
+        self,
+        target: str,
+        operation: Operation,
+        params: dict[str, Any],
+        *,
+        data: dict[str, Any] | None = None,
+        recv: tuple[memoryview, ...] | None = None,
+    ) -> PayloadReply:
         started = time.perf_counter()
-        key = (asyncio.get_running_loop(), target)
-        entry = None
         try:
-            entry = await self._get_payload_connection(key)
-            reply, response_data = await self.payload_transfer.request(
-                entry[0],
-                RequestHeader(operation, body),
+            reply = await self.payload_client.request(
+                target,
+                RequestHeader(operation, params),
                 send=data,
                 recv=recv,
             )
@@ -747,18 +693,13 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"Failed to {operation.value.lower()} data on storage unit "
                 f"{target} ({self._describe_storage_unit(target)}): {exc}"
             ) from exc
-        except BaseException as exc:
-            # A late failure must not evict a newer connection for the same peer.
-            if self._payload_connections.get(key) is entry:
-                self._payload_connections.pop(key, None)
-            if isinstance(exc, TransferTimeout):
-                size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
-                raise StorageUnitTimeout(
-                    f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {operation.value.lower()} "
-                    f"at storage unit {target} ({self._describe_storage_unit(target)}){size}"
-                ) from exc
-            if not isinstance(exc, Exception):
-                raise
+        except TransferTimeout as exc:
+            size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+            raise StorageUnitTimeout(
+                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {operation.value.lower()} "
+                f"at storage unit {target} ({self._describe_storage_unit(target)}){size}"
+            ) from exc
+        except Exception as exc:
             raise RuntimeError(
                 f"Failed to {operation.value.lower()} data on storage unit "
                 f"{target} ({self._describe_storage_unit(target)}): {type(exc).__name__}: {exc}"
@@ -771,9 +712,9 @@ class AsyncSimpleStorageManager(StorageManager):
                 time.perf_counter() - started,
                 reply.wire_bytes,
                 f"to {target} at {self._describe_storage_unit(target)} "
-                f"samples={len(body['global_indexes'])} fields={list(data)}",
+                f"samples={len(params['global_indexes'])} fields={list(data)}",
             )
-        return reply, response_data
+        return reply
 
     async def _put_to_single_storage_unit(
         self,
@@ -797,13 +738,13 @@ class AsyncSimpleStorageManager(StorageManager):
         merge_plan: dict[str, dict[str, Any]],
         target_storage_unit: str,
     ) -> dict[str, dict[str, Any]]:
-        reply, _ = await self._request_payload(
+        reply = await self._request_payload(
             target_storage_unit,
             Operation.UPDATE,
             {"global_indexes": global_indexes, "merge_fn": merge_fn, "merge_plan": merge_plan},
             data=storage_data,
         )
-        return reply.body.get("stored_shapes", {})
+        return reply.meta.get("stored_shapes", {})
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -977,7 +918,7 @@ class AsyncSimpleStorageManager(StorageManager):
         parser_args: list | None = None,
     ):
         """Get data from a single SU by global index keys."""
-        _, response_data = await self._request_payload(
+        reply = await self._request_payload(
             target_storage_unit,
             Operation.GET,
             {
@@ -987,7 +928,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 "parser_args": parser_args,
             },
         )
-        return fields, response_data
+        return fields, reply.payload
 
     async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
@@ -1335,32 +1276,12 @@ class AsyncSimpleStorageManager(StorageManager):
 
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
-    def _close_payload(self) -> None:
-        if not hasattr(self, "payload_transfer"):
-            return
-        self._payload_closed = True
-        self._payload_connections.clear()
-        for key, task in self._payload_connecting.copy().items():
-            loop = task.get_loop()
-            if not task.done():
-                try:
-                    loop.call_soon_threadsafe(task.cancel)
-                except RuntimeError:
-                    if not loop.is_closed():
-                        raise
-                if loop.is_running():
-                    continue
-            elif not task.cancelled():
-                task.exception()
-            # A stopped loop might resume to process cancellation, but shutdown
-            # cannot rely on that loop ever running its completion callbacks.
-            self._payload_connecting.pop(key, None)
-        self._shutdown_idle_payload()
-
     def close(self) -> None:
         """Stop pending handshakes and release pools before their shared context."""
         try:
-            self._close_payload()
+            client = getattr(self, "payload_client", None)
+            if client is not None:
+                client.close()
         finally:
             for name in ("storage_rpc_pool", "storage_probe_pool", "storage_dump_pool"):
                 pool = getattr(self, name, None)

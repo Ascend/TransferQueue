@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .exceptions import StorageKeyNotFoundError
 from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
@@ -21,7 +22,7 @@ from .managers import (
     StorageManagerFactory,
     YuanrongStorageManager,
 )
-from .simple_storage import SimpleStorageUnit, StorageKeyNotFoundError, StorageUnitData
+from .simple_storage import SimpleStorageUnit, StorageUnitData
 
 __all__ = [
     "SimpleStorageUnit",

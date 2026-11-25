@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Storage-unit retry and timeout-diagnosis tests."""
+"""PayloadClient connection lifecycle, storage-unit retry, and timeout-diagnosis tests."""
 
 import asyncio
 import logging
@@ -27,35 +27,40 @@ from tensordict import TensorDict
 
 from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.storage.payload_transfer import (
     Operation,
-    ReplyHeader,
+    PayloadClient,
+    PayloadReply,
+    RequestHeader,
     StorageRejected,
     TransferError,
     TransferTimeout,
 )
-from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
-def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
+def _manager(with_unit: bool = True, transfer: MagicMock | None = None) -> AsyncSimpleStorageManager:
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
     manager.storage_manager_id = "TQ_STORAGE_test"
     manager.storage_unit_infos = {}
     manager.config = {}
-    manager._payload_connections = {}
-    manager._payload_connecting = {}
-    manager._payload_closed = False
     if with_unit:
         manager.storage_unit_infos["unit_a"] = ZMQServerInfo(
             role=Role.STORAGE,
             id="unit_a",
             ip="10.0.0.7",
             ports={"put_get_socket": 5555},
+        )
+    if transfer is not None:
+        manager.payload_client = PayloadClient(
+            transfer=transfer,
+            peers={"unit_a": {"backend": "test"}},
+            timeout=200,
         )
     manager.close = lambda: None
     return manager
@@ -84,9 +89,7 @@ class _SocketLease:
 
 @pytest.mark.asyncio
 async def test_payload_concurrent_requests_share_one_handshake():
-    manager = _manager()
     peer = {"backend": "test", "token": "opaque"}
-    manager.config = {"payload_peers": {"unit_a": peer}}
     started, release = asyncio.Event(), asyncio.Event()
     connection = object()
 
@@ -96,27 +99,25 @@ async def test_payload_concurrent_requests_share_one_handshake():
         await release.wait()
         return connection
 
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=connect),
-        request=AsyncMock(return_value=(ReplyHeader({}), {"value": [1]})),
+        request=AsyncMock(return_value=PayloadReply(payload={"value": [1]})),
     )
-    calls = [
-        asyncio.create_task(
-            manager._request_payload(
-                "unit_a",
-                Operation.GET,
-                {"global_indexes": [i]},
-            )
-        )
-        for i in range(8)
-    ]
-    await started.wait()
-    release.set()
-    await asyncio.wait_for(asyncio.gather(*calls), timeout=2)
-    await manager._request_payload("unit_a", Operation.GET, {})
-    manager.payload_transfer.connect.assert_awaited_once()
-    assert manager.payload_transfer.request.await_count == 9
-    assert all(call.args[0] is connection for call in manager.payload_transfer.request.await_args_list)
+    client = PayloadClient(transfer=transfer, peers={"unit_a": peer}, timeout=5)
+    try:
+        calls = [
+            asyncio.create_task(client.request("unit_a", RequestHeader(Operation.GET, {"global_indexes": [i]})))
+            for i in range(8)
+        ]
+        await started.wait()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*calls), timeout=2)
+        await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        transfer.connect.assert_awaited_once()
+        assert transfer.request.await_count == 9
+        assert all(call.args[0] is connection for call in transfer.request.await_args_list)
+    finally:
+        client.close()
 
 
 @pytest.mark.asyncio
@@ -124,21 +125,22 @@ async def test_payload_concurrent_requests_share_one_handshake():
     "failure", [TransferTimeout("lost"), TransferError("broken"), asyncio.CancelledError(), StorageRejected("denied")]
 )
 async def test_payload_connection_eviction_and_storage_rejection(failure):
-    manager = _manager()
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=[object(), object()]),
-        request=AsyncMock(side_effect=[failure, (ReplyHeader({}), {"value": [1]})]),
+        request=AsyncMock(side_effect=[failure, PayloadReply(payload={"value": [1]})]),
     )
-    expected = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else RuntimeError
-    with pytest.raises(expected):
-        await manager._request_payload("unit_a", Operation.GET, {})
-    await manager._request_payload("unit_a", Operation.GET, {})
-    assert manager.payload_transfer.connect.await_count == (1 if isinstance(failure, StorageRejected) else 2)
+    client = PayloadClient(transfer=transfer, peers={"unit_a": {"backend": "test"}}, timeout=5)
+    try:
+        with pytest.raises(type(failure)):
+            await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        assert transfer.connect.await_count == (1 if isinstance(failure, StorageRejected) else 2)
+    finally:
+        client.close()
 
 
 @pytest.mark.asyncio
-async def test_payload_connect_timeout_is_bounded_and_can_reconnect(monkeypatch):
-    manager = _manager()
+async def test_payload_connect_timeout_is_bounded_and_can_reconnect():
     cancelled = asyncio.Event()
 
     async def stalled_connect(_):
@@ -147,63 +149,72 @@ async def test_payload_connect_timeout_is_bounded_and_can_reconnect(monkeypatch)
         finally:
             cancelled.set()
 
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=stalled_connect),
-        request=AsyncMock(return_value=(ReplyHeader({}), {})),
+        request=AsyncMock(return_value=PayloadReply()),
     )
-    monkeypatch.setattr(ssm, "TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 0.01)
-    with pytest.raises(StorageUnitTimeout):
-        await manager._request_payload("unit_a", Operation.GET, {})
-    assert cancelled.is_set()
-    manager.payload_transfer.request.assert_not_awaited()
-    manager.payload_transfer.connect.side_effect = None
-    manager.payload_transfer.connect.return_value = object()
-    await manager._request_payload("unit_a", Operation.GET, {})
-    assert manager.payload_transfer.connect.await_count == 2
+    client = PayloadClient(transfer=transfer, peers={"unit_a": {"backend": "test"}}, timeout=0.01)
+    try:
+        with pytest.raises(TransferTimeout):
+            await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        assert cancelled.is_set()
+        transfer.request.assert_not_awaited()
+        transfer.connect.side_effect = None
+        transfer.connect.return_value = object()
+        await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        assert transfer.connect.await_count == 2
+    finally:
+        client.close()
 
 
 @pytest.mark.asyncio
 async def test_late_failure_does_not_evict_replacement_connection():
-    manager = _manager()
     old, new = object(), object()
     entered, release = asyncio.Event(), asyncio.Event()
 
     async def request(connection, header, **_):
-        if header.body.get("slow"):
+        if header.params.get("slow"):
             entered.set()
             await release.wait()
             raise TransferTimeout("late failure")
         if connection is old:
             raise TransferTimeout("first failure")
-        return ReplyHeader({}), {}
+        return PayloadReply()
 
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=[old, new]),
         request=AsyncMock(side_effect=request),
     )
-    late = asyncio.create_task(manager._request_payload("unit_a", Operation.GET, {"slow": True}))
-    await entered.wait()
+    client = PayloadClient(transfer=transfer, peers={"unit_a": {"backend": "test"}}, timeout=5)
     try:
-        with pytest.raises(StorageUnitTimeout):
-            await manager._request_payload("unit_a", Operation.GET, {})
-        await manager._request_payload("unit_a", Operation.GET, {})
+        late = asyncio.create_task(client.request("unit_a", RequestHeader(Operation.GET, {"slow": True})))
+        await entered.wait()
+        try:
+            with pytest.raises(TransferTimeout):
+                await client.request("unit_a", RequestHeader(Operation.GET, {}))
+            await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        finally:
+            release.set()
+            with pytest.raises(TransferTimeout):
+                await late
+        await client.request("unit_a", RequestHeader(Operation.GET, {}))
+        assert transfer.connect.await_count == 2
     finally:
-        release.set()
-        with pytest.raises(StorageUnitTimeout):
-            await late
-    await manager._request_payload("unit_a", Operation.GET, {})
-    assert manager.payload_transfer.connect.await_count == 2
+        client.close()
 
 
 def test_payload_connections_do_not_cross_event_loops():
-    manager = _manager()
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=[object(), object()]),
-        request=AsyncMock(return_value=(ReplyHeader({}), {})),
+        request=AsyncMock(return_value=PayloadReply()),
     )
-    for _ in range(2):
-        asyncio.run(manager._request_payload("unit_a", Operation.GET, {}))
-    assert manager.payload_transfer.connect.await_count == 2
+    client = PayloadClient(transfer=transfer, peers={"unit_a": {"backend": "test"}}, timeout=5)
+    try:
+        for _ in range(2):
+            asyncio.run(client.request("unit_a", RequestHeader(Operation.GET, {})))
+        assert transfer.connect.await_count == 2
+    finally:
+        client.close()
 
 
 def _client_with_one_unit(client_class, monkeypatch):
@@ -225,7 +236,7 @@ async def _cancel_get_during_handshake(client, monkeypatch):
         finally:
             cancelled.set()
 
-    monkeypatch.setattr(client.storage_manager.payload_transfer, "connect", connect)
+    monkeypatch.setattr(client.storage_manager.payload_client.transfer, "connect", connect)
     _, metadata = _single_sample_batch()
     read = asyncio.create_task(client.async_get_data(metadata))
     await asyncio.wait_for(entered.wait(), timeout=5)
@@ -243,7 +254,7 @@ def test_sync_client_drains_handshake_left_by_cancelled_get(monkeypatch):
     finally:
         client.close()
     assert cancelled.is_set()
-    assert not manager._payload_connecting
+    assert manager.payload_client.closed
     assert not manager._notify_thread.is_alive()
     assert client.zmq_context.closed
 
@@ -251,10 +262,10 @@ def test_sync_client_drains_handshake_left_by_cancelled_get(monkeypatch):
 @pytest.mark.asyncio
 async def test_running_handshake_releases_transport_after_cancellation(monkeypatch):
     client = _client_with_one_unit(AsyncTransferQueueClient, monkeypatch)
-    manager = client.storage_manager
+    payload_client = client.storage_manager.payload_client
     cancelled = await _cancel_get_during_handshake(client, monkeypatch)
-    (handshake,) = manager._payload_connecting.values()
-    with patch.object(manager.payload_transfer, "shutdown", wraps=manager.payload_transfer.shutdown) as shutdown:
+    (handshake,) = payload_client._connecting.values()
+    with patch.object(payload_client.transfer, "shutdown", wraps=payload_client.transfer.shutdown) as shutdown:
         client.close()
         shutdown.assert_not_called()
         await asyncio.gather(handshake, return_exceptions=True)
@@ -267,7 +278,7 @@ def test_async_client_closes_cleanly_after_asyncio_run_loop_exits(monkeypatch):
     manager = client.storage_manager
     asyncio.run(_cancel_get_during_handshake(client, monkeypatch))
     client.close()
-    assert not manager._payload_connecting
+    assert manager.payload_client.closed
     assert not manager._notify_thread.is_alive()
     assert client.zmq_context.closed
 
@@ -284,23 +295,25 @@ def test_async_client_closes_cleanly_after_asyncio_run_loop_exits(monkeypatch):
     ],
 )
 async def test_payload_failure_maps_to_public_exception_types(operation, error, expected):
-    manager = _manager()
-    manager.config = {"payload_peers": {"unit_a": {"backend": "test"}}}
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(return_value="connection"),
         request=AsyncMock(side_effect=error),
     )
-    with pytest.raises(expected) as caught:
-        await manager._request_payload(
-            "unit_a",
-            operation,
-            {"global_indexes": [0]},
-            data=None if operation == Operation.GET else {"value": [1]},
-        )
-    assert type(caught.value) is expected
-    if expected is not asyncio.CancelledError:
-        assert "unit_a" in str(caught.value)
-        assert caught.value.__cause__ is error
+    manager = _manager(transfer=transfer)
+    try:
+        with pytest.raises(expected) as caught:
+            await manager._request_payload(
+                "unit_a",
+                operation,
+                {"global_indexes": [0]},
+                data=None if operation == Operation.GET else {"value": [1]},
+            )
+        assert type(caught.value) is expected
+        if expected is not asyncio.CancelledError:
+            assert "unit_a" in str(caught.value)
+            assert caught.value.__cause__ is error
+    finally:
+        manager.payload_client.close()
 
 
 @pytest.mark.asyncio
@@ -453,37 +466,43 @@ async def test_lost_request_recovers_without_diagnosis():
 
 @pytest.mark.asyncio
 async def test_transfer_error_evicts_connection_and_retries_only_when_allowed():
-    manager = _manager()
-    manager.notify_data_update = AsyncMock(return_value=True)
     first_conn, second_conn = object(), object()
-    manager.payload_transfer = MagicMock(
+    transfer = MagicMock(
         connect=AsyncMock(side_effect=[first_conn, second_conn]),
         request=AsyncMock(
             side_effect=[
                 TransferError("connection reset by peer"),
-                (ReplyHeader({}), None),
-                (ReplyHeader({}), {"input_ids": [torch.tensor([7, 8])]}),
+                PayloadReply(),
+                PayloadReply(payload={"input_ids": [torch.tensor([7, 8])]}),
             ]
         ),
     )
+    manager = _manager(transfer=transfer)
+    manager.notify_data_update = AsyncMock(return_value=True)
     data, metadata = _single_sample_batch()
 
-    with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3):
-        await manager.put_data(data, metadata)
-        result = await manager.get_data(metadata)
+    try:
+        with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3):
+            await manager.put_data(data, metadata)
+            result = await manager.get_data(metadata)
 
-    assert manager.payload_transfer.connect.await_count == 2
-    assert manager.payload_transfer.request.await_args_list[0].args[0] is first_conn
-    assert manager.payload_transfer.request.await_args_list[1].args[0] is second_conn
-    assert manager.payload_transfer.request.await_args_list[2].args[0] is second_conn
-    torch.testing.assert_close(result["input_ids"].unbind()[0], torch.tensor([7, 8]))
+        assert transfer.connect.await_count == 2
+        assert transfer.request.await_args_list[0].args[0] is first_conn
+        assert transfer.request.await_args_list[1].args[0] is second_conn
+        assert transfer.request.await_args_list[2].args[0] is second_conn
+        torch.testing.assert_close(result["input_ids"].unbind()[0], torch.tensor([7, 8]))
 
-    # StorageRejected is a valid business rejection: keep the connection and do not retry.
-    manager.payload_transfer.request = AsyncMock(side_effect=StorageRejected("capacity exceeded"))
-    with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(RuntimeError, match="capacity exceeded"):
-        await manager.put_data(data, metadata)
-    assert manager.payload_transfer.request.await_count == 1
-    assert manager.payload_transfer.connect.await_count == 2
+        # StorageRejected is a valid business rejection: keep the connection and do not retry.
+        transfer.request = AsyncMock(side_effect=StorageRejected("capacity exceeded"))
+        with (
+            patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
+            pytest.raises(RuntimeError, match="capacity exceeded"),
+        ):
+            await manager.put_data(data, metadata)
+        assert transfer.request.await_count == 1
+        assert transfer.connect.await_count == 2
+    finally:
+        manager.payload_client.close()
 
 
 def _wrapped_transfer_error() -> RuntimeError:

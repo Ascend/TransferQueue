@@ -1,4 +1,5 @@
-# Copyright 2026 The TransferQueue Team
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,33 +13,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SimpleStorage payload transport contracts and backend implementations."""
+"""SimpleStorage payload transport contracts, client manager, and backend implementations."""
 
 from .base import (
-    FieldData,
-    HeaderBody,
     Operation,
+    PayloadReply,
     PayloadTransfer,
-    PeerInfo,
-    ReplyHeader,
     RequestHeader,
-    Spans,
     StorageHandler,
     StorageRejected,
     TransferError,
     TransferTimeout,
 )
+from .client import PayloadClient
 from .zmq import ZmqPayloadTransfer, is_zmq_payload_request
 
 __all__ = [
-    "FieldData",
-    "HeaderBody",
     "Operation",
+    "PayloadClient",
+    "PayloadReply",
     "PayloadTransfer",
-    "PeerInfo",
-    "ReplyHeader",
     "RequestHeader",
-    "Spans",
     "StorageHandler",
     "StorageRejected",
     "TransferError",
