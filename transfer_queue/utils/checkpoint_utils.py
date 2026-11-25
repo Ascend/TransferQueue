@@ -26,21 +26,41 @@ logger = get_logger(__name__)
 
 _METADATA_FILE = "metadata.json"
 _CONTROLLER_FILE = "controller_state.pkl"
+_RUST_CONTROLLER_FILE = "controller_state.msgpack"
 
 
-def validate_checkpoint(checkpoint_dir: str | Path) -> bool:
-    """Return whether a TransferQueue checkpoint directory has a valid manifest and controller state.
+def validate_checkpoint(
+    checkpoint_dir: str | Path,
+    controller_backend: str = "python",
+    *,
+    storage_units: int | None = None,
+) -> bool:
+    """Return whether a TransferQueue checkpoint directory is valid for ``controller_backend``.
 
     Args:
         checkpoint_dir: Path to a checkpoint directory written by ``save_checkpoint``.
+        controller_backend: Target controller backend (``"python"`` or ``"rust"``).
+        storage_units: Expected storage unit count for ``"rust"`` checkpoints, or ``None`` to
+            accept any positive storage unit count.
 
     Returns:
-        ``True`` if ``metadata.json`` and ``controller_state.pkl`` pass structural and
-        native MessagePack metadata validation, ``False`` otherwise.
+        ``True`` if ``metadata.json`` and the ``controller_backend`` state file pass
+        structural and native MessagePack metadata validation, ``False`` otherwise.
+
+    Raises:
+        ValueError: If ``controller_backend`` is not ``"python"`` or ``"rust"``.
     """
+    if controller_backend not in ("python", "rust"):
+        raise ValueError(f"Unknown controller_backend {controller_backend!r}; expected 'python' or 'rust'")
+    if controller_backend == "rust":
+        try:
+            from transfer_queue._controller_engine import validate_checkpoint as validate_rust_checkpoint
+        except ImportError as error:
+            raise RuntimeError("The Rust Controller requires a build with the _controller_engine extension") from error
+
     checkpoint_dir = Path(checkpoint_dir)
     metadata_path = checkpoint_dir / _METADATA_FILE
-    controller_path = checkpoint_dir / _CONTROLLER_FILE
+    controller_path = checkpoint_dir / (_RUST_CONTROLLER_FILE if controller_backend == "rust" else _CONTROLLER_FILE)
     if not checkpoint_dir.is_dir() or not metadata_path.is_file() or not controller_path.is_file():
         return False
 
@@ -48,6 +68,10 @@ def validate_checkpoint(checkpoint_dir: str | Path) -> bool:
         meta = json.loads(metadata_path.read_text())
         if not isinstance(meta, dict) or not isinstance(meta.get("storage_saved"), bool):
             return False
+
+        if controller_backend == "rust":
+            validate_rust_checkpoint(str(controller_path), storage_units)
+            return True
 
         with open(controller_path, "rb") as f:
             state = pickle.load(f)

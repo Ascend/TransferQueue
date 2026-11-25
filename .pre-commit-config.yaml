@@ -15,3 +15,23 @@ repos:
         # unresolved and produces false errors.
         pass_filenames: false
         args: [transfer_queue]
+
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        files: ^crates/.*\.rs$
+        pass_filenames: false
+      - id: check-license
+        name: check license headers
+        entry: python3 tests/sanity/check_license.py --directories
+        language: system
+        files: \.(py|rs)$
+      - id: check-docstrings
+        name: check docstrings
+        entry: python3 tests/sanity/check_docstrings.py
+        language: system
+        files: ^transfer_queue/.*\.py$
+        pass_filenames: false

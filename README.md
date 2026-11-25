@@ -204,6 +204,7 @@ Please refer to [tutorial/06_streaming_dataloader.py](tutorial/06_streaming_data
 ```bash
 pip install TransferQueue
 ```
+Prebuilt Linux (`x86_64` and `aarch64`) wheels bundle the compiled Rust Controller extension, so no Rust toolchain is required at runtime.
 
 ### Install from source code
 
@@ -217,7 +218,28 @@ pip install TransferQueue
    ```bash
    pip install .
    ```
-   
+   > Note: Without a Rust toolchain installed, `pip install .` skips the optional Rust extension and installs TransferQueue with the default Python Controller.
+
+### Build the Rust Controller from source
+
+1. Install the [Rust toolchain](https://www.rust-lang.org/tools/install) (`rustup` automatically selects the version pinned in `rust-toolchain.toml`):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   source "$HOME/.cargo/env"
+   ```
+
+2. Install TransferQueue from source:
+   ```bash
+   pip install .
+   ```
+
+3. Enable the Rust Controller (uses built-in FIFO sampling; custom `controller.sampler` is not yet supported):
+   ```python
+   import transfer_queue as tq
+
+   tq.init({"controller": {"backend": "rust"}})
+   ```
+
 ### Build wheel package from source code
 
 1. Clone the source code from the GitHub repository
@@ -225,7 +247,7 @@ pip install TransferQueue
    git clone https://github.com/Ascend/TransferQueue/
    cd TransferQueue
    ```
-   
+
 2. Install dependencies
    ```bash
    pip install build

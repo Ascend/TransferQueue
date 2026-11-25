@@ -1,0 +1,52 @@
+name: Release Linux wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/wheel-package.yml
+
+  publish:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: wheelhouse
+          merge-multiple: true
+      - name: Publish both wheels on GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          version=${GITHUB_REF_NAME#v}
+          wheels=()
+          for arch in x86_64 aarch64; do
+            candidates=(wheelhouse/transferqueue-"$version"-cp310-abi3-*manylinux_2_28_"$arch"*.whl)
+            if (( ${#candidates[@]} != 1 )); then
+              echo "Expected one $arch wheel for $GITHUB_REF_NAME. Check transfer_queue/version/version." >&2
+              exit 1
+            fi
+            wheels+=("${candidates[0]}")
+          done
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --clobber "${wheels[@]}"
+          else
+            options=()
+            if [[ $version =~ (a|b|rc|\.dev)[0-9]+$ ]]; then
+              options+=(--prerelease)
+            fi
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes \
+              "${options[@]}" "${wheels[@]}"
+          fi

@@ -1456,6 +1456,7 @@ class TestTransferQueueControllerCheckpoint:
             assert validate_checkpoint(bad_ckpt_dir) is False
         (bad_ckpt_dir / "metadata.json").write_text('{"storage_saved": true, "user_metadata": {}}')
         assert validate_checkpoint(bad_ckpt_dir) is True
+        assert validate_checkpoint(bad_ckpt_dir, "rust") is False
 
         with open(bad_ckpt_path, "rb") as f:
             state = pickle.load(f)

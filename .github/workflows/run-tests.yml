@@ -1,4 +1,4 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# This workflow will install Python dependencies and run unit and E2E tests in parallel
 # For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: Run Tests
@@ -14,7 +14,7 @@ on:
       - v0.*
 
 jobs:
-  build:
+  unit-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -25,18 +25,49 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        rustup show active-toolchain
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[test,build,yuanrong]"
         pip install "mooncake-transfer-engine-non-cuda>=0.3.13"
-    - name: Run Tests
+    - name: Run Unit Tests
       run: |
-        pytest tests
+        ulimit -n 65536 || true
+        pytest tests --ignore=tests/e2e
+
+  e2e-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11"]
+        controller: [python, rust]
+    env:
+      TQ_CONTROLLER_BACKEND: ${{ matrix.controller }}
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        rustup show active-toolchain
+        python -m pip install --upgrade pip
+        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        pip install -e ".[test,build,yuanrong]"
+        pip install "mooncake-transfer-engine-non-cuda>=0.3.13"
+    - name: Run SimpleStorage E2E Tests
+      run: |
+        ulimit -n 65536 || true
+        pytest tests/e2e
     - name: Run MooncakeStore Backend Specific E2E Tests
       run: |
         TQ_TEST_BACKEND=MooncakeStore pytest tests/e2e/test_e2e_lifecycle_consistency.py

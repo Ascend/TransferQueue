@@ -18,15 +18,19 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
+        controller: [python, rust]
+    env:
+      TQ_CONTROLLER_BACKEND: ${{ matrix.controller }}
 
     steps:
     - uses: actions/checkout@v4
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        rustup show active-toolchain
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[yuanrong]"
@@ -35,6 +39,7 @@ jobs:
         export RAY_DEDUP_LOGS=0
         python3 recipe/simple_use_case/single_controller_demo.py --num-samples 8 --global-batch-size 4 --rollout-agent-num-workers 1
     - name: Run data-centric pipeline demo
+      if: matrix.controller == 'python' # Uses RankAwareSampler.
       run: |
         export RAY_DEDUP_LOGS=0
         python3 recipe/simple_use_case/relax_demo.py --num-steps 1 --global-batch-size 1 --micro-batch-size 1 --num-rollout-workers 1 --num-ref-workers 1 --num-actor-workers 1 --num-reward-workers 1 --rollout-sleep-seconds 0.01 --stage-sleep-seconds 0.01 --weight-sync-seconds 0.01

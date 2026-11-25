@@ -30,6 +30,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        rustup show active-toolchain
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e ".[test,build,yuanrong,mooncake]"
@@ -43,3 +44,5 @@ jobs:
       run: |
         python -m build --wheel
         pip install dist/*.whl --force-reinstall
+        cd "$RUNNER_TEMP"
+        python -c 'from transfer_queue._controller_engine import ControllerEngine'

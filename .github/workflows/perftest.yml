@@ -19,6 +19,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.11"]
+        controller: [python, rust]
 
     steps:
     - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -28,6 +29,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
     - name: Install dependencies
       run: |
+        rustup show active-toolchain
         python -m pip install --upgrade pip
         pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
         pip install -e .
@@ -48,6 +50,7 @@ jobs:
         cd scripts/performance_test
         python perftest.py \
           --backend_config=../../transfer_queue/config.yaml \
+          --controller_backend=${{ matrix.controller }} \
           --device=cpu \
           --global_batch_size=128 \
           --field_num=4 \

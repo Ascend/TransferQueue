@@ -1,4 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,36 +13,42 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import re
 from argparse import ArgumentParser
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
-# Add license headers below
-license_head_huawei = "Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved."
-license_head_tq_2025 = "Copyright 2025 The TransferQueue Team"
-license_head_tq_2026 = "Copyright 2026 The TransferQueue Team"
+LICENSE_HEADER_RE = re.compile(
+    r"Copyright \d{4}(?:-\d{4})? (?:Huawei Technologies Co\., Ltd\. All Rights Reserved\.|The TransferQueue Team)"
+)
+SUPPORTED_SUFFIXES = {".py", ".rs"}
+IGNORED_DIRS = {
+    "__pycache__",
+    "build",
+    "dist",
+    "target",
+    "venv",
+    "worktrees",
+}
 
-license_headers = [
-    license_head_huawei,
-    license_head_tq_2025,
-    license_head_tq_2026,
-]
 
+def get_source_files(path_arg: Path) -> Iterable[Path]:
+    """Yield Python and Rust source files under a directory or file path."""
+    if path_arg.is_file():
+        if path_arg.suffix in SUPPORTED_SUFFIXES:
+            yield path_arg
+        return
+    if not path_arg.is_dir():
+        return
 
-def get_py_files(path_arg: Path) -> Iterable[Path]:
-    """Get Python files under a directory. If already a Python file, return it.
-
-    Args:
-        path_arg (Path): path to scan for .py files
-
-    Returns:
-        Iterable[Path]: list of .py files
-    """
-    if path_arg.is_dir():
-        return path_arg.glob("**/*.py")
-    elif path_arg.is_file() and path_arg.suffix == ".py":
-        return [path_arg]
-    return []
+    for root, dirs, files in os.walk(path_arg):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in IGNORED_DIRS and not d.endswith(".egg-info")]
+        root_path = Path(root)
+        for file in files:
+            candidate = root_path / file
+            if candidate.suffix in SUPPORTED_SUFFIXES:
+                yield candidate
 
 
 if __name__ == "__main__":
@@ -52,23 +59,14 @@ if __name__ == "__main__":
         required=True,
         type=Path,
         nargs="+",
-        help="List of directories to check for license headers",
+        help="List of directories or files to check for license headers",
     )
     args = parser.parse_args()
 
-    # Collect all Python files from specified directories
-    pathlist = set(path for path_arg in args.directories for path in get_py_files(path_arg))
+    pathlist = sorted({path.resolve() for path_arg in args.directories for path in get_source_files(path_arg)})
 
     for path in pathlist:
-        # because path is object not string
-        path_in_str = str(path.absolute())
+        path_in_str = str(path)
         print(path_in_str)
-        with open(path_in_str, encoding="utf-8") as f:
-            file_content = f.read()
-
-            has_license = False
-            for lh in license_headers:
-                if lh in file_content:
-                    has_license = True
-                    break
-            assert has_license, f"file {path_in_str} does not contain license"
+        header_text = "\n".join(path.read_text(encoding="utf-8").splitlines()[:20])
+        assert LICENSE_HEADER_RE.search(header_text), f"file {path_in_str} does not contain license"

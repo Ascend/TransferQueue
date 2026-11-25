@@ -3,10 +3,18 @@
 # -------------------------------
 [build-system]
 requires = [
-    "setuptools>=61.0",
+    "setuptools>=62.4",
+    "setuptools-rust>=1.10",
     "wheel"
 ]
 build-backend = "setuptools.build_meta"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "transfer_queue._controller_engine"
+path = "crates/controller-py/Cargo.toml"
+binding = "PyO3"
+args = ["--locked"]
+optional = true
 
 # -------------------------------
 # project (PEP 621 metadata)
@@ -126,6 +134,9 @@ mooncake = [
 # If you need to mimic `package_dir={'': '.'}`:
 [tool.setuptools.package-dir]
 "" = "."
+
+[tool.setuptools.packages.find]
+exclude = ["target", "target.*", "crates", "crates.*"]
 
 # If you need to include specific non-Python data (like YAML files or version file):
 # This is the rough equivalent of package_data={'': ['version/*']}

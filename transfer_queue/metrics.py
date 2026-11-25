@@ -30,13 +30,16 @@
 
 import os
 import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from itertools import accumulate
 from threading import Thread
 from typing import Any
 
 import psutil
 import zmq
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
+from prometheus_client.core import CounterMetricFamily, HistogramMetricFamily
 
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
@@ -51,6 +54,7 @@ logger = get_logger(__name__)
 
 TQ_METRICS_COLLECT_INTERVAL = int(os.environ.get("TQ_METRICS_COLLECT_INTERVAL", 10))
 TQ_METRICS_STORAGE_TIMEOUT = int(os.environ.get("TQ_METRICS_STORAGE_TIMEOUT", 5))
+REQUEST_LATENCY_BUCKETS = [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0]
 
 
 class TQMetricsExporter:
@@ -125,7 +129,7 @@ class TQMetricsExporter:
             f"tq_{role}_request_duration_seconds",
             f"{role.capitalize()} request processing duration",
             ["op_type"],
-            buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0],
+            buckets=REQUEST_LATENCY_BUCKETS,
             registry=r,
         )
         self.request_total = Counter(
@@ -601,3 +605,48 @@ class TQMetricsExporter:
             except Exception as e:
                 logger.error(f"Metrics collection error: {e}")
             time.sleep(TQ_METRICS_COLLECT_INTERVAL)
+
+
+class RustControllerMetrics(TQMetricsExporter):
+    """Export counters and latency buckets collected on the Rust state thread."""
+
+    def __init__(self, snapshot: Callable[[], dict[str, Any]], zmq_context: zmq.Context):
+        super().__init__(zmq_context=zmq_context)
+        self._read_snapshot = snapshot
+        for metric in (
+            self.request_total,
+            self.request_errors_total,
+            self.request_samples_total,
+            self.request_duration,
+        ):
+            self.registry.unregister(metric)
+        self.registry.register(self)
+
+    def collect_controller_metrics(self) -> None:
+        """Pull the latest metrics snapshot from the Rust engine and update Prometheus gauges."""
+        self.update_controller_snapshot(self._read_snapshot())
+        super().collect_controller_metrics()
+
+    def collect(self) -> Iterator[CounterMetricFamily | HistogramMetricFamily]:
+        """Yield live Prometheus counter and latency histogram families from the Rust controller."""
+        requests = self._read_snapshot()["requests"]
+        labels = ["op_type"]
+        for suffix, key, description in (
+            ("request", "count", "Total number of requests processed by the controller"),
+            ("request_errors", "errors", "Total number of request errors in the controller"),
+            ("request_samples", "samples", "Total number of samples processed per operation type in the controller"),
+        ):
+            counter = CounterMetricFamily(f"tq_controller_{suffix}", description, labels=labels)
+            for operation, stats in requests.items():
+                counter.add_metric([operation], stats[key])
+            yield counter
+
+        latency = HistogramMetricFamily(
+            "tq_controller_request_duration_seconds", "Controller request processing duration", labels=labels
+        )
+        bounds = [str(value) for value in REQUEST_LATENCY_BUCKETS] + ["+Inf"]
+        for operation, stats in requests.items():
+            latency.add_metric(
+                [operation], list(zip(bounds, accumulate(stats["buckets"]), strict=True)), stats["seconds"]
+            )
+        yield latency

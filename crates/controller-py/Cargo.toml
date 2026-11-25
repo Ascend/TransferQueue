@@ -1,0 +1,13 @@
+[package]
+name = "tq-controller-py"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "_controller_engine"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.2", features = ["abi3-py310"] }
+tq-controller = { path = "../controller" }
