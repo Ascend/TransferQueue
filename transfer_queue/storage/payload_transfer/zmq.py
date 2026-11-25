@@ -23,12 +23,14 @@ from threading import Event, Lock
 import zmq
 
 from transfer_queue.storage.payload_transfer.base import (
-    DeliveryState,
     Operation,
     PayloadPeerInfo,
     PayloadReply,
     PayloadTransfer,
     RequestHeader,
+    StorageHandler,
+)
+from transfer_queue.storage.payload_transfer.errors import (
     StorageRejected,
     TransferError,
     TransferTimeout,
@@ -45,9 +47,9 @@ from transfer_queue.utils.zmq_utils import (
 # Preserves the existing ZMQ GET_ERROR message convention across rolling upgrades.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
-# System and socket errnos that may recover on a fresh connection or once local resource pressure
-# clears. Deterministic configuration, state, or termination errors (e.g. EINVAL, ETERM,
-# EPROTONOSUPPORT) stay non-transient so callers surface the first failure without retrying.
+# libzmq handles TCP connect/reconnect asynchronously in its C++ I/O thread (peer drops surface as
+# zmq.Again -> TransferTimeout). Python-side ZMQError only merits a retry on transient local
+# resource exhaustion or interrupted syscalls; EINVAL/ETERM/EPROTONOSUPPORT fail immediately.
 _TRANSIENT_ZMQ_ERRNOS = frozenset(
     {
         errno.EAGAIN,
@@ -56,15 +58,6 @@ _TRANSIENT_ZMQ_ERRNOS = frozenset(
         errno.ENFILE,
         errno.ENOBUFS,
         errno.ENOMEM,
-        errno.ECONNRESET,
-        errno.ECONNABORTED,
-        errno.ECONNREFUSED,
-        errno.EPIPE,
-        errno.ENETDOWN,
-        errno.ENETUNREACH,
-        errno.ENETRESET,
-        errno.EHOSTUNREACH,
-        errno.ETIMEDOUT,
     }
 )
 
@@ -88,25 +81,24 @@ class ZmqPayloadTransfer(PayloadTransfer):
     def __init__(self, *, owner_id: str, pool: ZMQSocketPool | None = None):
         self.owner_id = owner_id
         self.pool = pool
+        self._handle: StorageHandler | None = None
         self._closed = Event()
         self._handler_lock = Lock()
 
-    def listen(self, *, handle, address=None) -> PayloadPeerInfo:
+    def listen(self, *, handle: StorageHandler, address=None) -> PayloadPeerInfo:
         """Bind the local storage handler and return ZMQ server bootstrap metadata."""
         self._handle = handle
         return PayloadPeerInfo("zmq", address)
 
-    async def request(self, peer_info, header, *, send=None, recv=None):
+    async def request(self, peer_info, header, *, send=None):
         """Lease a pooled DEALER socket for ``peer_info``, send ``header``, and decode its reply."""
         if self._closed.is_set() or self.pool is None:
-            raise TransferError("ZMQ payload client is unavailable", transient=False, delivery=DeliveryState.UNSENT)
+            raise TransferError("ZMQ payload client is unavailable")
         if not isinstance(peer_info, PayloadPeerInfo) or peer_info.backend != "zmq":
-            raise TransferError("invalid ZMQ payload peer", transient=False, delivery=DeliveryState.UNSENT)
+            raise TransferError("invalid ZMQ payload peer")
         address = peer_info.address
         if not isinstance(address, ZMQServerInfo):
-            raise TransferError("invalid ZMQ payload peer", transient=False, delivery=DeliveryState.UNSENT)
-        if recv is not None:
-            raise NotImplementedError("ZMQ receive destinations are not implemented")
+            raise TransferError("invalid ZMQ payload peer")
         if header.operation == Operation.GET:
             if send is not None:
                 raise ValueError("GET does not accept send field data")
@@ -115,13 +107,10 @@ class ZmqPayloadTransfer(PayloadTransfer):
 
         request_type, response_type, error_type = _WIRE_TYPES[header.operation]
         wire_bytes = 0
-        delivery = DeliveryState.UNSENT
         try:
             async with self.pool.alease(address) as socket:
                 if self._closed.is_set():
-                    raise TransferError(
-                        "ZMQ payload client is unavailable", transient=False, delivery=DeliveryState.UNSENT
-                    )
+                    raise TransferError("ZMQ payload client is unavailable")
                 # Serialize only after acquiring a socket permit so queued callers keep zero-copy views.
                 body = dict(header.params)
                 if send is not None:
@@ -135,47 +124,29 @@ class ZmqPayloadTransfer(PayloadTransfer):
                 frames = request.serialize()
                 if send is not None:
                     wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-                delivery = DeliveryState.IN_DOUBT
                 await socket.send_multipart(frames, copy=False)
                 del frames
                 reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
                 if reply.request_type not in (response_type, error_type):
-                    detail = reply.body.get("message") if isinstance(reply.body, dict) else None
-                    reason = f"unexpected response {reply.request_type}" + (f": {detail}" if detail else "")
-                    rejected_at_ingress = reply.request_type == ZMQRequestType.PUT_GET_OPERATION_ERROR or (
-                        reply.request_type == ZMQRequestType.PUT_GET_ERROR
-                        and isinstance(detail, str)
-                        and detail.startswith("undecodable request:")
-                    )
-                    raise TransferError(
-                        reason,
-                        transient=False,
-                        delivery=DeliveryState.REJECTED if rejected_at_ingress else DeliveryState.IN_DOUBT,
-                    )
+                    reason = f"unexpected response {reply.request_type}"
+                    if isinstance(reply.body, dict) and (detail := reply.body.get("message")):
+                        reason += f": {detail}"
+                    raise TransferError(reason)
                 reply_meta = dict(reply.body)
                 payload = None
                 if reply.request_type == response_type and header.operation == Operation.GET:
                     payload = reply_meta.pop("data", None)
                     if not isinstance(payload, dict):
-                        raise TransferError(
-                            "GET response must contain field data",
-                            transient=False,
-                            delivery=DeliveryState.IN_DOUBT,
-                        )
+                        raise TransferError("GET response must contain field data")
         except zmq.error.Again as exc:
-            raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes, delivery=delivery) from exc
+            raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes) from exc
         except zmq.ZMQError as exc:
             raise TransferError(
                 f"ZMQ storage request failed: {type(exc).__name__}: {exc}",
                 transient=exc.errno in _TRANSIENT_ZMQ_ERRNOS,
-                delivery=delivery,
             ) from exc
         except ZMQMessageDecodeError as exc:
-            raise TransferError(
-                f"ZMQ storage request failed: {type(exc).__name__}: {exc}",
-                transient=False,
-                delivery=delivery,
-            ) from exc
+            raise TransferError(f"ZMQ storage request failed: {type(exc).__name__}: {exc}") from exc
 
         # A valid storage rejection completes the exchange and leaves the socket reusable in the pool.
         if reply.request_type == error_type:
@@ -197,6 +168,8 @@ class ZmqPayloadTransfer(PayloadTransfer):
             with self._handler_lock:
                 if self._closed.is_set():
                     raise StorageRejected("storage unit is shutting down")
+                if self._handle is None:
+                    raise StorageRejected("storage payload handler is not registered")
                 reply = self._handle(RequestHeader(operation, params), data)
             result = dict(reply.meta)
             if reply.payload is not None:

@@ -16,7 +16,6 @@
 import os
 import time
 from collections import defaultdict
-from collections.abc import Callable
 from contextlib import contextmanager
 from threading import Lock
 
@@ -109,7 +108,7 @@ class IntervalPerfMonitor:
             self.last_flush_time = now
 
     @contextmanager
-    def measure(self, op_type: str, *, count_error: Callable[[Exception], bool] | None = None):
+    def measure(self, op_type: str):
         """Measures performance statistics."""
         start_time = time.perf_counter()
         try:

@@ -19,11 +19,12 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum
 from typing import Any, Callable, TypeAlias
 
+from transfer_queue.utils.enum_utils import ExplicitEnum
 
-class Operation(str, Enum):
+
+class Operation(ExplicitEnum):
     """Logical data-plane storage operation."""
 
     PUT = "PUT"
@@ -57,57 +58,6 @@ class PayloadPeerInfo:
         return f"PayloadPeerInfo(backend={self.backend!r}, address={addr_repr})"
 
     __str__ = __repr__
-
-
-class DeliveryState(str, Enum):
-    """Whether a failed payload request may have been executed by the StorageUnit."""
-
-    UNSENT = "unsent"
-    REJECTED = "rejected"
-    IN_DOUBT = "in_doubt"
-
-
-class TransferError(RuntimeError):
-    """Transport, protocol, or peer-configuration failure.
-
-    ``transient`` indicates whether retrying on a fresh connection could recover.
-    ``delivery`` distinguishes failures before sending (``UNSENT``), ingress rejections
-    before storage execution (``REJECTED``), and post-send failures whose server-side
-    execution is uncertain (``IN_DOUBT``).
-    """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        transient: bool = False,
-        delivery: DeliveryState = DeliveryState.IN_DOUBT,
-    ):
-        super().__init__(message)
-        self.transient = transient
-        self.delivery = delivery
-
-
-class TransferTimeout(TransferError):
-    """Transport request timed out."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        wire_bytes: int = 0,
-        delivery: DeliveryState = DeliveryState.IN_DOUBT,
-    ):
-        super().__init__(message, transient=True, delivery=delivery)
-        self.wire_bytes = wire_bytes
-
-
-class StorageRejected(RuntimeError):
-    """Storage unit received the request and rejected it."""
-
-    def __init__(self, message: str, *, missing_key: bool = False):
-        super().__init__(message)
-        self.missing_key = missing_key
 
 
 @dataclass(frozen=True)
@@ -164,28 +114,22 @@ class PayloadTransfer(ABC):
         header: RequestHeader,
         *,
         send: dict[str, Any] | None = None,
-        recv: tuple[memoryview, ...] | None = None,
     ) -> PayloadReply:
         """Send one storage request to ``peer_info`` and await its ``PayloadReply``.
 
         Write path (``PUT`` / ``UPDATE``):
-            Pass unencoded field values in ``send`` and leave ``recv=None``. Returns
-            ``PayloadReply(meta=..., payload=None)`` after the StorageUnit commits the write.
-            Once returned, the backend no longer reads ``send`` and source buffers may be reused.
+            Pass unencoded field values in ``send``. Returns ``PayloadReply(meta=..., payload=None)``
+            after the StorageUnit commits the write. Once returned, the backend no longer reads
+            ``send`` and source buffers may be reused.
 
         Read path (``GET``, ``send=None``):
-            - ``recv=None`` (backend-allocated): backend allocates receive buffers and returns
-              decoded field values in ``reply.payload``.
-            - ``recv=(span0, ...)`` (pre-allocated): caller provides writable ``memoryview`` slices
-              (retaining their backing memory); backend validates layout bounds, fills ``recv``
-              in place, and returns ``PayloadReply(meta=..., payload=None)`` once readable.
+            Backend allocates receive buffers and returns decoded field values in ``reply.payload``.
 
         Errors and in-flight memory:
             - ``StorageRejected``: StorageUnit rejected a delivered request; peer state stays usable.
-            - ``TransferTimeout`` / ``TransferError``: set ``transient=True`` only when a retry over
-              a healthy connection may succeed, and set ``delivery`` to ``UNSENT`` / ``REJECTED`` /
-              ``IN_DOUBT`` so callers never replay in-doubt writes over concurrent updates. Retain any
-              ``send``/``recv`` memory still accessed by in-flight native operations until safe.
+            - ``TransferTimeout`` / ``TransferError``: set ``transient=True`` only when retrying on
+              a healthy connection may succeed. Retain any ``send`` memory still accessed by
+              in-flight native operations until safe.
         """
 
     # ==================== Shared Lifecycle ====================

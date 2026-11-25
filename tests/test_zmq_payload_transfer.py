@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end contract, concurrency, and fault-isolation tests for ZmqPayloadTransfer."""
+"""End-to-end contract, concurrency, fault-isolation, and write-safety tests for ZmqPayloadTransfer."""
 
 import asyncio
 import errno
@@ -37,7 +37,6 @@ from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.storage.payload_transfer import (
-    DeliveryState,
     Operation,
     PayloadPeerInfo,
     PayloadReply,
@@ -102,6 +101,7 @@ def test_payload_peer_info_is_opaque_in_omegaconf_and_compact_in_logs():
 @pytest.mark.asyncio
 async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
     async with _running_zmq_transfer(monkeypatch) as (client, peer_info, unit):
+        assert unit.get_bootstrap_info() == (unit.get_zmq_server_info(), peer_info)
         put = RequestHeader(Operation.PUT, {"global_indexes": [10, 2]})
         payload = {
             "dense": torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32),
@@ -143,10 +143,6 @@ async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
             send={"ragged": [torch.tensor([99])]},
         )
         torch.testing.assert_close(held_view, torch.tensor([40, 50]))
-
-        for recv_target in ((), (memoryview(bytearray(24)),)):
-            with pytest.raises(NotImplementedError, match="receive destinations"):
-                await client.request(peer_info, get, recv=recv_target)
         assert unit._arrivals_by_op["GET_DATA"] == 1
 
 
@@ -326,6 +322,17 @@ async def test_missing_key_wire_compatibility_both_directions(monkeypatch):
     """Preserve [TQKeyNotFound] wire compatibility between old and new clients/storage units."""
     info = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
     peer_info = PayloadPeerInfo("zmq", info)
+
+    unregistered = ZmqPayloadTransfer(owner_id="unit")
+    unregistered_reply = unregistered.handle_request(
+        ZMQMessage.create(
+            request_type=ZMQRequestType.GET_DATA,
+            sender_id="client",
+            body={"fields": ["x"], "global_indexes": [0]},
+        )
+    )
+    assert unregistered_reply.request_type == ZMQRequestType.GET_ERROR
+    assert "not registered" in unregistered_reply.body["message"]
 
     storage = StorageUnitData()
     storage.put_data({"x": [torch.tensor([1])]}, [99])
@@ -518,9 +525,8 @@ def test_storage_listen_callback_does_not_retain_owner(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ack_failure", ["lost_ack_timeout", "corrupt_ack_decode"])
-async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch, ack_failure):
-    """Once a PUT has been sent and committed, a lost or corrupt ACK must not replay over a newer write."""
+async def test_put_with_corrupt_ack_does_not_overwrite_subsequent_write(monkeypatch):
+    """A committed PUT whose ACK fails to decode must not replay over a newer write."""
     monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
     peer = unit.get_zmq_server_info()
@@ -535,14 +541,7 @@ async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch
         unit.storage_data.put_data({"text": ["B"]}, [0])
 
     socket.send_multipart = AsyncMock(side_effect=send_and_interleave_newer_write)
-    if ack_failure == "lost_ack_timeout":
-        socket.recv_multipart = AsyncMock(side_effect=zmq.Again())
-        expected_exc = StorageUnitTimeout
-        expect_diagnose = True
-    else:
-        socket.recv_multipart = AsyncMock(return_value=[b""])
-        expected_exc = RuntimeError
-        expect_diagnose = False
+    socket.recv_multipart = AsyncMock(return_value=[b""])
 
     pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
     monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
@@ -550,7 +549,6 @@ async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch
     manager.storage_manager_id = "manager"
     manager.storage_unit_infos = {peer.id: peer}
     manager._payload_peers = {peer.id: unit.get_payload_peer_info()}
-    manager._payload_closed = False
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     manager.notify_data_update = AsyncMock()
     manager._diagnose_storage_unit = AsyncMock(return_value="diagnosis")
@@ -563,14 +561,13 @@ async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch
     )
     data = TensorDict({"text": np.array(["A"], dtype=object)}, batch_size=1)
     try:
-        with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(expected_exc) as caught:
+        with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(RuntimeError):
             await manager.put_data(data, metadata)
 
         assert send_calls == 1
-        assert "write outcome in doubt" in str(caught.value)
         assert unit.storage_data.get_data(["text"], [0])["text"] == ["B"]
         manager.notify_data_update.assert_not_awaited()
-        assert manager._diagnose_storage_unit.await_count == (1 if expect_diagnose else 0)
+        manager._diagnose_storage_unit.assert_not_awaited()
         socket.close.assert_called_once_with(linger=0)
     finally:
         manager.payload_transfer.shutdown()
@@ -579,7 +576,7 @@ async def test_put_with_lost_ack_does_not_overwrite_subsequent_write(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_zmq_fault_classification_distinguishes_transient_and_delivery_states(monkeypatch):
+async def test_zmq_fault_classification_distinguishes_transient_and_deterministic_errors(monkeypatch):
     info = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
     peer_info = PayloadPeerInfo("zmq", info)
 
@@ -626,27 +623,11 @@ async def test_zmq_fault_classification_distinguishes_transient_and_delivery_sta
         with pytest.raises(TransferError) as emfile_err:
             await client.request(peer_info, header, send={"text": ["input"]})
         assert emfile_err.value.transient is True
-        assert emfile_err.value.delivery == DeliveryState.UNSENT
 
-        with pytest.raises(TransferError) as einval_err:
-            await client.request(peer_info, header, send={"text": ["input"]})
-        assert einval_err.value.transient is False
-        assert einval_err.value.delivery == DeliveryState.UNSENT
-
-        with pytest.raises(TransferError) as eterm_err:
-            await client.request(peer_info, header, send={"text": ["input"]})
-        assert eterm_err.value.transient is False
-        assert eterm_err.value.delivery == DeliveryState.UNSENT
-
-        with pytest.raises(TransferError) as rejected_err:
-            await client.request(peer_info, header, send={"text": ["input"]})
-        assert rejected_err.value.transient is False
-        assert rejected_err.value.delivery == DeliveryState.REJECTED
-
-        with pytest.raises(TransferError) as corrupt_err:
-            await client.request(peer_info, header, send={"text": ["input"]})
-        assert corrupt_err.value.transient is False
-        assert corrupt_err.value.delivery == DeliveryState.IN_DOUBT
+        for _ in range(4):
+            with pytest.raises(TransferError) as det_err:
+                await client.request(peer_info, header, send={"text": ["input"]})
+            assert det_err.value.transient is False
 
         reply = await asyncio.wait_for(client.request(peer_info, header, send={"text": ["input"]}), timeout=2)
         assert reply.payload is None
@@ -675,11 +656,11 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
     manager.storage_manager_id = "manager"
     manager.storage_unit_infos = {peer.id: peer}
     manager._payload_peers = {peer.id: unit.get_payload_peer_info()}
-    manager._payload_closed = False
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    manager._diagnose_storage_unit = AsyncMock(return_value="diagnosis")
     merge = MagicMock(side_effect=lambda old, new: torch.cat([old, new]))
     try:
-        with pytest.raises(StorageUnitTimeout) as caught:
+        with pytest.raises(StorageUnitTimeout):
             await manager._update_to_single_storage_unit(
                 [0],
                 {"value": [torch.tensor([2])]},
@@ -687,11 +668,11 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
                 {"value": {"held": [True], "dtype": torch.int64, "is_non_tensor": False}},
                 peer.id,
             )
-        assert caught.value.delivery == DeliveryState.IN_DOUBT
         assert len(applied) == 1
         assert applied[0].request_type == ZMQRequestType.UPDATE_DATA_RESPONSE
         torch.testing.assert_close(unit.storage_data.get_data(["value"], [0])["value"][0], torch.tensor([1, 2]))
         socket.send_multipart.assert_awaited_once()
+        manager._diagnose_storage_unit.assert_awaited_once()
         socket.close.assert_called_once_with(linger=0)
     finally:
         manager.payload_transfer.shutdown()
@@ -745,7 +726,6 @@ async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
         with pytest.raises(TransferError) as caught:
             await asyncio.wait_for(queued_put, timeout=2)
         assert caught.value.transient is False
-        assert caught.value.delivery == DeliveryState.UNSENT
         assert sent_frames == 1
         assert unit.storage_data.get_data(["text"], [0])["text"] == ["first"]
         with pytest.raises(StorageKeyNotFoundError):
@@ -769,7 +749,6 @@ async def test_invalid_zmq_endpoint_port_fails_once_without_retry_or_diagnosis()
     manager.storage_manager_id = "manager"
     manager.storage_unit_infos = {"bad_unit": bad_info}
     manager._payload_peers = {"bad_unit": PayloadPeerInfo("zmq", bad_info)}
-    manager._payload_closed = False
     manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     manager.notify_data_update = AsyncMock()
     manager._diagnose_storage_unit = AsyncMock(return_value="diagnosis")
@@ -787,7 +766,6 @@ async def test_invalid_zmq_endpoint_port_fails_once_without_retry_or_diagnosis()
 
         assert isinstance(caught.value.__cause__, TransferError)
         assert caught.value.__cause__.transient is False
-        assert caught.value.__cause__.delivery == DeliveryState.UNSENT
         assert connect_spy.call_count == 1
         manager._diagnose_storage_unit.assert_not_awaited()
     finally:

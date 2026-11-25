@@ -38,7 +38,6 @@ from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
 
@@ -83,12 +82,14 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
             f"on node {scheduling_strategies[storage_unit_rank].node_id}."
         )
 
-    storage_zmq_info = process_zmq_server_info(simple_storage_handles)
+    bootstrap_infos = ray.get([unit.get_bootstrap_info.remote() for unit in simple_storage_handles.values()])
+    storage_zmq_info = {}
+    payload_peers = {}
+    for name, (zmq_info, peer_info) in zip(simple_storage_handles, bootstrap_infos, strict=True):
+        storage_zmq_info[name] = zmq_info
+        payload_peers[zmq_info.id] = peer_info
     backend_name = conf.backend.storage_backend
     conf.backend[backend_name].zmq_info = storage_zmq_info
-    peer_infos = ray.get([unit.get_payload_peer_info.remote() for unit in simple_storage_handles.values()])
-    conf.backend[backend_name].payload_peers = {
-        storage_zmq_info[name].id: peer for name, peer in zip(simple_storage_handles, peer_infos, strict=True)
-    }
+    conf.backend[backend_name].payload_peers = payload_peers
 
     return simple_storage_handles

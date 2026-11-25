@@ -316,13 +316,11 @@ class TQMetricsExporter:
         )
 
     @contextmanager
-    def measure(self, op_type: str, *, count_error: Callable[[Exception], bool] | None = None):
+    def measure(self, op_type: str):
         """Context manager that records request count and latency for *op_type*.
 
         Prometheus errors are caught and logged so that metrics failures never
-        block or crash the controller's request processing loop. ``count_error``
-        may return ``False`` for expected domain races (such as missing keys after
-        a concurrent ``clear``) that should not increment ``request_errors_total``.
+        block or crash the controller's request processing loop.
 
         Usage::
 
@@ -336,12 +334,11 @@ class TQMetricsExporter:
         start = time.perf_counter()
         try:
             yield
-        except Exception as exc:
-            if count_error is None or count_error(exc):
-                try:
-                    self.request_errors_total.labels(op_type=op_type).inc()
-                except Exception:
-                    logger.debug(f"Metrics: failed to increment error counter for {op_type}", exc_info=True)
+        except Exception:
+            try:
+                self.request_errors_total.labels(op_type=op_type).inc()
+            except Exception:
+                logger.debug(f"Metrics: failed to increment error counter for {op_type}", exc_info=True)
             raise
         finally:
             elapsed = time.perf_counter() - start

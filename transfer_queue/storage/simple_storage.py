@@ -55,6 +55,7 @@ import zmq
 from transfer_queue.storage.exceptions import StorageKeyNotFoundError as StorageKeyNotFoundError
 from transfer_queue.storage.payload_transfer import (
     Operation,
+    PayloadPeerInfo,
     PayloadReply,
     PayloadTransfer,
     RequestHeader,
@@ -1246,27 +1247,31 @@ class SimpleStorageUnit:
             worker_socket.close(linger=0)
 
     def _record_arrival(self, operation: str) -> None:
-        with getattr(self, "_storage_lock", nullcontext()):
+        with self._storage_lock:
             self._requests_arrived += 1
             self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
     def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None) -> PayloadReply:
         """Run storage operations and observability with synchronized state access."""
-        operation = header.operation
-        op_type = f"{operation.value}_DATA"
+        op_type = f"{header.operation.value}_DATA"
         self._record_arrival(op_type)
         monitor = self._metrics if self._metrics is not None else self._perf_monitor
-        with monitor.measure(
-            op_type=op_type,
-            count_error=lambda exc: not (isinstance(exc, StorageRejected) and exc.missing_key),
-        ):
-            return handle_storage_request(
-                self.storage_unit_id,
-                self.storage_data,
-                header,
-                data,
-                storage_lock=getattr(self, "_storage_lock", None),
-            )
+        missing_key_err: StorageRejected | None = None
+        with monitor.measure(op_type=op_type):
+            try:
+                return handle_storage_request(
+                    self.storage_unit_id,
+                    self.storage_data,
+                    header,
+                    data,
+                    storage_lock=self._storage_lock,
+                )
+            except StorageRejected as exc:
+                # Concurrent clear vs get is a normal race, not a storage unit error.
+                if not exc.missing_key:
+                    raise
+                missing_key_err = exc
+        raise missing_key_err
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
@@ -1387,7 +1392,7 @@ class SimpleStorageUnit:
                 limit_pytorch_auto_parallel_threads(
                     target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
                 ),
-                getattr(self, "_storage_lock", nullcontext()),
+                self._storage_lock,
             ):
                 self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
@@ -1419,7 +1424,7 @@ class SimpleStorageUnit:
         except Exception:
             process_rss = 0
 
-        with getattr(self, "_storage_lock", nullcontext()):
+        with self._storage_lock:
             metrics = {
                 "storage_unit_id": self.storage_unit_id,
                 "capacity": self.storage_unit_size,
@@ -1489,7 +1494,7 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            with getattr(self, "_storage_lock", nullcontext()):
+            with self._storage_lock:
                 self.storage_data.save_checkpoint(path, self.storage_unit_id)
             logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
             return ZMQMessage.create(
@@ -1510,7 +1515,7 @@ class SimpleStorageUnit:
         path = request.body["path"]
         fields_by_index = request.body["fields_by_index"]
         try:
-            with getattr(self, "_storage_lock", nullcontext()):
+            with self._storage_lock:
                 missing = fields_by_index.keys() - self.storage_data._active_keys
                 if missing:
                     raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
@@ -1556,7 +1561,7 @@ class SimpleStorageUnit:
         updates: list[dict[str, Any]] = []
         bytes_read = 0
         try:
-            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS), getattr(self, "_storage_lock", nullcontext()):
+            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS), self._storage_lock:
                 for shard in request.body["shards"]:
                     records = sorted(shard["records"], key=lambda row: row["offset"])
                     with open(shard["path"], "rb", buffering=0) as f:
@@ -1620,7 +1625,7 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            with getattr(self, "_storage_lock", nullcontext()):
+            with self._storage_lock:
                 previous_key_count = self.storage_data.active_key_count
                 checkpoint_size = self.storage_data.load_checkpoint(path)
                 active_key_count = self.storage_data.active_key_count
@@ -1753,7 +1758,11 @@ class SimpleStorageUnit:
         logger.info(f"[{self.storage_unit_id}]: Prometheus metrics exporter started on {endpoint}")
         return endpoint
 
-    def get_payload_peer_info(self):
+    def get_bootstrap_info(self) -> tuple[ZMQServerInfo, PayloadPeerInfo]:
+        """Return both control-plane ZMQ info and payload discovery metadata in one RPC."""
+        return self.zmq_server_info, self.payload_peer_info
+
+    def get_payload_peer_info(self) -> PayloadPeerInfo:
         """Publish the selected backend's discovery information unchanged."""
         return self.payload_peer_info
 

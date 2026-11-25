@@ -37,6 +37,7 @@ def _unit():
     unit = _StorageUnitClass.__new__(_StorageUnitClass)
     unit.storage_unit_id = "TQ_STORAGE_UNIT_test0001"
     unit._shutdown_event = threading.Event()
+    unit._storage_lock = threading.Lock()
     return unit
 
 
