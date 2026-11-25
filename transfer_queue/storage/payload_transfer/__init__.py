@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""SimpleStorage payload transport contracts, client manager, and backend implementations."""
+"""SimpleStorage payload transport contracts and backend implementations."""
 
 from .base import (
     Operation,
+    PayloadPeerInfo,
     PayloadReply,
     PayloadTransfer,
     RequestHeader,
@@ -25,12 +26,11 @@ from .base import (
     TransferError,
     TransferTimeout,
 )
-from .client import PayloadClient
 from .zmq import ZmqPayloadTransfer
 
 __all__ = [
     "Operation",
-    "PayloadClient",
+    "PayloadPeerInfo",
     "PayloadReply",
     "PayloadTransfer",
     "RequestHeader",

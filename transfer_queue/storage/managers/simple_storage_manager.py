@@ -34,7 +34,7 @@ from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.payload_transfer import (
     Operation,
-    PayloadClient,
+    PayloadPeerInfo,
     PayloadReply,
     RequestHeader,
     StorageRejected,
@@ -57,8 +57,8 @@ logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
-# Attempts per storage-unit request, including the first. A timed-out payload
-# connection is evicted; ZMQ also discards the affected socket before retrying.
+# Attempts per storage-unit request, including the first. Each backend isolates
+# failed sockets or peer handles internally before a retry.
 TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3))
 
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
@@ -244,18 +244,24 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
-        raw_peers = config.get("payload_peers")
-        peers = (
-            raw_peers
-            if raw_peers is not None
-            else {su_id: {"backend": "zmq", "address": info} for su_id, info in self.storage_unit_infos.items()}
-        )
-        self.payload_client = PayloadClient(
-            transfer=ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool),
-            peers=peers,
-            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
-        )
+        self._payload_peers = self._resolve_payload_peers(config.get("payload_peers"))
+        self._payload_closed = False
+        self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
+
+    def _resolve_payload_peers(self, raw_peers: Any) -> dict[str, PayloadPeerInfo]:
+        """Normalize peer discovery descriptors once during manager initialization."""
+        if raw_peers is None:
+            return {su_id: PayloadPeerInfo("zmq", info) for su_id, info in self.storage_unit_infos.items()}
+        resolved: dict[str, PayloadPeerInfo] = {}
+        for su_id, peer in raw_peers.items():
+            if isinstance(peer, PayloadPeerInfo):
+                resolved[su_id] = peer
+            elif isinstance(peer, Mapping):
+                resolved[su_id] = PayloadPeerInfo(peer["backend"], peer.get("address"))
+            else:
+                raise TypeError(f"Invalid payload peer for {su_id}: {peer!r}")
+        return resolved
 
     def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
         """Warn when the pool may park more sockets than the context can hold.
@@ -384,8 +390,7 @@ class AsyncSimpleStorageManager(StorageManager):
         return f"{tcp} {_describe_unit_state(body)}"
 
     def _is_retryable_payload_error(self, exc: RuntimeError) -> bool:
-        client = getattr(self, "payload_client", None)
-        if client is not None and client.closed:
+        if getattr(self, "_payload_closed", False):
             return False
         return isinstance(exc, StorageUnitTimeout) or isinstance(exc.__cause__, TransferError)
 
@@ -403,8 +408,7 @@ class AsyncSimpleStorageManager(StorageManager):
             operation: Operation name for logs, e.g. ``get`` or ``put``.
             target_storage_unit: Unit this request is routed to.
             request_context: Request shape, so both ends of a failure can be correlated.
-            make_request: Zero-arg callable returning a coroutine for one attempt. Payload
-                failures evict the connection; administrative RPC leases discard failed sockets.
+            make_request: Zero-arg callable returning a coroutine for one attempt.
             max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
                 for a request that must not be replayed.
         """
@@ -681,8 +685,14 @@ class AsyncSimpleStorageManager(StorageManager):
     ) -> PayloadReply:
         started = time.perf_counter()
         try:
-            reply = await self.payload_client.request(
-                target,
+            peers = getattr(self, "_payload_peers", None)
+            peer = (
+                peers[target]
+                if peers is not None and target in peers
+                else PayloadPeerInfo("zmq", self.storage_unit_infos[target])
+            )
+            reply = await self.payload_transfer.request(
+                peer,
                 RequestHeader(operation, params),
                 send=data,
                 recv=recv,
@@ -1277,11 +1287,12 @@ class AsyncSimpleStorageManager(StorageManager):
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
     def close(self) -> None:
-        """Stop pending handshakes and release pools before their shared context."""
+        """Shut down the payload adapter and release socket pools before their shared context."""
+        self._payload_closed = True
         try:
-            client = getattr(self, "payload_client", None)
-            if client is not None:
-                client.close()
+            transfer = getattr(self, "payload_transfer", None)
+            if transfer is not None:
+                transfer.shutdown()
         finally:
             for name in ("storage_rpc_pool", "storage_probe_pool", "storage_dump_pool"):
                 pool = getattr(self, name, None)

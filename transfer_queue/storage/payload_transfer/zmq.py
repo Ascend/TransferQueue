@@ -23,6 +23,7 @@ import zmq
 
 from transfer_queue.storage.payload_transfer.base import (
     Operation,
+    PayloadPeerInfo,
     PayloadReply,
     PayloadTransfer,
     RequestHeader,
@@ -65,21 +66,20 @@ class ZmqPayloadTransfer(PayloadTransfer):
         self._closed = Event()
         self._handler_lock = Lock()
 
-    def listen(self, *, handle, address=None):
+    def listen(self, *, handle, address=None) -> PayloadPeerInfo:
         """Bind the local storage handler and return ZMQ server bootstrap metadata."""
         self._handle = handle
-        return {"backend": "zmq", "address": address}
+        return PayloadPeerInfo("zmq", address)
 
-    async def connect(self, peer_info):
-        """Validate a ZMQ peer descriptor and return its ``ZMQServerInfo`` handle."""
-        if peer_info.get("backend") != "zmq" or not isinstance(peer_info.get("address"), ZMQServerInfo):
-            raise TransferError("invalid ZMQ payload peer")
-        return peer_info["address"]
-
-    async def request(self, connection, header, *, send=None, recv=None):
-        """Send a multipart request over a pooled ZMQ socket and decode its reply."""
+    async def request(self, peer_info, header, *, send=None, recv=None):
+        """Lease a pooled DEALER socket for ``peer_info``, send ``header``, and decode its reply."""
         if self._closed.is_set() or self.pool is None:
             raise TransferError("ZMQ payload client is unavailable")
+        if not isinstance(peer_info, PayloadPeerInfo) or peer_info.backend != "zmq":
+            raise TransferError("invalid ZMQ payload peer")
+        address = peer_info.address
+        if not isinstance(address, ZMQServerInfo):
+            raise TransferError("invalid ZMQ payload peer")
         if recv is not None:
             raise NotImplementedError("ZMQ receive destinations are not implemented")
         if header.operation == Operation.GET:
@@ -91,7 +91,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
         request_type, response_type, error_type = _WIRE_TYPES[header.operation]
         wire_bytes = 0
         try:
-            async with self.pool.alease(connection) as socket:
+            async with self.pool.alease(address) as socket:
                 # Serialize only after acquiring a socket permit so queued callers keep zero-copy views.
                 body = dict(header.params)
                 if send is not None:
@@ -99,7 +99,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
                 request = ZMQMessage.create(
                     request_type=request_type,
                     sender_id=self.owner_id,
-                    receiver_id=connection.id,
+                    receiver_id=address.id,
                     body=body,
                 )
                 frames = request.serialize()
@@ -124,7 +124,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
         except (zmq.ZMQError, ZMQMessageDecodeError) as exc:
             raise TransferError(f"ZMQ storage request failed: {type(exc).__name__}: {exc}") from exc
 
-        # A valid storage rejection completes the exchange and leaves the socket reusable.
+        # A valid storage rejection completes the exchange and leaves the socket reusable in the pool.
         if reply.request_type == error_type:
             message = reply_meta.get("message", "storage request rejected")
             prefix = f"[{KEY_NOT_FOUND_MARKER}] "
@@ -156,9 +156,11 @@ class ZmqPayloadTransfer(PayloadTransfer):
         return ZMQMessage.create(request_type=reply_type, sender_id=self.owner_id, body=result)
 
     def shutdown(self):
-        """Mark the transport closed and wait for any active handler call to finish."""
+        """Stop admitting new payload work and wait for any active handler call to finish.
+
+        The borrowed ``ZMQSocketPool`` is shared with administrative RPCs (e.g. ``CLEAR_DATA``)
+        and is closed by ``AsyncSimpleStorageManager.close()`` rather than here.
+        """
         self._closed.set()
-        # The worker may still be accessing storage when admission closes.
-        # Release its callback only after it has returned.
         with self._handler_lock:
             self._handle = None

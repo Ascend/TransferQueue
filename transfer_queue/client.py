@@ -1661,13 +1661,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """Start the synchronous loop."""
         asyncio.set_event_loop(self._loop)
         self._loop.run_forever()
-        # A cancelled RPC can leave a shared handshake on this loop. Let its cleanup
-        # finish on the owning thread before close() joins it and destroys the context.
-        pending = asyncio.all_tasks(self._loop)
-        for task in pending:
-            task.cancel()
-        if pending:
-            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
     def _run_coroutine(self, coro):
         """Run a coroutine on the client's background event loop."""

@@ -31,12 +31,40 @@ class Operation(str, Enum):
     UPDATE = "UPDATE"
 
 
+class PayloadPeerInfo:
+    """Opaque peer discovery descriptor for one StorageUnit's payload endpoint.
+
+    Kept as a plain class rather than a ``dict`` or ``dataclass`` so OmegaConf
+    (with ``allow_objects=True``) stores instances as atomic ``AnyNode`` objects
+    without ``${...}`` interpolation or dumping binary descriptors into logs.
+    """
+
+    def __init__(self, backend: str, address: Any = None):
+        self.backend = backend
+        self.address = address
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, PayloadPeerInfo):
+            return NotImplemented
+        return self.backend == other.backend and self.address == other.address
+
+    def __repr__(self) -> str:
+        if isinstance(self.address, bytes | bytearray | memoryview):
+            addr_repr = f"<{len(self.address)} bytes>"
+        else:
+            text = repr(self.address) if isinstance(self.address, str) else str(self.address)
+            addr_repr = text if len(text) <= 96 else f"{text[:93]}..."
+        return f"PayloadPeerInfo(backend={self.backend!r}, address={addr_repr})"
+
+    __str__ = __repr__
+
+
 class TransferError(RuntimeError):
     """Transport or protocol failure."""
 
 
 class TransferTimeout(TransferError):
-    """Transport request or handshake timed out."""
+    """Transport request timed out."""
 
     def __init__(self, message: str, *, wire_bytes: int = 0):
         super().__init__(message)
@@ -77,12 +105,18 @@ StorageHandler: TypeAlias = Callable[[RequestHeader, dict[str, Any] | None], Pay
 
 
 class PayloadTransfer(ABC):
-    """Pluggable SimpleStorage data-plane transport owning both server and client endpoints."""
+    """Pluggable SimpleStorage data-plane transport.
+
+    Each backend owns its own peer connection establishment, reuse, fault isolation,
+    and teardown. When a failure occurs on a multiplexed endpoint or remote agent, the
+    backend decides whether only that request failed or the peer handle must be retired
+    after draining in-flight operations and retaining accessible memory.
+    """
 
     # ==================== Server-side (called by SimpleStorageUnit) ====================
 
     @abstractmethod
-    def listen(self, *, handle: StorageHandler, address: Any = None) -> dict[str, Any]:
+    def listen(self, *, handle: StorageHandler, address: Any = None) -> PayloadPeerInfo:
         """Start the server endpoint, bind ``handle``, and return peer discovery metadata.
 
         ``SimpleStorageUnit`` synchronizes storage state access internally, so transport
@@ -90,26 +124,18 @@ class PayloadTransfer(ABC):
         should avoid blocking on network I/O while inside ``handle``.
         """
 
-    # ==================== Client-side (called by PayloadClient) ====================
-
-    @abstractmethod
-    async def connect(self, peer_info: dict[str, Any]) -> Any:
-        """Handshake with ``peer_info`` and return a connection usable on its owning event loop.
-
-        A connection must support concurrent ``request`` calls on that loop, and a failed or
-        cancelled ``connect`` must release any partial resources.
-        """
+    # ==================== Client-side (called by AsyncSimpleStorageManager) ====================
 
     @abstractmethod
     async def request(
         self,
-        connection: Any,
+        peer_info: PayloadPeerInfo,
         header: RequestHeader,
         *,
         send: dict[str, Any] | None = None,
         recv: tuple[memoryview, ...] | None = None,
     ) -> PayloadReply:
-        """Send one storage request over ``connection`` and await its ``PayloadReply``.
+        """Send one storage request to ``peer_info`` and await its ``PayloadReply``.
 
         Write path (``PUT`` / ``UPDATE``):
             Pass unencoded field values in ``send`` and leave ``recv=None``. Returns
@@ -124,18 +150,18 @@ class PayloadTransfer(ABC):
               in place, and returns ``PayloadReply(meta=..., payload=None)`` once readable.
 
         Errors and in-flight memory:
-            - ``StorageRejected``: StorageUnit rejected a delivered request; ``connection`` stays usable.
-            - ``TransferTimeout`` / ``TransferError``: transport or protocol failure. On any failure or
-              cancellation, the backend must retain any ``send``/``recv`` memory still accessed in flight.
+            - ``StorageRejected``: StorageUnit rejected a delivered request; peer state stays usable.
+            - ``TransferTimeout`` / ``TransferError``: retain any ``send``/``recv`` memory still
+              accessed by in-flight native operations until safe.
         """
 
     # ==================== Shared Lifecycle ====================
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Stop admitting requests, drain or terminate local work, and release resources.
+        """Stop admitting new requests, drain or terminate local work, and release owned resources.
 
-        Called synchronously by ``SimpleStorageUnit`` or ``PayloadClient``. On return,
-        ``handle`` must not remain active or be invoked later; retain buffers still
-        referenced by outstanding native operations until safe to reclaim.
+        Called synchronously by ``SimpleStorageUnit`` or ``AsyncSimpleStorageManager``. On return,
+        ``handle`` must not remain active or be invoked later; retain buffers still referenced by
+        outstanding native operations until safe to reclaim.
         """
