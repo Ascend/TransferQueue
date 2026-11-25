@@ -38,11 +38,11 @@ import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import AbstractContextManager, nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
@@ -52,14 +52,16 @@ import ray
 import torch
 import zmq
 
-from transfer_queue.storage.payload_transfer.base import (
+from transfer_queue.storage.payload_transfer import (
+    FieldData,
+    HeaderBody,
     Operation,
     PayloadTransfer,
     RequestHeader,
     StorageRejected,
+    ZmqPayloadTransfer,
+    is_zmq_payload_request,
 )
-from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER as KEY_NOT_FOUND_MARKER
-from transfer_queue.storage.payload_transfer.zmq import REQUEST_TYPES, ZmqPayloadTransfer
 from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import get_env_bool, limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
@@ -907,18 +909,23 @@ def handle_storage_request(
     storage_unit_id: str,
     storage_data: StorageUnitData,
     header: RequestHeader,
-    data: dict[str, Any] | None,
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Apply storage semantics on the unit worker for every payload backend."""
+    data: FieldData | None,
+    *,
+    storage_lock: AbstractContextManager[Any] | None = None,
+) -> tuple[HeaderBody, FieldData | None]:
+    """Apply storage semantics for every payload backend, holding ``storage_lock`` only on state access."""
     body = header.body
     operation = header.operation
+    guard = storage_lock if storage_lock is not None else nullcontext()
     try:
         indexes = body["global_indexes"]
         with limit_pytorch_auto_parallel_threads(
             target_num_threads=TQ_NUM_THREADS, info=f"[{storage_unit_id}] {operation.value}"
         ):
             if operation == Operation.GET:
-                result = storage_data.get_data(body["fields"], indexes)
+                fields = body["fields"]
+                with guard:
+                    result = storage_data.get_data(fields, indexes)
                 if (parser := body.get("data_parser")) is not None:
                     result = _apply_data_parser(result, parser, body.get("parser_args"))
                 return {}, result
@@ -927,7 +934,8 @@ def handle_storage_request(
                     raise TypeError("PUT requires field data")
                 if (parser := body.get("data_parser")) is not None:
                     data = _apply_data_parser(data, parser)
-                storage_data.put_data(data, indexes)
+                with guard:
+                    storage_data.put_data(data, indexes)
                 return {}, None
 
             merge_fn = body.get("merge_fn")
@@ -938,7 +946,8 @@ def handle_storage_request(
                 raise TypeError("update data must be a non-empty dict")
             if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
                 raise ValueError("merge_plan must describe every update field")
-            stored_shapes = storage_data.apply_update(indexes, data, merge_fn, merge_plan)
+            with guard:
+                stored_shapes = storage_data.apply_update(indexes, data, merge_fn, merge_plan)
             return {"stored_shapes": stored_shapes}, None
     except Exception as exc:
         missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
@@ -1012,6 +1021,7 @@ class SimpleStorageUnit:
 
         self._requests_arrived = 0
         self._arrivals_by_op = {}
+        self._storage_lock = Lock()
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -1029,8 +1039,6 @@ class SimpleStorageUnit:
         self._perf_monitor = IntervalPerfMonitor(caller_name=self.storage_unit_id)
 
         self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_unit_id)
-        # The existing ZMQ worker needs a wire adapter, not a PayloadTransfer API.
-        self._handle_zmq_payload = self.payload_transfer.handle_request
         self._init_zmq_socket()
         self.payload_peer_info = self.payload_transfer.listen(
             address=self.zmq_server_info,
@@ -1247,21 +1255,24 @@ class SimpleStorageUnit:
             worker_socket.close(linger=0)
 
     def _record_arrival(self, operation: str) -> None:
-        self._requests_arrived += 1
-        self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
+        with getattr(self, "_storage_lock", nullcontext()):
+            self._requests_arrived += 1
+            self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
-    def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None):
-        """Run storage operations and observability on the StorageUnit worker.
-
-        All payload backends must serialize this handler with administrative operations;
-        the storage state and local performance monitor rely on that ordering.
-        """
+    def _handle_payload(self, header: RequestHeader, data: FieldData | None):
+        """Run storage operations and observability with synchronized state access."""
         operation = header.operation
         op_type = f"{operation.value}_DATA"
         self._record_arrival(op_type)
         monitor = self._metrics if self._metrics is not None else self._perf_monitor
         with monitor.measure(op_type=op_type):
-            return handle_storage_request(self.storage_unit_id, self.storage_data, header, data)
+            return handle_storage_request(
+                self.storage_unit_id,
+                self.storage_data,
+                header,
+                data,
+                storage_lock=getattr(self, "_storage_lock", None),
+            )
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""
@@ -1291,12 +1302,13 @@ class SimpleStorageUnit:
         started = time.perf_counter()
 
         try:
-            if operation not in REQUEST_TYPES.values():
+            is_payload = is_zmq_payload_request(operation)
+            if not is_payload:
                 self._record_arrival(operation.name)
             logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
-            if operation in REQUEST_TYPES.values():
-                response_msg = self._handle_zmq_payload(request_msg)
+            if is_payload:
+                response_msg = self.payload_transfer.handle_request(request_msg)
             elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
                 with monitor.measure(op_type="CLEAR_DATA"):
                     response_msg = self._handle_clear(request_msg)
@@ -1375,8 +1387,11 @@ class SimpleStorageUnit:
         try:
             global_indexes = data_parts.body["global_indexes"]
 
-            with limit_pytorch_auto_parallel_threads(
-                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
+            with (
+                limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
+                ),
+                getattr(self, "_storage_lock", nullcontext()),
             ):
                 self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
@@ -1408,19 +1423,20 @@ class SimpleStorageUnit:
         except Exception:
             process_rss = 0
 
-        metrics = {
-            "storage_unit_id": self.storage_unit_id,
-            "capacity": self.storage_unit_size,
-            "active_keys": self.storage_data.active_key_count,
-            "process_rss_bytes": process_rss,
-            "ssd_offload_enabled": int(self.storage_data.ssd_offload_enabled),
-            "ssd_active_values": self.storage_data.ssd_active_values,
-            "ssd_active_bytes": self.storage_data.ssd_active_bytes,
-            "ssd_fallback_values_total": self.storage_data.ssd_fallback_values_total,
-            # Counted on arrival; op_stats below only advances on completion.
-            "requests_arrived": self._requests_arrived,
-            "arrivals_by_op": dict(self._arrivals_by_op),
-        }
+        with getattr(self, "_storage_lock", nullcontext()):
+            metrics = {
+                "storage_unit_id": self.storage_unit_id,
+                "capacity": self.storage_unit_size,
+                "active_keys": self.storage_data.active_key_count,
+                "process_rss_bytes": process_rss,
+                "ssd_offload_enabled": int(self.storage_data.ssd_offload_enabled),
+                "ssd_active_values": self.storage_data.ssd_active_values,
+                "ssd_active_bytes": self.storage_data.ssd_active_bytes,
+                "ssd_fallback_values_total": self.storage_data.ssd_fallback_values_total,
+                # Counted on arrival; op_stats below only advances on completion.
+                "requests_arrived": self._requests_arrived,
+                "arrivals_by_op": dict(self._arrivals_by_op),
+            }
         if self._accept_probe is not None:
             stats = self._accept_probe.stats
             metrics["accept_queue"] = {
@@ -1477,7 +1493,8 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            self.storage_data.save_checkpoint(path, self.storage_unit_id)
+            with getattr(self, "_storage_lock", nullcontext()):
+                self.storage_data.save_checkpoint(path, self.storage_unit_id)
             logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
@@ -1497,26 +1514,27 @@ class SimpleStorageUnit:
         path = request.body["path"]
         fields_by_index = request.body["fields_by_index"]
         try:
-            missing = fields_by_index.keys() - self.storage_data._active_keys
-            if missing:
-                raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
-            row_offsets = {}
-            row_schema = {}
-            with open(path, "wb") as f:
-                for index in sorted(fields_by_index):
-                    # Reused global indexes can retain fields no longer present in metadata.
-                    fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
-                    # Controller metadata can trail the stored values, so report what each
-                    # row actually holds; only type metadata leaves the unit.
-                    row_schema[index] = {
-                        name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
-                        for name, value in fields.items()
-                    }
-                    offset = f.tell()
-                    compact_pickle.dump({"global_index": index, "fields": fields}, f)
-                    row_offsets[index] = [offset, f.tell() - offset]
-                f.flush()
-                os.fsync(f.fileno())
+            with getattr(self, "_storage_lock", nullcontext()):
+                missing = fields_by_index.keys() - self.storage_data._active_keys
+                if missing:
+                    raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
+                row_offsets = {}
+                row_schema = {}
+                with open(path, "wb") as f:
+                    for index in sorted(fields_by_index):
+                        # Reused global indexes can retain fields no longer present in metadata.
+                        fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
+                        # Controller metadata can trail the stored values, so report what each
+                        # row actually holds; only type metadata leaves the unit.
+                        row_schema[index] = {
+                            name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+                            for name, value in fields.items()
+                        }
+                        offset = f.tell()
+                        compact_pickle.dump({"global_index": index, "fields": fields}, f)
+                        row_offsets[index] = [offset, f.tell() - offset]
+                    f.flush()
+                    os.fsync(f.fileno())
             logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
             return ZMQMessage.create(
                 request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
@@ -1542,7 +1560,7 @@ class SimpleStorageUnit:
         updates: list[dict[str, Any]] = []
         bytes_read = 0
         try:
-            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS):
+            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS), getattr(self, "_storage_lock", nullcontext()):
                 for shard in request.body["shards"]:
                     records = sorted(shard["records"], key=lambda row: row["offset"])
                     with open(shard["path"], "rb", buffering=0) as f:
@@ -1606,8 +1624,11 @@ class SimpleStorageUnit:
         """
         path = data_parts.body["path"]
         try:
-            previous_key_count = self.storage_data.active_key_count
-            checkpoint_size = self.storage_data.load_checkpoint(path)
+            with getattr(self, "_storage_lock", nullcontext()):
+                previous_key_count = self.storage_data.active_key_count
+                checkpoint_size = self.storage_data.load_checkpoint(path)
+                active_key_count = self.storage_data.active_key_count
+                field_count = len(self.storage_data.field_data)
 
             if checkpoint_size != self.storage_unit_size:
                 logger.warning(
@@ -1623,7 +1644,7 @@ class SimpleStorageUnit:
 
             logger.info(
                 f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "
-                f"{self.storage_data.active_key_count} keys, {len(self.storage_data.field_data)} fields"
+                f"{active_key_count} keys, {field_count} fields"
             )
             return ZMQMessage.create(
                 request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]

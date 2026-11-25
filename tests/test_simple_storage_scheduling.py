@@ -99,9 +99,13 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
     monkeypatch.setattr(simple_storage_bootstrap, "get_node_round_robin_scheduling_strategies", get_strategies)
     monkeypatch.setattr(simple_storage_bootstrap, "SimpleStorageUnit", storage_unit)
     zmq_info = ZMQServerInfo(Role.STORAGE, "unit-id", "127.0.0.1", {"put_get_socket": 5555})
-    monkeypatch.setattr(simple_storage_bootstrap, "process_zmq_server_info", lambda _: {
-        "TransferQueueStorageUnit#0": zmq_info,
-    })
+    monkeypatch.setattr(
+        simple_storage_bootstrap,
+        "process_zmq_server_info",
+        lambda _: {
+            "TransferQueueStorageUnit#0": zmq_info,
+        },
+    )
     peer_info = {"backend": "test", "handshake": "opaque"}
     monkeypatch.setattr(simple_storage_bootstrap.ray, "get", lambda _: [peer_info])
 
@@ -115,7 +119,8 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
                     "required_node_resource": "storage_pool",
                 },
             }
-        }, flags={"allow_objects": True},
+        },
+        flags={"allow_objects": True},
     )
 
     handles = simple_storage_bootstrap.initialize_simple_storage(conf)

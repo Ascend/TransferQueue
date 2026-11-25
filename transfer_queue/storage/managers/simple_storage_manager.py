@@ -32,14 +32,14 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.payload_transfer.base import (
+from transfer_queue.storage.payload_transfer import (
     Operation,
     RequestHeader,
     StorageRejected,
     TransferError,
     TransferTimeout,
+    ZmqPayloadTransfer,
 )
-from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import StorageKeyNotFoundError
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
@@ -243,8 +243,8 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
-        self._payload_connections = {}
-        self._payload_connecting = {}
+        self._payload_connections: dict[Any, Any] = {}
+        self._payload_connecting: dict[Any, Any] = {}
         self._payload_closed = False
         self._payload_shutdown_lock = Lock()
         self._payload_shutdown_started = False
@@ -377,6 +377,11 @@ class AsyncSimpleStorageManager(StorageManager):
 
         return f"{tcp} {_describe_unit_state(body)}"
 
+    def _is_retryable_payload_error(self, exc: RuntimeError) -> bool:
+        if getattr(self, "_payload_closed", False):
+            return False
+        return isinstance(exc, StorageUnitTimeout) or isinstance(exc.__cause__, TransferError)
+
     async def _request_with_retry(
         self,
         operation: str,
@@ -385,7 +390,7 @@ class AsyncSimpleStorageManager(StorageManager):
         make_request: Callable[[], Any],
         max_attempts: int | None = None,
     ):
-        """Run one storage-unit request, retrying a missing answer on a fresh connection.
+        """Run one storage-unit request, retrying transport failures on a fresh connection.
 
         Args:
             operation: Operation name for logs, e.g. ``get`` or ``put``.
@@ -402,8 +407,10 @@ class AsyncSimpleStorageManager(StorageManager):
         for attempt in range(1, attempts_allowed + 1):
             try:
                 return await make_request()
-            except StorageUnitTimeout as e:
-                # The exception already names the unit, its endpoint and the timeout, so these
+            except RuntimeError as e:
+                if not self._is_retryable_payload_error(e):
+                    raise
+                # The exception already names the unit, its endpoint and the failure, so these
                 # lines only add what it cannot know: which attempt this was, and the shape.
                 if attempt < attempts_allowed:
                     logger.warning(
@@ -679,15 +686,21 @@ class AsyncSimpleStorageManager(StorageManager):
             raise TransferError("payload transport is closed")
         _, target = key
         peers = self.config.get("payload_peers")
-        peer = peers[target] if peers is not None else {
-            "backend": "zmq", "address": self.storage_unit_infos[target],
-        }
+        peer = (
+            peers[target]
+            if peers is not None
+            else {
+                "backend": "zmq",
+                "address": self.storage_unit_infos[target],
+            }
+        )
         if isinstance(peer, DictConfig):
             # Backend metadata is opaque; strings must not be resolved as config expressions.
             peer = OmegaConf.to_container(peer, resolve=False)
         try:
             connection = await asyncio.wait_for(
-                self.payload_transfer.connect(peer), timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+                self.payload_transfer.connect(peer),
+                timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
             )
         except asyncio.TimeoutError as exc:
             raise TransferTimeout("payload connection timed out") from exc
@@ -716,14 +729,17 @@ class AsyncSimpleStorageManager(StorageManager):
             self._payload_shutdown_started = True
         self.payload_transfer.shutdown()
 
-    async def _request_payload(self, target, operation, body, *, data=None, recv=()):
+    async def _request_payload(self, target, operation, body, *, data=None, recv=None):
         started = time.perf_counter()
         key = (asyncio.get_running_loop(), target)
         entry = None
         try:
             entry = await self._get_payload_connection(key)
             reply, response_data = await self.payload_transfer.request(
-                entry[0], RequestHeader(operation, body), send=data, recv=recv,
+                entry[0],
+                RequestHeader(operation, body),
+                send=data,
+                recv=recv,
             )
         except StorageRejected as exc:
             error = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
@@ -968,9 +984,8 @@ class AsyncSimpleStorageManager(StorageManager):
                 "global_indexes": global_indexes,
                 "fields": fields,
                 "data_parser": data_parser,
-                "parser_args": parser_args
+                "parser_args": parser_args,
             },
-            recv=None,
         )
         return fields, response_data
 

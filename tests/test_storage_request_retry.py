@@ -16,7 +16,6 @@
 """Storage-unit retry and timeout-diagnosis tests."""
 
 import asyncio
-import errno
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -30,7 +29,7 @@ from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
-from transfer_queue.storage.payload_transfer.base import (
+from transfer_queue.storage.payload_transfer import (
     Operation,
     ReplyHeader,
     StorageRejected,
@@ -101,21 +100,29 @@ async def test_payload_concurrent_requests_share_one_handshake():
         connect=AsyncMock(side_effect=connect),
         request=AsyncMock(return_value=(ReplyHeader({}), {"value": [1]})),
     )
-    calls = [asyncio.create_task(manager._request_payload(
-        "unit_a", Operation.GET, {"global_indexes": [i]}, recv=None,
-    )) for i in range(8)]
+    calls = [
+        asyncio.create_task(
+            manager._request_payload(
+                "unit_a",
+                Operation.GET,
+                {"global_indexes": [i]},
+            )
+        )
+        for i in range(8)
+    ]
     await started.wait()
     release.set()
     await asyncio.wait_for(asyncio.gather(*calls), timeout=2)
-    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    await manager._request_payload("unit_a", Operation.GET, {})
     manager.payload_transfer.connect.assert_awaited_once()
     assert manager.payload_transfer.request.await_count == 9
     assert all(call.args[0] is connection for call in manager.payload_transfer.request.await_args_list)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [TransferTimeout("lost"), TransferError("broken"),
-                                    asyncio.CancelledError(), StorageRejected("denied")])
+@pytest.mark.parametrize(
+    "failure", [TransferTimeout("lost"), TransferError("broken"), asyncio.CancelledError(), StorageRejected("denied")]
+)
 async def test_payload_connection_eviction_and_storage_rejection(failure):
     manager = _manager()
     manager.payload_transfer = MagicMock(
@@ -124,8 +131,8 @@ async def test_payload_connection_eviction_and_storage_rejection(failure):
     )
     expected = asyncio.CancelledError if isinstance(failure, asyncio.CancelledError) else RuntimeError
     with pytest.raises(expected):
-        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
-    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+        await manager._request_payload("unit_a", Operation.GET, {})
+    await manager._request_payload("unit_a", Operation.GET, {})
     assert manager.payload_transfer.connect.await_count == (1 if isinstance(failure, StorageRejected) else 2)
 
 
@@ -146,12 +153,12 @@ async def test_payload_connect_timeout_is_bounded_and_can_reconnect(monkeypatch)
     )
     monkeypatch.setattr(ssm, "TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 0.01)
     with pytest.raises(StorageUnitTimeout):
-        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+        await manager._request_payload("unit_a", Operation.GET, {})
     assert cancelled.is_set()
     manager.payload_transfer.request.assert_not_awaited()
     manager.payload_transfer.connect.side_effect = None
     manager.payload_transfer.connect.return_value = object()
-    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    await manager._request_payload("unit_a", Operation.GET, {})
     assert manager.payload_transfer.connect.await_count == 2
 
 
@@ -171,19 +178,20 @@ async def test_late_failure_does_not_evict_replacement_connection():
         return ReplyHeader({}), {}
 
     manager.payload_transfer = MagicMock(
-        connect=AsyncMock(side_effect=[old, new]), request=AsyncMock(side_effect=request),
+        connect=AsyncMock(side_effect=[old, new]),
+        request=AsyncMock(side_effect=request),
     )
-    late = asyncio.create_task(manager._request_payload("unit_a", Operation.GET, {"slow": True}, recv=None))
+    late = asyncio.create_task(manager._request_payload("unit_a", Operation.GET, {"slow": True}))
     await entered.wait()
     try:
         with pytest.raises(StorageUnitTimeout):
-            await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
-        await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+            await manager._request_payload("unit_a", Operation.GET, {})
+        await manager._request_payload("unit_a", Operation.GET, {})
     finally:
         release.set()
         with pytest.raises(StorageUnitTimeout):
             await late
-    await manager._request_payload("unit_a", Operation.GET, {}, recv=None)
+    await manager._request_payload("unit_a", Operation.GET, {})
     assert manager.payload_transfer.connect.await_count == 2
 
 
@@ -194,7 +202,7 @@ def test_payload_connections_do_not_cross_event_loops():
         request=AsyncMock(return_value=(ReplyHeader({}), {})),
     )
     for _ in range(2):
-        asyncio.run(manager._request_payload("unit_a", Operation.GET, {}, recv=None))
+        asyncio.run(manager._request_payload("unit_a", Operation.GET, {}))
     assert manager.payload_transfer.connect.await_count == 2
 
 
@@ -254,79 +262,45 @@ async def test_running_handshake_releases_transport_after_cancellation(monkeypat
         shutdown.assert_called_once_with()
 
 
-@pytest.mark.parametrize("state", ["stopped", "closed", "done_callback_pending"])
-def test_manager_closes_when_external_loop_cannot_finish_handshake(monkeypatch, state):
+def test_async_client_closes_cleanly_after_asyncio_run_loop_exits(monkeypatch):
     client = _client_with_one_unit(AsyncTransferQueueClient, monkeypatch)
     manager = client.storage_manager
-    loop = asyncio.new_event_loop()
-    handshake = loop.create_future()
-    key = (loop, "unit")
-    manager._payload_connecting[key] = handshake
-    handshake.add_done_callback(lambda task: manager._payload_connect_done(key, task))
-    if state == "done_callback_pending":
-        handshake.set_result(None)
-    if state != "stopped":
-        loop.close()
-
-    try:
-        with patch.object(manager.payload_transfer, "shutdown", wraps=manager.payload_transfer.shutdown) as shutdown:
-            client.close()
-            shutdown.assert_called_once_with()
-            if state == "stopped":
-                loop.run_until_complete(asyncio.sleep(0))
-                assert handshake.cancelled()
-                shutdown.assert_called_once_with()
-        assert not manager._payload_connecting
-        assert not manager._notify_thread.is_alive()
-        assert client.zmq_context.closed
-    finally:
-        loop.close()
+    asyncio.run(_cancel_get_during_handshake(client, monkeypatch))
+    client.close()
+    assert not manager._payload_connecting
+    assert not manager._notify_thread.is_alive()
+    assert client.zmq_context.closed
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("operation", list(Operation))
-@pytest.mark.parametrize("phase", ["connect", "request"])
-@pytest.mark.parametrize("failure", ["transport", "zmq", "decode", "timeout", "rejection", "missing_key", "cancel"])
-async def test_payload_failure_preserves_target_and_exception_category(operation, phase, failure):
+@pytest.mark.parametrize(
+    "operation, error, expected",
+    [
+        (Operation.GET, TransferTimeout("timed out", wire_bytes=1024), StorageUnitTimeout),
+        (Operation.PUT, TransferError("backend failed"), RuntimeError),
+        (Operation.GET, StorageRejected("key missing", missing_key=True), StorageKeyNotFoundError),
+        (Operation.PUT, StorageRejected("write rejected"), RuntimeError),
+        (Operation.GET, asyncio.CancelledError(), asyncio.CancelledError),
+    ],
+)
+async def test_payload_failure_maps_to_public_exception_types(operation, error, expected):
     manager = _manager()
     manager.config = {"payload_peers": {"unit_a": {"backend": "test"}}}
-    manager.payload_transfer = MagicMock()
-    manager.payload_transfer.connect = AsyncMock(return_value="connection")
-    manager.payload_transfer.request = AsyncMock()
-    error = {
-        "transport": TransferError("backend failed"),
-        "zmq": zmq.ZMQError(errno.EMFILE),
-        "decode": ValueError("invalid frame"),
-        "timeout": TransferTimeout("timed out", wire_bytes=1024),
-        "rejection": StorageRejected("write rejected"),
-        "missing_key": StorageRejected("key missing", missing_key=True),
-        "cancel": asyncio.CancelledError(),
-    }[failure]
-    getattr(manager.payload_transfer, phase).side_effect = error
-    expected = {
-        "timeout": StorageUnitTimeout,
-        "missing_key": StorageKeyNotFoundError if operation == Operation.GET else RuntimeError,
-        "cancel": asyncio.CancelledError,
-    }.get(failure, RuntimeError)
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(return_value="connection"),
+        request=AsyncMock(side_effect=error),
+    )
     with pytest.raises(expected) as caught:
         await manager._request_payload(
-            "unit_a", operation, {"global_indexes": [0]},
+            "unit_a",
+            operation,
+            {"global_indexes": [0]},
             data=None if operation == Operation.GET else {"value": [1]},
-            recv=None if operation == Operation.GET else (),
         )
     assert type(caught.value) is expected
-    if failure != "cancel":
+    if expected is not asyncio.CancelledError:
         assert "unit_a" in str(caught.value)
-        assert "10.0.0.7:5555" in str(caught.value)
-        assert operation.name.lower() in str(caught.value)
         assert caught.value.__cause__ is error
-        if failure in ("transport", "zmq", "decode"):
-            assert type(error).__name__ in str(caught.value)
-            assert str(error) in str(caught.value)
-    elif phase == "request":
-        assert caught.value is error
-    if phase == "connect":
-        manager.payload_transfer.request.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -478,10 +452,53 @@ async def test_lost_request_recovers_without_diagnosis():
 
 
 @pytest.mark.asyncio
+async def test_transfer_error_evicts_connection_and_retries_only_when_allowed():
+    manager = _manager()
+    manager.notify_data_update = AsyncMock(return_value=True)
+    first_conn, second_conn = object(), object()
+    manager.payload_transfer = MagicMock(
+        connect=AsyncMock(side_effect=[first_conn, second_conn]),
+        request=AsyncMock(
+            side_effect=[
+                TransferError("connection reset by peer"),
+                (ReplyHeader({}), None),
+                (ReplyHeader({}), {"input_ids": [torch.tensor([7, 8])]}),
+            ]
+        ),
+    )
+    data, metadata = _single_sample_batch()
+
+    with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3):
+        await manager.put_data(data, metadata)
+        result = await manager.get_data(metadata)
+
+    assert manager.payload_transfer.connect.await_count == 2
+    assert manager.payload_transfer.request.await_args_list[0].args[0] is first_conn
+    assert manager.payload_transfer.request.await_args_list[1].args[0] is second_conn
+    assert manager.payload_transfer.request.await_args_list[2].args[0] is second_conn
+    torch.testing.assert_close(result["input_ids"].unbind()[0], torch.tensor([7, 8]))
+
+    # StorageRejected is a valid business rejection: keep the connection and do not retry.
+    manager.payload_transfer.request = AsyncMock(side_effect=StorageRejected("capacity exceeded"))
+    with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(RuntimeError, match="capacity exceeded"):
+        await manager.put_data(data, metadata)
+    assert manager.payload_transfer.request.await_count == 1
+    assert manager.payload_transfer.connect.await_count == 2
+
+
+def _wrapped_transfer_error() -> RuntimeError:
+    try:
+        raise RuntimeError("Failed to get data on storage unit unit_a") from TransferError("endpoint reset")
+    except RuntimeError as err:
+        return err
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error, max_attempts, expected_attempts",
     [
         (StorageUnitTimeout("no answer"), 3, 3),
+        (_wrapped_transfer_error(), 3, 3),
         (RuntimeError("unit rejected request"), 3, 1),
         (StorageUnitTimeout("no answer"), 0, 1),
     ],

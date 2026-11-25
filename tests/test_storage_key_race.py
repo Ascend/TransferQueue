@@ -21,9 +21,8 @@ from functools import partial
 import pytest
 import torch
 
-from transfer_queue.storage.payload_transfer.zmq import ZmqPayloadTransfer
+from transfer_queue.storage.payload_transfer import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
-    KEY_NOT_FOUND_MARKER,
     StorageKeyNotFoundError,
     StorageUnitData,
     handle_storage_request,
@@ -80,5 +79,5 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
         reply = transport.handle_request(request)
 
     assert reply.request_type == ZMQRequestType.GET_ERROR
-    assert KEY_NOT_FOUND_MARKER in reply.body["message"]
+    assert reply.body["missing_key"] is True
     assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []

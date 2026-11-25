@@ -17,6 +17,7 @@ import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from threading import Lock
 
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -48,6 +49,7 @@ class IntervalPerfMonitor:
     def __init__(self, caller_name: str):
         self.caller_name = caller_name
         self.last_flush_time = time.perf_counter()
+        self._lock = Lock()
 
         self.success_counts: dict[str, int] = defaultdict(int)
         self.process_time: dict[str, list[float]] = defaultdict(list)
@@ -113,8 +115,9 @@ class IntervalPerfMonitor:
             yield
         finally:
             cost = time.perf_counter() - start_time
-            self.success_counts[op_type] += 1
-            self.process_time[op_type].append(cost)
+            with self._lock:
+                self.success_counts[op_type] += 1
+                self.process_time[op_type].append(cost)
 
-            # try flush logs
-            self._flush_logs()
+                # try flush logs
+                self._flush_logs()
