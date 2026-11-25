@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import errno
 from threading import Event, Lock
 
 import zmq
@@ -43,6 +44,29 @@ from transfer_queue.utils.zmq_utils import (
 
 # Preserves the existing ZMQ GET_ERROR message convention across rolling upgrades.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
+
+# System and socket errnos that may recover on a fresh connection or once local resource pressure
+# clears. Deterministic configuration, state, or termination errors (e.g. EINVAL, ETERM,
+# EPROTONOSUPPORT) stay non-transient so callers surface the first failure without retrying.
+_TRANSIENT_ZMQ_ERRNOS = frozenset(
+    {
+        errno.EAGAIN,
+        errno.EINTR,
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOBUFS,
+        errno.ENOMEM,
+        errno.ECONNRESET,
+        errno.ECONNABORTED,
+        errno.ECONNREFUSED,
+        errno.EPIPE,
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
+        errno.ENETRESET,
+        errno.EHOSTUNREACH,
+        errno.ETIMEDOUT,
+    }
+)
 
 # Maps each logical Operation to its ZMQ (request, response, error) message types.
 _WIRE_TYPES = {
@@ -94,6 +118,10 @@ class ZmqPayloadTransfer(PayloadTransfer):
         delivery = DeliveryState.UNSENT
         try:
             async with self.pool.alease(address) as socket:
+                if self._closed.is_set():
+                    raise TransferError(
+                        "ZMQ payload client is unavailable", transient=False, delivery=DeliveryState.UNSENT
+                    )
                 # Serialize only after acquiring a socket permit so queued callers keep zero-copy views.
                 body = dict(header.params)
                 if send is not None:
@@ -139,7 +167,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
         except zmq.ZMQError as exc:
             raise TransferError(
                 f"ZMQ storage request failed: {type(exc).__name__}: {exc}",
-                transient=exc.errno != zmq.ETERM,
+                transient=exc.errno in _TRANSIENT_ZMQ_ERRNOS,
                 delivery=delivery,
             ) from exc
         except ZMQMessageDecodeError as exc:

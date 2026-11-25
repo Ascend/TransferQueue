@@ -33,6 +33,7 @@ from omegaconf import OmegaConf
 from tensordict import TensorDict
 
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
 from transfer_queue.storage.payload_transfer import (
@@ -611,6 +612,7 @@ async def test_zmq_fault_classification_distinguishes_transient_and_delivery_sta
         MagicMock(
             side_effect=[
                 zmq.ZMQError(errno.EMFILE),
+                zmq.ZMQError(errno.EINVAL),
                 zmq.ZMQError(zmq.ETERM),
                 ingress_rejected,
                 corrupt_reply,
@@ -625,6 +627,11 @@ async def test_zmq_fault_classification_distinguishes_transient_and_delivery_sta
             await client.request(peer_info, header, send={"text": ["input"]})
         assert emfile_err.value.transient is True
         assert emfile_err.value.delivery == DeliveryState.UNSENT
+
+        with pytest.raises(TransferError) as einval_err:
+            await client.request(peer_info, header, send={"text": ["input"]})
+        assert einval_err.value.transient is False
+        assert einval_err.value.delivery == DeliveryState.UNSENT
 
         with pytest.raises(TransferError) as eterm_err:
             await client.request(peer_info, header, send={"text": ["input"]})
@@ -690,6 +697,103 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
         manager.payload_transfer.shutdown()
         pool.close()
         unit.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
+    """A PUT queued on a full socket pool before shutdown() must not send or commit once a socket frees up."""
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
+    unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+    peer_info = unit.get_payload_peer_info()
+    first_sending, release_first = asyncio.Event(), asyncio.Event()
+    sent_frames = 0
+
+    async def gated_send(frames, **_kwargs):
+        nonlocal sent_frames
+        sent_frames += 1
+        first_sending.set()
+        await release_first.wait()
+        reply = unit.payload_transfer.handle_request(ZMQMessage.deserialize(frames))
+        assert reply.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+
+    socket = MagicMock(closed=False)
+    socket.send_multipart = AsyncMock(side_effect=gated_send)
+    socket.recv_multipart = AsyncMock(
+        return_value=ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA_RESPONSE, sender_id=unit.storage_unit_id, body={}
+        ).serialize()
+    )
+    pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
+    monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
+    client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    try:
+        first_put = asyncio.create_task(
+            client.request(peer_info, RequestHeader(Operation.PUT, {"global_indexes": [0]}), send={"text": ["first"]})
+        )
+        await asyncio.wait_for(first_sending.wait(), timeout=2)
+
+        queued_put = asyncio.create_task(
+            client.request(peer_info, RequestHeader(Operation.PUT, {"global_indexes": [1]}), send={"text": ["queued"]})
+        )
+        await asyncio.sleep(0.01)
+        assert sent_frames == 1
+
+        client.shutdown()
+        release_first.set()
+        await asyncio.wait_for(first_put, timeout=2)
+
+        with pytest.raises(TransferError) as caught:
+            await asyncio.wait_for(queued_put, timeout=2)
+        assert caught.value.transient is False
+        assert caught.value.delivery == DeliveryState.UNSENT
+        assert sent_frames == 1
+        assert unit.storage_data.get_data(["text"], [0])["text"] == ["first"]
+        with pytest.raises(StorageKeyNotFoundError):
+            unit.storage_data.get_data(["text"], [1])
+    finally:
+        client.shutdown()
+        pool.close()
+        unit.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_invalid_zmq_endpoint_port_fails_once_without_retry_or_diagnosis():
+    """libzmq EINVAL on a malformed endpoint (e.g. port -1) fails immediately without retries or probing."""
+    context = zmq.asyncio.Context()
+    bad_info = ZMQServerInfo(role=Role.STORAGE, id="bad_unit", ip="127.0.0.1", ports={"put_get_socket": -1})
+    pool = ZMQSocketPool(context, f"{STORAGE_MANAGER_IDENTITY_PREFIX}einval", "put_get_socket", timeout=1, maxsize=1)
+    connect_spy = MagicMock(wraps=pool._connect)
+    pool._connect = connect_spy  # type: ignore[method-assign]
+
+    manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
+    manager.storage_manager_id = "manager"
+    manager.storage_unit_infos = {"bad_unit": bad_info}
+    manager._payload_peers = {"bad_unit": PayloadPeerInfo("zmq", bad_info)}
+    manager._payload_closed = False
+    manager.payload_transfer = ZmqPayloadTransfer(owner_id="manager", pool=pool)
+    manager.notify_data_update = AsyncMock()
+    manager._diagnose_storage_unit = AsyncMock(return_value="diagnosis")
+
+    metadata = BatchMeta(
+        global_indexes=[0],
+        partition_ids=["0"],
+        field_schema={"text": {"dtype": None, "shape": None, "is_nested": False, "is_non_tensor": True}},
+        production_status=np.ones(1, dtype=np.int8),
+    )
+    data = TensorDict({"text": np.array(["A"], dtype=object)}, batch_size=1)
+    try:
+        with patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3), pytest.raises(RuntimeError) as caught:
+            await manager.put_data(data, metadata)
+
+        assert isinstance(caught.value.__cause__, TransferError)
+        assert caught.value.__cause__.transient is False
+        assert caught.value.__cause__.delivery == DeliveryState.UNSENT
+        assert connect_spy.call_count == 1
+        manager._diagnose_storage_unit.assert_not_awaited()
+    finally:
+        manager.payload_transfer.shutdown()
+        pool.close()
+        context.term()
 
 
 @pytest.mark.asyncio

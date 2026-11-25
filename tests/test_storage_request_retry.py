@@ -179,12 +179,12 @@ async def test_notify_raises_on_request_error_without_waiting_for_timeout():
 @pytest.mark.parametrize(
     "error, data_parser, expected_attempts, expect_diagnose, expect_in_doubt_note",
     [
-        (TransferError("socket open failed", transient=True, delivery=DeliveryState.UNSENT), None, 3, True, False),
+        (TransferError("socket open failed", transient=True, delivery=DeliveryState.UNSENT), None, 3, False, False),
         (
             TransferError("socket open failed", transient=True, delivery=DeliveryState.UNSENT),
             lambda data: data,
             1,
-            True,
+            False,
             False,
         ),
         (TransferTimeout("no answer after send", delivery=DeliveryState.IN_DOUBT), None, 1, True, True),
@@ -364,9 +364,9 @@ def _wrapped_transfer_error(*, transient: bool, delivery: DeliveryState) -> Runt
     "operation, error, max_attempts, expected_attempts, expect_diagnose",
     [
         ("get", StorageUnitTimeout("no answer"), 3, 3, True),
-        ("get", _wrapped_transfer_error(transient=True, delivery=DeliveryState.IN_DOUBT), 3, 3, True),
+        ("get", _wrapped_transfer_error(transient=True, delivery=DeliveryState.IN_DOUBT), 3, 3, False),
         ("get", _wrapped_transfer_error(transient=False, delivery=DeliveryState.IN_DOUBT), 3, 1, False),
-        ("put", _wrapped_transfer_error(transient=True, delivery=DeliveryState.UNSENT), 3, 3, True),
+        ("put", _wrapped_transfer_error(transient=True, delivery=DeliveryState.UNSENT), 3, 3, False),
         ("put", _wrapped_transfer_error(transient=True, delivery=DeliveryState.IN_DOUBT), 3, 1, False),
         ("put", StorageUnitTimeout("no answer", delivery=DeliveryState.IN_DOUBT), 3, 1, True),
         ("get", RuntimeError("unit rejected request"), 3, 1, False),

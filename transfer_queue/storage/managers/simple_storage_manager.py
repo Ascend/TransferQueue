@@ -447,10 +447,15 @@ class AsyncSimpleStorageManager(StorageManager):
                         f"on a new connection. {request_context} {e}"
                     )
                     continue
-                if can_retry or isinstance(e, StorageUnitTimeout):
+                if isinstance(e, StorageUnitTimeout):
                     logger.error(
                         f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
                         f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
+                    )
+                elif can_retry:
+                    logger.error(
+                        f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
+                        f"{request_context} {e}"
                     )
                 raise
 

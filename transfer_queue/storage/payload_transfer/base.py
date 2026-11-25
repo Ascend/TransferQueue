@@ -192,9 +192,13 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Stop admitting new requests, drain or terminate local work, and release owned resources.
+        """Stop admitting new requests and release resources owned by this adapter.
 
-        Called synchronously by ``SimpleStorageUnit`` or ``AsyncSimpleStorageManager``. On return,
-        ``handle`` must not remain active or be invoked later; retain buffers still referenced by
-        outstanding native operations until safe to reclaim.
+        Called synchronously by ``SimpleStorageUnit`` or ``AsyncSimpleStorageManager``:
+        - Server-side (``SimpleStorageUnit``): stop admitting new requests and wait for any
+          active ``handle`` invocation to finish so ``handle`` is never called after return.
+        - Client-side (``AsyncSimpleStorageManager``): matching ``AsyncTransferQueueClient.close()``,
+          callers must finish or cancel in-flight ``request()`` coroutines first; requests queued
+          behind internal concurrency gates must not be sent after ``shutdown()`` returns, and any
+          buffers still referenced by cancelled native operations must be retained until safe.
         """
