@@ -632,38 +632,38 @@ class AsyncSimpleStorageManager(StorageManager):
                 reply = await self.payload_transfer.request(peer, header, send=data)
                 break
             except StorageRejected as exc:
-                error = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
-                raise error(f"Failed to {op_name} data on storage unit {target} ({endpoint}): {exc}") from exc
+                error_type = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
+                raise error_type(f"Failed to {op_name} data on storage unit {target} ({endpoint}): {exc}") from exc
             except TransferError as exc:
-                is_timeout = isinstance(exc, TransferTimeout)
-                if is_timeout:
+                request_error: RuntimeError
+                if isinstance(exc, TransferTimeout):
                     size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
-                    error = StorageUnitTimeout(
+                    request_error = StorageUnitTimeout(
                         f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {op_name} "
                         f"at storage unit {target} ({endpoint}){size}"
                     )
                 else:
-                    error = RuntimeError(
+                    request_error = RuntimeError(
                         f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
                     )
 
                 if exc.transient and attempt < attempts_allowed:
                     logger.warning(
                         f"[{self.storage_manager_id}]: {op_name} retry {attempt + 1}/{attempts_allowed} "
-                        f"on a new connection. {request_context} {error}"
+                        f"on a new connection. {request_context} {request_error}"
                     )
                     continue
-                if is_timeout:
+                if isinstance(exc, TransferTimeout):
                     logger.error(
                         f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
-                        f"{request_context} {error} {await self._diagnose_storage_unit(target)}"
+                        f"{request_context} {request_error} {await self._diagnose_storage_unit(target)}"
                     )
                 elif exc.transient:
                     logger.error(
                         f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
-                        f"{request_context} {error}"
+                        f"{request_context} {request_error}"
                     )
-                raise error from exc
+                raise request_error from exc
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
