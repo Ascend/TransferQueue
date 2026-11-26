@@ -192,7 +192,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
     def shutdown(self):
         """Stop admitting new payload work and wait for any active handler call to finish.
 
-        Both the server-side ROUTER/worker sockets (owned by ``SimpleStorageUnit``) and the
+        Both the server-side ROUTER socket (owned by ``SimpleStorageUnit``) and the
         client-side ``ZMQSocketPool`` (shared with administrative RPCs such as ``CLEAR_DATA``)
         are closed by their respective owners after ``shutdown()`` returns.
         """

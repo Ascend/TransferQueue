@@ -35,7 +35,6 @@ import os
 import pickle
 import shutil
 import sys
-import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -123,9 +122,9 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
 
-# Exit the unit process when its worker or proxy thread dies, so the unit fails visibly. Both are
-# daemon threads, so without this the process keeps accepting requests it can never answer and
-# looks alive. Disable only to inspect a dead worker in place.
+# Exit the unit process when its worker thread dies, so the unit fails visibly. The worker runs
+# as a daemon thread, so without this the process keeps accepting requests on its ROUTER socket
+# that it can never answer and looks alive. Disable only to inspect a dead worker in place.
 TQ_STORAGE_EXIT_ON_WORKER_DEATH = get_env_bool("TQ_STORAGE_EXIT_ON_WORKER_DEATH", True)
 
 # Distinguishes a worker-death abort from a normal exit in Ray's actor-failure logs.
@@ -902,6 +901,10 @@ def _is_storage_unit_error(exc: Exception) -> bool:
     return not (isinstance(exc, StorageRejected) and exc.missing_key)
 
 
+class _PartialReplySendError(RuntimeError):
+    """Raised when a ROUTER socket fails after queuing a non-final SNDMORE frame."""
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -963,7 +966,6 @@ class SimpleStorageUnit:
         self._requests_arrived = 0
         self._arrivals_by_op = {}
         self._storage_lock = Lock()
-        set_pytorch_auto_parallel_threads(target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] init")
 
         # Shutdown event for graceful termination
         self._shutdown_event = Event()
@@ -1052,6 +1054,9 @@ class SimpleStorageUnit:
         """Worker thread for processing requests."""
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         try:
+            set_pytorch_auto_parallel_threads(
+                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] worker"
+            )
             self._worker_loop(self._perf_monitor)
         except BaseException:
             logger.critical(
@@ -1087,68 +1092,52 @@ class SimpleStorageUnit:
         _flush_log_output()
         os._exit(_WORKER_DEATH_EXIT_CODE)
 
-    def _rebind_router_socket(self, poller: zmq.Poller) -> None:
-        """Close a mid-message ROUTER socket to discard partial frames and rebind the same port."""
-        assert self.zmq_context is not None and self.put_get_socket is not None
-        with suppress(KeyError):
-            poller.unregister(self.put_get_socket)
-        self.put_get_socket.close(linger=0)
-
-        address = format_zmq_address(self._node_ip, self._put_get_socket_port)
-        replacement = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
-        replacement.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
-        try:
-            for attempt in range(50):
-                try:
-                    replacement.bind(address)
-                    break
-                except zmq.ZMQError as exc:
-                    if exc.errno != errno.EADDRINUSE or self._shutdown_event.is_set() or attempt == 49:
-                        raise
-                    time.sleep(0.01)
-        except BaseException:
-            replacement.close(linger=0)
-            raise
-        self.put_get_socket = replacement
-        poller.register(self.put_get_socket, zmq.POLLIN)
-
     def _worker_loop(self, perf_monitor: Any) -> None:
         """Poll the ROUTER socket directly and answer requests until shutdown is signalled."""
         assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
         poller = zmq.Poller()
         poller.register(self.put_get_socket, zmq.POLLIN)
-        try:
-            while not self._shutdown_event.is_set():
-                monitor = self._metrics if self._metrics is not None else perf_monitor
+        while not self._shutdown_event.is_set():
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+            try:
+                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+            except zmq.error.ContextTerminated:
+                logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
+                break
+            except zmq.ZMQError as e:
+                if e.errno == errno.EINTR:
+                    continue
+                if self._shutdown_event.is_set():
+                    break
+                raise
+
+            if self._shutdown_event.is_set():
+                break
+
+            if self.put_get_socket in socks:
+                # Keep request handling in a separate scope so payload references are
+                # released before the worker waits for the next request.
                 try:
-                    # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
-                    socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+                    self._process_one_worker_request(self.put_get_socket, monitor)
                 except zmq.error.ContextTerminated:
                     logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
                     break
-                except zmq.ZMQError as e:
-                    if e.errno == errno.EINTR:
-                        continue
+                except _PartialReplySendError:
                     if self._shutdown_event.is_set():
                         break
                     raise
-
-                if self._shutdown_event.is_set():
-                    break
-
-                if self.put_get_socket in socks:
-                    # Keep request handling in a separate scope so payload references are
-                    # released before the worker waits for the next request.
-                    try:
-                        self._process_one_worker_request(self.put_get_socket, monitor)
-                    except Exception as e:
-                        if self._shutdown_event.is_set():
-                            break
-                        logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
-                        self._rebind_router_socket(poller)
-        finally:
-            if self.put_get_socket is not None:
-                self.put_get_socket.close(linger=0)
+                except zmq.ZMQError as e:
+                    if self._shutdown_event.is_set():
+                        break
+                    if e.errno not in (errno.EAGAIN, errno.EINTR):
+                        raise
+                    logger.warning(f"[{self.storage_unit_id}]: transient ZMQ error on request: {e}")
+                except Exception as e:
+                    if self._shutdown_event.is_set():
+                        break
+                    # No SNDMORE frame entered put_get_socket, so keep it bound to preserve queued requests.
+                    logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
 
     def _record_arrival(self, operation: str) -> None:
         with self._storage_lock:
@@ -1208,6 +1197,26 @@ class SimpleStorageUnit:
                 detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
                 raise StorageRejected(detail, missing_key=missing_key) from exc
 
+    @staticmethod
+    def _send_multipart_reply(router_socket: zmq.Socket, identity: Any, response_frames: list[Any]) -> None:
+        """Send ``[identity, *response_frames]``, flagging mid-message failures that taint ``router_socket``."""
+        # Materialize all ZMQ frames before touching router_socket so buffer/allocation errors
+        # happen prior to queuing any SNDMORE frame.
+        prepared = [
+            part if isinstance(part, zmq.Frame) else zmq.Frame(memoryview(part), copy=False)
+            for part in (identity, *response_frames)
+        ]
+        last = len(prepared) - 1
+        sent_partial = False
+        try:
+            for idx, frame in enumerate(prepared):
+                router_socket.send(frame, zmq.SNDMORE if idx < last else 0, copy=False)
+                sent_partial = idx < last
+        except BaseException as exc:
+            if sent_partial:
+                raise _PartialReplySendError(f"{type(exc).__name__}: {exc}") from exc
+            raise
+
     def _process_one_worker_request(self, router_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request from the ROUTER socket and send its response."""
         # Multipart frames from ROUTER: [identity, serialized_msg_frame1, ...]
@@ -1233,7 +1242,7 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"undecodable request: {type(e).__name__}: {e}"},
             )
-            router_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
+            self._send_multipart_reply(router_socket, identity, error_msg.serialize())
             return
 
         operation = request_msg.request_type
@@ -1300,7 +1309,7 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"{self.storage_unit_id}: failed to serialize response: {type(e).__name__}: {e}"},
             ).serialize()
-        router_socket.send_multipart([identity] + response_frames, copy=False)
+        self._send_multipart_reply(router_socket, identity, response_frames)
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """

@@ -38,8 +38,8 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
-# Identity prefixes of the peers allowed to reach a storage unit. The storage proxy drops
-# anything else, so an identity built without these prefixes is silently unreachable.
+# Identity prefixes of the peers allowed to reach a storage unit. The storage unit's ROUTER
+# worker drops anything else, so an identity built without these prefixes is silently unreachable.
 STORAGE_MANAGER_IDENTITY_PREFIX = "TQ_STORAGE_"
 METRICS_COLLECTOR_IDENTITY_PREFIX = "metrics_collector_"
 STORAGE_CLIENT_IDENTITY_PREFIXES = (

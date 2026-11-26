@@ -215,28 +215,6 @@ def test_tensor_serialization(dtype):
     assert isinstance(deserialized.shape, torch.Size)
 
 
-def test_decode_rejects_empty_or_truncated_buffer_for_non_empty_tensor_and_numpy():
-    encoder = MsgpackEncoder()
-    decoder = MsgpackDecoder()
-
-    tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-    tensor_frames = list(encoder.encode(tensor))
-    for bad_buf in (b"", bytes(tensor_frames[1])[:8]):
-        with pytest.raises(ValueError, match="Tensor buffer size mismatch"):
-            decoder.decode([tensor_frames[0], bad_buf])
-
-    arr = np.arange(12, dtype=np.float32).reshape(3, 4)
-    arr_frames = list(encoder.encode(arr))
-    for bad_buf in (b"", bytes(arr_frames[1])[:8]):
-        with pytest.raises(ValueError, match="NumPy buffer size mismatch"):
-            decoder.decode([arr_frames[0], bad_buf])
-
-    empty_tensor = torch.empty((0, 4), dtype=torch.float32)
-    assert decoder.decode(encoder.encode(empty_tensor)).shape == (0, 4)
-    empty_arr = np.empty((0, 4), dtype=np.float32)
-    assert decoder.decode(encoder.encode(empty_arr)).shape == (0, 4)
-
-
 def test_zmq_msg_serialization():
     from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 

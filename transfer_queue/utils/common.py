@@ -87,18 +87,18 @@ def get_node_round_robin_scheduling_strategies(
 
 
 def set_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = "") -> int:
-    """Configure PyTorch intra-op CPU parallelism once for the current process."""
+    """Configure PyTorch intra-op CPU parallelism once for the calling thread/process."""
     pytorch_current_num_threads = torch.get_num_threads()
-    physical_cores = psutil.cpu_count(logical=False) or 1
+    available_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or os.cpu_count() or 1
     pid = os.getpid()
     if target_num_threads is None:
-        target_num_threads = 16 if physical_cores >= 16 else physical_cores
-    elif target_num_threads > physical_cores:
+        target_num_threads = 16 if available_cores >= 16 else available_cores
+    elif target_num_threads > available_cores:
         logger.warning(
-            f"target_num_threads {target_num_threads} should not exceed total "
-            f"physical CPU cores {physical_cores}. Setting to {physical_cores}."
+            f"target_num_threads {target_num_threads} should not exceed available "
+            f"CPU cores {available_cores}. Setting to {available_cores}."
         )
-        target_num_threads = physical_cores
+        target_num_threads = available_cores
 
     torch.set_num_threads(target_num_threads)
     logger.debug(

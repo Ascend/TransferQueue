@@ -17,7 +17,6 @@
 # This implementation is inspired by https://github.com/vllm-project/vllm/blob/main/vllm/v1/serial_utils.py
 
 
-import math
 import pickle
 import struct
 import warnings
@@ -309,14 +308,8 @@ class MsgpackDecoder:
         dtype, shape, idx = meta
         buffer = self.aux_buffers[idx]
         torch_dtype = getattr(torch, dtype)
-        expected_nbytes = math.prod(shape) * torch_dtype.itemsize
-        actual_nbytes = memoryview(buffer).nbytes
-        if actual_nbytes != expected_nbytes:
-            raise ValueError(
-                f"Tensor buffer size mismatch for shape={shape} dtype={dtype}: "
-                f"expected {expected_nbytes} bytes, got {actual_nbytes}"
-            )
-        if expected_nbytes == 0:
+
+        if not buffer:  # Handle empty tensors
             return torch.empty(shape, dtype=torch_dtype)
 
         # Create uint8 tensor from buffer, then view as original dtype and reshape
@@ -343,14 +336,8 @@ class MsgpackDecoder:
         dtype_str, shape, idx = meta
         buffer = self.aux_buffers[idx]
         np_dtype = np.dtype(dtype_str)
-        expected_nbytes = math.prod(shape) * np_dtype.itemsize
-        actual_nbytes = memoryview(buffer).nbytes
-        if actual_nbytes != expected_nbytes:
-            raise ValueError(
-                f"NumPy buffer size mismatch for shape={shape} dtype={dtype_str}: "
-                f"expected {expected_nbytes} bytes, got {actual_nbytes}"
-            )
-        if expected_nbytes == 0:
+
+        if not buffer:  # empty array
             return np.empty(shape, dtype=np_dtype)
 
         # Reconstruct from raw bytes: uint8 view → reinterpret as original dtype

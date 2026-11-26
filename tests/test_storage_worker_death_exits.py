@@ -15,10 +15,10 @@
 
 """The unit process must exit when the thread that answers requests dies.
 
-Worker and proxy both run as daemon threads, so an exception in either only unwinds that
-thread: the process stays up with its ROUTER still bound, keeps accepting connections and
-never answers them, and every caller blocks until its own timeout. Exiting instead turns a
-silent hang into a visible actor failure.
+The worker runs as a daemon thread, so an unhandled exception in it only unwinds that thread:
+the process stays up with its ROUTER still bound, keeps accepting connections and never answers
+them, and every caller blocks until its own timeout. Exiting instead turns a silent hang into a
+visible actor failure.
 """
 
 import errno
@@ -26,10 +26,12 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 import zmq
 
 from transfer_queue.storage import simple_storage
-from transfer_queue.storage.simple_storage import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import SimpleStorageUnit, _PartialReplySendError
+from transfer_queue.utils import common
 
 _StorageUnitClass = SimpleStorageUnit.__ray_metadata__.modified_class
 
@@ -132,3 +134,55 @@ def test_poll_error_during_shutdown_exits_cleanly():
         unit._worker_routine()
 
     exit_call.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_on_frame_idx", [1, 2])
+def test_mid_multipart_reply_failure_aborts_process_without_misrouting(fail_on_frame_idx):
+    """Once a non-final SNDMORE frame entered ROUTER, a subsequent send failure aborts the unit."""
+    unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
+    router = MagicMock()
+    calls = 0
+
+    def fail_after_sndmore(_frame, flags=0, **_kwargs):
+        nonlocal calls
+        if calls == fail_on_frame_idx:
+            raise MemoryError("simulated mid-multipart OOM")
+        calls += 1
+
+    router.send.side_effect = fail_after_sndmore
+    unit.put_get_socket = router
+    poller = MagicMock()
+    poller.poll.return_value = [(router, zmq.POLLIN)]
+
+    def trigger_partial_send(sock, _monitor):
+        unit._send_multipart_reply(sock, b"TQ_STORAGE_client", [b"header", b"payload"])
+
+    unit._process_one_worker_request = trigger_partial_send  # type: ignore[method-assign]
+
+    with (
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
+        patch.object(simple_storage.os, "_exit") as exit_call,
+    ):
+        with pytest.raises(_PartialReplySendError):
+            unit._worker_routine()
+
+    exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
+
+
+def test_set_pytorch_threads_falls_back_to_logical_cores_when_physical_is_none(monkeypatch, caplog):
+    """Kunpeng ARM64 / container hosts where cpu_count(logical=False) is None must not clamp to 1 thread."""
+    monkeypatch.setattr(
+        common.psutil,
+        "cpu_count",
+        lambda logical=True: None if not logical else 64,
+    )
+    previous = torch.get_num_threads()
+    try:
+        chosen = common.set_pytorch_auto_parallel_threads(target_num_threads=8, info="arm64-test")
+        assert chosen == 8
+        assert torch.get_num_threads() == 8
+        assert "should not exceed" not in caplog.text
+    finally:
+        torch.set_num_threads(previous)

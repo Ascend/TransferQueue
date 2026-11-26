@@ -63,8 +63,8 @@ class MockStorageClient:
 
     def __init__(self, storage_put_get_address, storage_ip, identity=None):
         self.context = zmq.Context()
-        # The storage proxy drops identities outside STORAGE_CLIENT_IDENTITY_PREFIXES, so mirror
-        # the prefix a real storage manager uses instead of letting ZMQ auto-assign one.
+        # The storage unit's ROUTER worker drops identities outside STORAGE_CLIENT_IDENTITY_PREFIXES,
+        # so mirror the prefix a real storage manager uses instead of letting ZMQ auto-assign one.
         if identity is None:
             identity = f"{STORAGE_MANAGER_IDENTITY_PREFIX}{uuid4().hex[:8]}".encode()
         self.socket = create_zmq_socket(self.context, zmq.DEALER, storage_ip, identity=identity)
@@ -1198,14 +1198,14 @@ def test_storage_unit_checkpoint_load_missing_file(storage_setup, tmp_path):
 
 
 def test_foreign_payload_dropped_and_unit_stays_usable(storage_setup):
-    """A non-TransferQueue peer (e.g. a TLS probe) must not stop the proxy."""
+    """A non-TransferQueue peer (e.g. a TLS probe) must not stop the unit worker."""
     _, put_get_address, storage_ip = storage_setup
 
     foreign = MockStorageClient(put_get_address, storage_ip, identity=b"foreign_probe")
     foreign.socket.setsockopt(zmq.RCVTIMEO, 1000)
     # A TLS ClientHello record header: what a port scanner sends to an unknown TCP port.
     foreign.socket.send(b"\x16\x03\x01\x02\x00")
-    # Dropped before the worker, so unlike a decode failure it draws no reply at all.
+    # Dropped at the identity filter before decoding, so it draws no reply at all.
     with pytest.raises(zmq.Again):
         foreign.socket.recv_multipart()
     foreign.close()
@@ -1217,7 +1217,7 @@ def test_foreign_payload_dropped_and_unit_stays_usable(storage_setup):
 
 
 def test_undecodable_request_answered_and_worker_survives(storage_setup):
-    """An allowed identity passes the proxy, so the worker itself must survive bad frames."""
+    """An allowed identity passes the identity filter, so the worker itself must survive bad frames."""
     _, put_get_address, storage_ip = storage_setup
 
     client = MockStorageClient(put_get_address, storage_ip)
@@ -1230,46 +1230,52 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     client.close()
 
 
-@pytest.mark.parametrize("fail_stage", ["after_identity", "after_get_header"])
-def test_worker_survives_a_reply_failing_between_frames(fail_stage):
-    """A reply that fails mid-message is discarded without ending the worker or misrouting the next reply."""
+@pytest.mark.parametrize("failure_mode", ["before_send", "bad_frame_buffer"])
+def test_pre_send_worker_error_preserves_already_queued_concurrent_requests(failure_mode):
+    """A request failing before any SNDMORE frame enters ROUTER keeps queued sibling requests intact."""
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
-    unit.storage_data.put_data({"val": [torch.tensor([3.0, 4.0])]}, [0])
     process_request = unit._process_one_worker_request
-    failed = []
+    initial_router = unit.put_get_socket
+    first_failed = False
 
-    def fail_mid_reply(router_socket, monitor):
-        if not failed:
-            failed.append(True)
+    def fail_first_before_sndmore(router_socket, monitor):
+        nonlocal first_failed
+        if not first_failed:
+            first_failed = True
             frames = router_socket.recv_multipart(copy=False)
-            identity = frames[0]
-            router_socket.send(identity, zmq.SNDMORE)
-            if fail_stage == "after_get_header":
-                partial_reply = ZMQMessage.create(
-                    request_type=ZMQRequestType.GET_DATA_RESPONSE,
-                    sender_id=unit.storage_unit_id,
-                    body={"data": {"val": [torch.tensor([3.0, 4.0])]}},
-                ).serialize()
-                assert len(partial_reply) == 2
-                router_socket.send(partial_reply[0], zmq.SNDMORE)
-            raise MemoryError
-        process_request(router_socket, monitor)
+            assert router_socket.poll(2000, zmq.POLLIN), "second request did not queue on ROUTER in time"
+            if failure_mode == "bad_frame_buffer":
+                # Non-buffer object fails inside _send_multipart_reply's pre-send preparation.
+                return unit._send_multipart_reply(router_socket, frames[0], [object()])
+            raise RuntimeError("boom before reply send")
+        return process_request(router_socket, monitor)
 
-    unit._process_one_worker_request = fail_mid_reply
+    unit._process_one_worker_request = fail_first_before_sndmore
     address, ip = unit.zmq_server_info.to_addr("put_get_socket"), unit.zmq_server_info.ip
-    stranded, next_client = MockStorageClient(address, ip), MockStorageClient(address, ip)
-    stranded.socket.setsockopt(zmq.RCVTIMEO, 1000)
+    client_a, client_b = MockStorageClient(address, ip), MockStorageClient(address, ip)
+    client_a.socket.setsockopt(zmq.RCVTIMEO, 500)
+    client_b.socket.setsockopt(zmq.RCVTIMEO, 2000)
     try:
+        msg_a = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA,
+            sender_id="mock_client_a",
+            body={"global_indexes": [0], "data": {"val": [torch.tensor([1.0])]}},
+        )
+        msg_b = ZMQMessage.create(
+            request_type=ZMQRequestType.PUT_DATA,
+            sender_id="mock_client_b",
+            body={"global_indexes": [1], "data": {"val": [torch.tensor([2.0])]}},
+        )
+        client_a.socket.send_multipart(msg_a.serialize())
+        client_b.socket.send_multipart(msg_b.serialize())
+
+        reply_b = ZMQMessage.deserialize(client_b.socket.recv_multipart(copy=False))
+        assert reply_b.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        torch.testing.assert_close(unit.storage_data.get_data(["val"], [1])["val"][0], torch.tensor([2.0]))
+        assert unit.put_get_socket is initial_router
         with pytest.raises(zmq.Again):
-            if fail_stage == "after_get_header":
-                stranded.send_get(0, [0], ["val"])
-            else:
-                stranded.send_put(0, [0], {"val": [torch.tensor([1.0])]})
-        response = next_client.send_get(1, [0], ["val"])
-        assert response.request_type == ZMQRequestType.GET_DATA_RESPONSE
-        torch.testing.assert_close(response.body["data"]["val"][0], torch.tensor([3.0, 4.0]))
-        assert not stranded.socket.poll(500), "the next reply was routed to the stranded caller"
+            client_a.socket.recv_multipart(copy=False)
     finally:
-        stranded.close()
-        next_client.close()
+        client_a.close()
+        client_b.close()
         unit.shutdown()
