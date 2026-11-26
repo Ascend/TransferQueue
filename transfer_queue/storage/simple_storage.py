@@ -901,10 +901,6 @@ def _is_storage_unit_error(exc: Exception) -> bool:
     return not (isinstance(exc, StorageRejected) and exc.missing_key)
 
 
-class _PartialReplySendError(RuntimeError):
-    """Raised when a ROUTER socket fails after queuing a non-final SNDMORE frame."""
-
-
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -966,6 +962,7 @@ class SimpleStorageUnit:
         self._requests_arrived = 0
         self._arrivals_by_op = {}
         self._storage_lock = Lock()
+        self._router_tainted = False
 
         # Shutdown event for graceful termination
         self._shutdown_event = Event()
@@ -1123,19 +1120,17 @@ class SimpleStorageUnit:
                 except zmq.error.ContextTerminated:
                     logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
                     break
-                except _PartialReplySendError:
-                    if self._shutdown_event.is_set():
-                        break
-                    raise
                 except zmq.ZMQError as e:
                     if self._shutdown_event.is_set():
                         break
-                    if e.errno not in (errno.EAGAIN, errno.EINTR):
+                    if self._router_tainted or e.errno not in (errno.EAGAIN, errno.EINTR):
                         raise
                     logger.warning(f"[{self.storage_unit_id}]: transient ZMQ error on request: {e}")
                 except Exception as e:
                     if self._shutdown_event.is_set():
                         break
+                    if self._router_tainted:
+                        raise
                     # No SNDMORE frame entered put_get_socket, so keep it bound to preserve queued requests.
                     logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
 
@@ -1197,9 +1192,8 @@ class SimpleStorageUnit:
                 detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
                 raise StorageRejected(detail, missing_key=missing_key) from exc
 
-    @staticmethod
-    def _send_multipart_reply(router_socket: zmq.Socket, identity: Any, response_frames: list[Any]) -> None:
-        """Send ``[identity, *response_frames]``, flagging mid-message failures that taint ``router_socket``."""
+    def _send_multipart_reply(self, router_socket: zmq.Socket, identity: Any, response_frames: list[Any]) -> None:
+        """Send ``[identity, *response_frames]``, marking ``_router_tainted`` if ``send`` fails mid-SNDMORE."""
         # Materialize all ZMQ frames before touching router_socket so buffer/allocation errors
         # happen prior to queuing any SNDMORE frame.
         prepared = [
@@ -1212,9 +1206,9 @@ class SimpleStorageUnit:
             for idx, frame in enumerate(prepared):
                 router_socket.send(frame, zmq.SNDMORE if idx < last else 0, copy=False)
                 sent_partial = idx < last
-        except BaseException as exc:
+        except BaseException:
             if sent_partial:
-                raise _PartialReplySendError(f"{type(exc).__name__}: {exc}") from exc
+                self._router_tainted = True
             raise
 
     def _process_one_worker_request(self, router_socket: zmq.Socket, monitor: Any) -> None:

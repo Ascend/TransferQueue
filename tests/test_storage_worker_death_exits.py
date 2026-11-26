@@ -30,7 +30,7 @@ import torch
 import zmq
 
 from transfer_queue.storage import simple_storage
-from transfer_queue.storage.simple_storage import SimpleStorageUnit, _PartialReplySendError
+from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils import common
 
 _StorageUnitClass = SimpleStorageUnit.__ray_metadata__.modified_class
@@ -42,6 +42,7 @@ def _unit():
     unit.storage_unit_id = "TQ_STORAGE_UNIT_test0001"
     unit._shutdown_event = threading.Event()
     unit._storage_lock = threading.Lock()
+    unit._router_tainted = False
     return unit
 
 
@@ -165,9 +166,10 @@ def test_mid_multipart_reply_failure_aborts_process_without_misrouting(fail_on_f
         patch.object(simple_storage.zmq, "Poller", return_value=poller),
         patch.object(simple_storage.os, "_exit") as exit_call,
     ):
-        with pytest.raises(_PartialReplySendError):
+        with pytest.raises(MemoryError):
             unit._worker_routine()
 
+    assert unit._router_tainted is True
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
 
 

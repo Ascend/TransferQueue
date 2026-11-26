@@ -41,7 +41,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    frame_nbytes,
 )
 
 # Preserves the existing ZMQ GET_ERROR message convention across rolling upgrades.
@@ -124,12 +123,12 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     )
                     frames = request.serialize()
                     if send is not None:
-                        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+                        wire_bytes = sum(len(frame) for frame in frames)
                     await socket.send_multipart(frames, copy=False)
                     del frames
                     raw_reply = await socket.recv_multipart(copy=False)
                     if header.operation == Operation.GET:
-                        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in raw_reply)
+                        wire_bytes = sum(len(frame) for frame in raw_reply)
                     reply = ZMQMessage.deserialize(raw_reply)
                     del raw_reply
         except zmq.error.Again as exc:
