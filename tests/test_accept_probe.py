@@ -197,7 +197,6 @@ def test_unit_shutdown_stops_the_probe():
     unit_class._shutdown_resources(
         shutdown_event=threading.Event(),
         worker_thread=None,
-        proxy_thread=None,
         zmq_context=None,
         put_get_socket=None,
         accept_probe=probe,
@@ -215,7 +214,6 @@ def test_shutdown_without_a_probe_is_a_no_op():
     unit_class._shutdown_resources(
         shutdown_event=threading.Event(),
         worker_thread=None,
-        proxy_thread=None,
         zmq_context=None,
         put_get_socket=None,
     )

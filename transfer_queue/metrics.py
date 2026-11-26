@@ -525,7 +525,7 @@ class TQMetricsExporter:
                 )
             self._zmq_socket_pool = ZMQSocketPool(
                 self._zmq_ctx,
-                # The storage proxy drops identities without this prefix, and the pool
+                # The storage unit drops identities without this prefix, and the pool
                 # builds each socket's identity from the owner id.
                 METRICS_COLLECTOR_IDENTITY_PREFIX.rstrip("_"),
                 "put_get_socket",

@@ -15,19 +15,24 @@
 
 """The unit process must exit when the thread that answers requests dies.
 
-Worker and proxy both run as daemon threads, so an exception in either only unwinds that
-thread: the process stays up with its ROUTER still bound, keeps accepting connections and
-never answers them, and every caller blocks until its own timeout. Exiting instead turns a
-silent hang into a visible actor failure.
+The worker runs as a daemon thread, so an unhandled exception in it only unwinds that thread:
+the process stays up with its ROUTER still bound, keeps accepting connections and never answers
+them, and every caller blocks until its own timeout. Exiting instead turns a silent hang into a
+visible actor failure.
 """
 
+import errno
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
+import zmq
+import zmq.utils.garbage
 
 from transfer_queue.storage import simple_storage
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
+from transfer_queue.utils import common
 
 _StorageUnitClass = SimpleStorageUnit.__ray_metadata__.modified_class
 
@@ -38,6 +43,7 @@ def _unit():
     unit.storage_unit_id = "TQ_STORAGE_UNIT_test0001"
     unit._shutdown_event = threading.Event()
     unit._storage_lock = threading.Lock()
+    unit._router_tainted = False
     return unit
 
 
@@ -78,13 +84,9 @@ def test_unhandled_worker_exception_triggers_the_exit():
     unit = _unit()
     unit._metrics = None
     unit._perf_monitor = MagicMock()
-    unit._node_ip = "127.0.0.1"
-    unit._inproc_addr = "inproc://worker_death_test"
-    unit.zmq_context = MagicMock()
+    unit.put_get_socket = MagicMock()
 
     with (
-        patch.object(simple_storage, "create_zmq_socket", return_value=MagicMock()),
-        patch.object(simple_storage.zmq, "Poller", return_value=MagicMock()),
         patch.object(_StorageUnitClass, "_worker_loop", side_effect=RuntimeError("boom")),
         patch.object(simple_storage.os, "_exit") as exit_call,
     ):
@@ -94,43 +96,125 @@ def test_unhandled_worker_exception_triggers_the_exit():
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
 
 
-def _failing_poller(shutdown_event: threading.Event | None = None) -> MagicMock:
-    """A proxy poller whose poll raises, optionally after a shutdown has begun."""
-
-    def poll(timeout):
-        if shutdown_event is not None:
-            shutdown_event.set()
-        raise RuntimeError("proxy boom")
-
-    poller = MagicMock()
-    poller.poll.side_effect = poll
-    return poller
-
-
-def test_proxy_death_exits_the_process():
-    """Without the proxy nothing reaches the worker, so the unit is equally unreachable."""
+def test_unrecoverable_poll_error_exits_on_first_failure():
+    """A broken listening ROUTER (e.g. ENOTSOCK) must abort immediately rather than spin."""
     unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
     unit.put_get_socket = MagicMock()
-    unit.worker_socket = MagicMock()
+    poller = MagicMock()
+    poller.poll.side_effect = zmq.ZMQError(errno.ENOTSOCK)
 
     with (
-        patch.object(simple_storage.zmq, "Poller", return_value=_failing_poller()),
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
         patch.object(simple_storage.os, "_exit") as exit_call,
     ):
-        unit._proxy_routine()
+        with pytest.raises(zmq.ZMQError):
+            unit._worker_routine()
 
+    poller.poll.assert_called_once()
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
 
 
-def test_proxy_shutdown_does_not_exit():
+def test_poll_error_during_shutdown_exits_cleanly():
     unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
     unit.put_get_socket = MagicMock()
-    unit.worker_socket = MagicMock()
+
+    def poll_then_shutdown(_timeout):
+        unit._shutdown_event.set()
+        raise zmq.ZMQError(errno.ENOTSOCK)
+
+    poller = MagicMock()
+    poller.poll.side_effect = poll_then_shutdown
 
     with (
-        patch.object(simple_storage.zmq, "Poller", return_value=_failing_poller(unit._shutdown_event)),
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
         patch.object(simple_storage.os, "_exit") as exit_call,
     ):
-        unit._proxy_routine()
+        unit._worker_routine()
 
     exit_call.assert_not_called()
+
+
+@pytest.mark.parametrize("fail_on_frame_idx", [1, 2])
+def test_mid_multipart_reply_failure_aborts_process_without_misrouting(fail_on_frame_idx):
+    """Once a non-final SNDMORE frame entered ROUTER, a subsequent send failure aborts the unit."""
+    unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
+    router = MagicMock(copy_threshold=zmq.COPY_THRESHOLD)
+    calls = 0
+
+    def fail_after_sndmore(_frame, flags=0, **_kwargs):
+        nonlocal calls
+        if calls == fail_on_frame_idx:
+            raise MemoryError("simulated mid-multipart OOM")
+        calls += 1
+
+    router.send.side_effect = fail_after_sndmore
+    unit.put_get_socket = router
+    poller = MagicMock()
+    poller.poll.return_value = [(router, zmq.POLLIN)]
+
+    def trigger_partial_send(sock, _monitor):
+        unit._send_multipart_reply(sock, b"TQ_STORAGE_client", [b"header", b"payload"])
+
+    unit._process_one_worker_request = trigger_partial_send  # type: ignore[method-assign]
+
+    with (
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
+        patch.object(simple_storage.os, "_exit") as exit_call,
+    ):
+        with pytest.raises(MemoryError):
+            unit._worker_routine()
+
+    assert unit._router_tainted is True
+    exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
+
+
+def test_set_pytorch_threads_falls_back_to_logical_cores_when_physical_is_none(monkeypatch, caplog):
+    """Kunpeng ARM64 / container hosts where cpu_count(logical=False) is None must not clamp to 1 thread."""
+    monkeypatch.setattr(
+        common.psutil,
+        "cpu_count",
+        lambda logical=True: None if not logical else 64,
+    )
+    previous = torch.get_num_threads()
+    try:
+        chosen = common.set_pytorch_auto_parallel_threads(target_num_threads=8, info="arm64-test")
+        assert chosen == 8
+        assert torch.get_num_threads() == 8
+        assert "should not exceed" not in caplog.text
+    finally:
+        torch.set_num_threads(previous)
+
+
+def test_send_multipart_reply_honors_copy_threshold_without_gc_on_small_frames():
+    """Small reply frames must copy inline below copy_threshold instead of waking pyzmq's GC thread."""
+    unit = _unit()
+    ctx = zmq.Context()
+    router = ctx.socket(zmq.ROUTER)
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.IDENTITY, b"TQ_STORAGE_client")
+    router.bind("inproc://copy-threshold-test")
+    dealer.connect("inproc://copy-threshold-test")
+    try:
+        dealer.send(b"ping")
+        identity = router.recv_multipart(copy=False)[0]
+
+        with patch.object(zmq.utils.garbage.gc, "store", wraps=zmq.utils.garbage.gc.store) as gc_store:
+            unit._send_multipart_reply(router, identity, [b"h" * 128, memoryview(b"p" * 1024)])
+            assert dealer.recv_multipart() == [b"h" * 128, b"p" * 1024]
+            gc_store.assert_not_called()
+
+            large_payload = memoryview(bytearray(router.copy_threshold + 1024))
+            unit._send_multipart_reply(router, identity, [b"h" * 128, large_payload])
+            received = dealer.recv_multipart()
+            assert len(received[1]) == len(large_payload)
+            assert gc_store.call_count == 1
+    finally:
+        dealer.close(linger=0)
+        router.close(linger=0)
+        ctx.term()

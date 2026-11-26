@@ -41,7 +41,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    frame_nbytes,
 )
 
 # Preserves the existing ZMQ GET_ERROR message convention across rolling upgrades.
@@ -124,10 +123,14 @@ class ZmqPayloadTransfer(PayloadTransfer):
                     )
                     frames = request.serialize()
                     if send is not None:
-                        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
+                        wire_bytes = sum(len(frame) for frame in frames)
                     await socket.send_multipart(frames, copy=False)
                     del frames
-                    reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+                    raw_reply = await socket.recv_multipart(copy=False)
+                    if header.operation == Operation.GET:
+                        wire_bytes = sum(len(frame) for frame in raw_reply)
+                    reply = ZMQMessage.deserialize(raw_reply)
+                    del raw_reply
         except zmq.error.Again as exc:
             raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes) from exc
         except zmq.ZMQError as exc:
@@ -188,7 +191,7 @@ class ZmqPayloadTransfer(PayloadTransfer):
     def shutdown(self):
         """Stop admitting new payload work and wait for any active handler call to finish.
 
-        Both the server-side ROUTER/worker sockets (owned by ``SimpleStorageUnit``) and the
+        Both the server-side ROUTER socket (owned by ``SimpleStorageUnit``) and the
         client-side ``ZMQSocketPool`` (shared with administrative RPCs such as ``CLEAR_DATA``)
         are closed by their respective owners after ``shutdown()`` returns.
         """

@@ -110,6 +110,7 @@ async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
         }
         put_reply = await client.request(peer_info, put, send=payload)
         assert put_reply.payload is None
+        assert put_reply.wire_bytes > 0
 
         update = RequestHeader(
             Operation.UPDATE,
@@ -126,6 +127,7 @@ async def test_payload_roundtrip_dense_nested_and_object_fields(monkeypatch):
         # Read in reversed sample order and verify earlier tensor views survive later writes.
         get = RequestHeader(Operation.GET, {"global_indexes": [2, 10], "fields": ["dense", "ragged", "text"]})
         get_reply = await client.request(peer_info, get)
+        assert get_reply.wire_bytes > 0
         data = get_reply.payload
         assert data is not None
         held_view = data["ragged"][0][1:3]
@@ -397,8 +399,6 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
     from transfer_queue.metrics import TQMetricsExporter
 
     monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
-    heavy = MagicMock()
-    monkeypatch.setattr("transfer_queue.storage.simple_storage.log_heavy_operation", heavy)
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
     if metrics_enabled:
         unit._metrics = TQMetricsExporter(role="storage")
@@ -419,7 +419,6 @@ def test_storage_observability_without_zmq_dispatch(monkeypatch, metrics_enabled
         assert real_error.value.missing_key is False
         assert unit._requests_arrived == 4
         assert unit._arrivals_by_op == {"PUT_DATA": 2, "GET_DATA": 2}
-        heavy.assert_not_called()
         if metrics_enabled:
             assert unit._metrics.request_total.labels(op_type="GET_DATA")._value.get() == 2
             assert unit._metrics.request_errors_total.labels(op_type="GET_DATA")._value.get() == 0
@@ -503,7 +502,6 @@ def test_unit_drains_dispatched_work_before_stopping_worker():
         shutdown = threads.submit(
             unit_class._shutdown_resources,
             stop_worker,
-            None,
             None,
             None,
             None,

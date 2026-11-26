@@ -86,32 +86,34 @@ def get_node_round_robin_scheduling_strategies(
     ]
 
 
+def set_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = "") -> int:
+    """Configure PyTorch intra-op CPU parallelism once for the calling thread/process."""
+    pytorch_current_num_threads = torch.get_num_threads()
+    available_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or os.cpu_count() or 1
+    pid = os.getpid()
+    if target_num_threads is None:
+        target_num_threads = 16 if available_cores >= 16 else available_cores
+    elif target_num_threads > available_cores:
+        logger.warning(
+            f"target_num_threads {target_num_threads} should not exceed available "
+            f"CPU cores {available_cores}. Setting to {available_cores}."
+        )
+        target_num_threads = available_cores
+
+    torch.set_num_threads(target_num_threads)
+    logger.debug(
+        f"{info} (pid={pid}): torch.get_num_threads() is {pytorch_current_num_threads}, "
+        f"setting to {target_num_threads}."
+    )
+    return target_num_threads
+
+
 @contextmanager
 def limit_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = ""):
     """Prevent PyTorch from overdoing the automatic parallelism during tensor aggregation operations."""
-    pytorch_current_num_threads = torch.get_num_threads()
-    physical_cores = psutil.cpu_count(logical=False)
     pid = os.getpid()
-    if target_num_threads is None:
-        # auto determine target_num_threads
-        if physical_cores >= 16:
-            target_num_threads = 16
-        else:
-            target_num_threads = physical_cores
-
-    if target_num_threads > physical_cores:
-        logger.warning(
-            f"target_num_threads {target_num_threads} should not exceed total "
-            f"physical CPU cores {physical_cores}. Setting to {physical_cores}."
-        )
-        target_num_threads = physical_cores
-
+    set_pytorch_auto_parallel_threads(target_num_threads=target_num_threads, info=info)
     try:
-        torch.set_num_threads(target_num_threads)
-        logger.debug(
-            f"{info} (pid={pid}): torch.get_num_threads() is {pytorch_current_num_threads}, "
-            f"setting to {target_num_threads}."
-        )
         yield
     finally:
         # Restore the original number of threads
