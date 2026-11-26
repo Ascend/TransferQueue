@@ -263,7 +263,7 @@ class ZMQMessage:
     def deserialize(cls, frames: list) -> "ZMQMessage":
         """Deserialize: choose decoding path based on the first frame marker (zero-copy or pickle fallback)."""
         if not frames:
-            raise ValueError("Empty frames received")
+            raise ZMQMessageDecodeError("Empty frames received")
 
         # Frame 0 is always the msgpack header; buffers for tensors/ndarrays follow it. A
         # zero-length frame 0 therefore means the multipart boundaries have shifted rather

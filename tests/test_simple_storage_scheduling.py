@@ -18,7 +18,10 @@ import pytest
 from omegaconf import OmegaConf
 
 from transfer_queue.storage.bootstrap import simple_storage_bootstrap
+from transfer_queue.storage.payload_transfer import PayloadPeerInfo
 from transfer_queue.utils import common
+from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 _NODE_A = "01" * 28
 _NODE_B = "02" * 28
@@ -96,7 +99,10 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
 
     monkeypatch.setattr(simple_storage_bootstrap, "get_node_round_robin_scheduling_strategies", get_strategies)
     monkeypatch.setattr(simple_storage_bootstrap, "SimpleStorageUnit", storage_unit)
-    monkeypatch.setattr(simple_storage_bootstrap, "process_zmq_server_info", lambda _: {})
+    zmq_info = ZMQServerInfo(Role.STORAGE, "unit-id", "127.0.0.1", {"put_get_socket": 5555})
+    peer_info = PayloadPeerInfo("test", "opaque")
+    ray_get = MagicMock(return_value=[(zmq_info, peer_info)])
+    monkeypatch.setattr(simple_storage_bootstrap.ray, "get", ray_get)
 
     conf = OmegaConf.create(
         {
@@ -108,10 +114,14 @@ def test_simple_storage_initialization_forwards_required_node_resource(monkeypat
                     "required_node_resource": "storage_pool",
                 },
             }
-        }
+        },
+        flags={"allow_objects": True},
     )
 
     handles = simple_storage_bootstrap.initialize_simple_storage(conf)
 
     get_strategies.assert_called_once_with(1, required_node_resource="storage_pool")
+    ray_get.assert_called_once()
     assert handles == {"TransferQueueStorageUnit#0": storage_handle}
+    assert conf.backend.SimpleStorage.zmq_info == {"TransferQueueStorageUnit#0": zmq_info}
+    assert conf.backend.SimpleStorage.payload_peers["unit-id"] == peer_info

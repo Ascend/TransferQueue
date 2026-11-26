@@ -19,7 +19,6 @@ import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
-from functools import partial
 from operator import itemgetter
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
@@ -30,10 +29,17 @@ from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
-from transfer_queue.storage.simple_storage import (
-    KEY_NOT_FOUND_MARKER,
-    StorageKeyNotFoundError,
+from transfer_queue.storage.payload_transfer import (
+    Operation,
+    PayloadPeerInfo,
+    PayloadReply,
+    RequestHeader,
+    StorageRejected,
+    TransferError,
+    TransferTimeout,
+    ZmqPayloadTransfer,
 )
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
@@ -43,7 +49,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    frame_nbytes,
     with_zmq_socket,
 )
 
@@ -51,8 +56,8 @@ logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
 
-# Attempts per storage-unit request, including the first. Each one must use a new connection: a
-# DEALER silently queues messages for a peer it never reached, so no timeout can catch that.
+# Attempts per storage-unit request, including the first. Each backend isolates
+# failed sockets or peer handles internally before a retry.
 TQ_SIMPLE_STORAGE_MAX_ATTEMPTS = int(os.environ.get("TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3))
 
 # Timeout for the post-failure probe, which only has to answer whether the unit still serves.
@@ -88,7 +93,8 @@ def _parser_arg_identity(parser_arg: Any, pos: int) -> tuple:
 class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
 
-    Distinct from an error the unit reported: only a missing answer is worth a new connection.
+    Distinct from an error the unit reported: only a missing answer or transient transport
+    failure is worth retrying on a fresh connection.
     """
 
 
@@ -238,7 +244,20 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+        self._payload_peers = self._resolve_payload_peers(config.get("payload_peers"))
+        self.payload_transfer = ZmqPayloadTransfer(owner_id=self.storage_manager_id, pool=self.storage_rpc_pool)
         self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
+
+    def _resolve_payload_peers(self, raw_peers: Any) -> dict[str, PayloadPeerInfo]:
+        """Normalize peer discovery descriptors once during manager initialization."""
+        if raw_peers is None:
+            return {su_id: PayloadPeerInfo("zmq", info) for su_id, info in self.storage_unit_infos.items()}
+        resolved: dict[str, PayloadPeerInfo] = {}
+        for su_id, peer in raw_peers.items():
+            if not isinstance(peer, PayloadPeerInfo):
+                raise TypeError(f"Invalid payload peer for {su_id}: {peer!r}")
+            resolved[su_id] = peer
+        return resolved
 
     def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
         """Warn when the pool may park more sockets than the context can hold.
@@ -366,46 +385,6 @@ class AsyncSimpleStorageManager(StorageManager):
 
         return f"{tcp} {_describe_unit_state(body)}"
 
-    async def _request_with_retry(
-        self,
-        operation: str,
-        target_storage_unit: str,
-        request_context: str,
-        make_request: Callable[[], Any],
-        max_attempts: int | None = None,
-    ):
-        """Run one storage-unit request, retrying a missing answer on a fresh connection.
-
-        Args:
-            operation: Operation name for logs, e.g. ``get`` or ``put``.
-            target_storage_unit: Unit this request is routed to.
-            request_context: Request shape, so both ends of a failure can be correlated.
-            make_request: Zero-arg callable returning a coroutine for one attempt. Must build a
-                new socket per call, which ``with_storage_unit_socket`` does.
-            max_attempts: Attempts allowed. Defaults to ``TQ_SIMPLE_STORAGE_MAX_ATTEMPTS``; pass 1
-                for a request that must not be replayed.
-        """
-        # Floored at one: a nonpositive count would skip the request and report success, which for
-        # put would publish metadata for data that was never sent.
-        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS if max_attempts is None else max_attempts)
-        for attempt in range(1, attempts_allowed + 1):
-            try:
-                return await make_request()
-            except StorageUnitTimeout as e:
-                # The exception already names the unit, its endpoint and the timeout, so these
-                # lines only add what it cannot know: which attempt this was, and the shape.
-                if attempt < attempts_allowed:
-                    logger.warning(
-                        f"[{self.storage_manager_id}]: {operation} retry {attempt + 1}/{attempts_allowed} "
-                        f"on a new connection. {request_context} {e}"
-                    )
-                    continue
-                logger.error(
-                    f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
-                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
-                )
-                raise
-
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
         """Slice a single field's data by non-contiguous batch positions.
@@ -519,24 +498,15 @@ class AsyncSimpleStorageManager(StorageManager):
         field_schema = extract_field_schema(data)
 
         routing = self._group_by_hash(metadata.global_indexes)
-        # Parser-backed puts are not replayed: the public API does not constrain parser side effects.
-        max_attempts = 1 if data_parser is not None else None
         tasks = []
         for su_id, group in routing.items():
             storage_data = {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()}
             tasks.append(
-                self._request_with_retry(
-                    "put",
-                    su_id,
-                    f"samples={len(group.global_indexes)} fields={list(storage_data.keys())}",
-                    partial(
-                        self._put_to_single_storage_unit,
-                        group.global_indexes,
-                        storage_data,
-                        target_storage_unit=su_id,
-                        data_parser=data_parser,
-                    ),
-                    max_attempts=max_attempts,
+                self._put_to_single_storage_unit(
+                    group.global_indexes,
+                    storage_data,
+                    target_storage_unit=su_id,
+                    data_parser=data_parser,
                 )
             )
 
@@ -593,21 +563,12 @@ class AsyncSimpleStorageManager(StorageManager):
                 for f in field_names
             }
             tasks.append(
-                self._request_with_retry(
-                    "update",
-                    su_id,
-                    f"samples={len(group.global_indexes)} fields={field_names}",
-                    partial(
-                        self._update_to_single_storage_unit,
-                        group.global_indexes,
-                        storage_data,
-                        merge_fn,
-                        unit_columns,
-                        target_storage_unit=su_id,
-                    ),
-                    # A merge reads stored state, so a replay after a lost answer
-                    # could fold the same new value in twice.
-                    max_attempts=1,
+                self._update_to_single_storage_unit(
+                    group.global_indexes,
+                    storage_data,
+                    merge_fn,
+                    unit_columns,
+                    target_storage_unit=su_id,
                 )
             )
 
@@ -645,64 +606,95 @@ class AsyncSimpleStorageManager(StorageManager):
             )
         return field_schema
 
-    @with_storage_unit_socket
+    async def _request_payload(
+        self,
+        target: str,
+        operation: Operation,
+        params: dict[str, Any],
+        *,
+        data: dict[str, Any] | None = None,
+        max_attempts: int = 1,
+    ) -> PayloadReply:
+        """Send one payload request to ``target``, retrying transient transport errors up to ``max_attempts``."""
+        op_name = operation.value.lower()
+        endpoint = self._describe_storage_unit(target)
+        fields = list(data) if data is not None else list(params.get("fields", ()))
+        request_context = f"samples={len(params['global_indexes'])} fields={fields}"
+        header = RequestHeader(operation, params)
+        # Floored at one: a nonpositive count would skip the request and report success, which for
+        # put would publish metadata for data that was never sent.
+        attempts_allowed = max(1, max_attempts)
+
+        for attempt in range(1, attempts_allowed + 1):
+            started = time.perf_counter()
+            try:
+                peer = self._payload_peers[target]
+                reply = await self.payload_transfer.request(peer, header, send=data)
+                break
+            except StorageRejected as exc:
+                error_type = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
+                raise error_type(f"Failed to {op_name} data on storage unit {target} ({endpoint}): {exc}") from exc
+            except TransferError as exc:
+                request_error: RuntimeError
+                if isinstance(exc, TransferTimeout):
+                    size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+                    request_error = StorageUnitTimeout(
+                        f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {op_name} "
+                        f"at storage unit {target} ({endpoint}){size}"
+                    )
+                else:
+                    request_error = RuntimeError(
+                        f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
+                    )
+
+                if exc.transient and attempt < attempts_allowed:
+                    logger.warning(
+                        f"[{self.storage_manager_id}]: {op_name} retry {attempt + 1}/{attempts_allowed} "
+                        f"on a new connection. {request_context} {request_error}"
+                    )
+                    continue
+                if isinstance(exc, TransferTimeout):
+                    logger.error(
+                        f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
+                        f"{request_context} {request_error} {await self._diagnose_storage_unit(target)}"
+                    )
+                elif exc.transient:
+                    logger.error(
+                        f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
+                        f"{request_context} {request_error}"
+                    )
+                raise request_error from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
+                ) from exc
+
+        if data is not None:
+            log_heavy_operation(
+                self.storage_manager_id,
+                op_name,
+                time.perf_counter() - started,
+                reply.wire_bytes,
+                f"to {target} at {endpoint} {request_context}",
+            )
+        return reply
+
     async def _put_to_single_storage_unit(
         self,
         global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
         data_parser: Callable[[Any], Any] | None = None,
-        socket: zmq.Socket = None,
     ):
-        """
-        Send data to a specific storage unit.
-        """
-
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "data": storage_data, "data_parser": data_parser},
+        # Parser-backed puts are not replayed: the public API does not constrain parser side effects.
+        await self._request_payload(
+            target_storage_unit,
+            Operation.PUT,
+            {"global_indexes": global_indexes, "data_parser": data_parser},
+            data=storage_data,
+            max_attempts=1 if data_parser is not None else TQ_SIMPLE_STORAGE_MAX_ATTEMPTS,
         )
 
-        serialized_bytes = 0
-        started = time.perf_counter()
-        try:
-            frames = request_msg.serialize()
-            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-            await socket.send_multipart(frames, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.PUT_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to put data to storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-            # This end serializes the put payload and waits out the round trip, so it holds both
-            # the true wire size and the end-to-end latency.
-            log_heavy_operation(
-                self.storage_manager_id,
-                "put",
-                time.perf_counter() - started,
-                serialized_bytes,
-                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
-                f"samples={len(global_indexes)} fields={list(storage_data.keys())}",
-            )
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during put to storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"serialized_mb={serialized_bytes / 2**20:.1f}"
-            ) from e
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error during put to storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
-
-    @with_storage_unit_socket
     async def _update_to_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -710,58 +702,15 @@ class AsyncSimpleStorageManager(StorageManager):
         merge_fn: Callable[[Any, Any], Any],
         merge_plan: dict[str, dict[str, Any]],
         target_storage_unit: str,
-        socket: zmq.Socket = None,
     ) -> dict[str, dict[str, Any]]:
-        """Send an update to one storage unit and return what it stored, per field."""
-        body: dict[str, Any] = {
-            "global_indexes": global_indexes,
-            "data": storage_data,
-            "merge_fn": merge_fn,
-            "merge_plan": merge_plan,
-        }
-
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.UPDATE_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body=body,
+        # A merge reads stored state, so _request_payload's default max_attempts=1 prevents double folding.
+        reply = await self._request_payload(
+            target_storage_unit,
+            Operation.UPDATE,
+            {"global_indexes": global_indexes, "merge_fn": merge_fn, "merge_plan": merge_plan},
+            data=storage_data,
         )
-
-        serialized_bytes = 0
-        started = time.perf_counter()
-        try:
-            frames = request_msg.serialize()
-            serialized_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
-            await socket.send_multipart(frames, copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type != ZMQRequestType.UPDATE_DATA_RESPONSE:
-                raise RuntimeError(
-                    f"Failed to update data on storage unit {target_storage_unit}: "
-                    f"{response_msg.body.get('message', 'Unknown error')}"
-                )
-            log_heavy_operation(
-                self.storage_manager_id,
-                "update",
-                time.perf_counter() - started,
-                serialized_bytes,
-                f"to {target_storage_unit} at {self._describe_storage_unit(target_storage_unit)} "
-                f"samples={len(global_indexes)} fields={list(storage_data)}",
-            )
-            return response_msg.body.get("stored_shapes", {})
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during update to storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}; "
-                f"serialized_mb={serialized_bytes / 2**20:.1f}"
-            ) from e
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error during update to storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(f"Error in update to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
+        return reply.meta.get("stored_shapes", {})
 
     @staticmethod
     def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
@@ -842,9 +791,6 @@ class AsyncSimpleStorageManager(StorageManager):
         if metadata.size == 0:
             return TensorDict({}, batch_size=0)
 
-        # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
-        max_attempts = 1 if data_parser is not None else None
-
         # A unit request reads the same fields for every row in it, so rows are grouped by the
         # fields read from them: a sample's own fields once per occurrence, so repeated keys
         # keep their parser_args, and the fields it links to one source row together, once per
@@ -880,21 +826,12 @@ class AsyncSimpleStorageManager(StorageManager):
         ]
 
         tasks = [
-            self._request_with_retry(
-                "get",
-                su_id,
-                f"samples={len(group.global_indexes)} fields={list(fields)}",
-                partial(
-                    self._get_from_single_storage_unit,
-                    group.global_indexes,
-                    list(fields),
-                    target_storage_unit=su_id,
-                    data_parser=data_parser,
-                    parser_args=None
-                    if parser_args is None
-                    else [args_by_fields[fields][p] for p in group.batch_positions],
-                ),
-                max_attempts=max_attempts,
+            self._get_from_single_storage_unit(
+                group.global_indexes,
+                list(fields),
+                target_storage_unit=su_id,
+                data_parser=data_parser,
+                parser_args=None if parser_args is None else [args_by_fields[fields][p] for p in group.batch_positions],
             )
             for su_id, fields, group in requests
         ]
@@ -926,7 +863,6 @@ class AsyncSimpleStorageManager(StorageManager):
 
         return TensorDict(tensor_data, batch_size=len(metadata))
 
-    @with_storage_unit_socket
     async def _get_from_single_storage_unit(
         self,
         global_indexes: list[int],
@@ -934,48 +870,21 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         data_parser: Callable[[Any, Any], Any] | None = None,
         parser_args: list | None = None,
-        socket: zmq.Socket = None,
     ):
         """Get data from a single SU by global index keys."""
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_DATA,  # type: ignore[arg-type]
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={
+        # Parser-backed gets are not replayed, matching put: the public API does not constrain parser side effects.
+        reply = await self._request_payload(
+            target_storage_unit,
+            Operation.GET,
+            {
                 "global_indexes": global_indexes,
                 "fields": fields,
                 "data_parser": data_parser,
                 "parser_args": parser_args,
             },
+            max_attempts=1 if data_parser is not None else TQ_SIMPLE_STORAGE_MAX_ATTEMPTS,
         )
-        try:
-            await socket.send_multipart(request_msg.serialize())
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-
-            if response_msg.request_type == ZMQRequestType.GET_DATA_RESPONSE:
-                storage_unit_data = response_msg.body["data"]
-                return fields, storage_unit_data
-            else:
-                message = response_msg.body.get("message", "Unknown error")
-                error_type = StorageKeyNotFoundError if KEY_NOT_FOUND_MARKER in message else RuntimeError
-                raise error_type(f"Failed to get data from storage unit {target_storage_unit}: {message}")
-        except zmq.error.Again as e:
-            raise StorageUnitTimeout(
-                f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during get from storage unit "
-                f"{target_storage_unit} at {self._describe_storage_unit(target_storage_unit)}"
-            ) from e
-        except StorageKeyNotFoundError:
-            # Already logged at debug by the storage unit; propagate for the caller to classify.
-            raise
-        except Exception as e:
-            logger.error(
-                f"[{self.storage_manager_id}]: Unexpected error from storage unit "
-                f"{target_storage_unit}: {type(e).__name__}: {e}"
-            )
-            raise RuntimeError(
-                f"Error getting data from storage unit {target_storage_unit}: {type(e).__name__}: {e}"
-            ) from e
+        return fields, reply.payload
 
     async def clear_data(self, metadata: BatchMeta, fields: list[str] | None = None) -> None:
         """Clear data in remote StorageUnit.
@@ -1324,16 +1233,14 @@ class AsyncSimpleStorageManager(StorageManager):
         logger.info(f"[{self.storage_manager_id}]: restored {len(su_ids)} storage units from {su_dir}")
 
     def close(self) -> None:
-        """Close all ZMQ sockets and context to prevent resource leaks."""
-        # Before super(), which may destroy the context these sockets live on. Absent when
-        # the base constructor raised (a failed handshake does), and __del__ still calls this.
-        pool = getattr(self, "storage_rpc_pool", None)
-        if pool is not None:
-            pool.close()
-        probe_pool = getattr(self, "storage_probe_pool", None)
-        if probe_pool is not None:
-            probe_pool.close()
-        dump_pool = getattr(self, "storage_dump_pool", None)
-        if dump_pool is not None:
-            dump_pool.close()
-        super().close()
+        """Shut down the payload adapter and release socket pools before their shared context."""
+        try:
+            transfer = getattr(self, "payload_transfer", None)
+            if transfer is not None:
+                transfer.shutdown()
+        finally:
+            for name in ("storage_rpc_pool", "storage_probe_pool", "storage_dump_pool"):
+                pool = getattr(self, name, None)
+                if pool is not None:
+                    pool.close()
+            super().close()

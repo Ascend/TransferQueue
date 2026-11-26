@@ -37,6 +37,7 @@ def _unit():
     unit = _StorageUnitClass.__new__(_StorageUnitClass)
     unit.storage_unit_id = "TQ_STORAGE_UNIT_test0001"
     unit._shutdown_event = threading.Event()
+    unit._storage_lock = threading.Lock()
     return unit
 
 
@@ -76,6 +77,7 @@ def test_unhandled_worker_exception_triggers_the_exit():
     """The whole point: a dead worker must take the process down, not linger unreachable."""
     unit = _unit()
     unit._metrics = None
+    unit._perf_monitor = MagicMock()
     unit._node_ip = "127.0.0.1"
     unit._inproc_addr = "inproc://worker_death_test"
     unit.zmq_context = MagicMock()

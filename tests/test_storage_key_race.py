@@ -16,16 +16,20 @@
 """A key removed by a concurrent ``clear`` must stay distinguishable from a real storage fault."""
 
 import logging
+import pickle
+from threading import Lock
 
 import pytest
 import torch
 
+from transfer_queue.storage.payload_transfer import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
     SimpleStorageUnit,
     StorageKeyNotFoundError,
     StorageUnitData,
 )
+from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
@@ -51,6 +55,19 @@ def test_key_not_found_is_a_key_error(storage_data):
         storage_data.get_data(["log_probs"], [0])
 
 
+def test_key_not_found_preserves_legacy_pickle_module_path():
+    # Rolling-upgrade Ray peers unpickle by (module, qualname); keep the pre-refactor module path.
+    err = StorageKeyNotFoundError("key 1 not found")
+    encoded = pickle.dumps(err)
+
+    assert StorageKeyNotFoundError.__module__ == "transfer_queue.storage.simple_storage"
+    assert b"transfer_queue.storage.simple_storage" in encoded
+    assert b"transfer_queue.storage.exceptions" not in encoded
+    restored = pickle.loads(encoded)
+    assert isinstance(restored, StorageKeyNotFoundError)
+    assert isinstance(restored, KeyError)
+
+
 def test_unknown_field_still_raises_value_error(storage_data):
     # A field absent from the schema is a caller bug, not the clear race.
     with pytest.raises(ValueError, match="field 'missing' not found"):
@@ -66,18 +83,26 @@ def test_surviving_key_is_unaffected(storage_data):
 def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
     # The reply crosses ZMQ as text, so the marker is what lets the caller rebuild the type.
     storage_data.clear([1])
-    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
-    unit = unit_class.__new__(unit_class)
-    unit.storage_unit_id = "storage_unit_0"
-    unit.storage_data = storage_data
     request = ZMQMessage.create(
         request_type=ZMQRequestType.GET_DATA,
         sender_id="client_0",
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
+    unit_cls = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = unit_cls.__new__(unit_cls)
+    unit.storage_unit_id = "storage_unit_0"
+    unit.storage_data = storage_data
+    unit._storage_lock = Lock()
+    unit._requests_arrived = 0
+    unit._arrivals_by_op = {}
+    unit._metrics = None
+    unit._perf_monitor = IntervalPerfMonitor("storage_unit_0")
+
+    transport = ZmqPayloadTransfer(owner_id="storage_unit_0")
+    transport.listen(handle=unit._handle_payload)
     with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
-        reply = unit_class._handle_get(unit, request)
+        reply = transport.handle_request(request)
 
     assert reply.request_type == ZMQRequestType.GET_ERROR
     assert KEY_NOT_FOUND_MARKER in reply.body["message"]

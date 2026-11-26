@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Storage-unit retry and timeout-diagnosis tests."""
+"""Storage-unit fault classification, retry, and timeout-diagnosis tests."""
 
 import asyncio
 import logging
@@ -26,24 +26,39 @@ import zmq
 from tensordict import TensorDict
 
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.exceptions import StorageKeyNotFoundError
 from transfer_queue.storage.managers import simple_storage_manager as ssm
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager, StorageUnitTimeout
+from transfer_queue.storage.payload_transfer import (
+    Operation,
+    PayloadPeerInfo,
+    PayloadReply,
+    StorageRejected,
+    TransferError,
+    TransferTimeout,
+)
 from transfer_queue.utils import common
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
-def _manager(with_unit: bool = True) -> AsyncSimpleStorageManager:
+def _manager(with_unit: bool = True, transfer: MagicMock | None = None) -> AsyncSimpleStorageManager:
     manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
     manager.storage_manager_id = "TQ_STORAGE_test"
     manager.storage_unit_infos = {}
+    manager._payload_peers = {}
+    manager.config = {}
     if with_unit:
-        manager.storage_unit_infos["unit_a"] = ZMQServerInfo(
+        info = ZMQServerInfo(
             role=Role.STORAGE,
             id="unit_a",
             ip="10.0.0.7",
             ports={"put_get_socket": 5555},
         )
+        manager.storage_unit_infos["unit_a"] = info
+        manager._payload_peers["unit_a"] = PayloadPeerInfo("test", "endpoint")
+    if transfer is not None:
+        manager.payload_transfer = transfer
     manager.close = lambda: None
     return manager
 
@@ -67,6 +82,37 @@ class _SocketLease:
 
     async def __aexit__(self, *_args):
         return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation, error, expected",
+    [
+        (Operation.GET, TransferTimeout("timed out", wire_bytes=1024), StorageUnitTimeout),
+        (Operation.PUT, TransferError("backend failed", transient=False), RuntimeError),
+        (Operation.GET, StorageRejected("key missing", missing_key=True), StorageKeyNotFoundError),
+        (Operation.PUT, StorageRejected("write rejected"), RuntimeError),
+        (Operation.GET, asyncio.CancelledError(), asyncio.CancelledError),
+    ],
+)
+async def test_payload_failure_maps_to_public_exception_types(operation, error, expected):
+    transfer = MagicMock(request=AsyncMock(side_effect=error))
+    manager = _manager(transfer=transfer)
+    with (
+        patch.object(manager, "_diagnose_storage_unit", AsyncMock(return_value="diagnosis")),
+        pytest.raises(expected) as caught,
+    ):
+        await manager._request_payload(
+            "unit_a",
+            operation,
+            {"global_indexes": [0]},
+            data=None if operation == Operation.GET else {"value": [1]},
+            max_attempts=1,
+        )
+    assert type(caught.value) is expected
+    if expected is not asyncio.CancelledError:
+        assert "unit_a" in str(caught.value)
+        assert caught.value.__cause__ is error
 
 
 @pytest.mark.asyncio
@@ -132,21 +178,37 @@ async def test_notify_raises_on_request_error_without_waiting_for_timeout():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data: data, 1)])
-async def test_put_retries_only_without_a_parser(data_parser, expected_attempts):
-    manager = _manager()
+@pytest.mark.parametrize(
+    "error, data_parser, expected_attempts, expect_diagnose",
+    [
+        (TransferTimeout("no answer"), None, 3, True),
+        (TransferTimeout("no answer"), lambda data: data, 1, True),
+        (TransferError("socket open failed", transient=True), None, 3, False),
+        (TransferError("socket open failed", transient=True), lambda data: data, 1, False),
+        (TransferError("corrupt ack", transient=False), None, 1, False),
+        (TransferError("undecodable request", transient=False), None, 1, False),
+        (StorageRejected("capacity exceeded"), None, 1, False),
+    ],
+)
+async def test_put_retries_transient_failures_without_a_parser_and_diagnoses_only_timeouts(
+    error, data_parser, expected_attempts, expect_diagnose
+):
+    transfer = MagicMock(request=AsyncMock(side_effect=error))
+    manager = _manager(transfer=transfer)
     manager.notify_data_update = AsyncMock()
-    manager._put_to_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("no answer"))
+    diagnose = AsyncMock(return_value="diagnosis")
     data, metadata = _single_sample_batch()
+    expected_exc = StorageUnitTimeout if isinstance(error, TransferTimeout) else RuntimeError
 
     with (
         patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
-        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
-        pytest.raises(StorageUnitTimeout),
+        patch.object(manager, "_diagnose_storage_unit", diagnose),
+        pytest.raises(expected_exc),
     ):
         await manager.put_data(data, metadata, data_parser=data_parser)
 
-    assert manager._put_to_single_storage_unit.await_count == expected_attempts
+    assert transfer.request.await_count == expected_attempts
+    assert diagnose.await_count == (1 if expect_diagnose else 0)
     manager.notify_data_update.assert_not_awaited()
 
 
@@ -154,20 +216,61 @@ _HELD_INPUT_IDS = {"input_ids": {"dtype": torch.int64, "is_non_tensor": False, "
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("data_parser, expected_attempts", [(None, 3), (lambda data, args: data, 1)])
-async def test_get_retries_only_without_a_parser(data_parser, expected_attempts):
-    manager = _manager()
-    manager._get_from_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("no answer"))
+@pytest.mark.parametrize(
+    "error, data_parser, expected_attempts, expect_diagnose",
+    [
+        (TransferTimeout("no answer"), None, 3, True),
+        (TransferTimeout("no answer"), lambda data, args: data, 1, True),
+        (TransferError("ZMQMessageDecodeError: corrupt payload", transient=False), None, 1, False),
+    ],
+)
+async def test_get_retries_only_transient_failures_without_a_parser(
+    error, data_parser, expected_attempts, expect_diagnose
+):
+    transfer = MagicMock(request=AsyncMock(side_effect=error))
+    manager = _manager(transfer=transfer)
+    diagnose = AsyncMock(return_value="diagnosis")
     _, metadata = _single_sample_batch()
+    expected_exc = StorageUnitTimeout if isinstance(error, TransferTimeout) else RuntimeError
 
     with (
         patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
-        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
-        pytest.raises(StorageUnitTimeout),
+        patch.object(manager, "_diagnose_storage_unit", diagnose),
+        pytest.raises(expected_exc),
     ):
         await manager.get_data(metadata, data_parser=data_parser)
 
-    assert manager._get_from_single_storage_unit.await_count == expected_attempts
+    assert transfer.request.await_count == expected_attempts
+    assert diagnose.await_count == (1 if expect_diagnose else 0)
+
+
+@pytest.mark.asyncio
+async def test_transient_put_and_get_failures_recover_without_diagnosis():
+    transfer = MagicMock(
+        request=AsyncMock(
+            side_effect=[
+                TransferTimeout("dropped SYN during put"),
+                PayloadReply(),
+                TransferError("socket open failed", transient=True),
+                PayloadReply(payload={"input_ids": [torch.tensor([7, 8])]}),
+            ]
+        )
+    )
+    manager = _manager(transfer=transfer)
+    manager.notify_data_update = AsyncMock(return_value=True)
+    diagnose = AsyncMock(return_value="diagnosis")
+    data, metadata = _single_sample_batch()
+
+    with (
+        patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
+        patch.object(manager, "_diagnose_storage_unit", diagnose),
+    ):
+        await manager.put_data(data, metadata)
+        result = await manager.get_data(metadata)
+
+    assert transfer.request.await_count == 4
+    diagnose.assert_not_awaited()
+    torch.testing.assert_close(result["input_ids"].unbind()[0], torch.tensor([7, 8]))
 
 
 @pytest.mark.asyncio
@@ -191,68 +294,43 @@ async def test_update_reports_controller_rejection_after_storage_commit():
 
 
 @pytest.mark.asyncio
-async def test_update_timeout_is_not_retried_or_published():
-    manager = _manager()
-    manager._update_to_single_storage_unit = AsyncMock(side_effect=StorageUnitTimeout("outcome unknown"))
+async def test_update_timeout_is_not_retried_or_published_but_is_diagnosed():
+    transfer = MagicMock(request=AsyncMock(side_effect=TransferTimeout("outcome unknown")))
+    manager = _manager(transfer=transfer)
     manager.notify_data_update = AsyncMock()
+    diagnose = AsyncMock(return_value="diagnosis")
     values, metadata = _single_sample_batch()
 
-    with patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"), pytest.raises(StorageUnitTimeout):
+    with (
+        patch.object(ssm, "TQ_SIMPLE_STORAGE_MAX_ATTEMPTS", 3),
+        patch.object(manager, "_diagnose_storage_unit", diagnose),
+        pytest.raises(StorageUnitTimeout),
+    ):
         await manager.update_data(metadata, values, lambda old, new: torch.cat([old, new]), _HELD_INPUT_IDS)
 
-    manager._update_to_single_storage_unit.assert_awaited_once()
+    transfer.request.assert_awaited_once()
+    diagnose.assert_awaited_once()
     manager.notify_data_update.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_lost_request_recovers_without_diagnosis():
-    manager = _manager()
-    request = AsyncMock(side_effect=[StorageUnitTimeout("no answer"), "payload"])
-
-    with patch.object(manager, "_diagnose_storage_unit") as diagnose:
-        result = await manager._request_with_retry("get", "unit_a", "samples=4", request)
-
-    assert result == "payload"
-    assert request.await_count == 2
-    diagnose.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "error, max_attempts, expected_attempts",
-    [
-        (StorageUnitTimeout("no answer"), 3, 3),
-        (RuntimeError("unit rejected request"), 3, 1),
-        (StorageUnitTimeout("no answer"), 0, 1),
-    ],
-)
-async def test_retry_attempts_are_bounded_and_only_cover_timeouts(error, max_attempts, expected_attempts):
-    manager = _manager()
-    request = AsyncMock(side_effect=error)
+async def test_nonpositive_max_attempts_still_executes_once_and_logs_context_once(caplog):
+    transfer = MagicMock(request=AsyncMock(side_effect=TransferTimeout("timed out")))
+    manager = _manager(transfer=transfer)
 
     with (
-        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
-        pytest.raises(type(error)),
-    ):
-        await manager._request_with_retry("get", "unit_a", "samples=4", request, max_attempts=max_attempts)
-
-    assert request.await_count == expected_attempts
-
-
-@pytest.mark.asyncio
-async def test_failure_log_has_context_without_repeating_the_unit(caplog):
-    manager = _manager()
-    error = StorageUnitTimeout("no answer in 200s during get from storage unit unit_a at 10.0.0.7:5555")
-
-    with (
-        patch.object(manager, "_diagnose_storage_unit", return_value="diagnosis"),
+        patch.object(manager, "_diagnose_storage_unit", AsyncMock(return_value="diagnosis")),
         caplog.at_level(logging.ERROR),
         pytest.raises(StorageUnitTimeout),
     ):
-        await manager._request_with_retry(
-            "get", "unit_a", "samples=4 fields=['input_ids']", AsyncMock(side_effect=error)
+        await manager._request_payload(
+            "unit_a",
+            Operation.GET,
+            {"global_indexes": [0, 1, 2, 3], "fields": ["input_ids"]},
+            max_attempts=0,
         )
 
+    transfer.request.assert_awaited_once()
     message = next(record.message for record in caplog.records if "failed after" in record.message)
     assert "samples=4 fields=['input_ids']" in message
     assert message.count("unit_a") == message.count("10.0.0.7:5555") == 1
@@ -275,8 +353,6 @@ def test_log_heavy_operation_thresholds(caplog, elapsed, payload_bytes, should_l
 @pytest.mark.parametrize(
     "tcp_result, probe_result, expected",
     [
-        # A probe that answers proves only that the unit is serving again, whatever the
-        # cumulative counters happen to say.
         ((None, None), {"active_keys": 4, "arrivals_by_op": {"GET_DATA": 0}}, "unit_serving_again"),
         ((None, None), {"active_keys": 4, "arrivals_by_op": {"GET_DATA": 9}}, "unit_serving_again"),
         ((None, None), {"active_keys": 4}, "unit_serving_again"),
@@ -313,27 +389,17 @@ def test_diagnosis_does_not_report_empty_op_stats_as_zero_traffic():
 @pytest.mark.parametrize(
     "arrivals",
     [
-        # Nine historical GETs, all already completed: they say nothing about this request.
         {"GET_DATA": 9},
-        # The unit restarted during the timeout window, so its counters began again at zero.
         {"GET_DATA": 0},
-        # The request arrived and finished after the caller gave up waiting.
         {"GET_DATA": 10},
     ],
 )
 def test_cumulative_counters_never_become_a_claim_about_this_request(arrivals):
-    """Counters are per-op and cumulative, so no value of them locates one request.
-
-    They carry no request id, never decrease, and reset when the unit restarts, so both
-    directions of inference are unsound: a nonzero count may be entirely historical, and a
-    zero one may mean the request reached a previous process.
-    """
     described = ssm._describe_unit_state({"requests_arrived": sum(arrivals.values()), "arrivals_by_op": arrivals})
 
     assert "verdict=unit_serving_again" in described
     assert "arrived_but_unfinished" not in described
     assert "request_lost_in_flight" not in described
-    # The raw counters stay in the line as triage input, just not as a verdict.
     assert "arrivals_by_op=" in described
 
 

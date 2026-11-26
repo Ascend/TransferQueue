@@ -186,7 +186,7 @@ def test_sampling_an_unused_port_returns_none():
 
 
 def test_unit_shutdown_stops_the_probe():
-    """Nothing else calls stop(), so the sampling thread would outlive the unit."""
+    """The sampling thread should stop with its storage unit."""
     from unittest.mock import MagicMock
 
     from transfer_queue.storage.simple_storage import SimpleStorageUnit
@@ -203,7 +203,7 @@ def test_unit_shutdown_stops_the_probe():
         accept_probe=probe,
     )
 
-    probe.stop.assert_called_once()
+    probe.stop.assert_called_once_with()
 
 
 def test_shutdown_without_a_probe_is_a_no_op():
