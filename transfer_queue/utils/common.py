@@ -26,6 +26,7 @@ from transfer_queue.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_TORCH_NUM_THREADS = torch.get_num_threads()
+CPU_COUNT = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or os.cpu_count() or 1
 
 
 def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
@@ -89,7 +90,7 @@ def get_node_round_robin_scheduling_strategies(
 def set_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = "") -> int:
     """Configure PyTorch intra-op CPU parallelism once for the calling thread/process."""
     pytorch_current_num_threads = torch.get_num_threads()
-    available_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or os.cpu_count() or 1
+    available_cores = CPU_COUNT
     pid = os.getpid()
     if target_num_threads is None:
         target_num_threads = 16 if available_cores >= 16 else available_cores

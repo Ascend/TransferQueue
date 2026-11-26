@@ -22,6 +22,7 @@ visible actor failure.
 """
 
 import errno
+import runpy
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -181,9 +182,12 @@ def test_set_pytorch_threads_falls_back_to_logical_cores_when_physical_is_none(m
         "cpu_count",
         lambda logical=True: None if not logical else 64,
     )
+    module_globals = runpy.run_path(common.__file__)
+    assert module_globals["CPU_COUNT"] == 64
     previous = torch.get_num_threads()
     try:
-        chosen = common.set_pytorch_auto_parallel_threads(target_num_threads=8, info="arm64-test")
+        with patch.object(common.psutil, "cpu_count", side_effect=AssertionError("CPU count must be cached")):
+            chosen = module_globals["set_pytorch_auto_parallel_threads"](target_num_threads=8, info="arm64-test")
         assert chosen == 8
         assert torch.get_num_threads() == 8
         assert "should not exceed" not in caplog.text
