@@ -890,6 +890,45 @@ class TestTransferQueueController:
 
         print("✓ Clear meta idempotent correct")
 
+    def test_controller_empty_field_fetch_after_insert(self, ray_setup):
+        """Empty-field fetch sees all inserted rows consistently before and after read-only queries."""
+        tq_controller = TransferQueueController.remote()
+        partition_id = "insert_growth_consistency"
+        schema = {"x": {"dtype": "torch.int64", "shape": (1,)}}
+
+        for _ in range(3):
+            meta = ray.get(tq_controller.get_metadata.remote(["x"], partition_id, mode="insert", batch_size=1))
+            assert ray.get(tq_controller.update_production_status.remote(partition_id, meta.global_indexes, schema))
+
+        consumed = ray.get(
+            tq_controller.get_metadata.remote(["x"], partition_id, mode="fetch", task_name="reader", batch_size=3)
+        )
+        assert consumed.global_indexes == [0, 1, 2]
+
+        inserted = ray.get(tq_controller.get_metadata.remote(["x"], partition_id, mode="insert", batch_size=2))
+        assert inserted.global_indexes == [3, 4]
+
+        visible_before = ray.get(tq_controller.scan_data_status.remote(partition_id, [], "reader"))
+        assert visible_before == [3, 4]
+
+        # Read-only status queries from another task must not change visibility or hit capacity bounds.
+        _, observer_consumption = ray.get(tq_controller.get_consumption_status.remote(partition_id, "observer"))
+        assert observer_consumption.tolist() == [0, 0, 0, 0, 0]
+        _, prod_status = ray.get(tq_controller.get_production_status.remote(partition_id, ["x"]))
+        assert prod_status.flatten().tolist() == [1, 1, 1, 0, 0]
+
+        visible_after = ray.get(tq_controller.scan_data_status.remote(partition_id, [], "reader"))
+        assert visible_after == visible_before
+
+        fetched = ray.get(
+            tq_controller.get_metadata.remote([], partition_id, mode="fetch", task_name="reader", batch_size=2)
+        )
+        assert fetched.global_indexes == [3, 4]
+        empty = ray.get(
+            tq_controller.get_metadata.remote([], partition_id, mode="fetch", task_name="reader", batch_size=1)
+        )
+        assert empty.global_indexes == []
+
 
 class TestTransferQueueControllerCustomMeta:
     """Integration tests for TransferQueueController custom_meta and custom_backend_meta methods.

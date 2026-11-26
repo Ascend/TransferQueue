@@ -816,35 +816,24 @@ class DataPartitionStatus:
             if field_name not in self.field_name_mapping:
                 return []
 
-        row_mask = torch.ones(self.allocated_samples_num, dtype=torch.bool)
+        consumption_status = self.consumption_status.get(task_name)
+        if consumption_status is None:
+            consumption_status = torch.zeros(self.allocated_samples_num, dtype=torch.int8)
+            self.consumption_status[task_name] = consumption_status
 
-        # Apply consumption filter (exclude already consumed samples)
-        _, consumption_status = self.get_consumption_status(task_name, mask=False)
-        if consumption_status is not None:
-            unconsumed_mask = consumption_status == 0
-            row_mask &= unconsumed_mask
+        if not self.global_indexes:
+            return []
 
-        if not field_names:
-            # With no required fields, production bits cannot distinguish active rows from spare capacity.
-            return [idx for idx in torch.where(row_mask)[0].tolist() if idx in self.global_indexes]
+        # Scan active rows in index order so spare capacity never enters filtering or empty-field fetches.
+        active = torch.tensor(sorted(self.global_indexes), dtype=torch.long)
+        unconsumed = active[consumption_status[active] == 0]
+        if not field_names or unconsumed.numel() == 0:
+            return unconsumed.tolist()
 
-        # Create column mask for requested fields
-        col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
         field_indices = [self.field_name_mapping[field] for field in field_names]
-        col_mask[field_indices] = True
-
-        # Filter production status by masks
-        relevant_status = self.production_status[row_mask][:, col_mask]
-
-        # Check if all required fields are ready for each sample
+        relevant_status = self.production_status[unconsumed[:, None], field_indices]
         all_fields_ready = torch.all(relevant_status, dim=1)
-        ready_indices_in_filtered = torch.nonzero(all_fields_ready, as_tuple=False).flatten()
-
-        # Map back to original sample indices
-        all_indices = torch.where(row_mask)[0]
-        ready_sample_indices = all_indices[ready_indices_in_filtered].tolist()
-
-        return ready_sample_indices
+        return unconsumed[all_fields_ready].tolist()
 
     # ==================== Metadata Methods ====================
     def get_field_schema(
@@ -1474,6 +1463,9 @@ class TransferQueueController:
 
             # register global_indexes in partition
             partition.global_indexes.update(batch_global_indexes)
+            if batch_global_indexes:
+                # Keep status tensors sized to all active rows before production is committed.
+                partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
 
             return self.generate_batch_meta(partition_id, batch_global_indexes, data_fields, mode)
 
