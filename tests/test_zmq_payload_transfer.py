@@ -21,7 +21,7 @@ import gc
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from threading import Event
+from threading import Event, Lock
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -49,9 +49,9 @@ from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER
 from transfer_queue.storage.simple_storage import (
     SimpleStorageUnit,
     StorageUnitData,
-    handle_storage_request,
 )
 from transfer_queue.utils.enum_utils import Role
+from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -317,6 +317,20 @@ async def test_queued_puts_do_not_serialize_before_socket_lease(monkeypatch):
         pool.close()
 
 
+def _in_memory_unit() -> SimpleStorageUnit:
+    """Construct a socket-free SimpleStorageUnit for direct _handle_payload testing."""
+    unit_cls = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = unit_cls.__new__(unit_cls)
+    unit.storage_unit_id = "unit"
+    unit.storage_data = StorageUnitData()
+    unit._storage_lock = Lock()
+    unit._requests_arrived = 0
+    unit._arrivals_by_op = {}
+    unit._metrics = None
+    unit._perf_monitor = IntervalPerfMonitor("unit")
+    return unit
+
+
 @pytest.mark.asyncio
 async def test_missing_key_wire_compatibility_both_directions(monkeypatch):
     """Preserve [TQKeyNotFound] wire compatibility between old and new clients/storage units."""
@@ -334,10 +348,10 @@ async def test_missing_key_wire_compatibility_both_directions(monkeypatch):
     assert unregistered_reply.request_type == ZMQRequestType.GET_ERROR
     assert "not registered" in unregistered_reply.body["message"]
 
-    storage = StorageUnitData()
-    storage.put_data({"x": [torch.tensor([1])]}, [99])
+    unit = _in_memory_unit()
+    unit.storage_data.put_data({"x": [torch.tensor([1])]}, [99])
     server_transfer = ZmqPayloadTransfer(owner_id="unit")
-    server_transfer.listen(handle=lambda hdr, data: handle_storage_request("unit", storage, hdr, data))
+    server_transfer.listen(handle=unit._handle_payload)
     raw_reply = server_transfer.handle_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.GET_DATA,
@@ -371,10 +385,11 @@ async def test_missing_key_wire_compatibility_both_directions(monkeypatch):
 
 @pytest.mark.parametrize("error", [AssertionError(), KeyError("k")])
 def test_parser_rejection_preserves_exception_type(error):
+    unit = _in_memory_unit()
     parser = MagicMock(side_effect=error)
     header = RequestHeader(Operation.PUT, {"global_indexes": [0], "data_parser": parser})
     with pytest.raises(StorageRejected, match=type(error).__name__):
-        handle_storage_request("unit", StorageUnitData(), header, {"text": ["value"]})
+        unit._handle_payload(header, {"text": ["value"]})
 
 
 @pytest.mark.parametrize("metrics_enabled", [False, True])
@@ -580,18 +595,18 @@ async def test_zmq_fault_classification_distinguishes_transient_and_deterministi
     info = ZMQServerInfo(role=Role.STORAGE, id="unit", ip="127.0.0.1", ports={"put_get_socket": 5555})
     peer_info = PayloadPeerInfo("zmq", info)
 
-    ingress_rejected = MagicMock(closed=False)
-    ingress_rejected.send_multipart = AsyncMock()
-    ingress_rejected.recv_multipart = AsyncMock(
-        return_value=ZMQMessage.create(
-            request_type=ZMQRequestType.PUT_GET_ERROR,
-            sender_id="unit",
-            body={"message": "undecodable request: AttributeError: custom class"},
-        ).serialize()
+    reusable_then_corrupt = MagicMock(closed=False)
+    reusable_then_corrupt.send_multipart = AsyncMock()
+    reusable_then_corrupt.recv_multipart = AsyncMock(
+        side_effect=[
+            ZMQMessage.create(
+                request_type=ZMQRequestType.PUT_GET_ERROR,
+                sender_id="unit",
+                body={"message": "undecodable request: AttributeError: custom class"},
+            ).serialize(),
+            [b""],
+        ]
     )
-    corrupt_reply = MagicMock(closed=False)
-    corrupt_reply.send_multipart = AsyncMock()
-    corrupt_reply.recv_multipart = AsyncMock(return_value=[b""])
     healthy = MagicMock(closed=False)
     healthy.send_multipart = AsyncMock()
     healthy.recv_multipart = AsyncMock(
@@ -611,8 +626,7 @@ async def test_zmq_fault_classification_distinguishes_transient_and_deterministi
                 zmq.ZMQError(errno.EMFILE),
                 zmq.ZMQError(errno.EINVAL),
                 zmq.ZMQError(zmq.ETERM),
-                ingress_rejected,
-                corrupt_reply,
+                reusable_then_corrupt,
                 healthy,
             ]
         ),
@@ -681,8 +695,8 @@ async def test_update_lost_reply_is_not_replayed_through_payload_adapter(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
-    """A PUT queued on a full socket pool before shutdown() must not send or commit once a socket frees up."""
+async def test_shutdown_aborts_queued_puts_without_churning_healthy_socket(monkeypatch):
+    """Queued PUTs rejected after shutdown() must not send data or destroy/recreate healthy pooled sockets."""
     monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
     peer_info = unit.get_payload_peer_info()
@@ -705,7 +719,8 @@ async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
         ).serialize()
     )
     pool = ZMQSocketPool(MagicMock(), "manager", "put_get_socket", maxsize=1)
-    monkeypatch.setattr(pool, "_connect", MagicMock(return_value=socket))
+    connect_mock = MagicMock(return_value=socket)
+    monkeypatch.setattr(pool, "_connect", connect_mock)
     client = ZmqPayloadTransfer(owner_id="manager", pool=pool)
     try:
         first_put = asyncio.create_task(
@@ -713,9 +728,14 @@ async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
         )
         await asyncio.wait_for(first_sending.wait(), timeout=2)
 
-        queued_put = asyncio.create_task(
-            client.request(peer_info, RequestHeader(Operation.PUT, {"global_indexes": [1]}), send={"text": ["queued"]})
-        )
+        queued_puts = [
+            asyncio.create_task(
+                client.request(
+                    peer_info, RequestHeader(Operation.PUT, {"global_indexes": [idx]}), send={"text": ["queued"]}
+                )
+            )
+            for idx in range(1, 33)
+        ]
         await asyncio.sleep(0.01)
         assert sent_frames == 1
 
@@ -723,10 +743,14 @@ async def test_shutdown_aborts_queued_put_before_sending(monkeypatch):
         release_first.set()
         await asyncio.wait_for(first_put, timeout=2)
 
-        with pytest.raises(TransferError) as caught:
-            await asyncio.wait_for(queued_put, timeout=2)
-        assert caught.value.transient is False
+        for task in queued_puts:
+            with pytest.raises(TransferError) as caught:
+                await asyncio.wait_for(task, timeout=2)
+            assert caught.value.transient is False
+
         assert sent_frames == 1
+        assert connect_mock.call_count == 1
+        socket.close.assert_not_called()
         assert unit.storage_data.get_data(["text"], [0])["text"] == ["first"]
         with pytest.raises(StorageKeyNotFoundError):
             unit.storage_data.get_data(["text"], [1])

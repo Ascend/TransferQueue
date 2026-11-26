@@ -613,9 +613,9 @@ class AsyncSimpleStorageManager(StorageManager):
         params: dict[str, Any],
         *,
         data: dict[str, Any] | None = None,
-        max_attempts: int | None = None,
+        max_attempts: int = 1,
     ) -> PayloadReply:
-        """Send one payload request to ``target``, retrying transient transport failures when allowed."""
+        """Send one payload request to ``target``, retrying transient transport errors up to ``max_attempts``."""
         op_name = operation.value.lower()
         endpoint = self._describe_storage_unit(target)
         fields = list(data) if data is not None else list(params.get("fields", ()))
@@ -623,7 +623,7 @@ class AsyncSimpleStorageManager(StorageManager):
         header = RequestHeader(operation, params)
         # Floored at one: a nonpositive count would skip the request and report success, which for
         # put would publish metadata for data that was never sent.
-        attempts_allowed = max(1, TQ_SIMPLE_STORAGE_MAX_ATTEMPTS if max_attempts is None else max_attempts)
+        attempts_allowed = max(1, max_attempts)
 
         for attempt in range(1, attempts_allowed + 1):
             started = time.perf_counter()
@@ -634,39 +634,36 @@ class AsyncSimpleStorageManager(StorageManager):
             except StorageRejected as exc:
                 error = StorageKeyNotFoundError if operation == Operation.GET and exc.missing_key else RuntimeError
                 raise error(f"Failed to {op_name} data on storage unit {target} ({endpoint}): {exc}") from exc
-            except TransferTimeout as exc:
-                size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
-                timeout_err = StorageUnitTimeout(
-                    f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {op_name} "
-                    f"at storage unit {target} ({endpoint}){size}"
-                )
-                if attempt < attempts_allowed:
-                    logger.warning(
-                        f"[{self.storage_manager_id}]: {op_name} retry {attempt + 1}/{attempts_allowed} "
-                        f"on a new connection. {request_context} {timeout_err}"
-                    )
-                    continue
-                logger.error(
-                    f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
-                    f"{request_context} {timeout_err} {await self._diagnose_storage_unit(target)}"
-                )
-                raise timeout_err from exc
             except TransferError as exc:
-                wrapped = RuntimeError(
-                    f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
-                )
+                is_timeout = isinstance(exc, TransferTimeout)
+                if is_timeout:
+                    size = f"; serialized_mb={exc.wire_bytes / 2**20:.1f}" if operation != Operation.GET else ""
+                    error = StorageUnitTimeout(
+                        f"no answer in {TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT}s during {op_name} "
+                        f"at storage unit {target} ({endpoint}){size}"
+                    )
+                else:
+                    error = RuntimeError(
+                        f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
+                    )
+
                 if exc.transient and attempt < attempts_allowed:
                     logger.warning(
                         f"[{self.storage_manager_id}]: {op_name} retry {attempt + 1}/{attempts_allowed} "
-                        f"on a new connection. {request_context} {wrapped}"
+                        f"on a new connection. {request_context} {error}"
                     )
                     continue
-                if exc.transient:
+                if is_timeout:
                     logger.error(
                         f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
-                        f"{request_context} {wrapped}"
+                        f"{request_context} {error} {await self._diagnose_storage_unit(target)}"
                     )
-                raise wrapped from exc
+                elif exc.transient:
+                    logger.error(
+                        f"[{self.storage_manager_id}]: {op_name} failed after {attempt} attempts. "
+                        f"{request_context} {error}"
+                    )
+                raise error from exc
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
@@ -695,7 +692,7 @@ class AsyncSimpleStorageManager(StorageManager):
             Operation.PUT,
             {"global_indexes": global_indexes, "data_parser": data_parser},
             data=storage_data,
-            max_attempts=1 if data_parser is not None else None,
+            max_attempts=1 if data_parser is not None else TQ_SIMPLE_STORAGE_MAX_ATTEMPTS,
         )
 
     async def _update_to_single_storage_unit(
@@ -706,13 +703,12 @@ class AsyncSimpleStorageManager(StorageManager):
         merge_plan: dict[str, dict[str, Any]],
         target_storage_unit: str,
     ) -> dict[str, dict[str, Any]]:
-        # A merge reads stored state, so a replay after a lost answer could fold the new value in twice.
+        # A merge reads stored state, so _request_payload's default max_attempts=1 prevents double folding.
         reply = await self._request_payload(
             target_storage_unit,
             Operation.UPDATE,
             {"global_indexes": global_indexes, "merge_fn": merge_fn, "merge_plan": merge_plan},
             data=storage_data,
-            max_attempts=1,
         )
         return reply.meta.get("stored_shapes", {})
 
@@ -886,7 +882,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 "data_parser": data_parser,
                 "parser_args": parser_args,
             },
-            max_attempts=1 if data_parser is not None else None,
+            max_attempts=1 if data_parser is not None else TQ_SIMPLE_STORAGE_MAX_ATTEMPTS,
         )
         return fields, reply.payload
 

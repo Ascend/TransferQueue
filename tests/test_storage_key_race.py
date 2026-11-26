@@ -17,7 +17,7 @@
 
 import logging
 import pickle
-from functools import partial
+from threading import Lock
 
 import pytest
 import torch
@@ -25,10 +25,11 @@ import torch
 from transfer_queue.storage.payload_transfer import ZmqPayloadTransfer
 from transfer_queue.storage.simple_storage import (
     KEY_NOT_FOUND_MARKER,
+    SimpleStorageUnit,
     StorageKeyNotFoundError,
     StorageUnitData,
-    handle_storage_request,
 )
+from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType
 
 
@@ -88,8 +89,18 @@ def test_get_error_reply_is_marked_and_logged_at_debug(storage_data, caplog):
         body={"fields": ["log_probs"], "global_indexes": [1]},
     )
 
+    unit_cls = SimpleStorageUnit.__ray_metadata__.modified_class
+    unit = unit_cls.__new__(unit_cls)
+    unit.storage_unit_id = "storage_unit_0"
+    unit.storage_data = storage_data
+    unit._storage_lock = Lock()
+    unit._requests_arrived = 0
+    unit._arrivals_by_op = {}
+    unit._metrics = None
+    unit._perf_monitor = IntervalPerfMonitor("storage_unit_0")
+
     transport = ZmqPayloadTransfer(owner_id="storage_unit_0")
-    transport.listen(handle=partial(handle_storage_request, "storage_unit_0", storage_data))
+    transport.listen(handle=unit._handle_payload)
     with caplog.at_level(logging.DEBUG, logger="transfer_queue.storage.simple_storage"):
         reply = transport.handle_request(request)
 

@@ -38,7 +38,7 @@ import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import AbstractContextManager, nullcontext, suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -897,62 +897,6 @@ def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., An
     return parsed
 
 
-def handle_storage_request(
-    storage_unit_id: str,
-    storage_data: StorageUnitData,
-    header: RequestHeader,
-    data: dict[str, Any] | None,
-    *,
-    storage_lock: AbstractContextManager[Any] | None = None,
-) -> PayloadReply:
-    """Apply storage semantics for every payload backend, holding ``storage_lock`` only on state access."""
-    params = header.params
-    operation = header.operation
-    guard = storage_lock if storage_lock is not None else nullcontext()
-    try:
-        indexes = params["global_indexes"]
-        with limit_pytorch_auto_parallel_threads(
-            target_num_threads=TQ_NUM_THREADS, info=f"[{storage_unit_id}] {operation.value}"
-        ):
-            if operation == Operation.GET:
-                fields = params["fields"]
-                with guard:
-                    result = storage_data.get_data(fields, indexes)
-                if (parser := params.get("data_parser")) is not None:
-                    result = _apply_data_parser(result, parser, params.get("parser_args"))
-                return PayloadReply(payload=result)
-            if operation == Operation.PUT:
-                if data is None:
-                    raise TypeError("PUT requires field data")
-                if (parser := params.get("data_parser")) is not None:
-                    data = _apply_data_parser(data, parser)
-                with guard:
-                    storage_data.put_data(data, indexes)
-                return PayloadReply()
-
-            merge_fn = params.get("merge_fn")
-            merge_plan = params.get("merge_plan")
-            if not callable(merge_fn):
-                raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
-            if not isinstance(data, dict) or not data:
-                raise TypeError("update data must be a non-empty dict")
-            if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
-                raise ValueError("merge_plan must describe every update field")
-            with guard:
-                stored_shapes = storage_data.apply_update(indexes, data, merge_fn, merge_plan)
-            return PayloadReply(meta={"stored_shapes": stored_shapes})
-    except Exception as exc:
-        missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
-        if operation == Operation.GET:
-            log = logger.debug if missing_key else logger.error
-            log(
-                f"[{storage_unit_id}]: GET error, fields={params.get('fields')}, "
-                f"global_indexes={params.get('global_indexes')}: {type(exc).__name__}: {exc}"
-            )
-        detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
-        raise StorageRejected(detail, missing_key=missing_key) from exc
-
-
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -1251,27 +1195,78 @@ class SimpleStorageUnit:
             self._requests_arrived += 1
             self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
+    @contextmanager
+    def _measure_payload_op(self, op_type: str):
+        """Record payload request count and latency, exempting missing-key races from error counts."""
+        if self._metrics is None:
+            with self._perf_monitor.measure(op_type=op_type):
+                yield
+            return
+        with suppress(Exception):
+            self._metrics.request_total.labels(op_type=op_type).inc()
+        started = time.perf_counter()
+        try:
+            yield
+        except Exception as exc:
+            if not (isinstance(exc, StorageRejected) and exc.missing_key):
+                with suppress(Exception):
+                    self._metrics.request_errors_total.labels(op_type=op_type).inc()
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            with suppress(Exception):
+                self._metrics.request_duration.labels(op_type=op_type).observe(elapsed)
+
     def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None) -> PayloadReply:
-        """Run storage operations and observability with synchronized state access."""
-        op_type = f"{header.operation.value}_DATA"
+        """Apply storage semantics and observability; parsers run outside ``_storage_lock``."""
+        operation = header.operation
+        params = header.params
+        op_type = f"{operation.value}_DATA"
         self._record_arrival(op_type)
-        monitor = self._metrics if self._metrics is not None else self._perf_monitor
-        missing_key_err: StorageRejected | None = None
-        with monitor.measure(op_type=op_type):
+
+        with self._measure_payload_op(op_type):
             try:
-                return handle_storage_request(
-                    self.storage_unit_id,
-                    self.storage_data,
-                    header,
-                    data,
-                    storage_lock=self._storage_lock,
-                )
-            except StorageRejected as exc:
-                # Concurrent clear vs get is a normal race, not a storage unit error.
-                if not exc.missing_key:
-                    raise
-                missing_key_err = exc
-        raise missing_key_err
+                indexes = params["global_indexes"]
+                with limit_pytorch_auto_parallel_threads(
+                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] {operation.value}"
+                ):
+                    if operation == Operation.GET:
+                        fields = params["fields"]
+                        with self._storage_lock:
+                            result = self.storage_data.get_data(fields, indexes)
+                        if (parser := params.get("data_parser")) is not None:
+                            result = _apply_data_parser(result, parser, params.get("parser_args"))
+                        return PayloadReply(payload=result)
+                    if operation == Operation.PUT:
+                        if data is None:
+                            raise TypeError("PUT requires field data")
+                        if (parser := params.get("data_parser")) is not None:
+                            data = _apply_data_parser(data, parser)
+                        with self._storage_lock:
+                            self.storage_data.put_data(data, indexes)
+                        return PayloadReply()
+
+                    merge_fn = params.get("merge_fn")
+                    merge_plan = params.get("merge_plan")
+                    if not callable(merge_fn):
+                        raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+                    if not isinstance(data, dict) or not data:
+                        raise TypeError("update data must be a non-empty dict")
+                    if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
+                        raise ValueError("merge_plan must describe every update field")
+                    with self._storage_lock:
+                        stored_shapes = self.storage_data.apply_update(indexes, data, merge_fn, merge_plan)
+                    return PayloadReply(meta={"stored_shapes": stored_shapes})
+            except Exception as exc:
+                missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
+                if operation == Operation.GET:
+                    log = logger.debug if missing_key else logger.error
+                    log(
+                        f"[{self.storage_unit_id}]: GET error, fields={params.get('fields')}, "
+                        f"global_indexes={params.get('global_indexes')}: {type(exc).__name__}: {exc}"
+                    )
+                detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
+                raise StorageRejected(detail, missing_key=missing_key) from exc
 
     def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
         """Process one storage request and send its response."""

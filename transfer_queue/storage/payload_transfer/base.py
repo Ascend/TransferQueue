@@ -98,11 +98,12 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     def listen(self, *, handle: StorageHandler, address: Any = None) -> PayloadPeerInfo:
-        """Start the server endpoint, bind ``handle``, and return peer discovery metadata.
+        """Bind ``handle`` to a server endpoint and return peer discovery metadata.
 
-        ``SimpleStorageUnit`` synchronizes storage state access internally, so transport
-        threads may invoke ``handle`` directly once request field data is ready. Backends
-        should avoid blocking on network I/O while inside ``handle``.
+        A backend may either start its own dedicated listener or attach ``handle`` to a
+        host-owned listener supplied via ``address`` (for example when control-plane RPCs
+        share the same port). ``SimpleStorageUnit`` synchronizes storage state internally,
+        so transport threads may invoke ``handle`` directly once request field data is ready.
         """
 
     # ==================== Client-side (called by AsyncSimpleStorageManager) ====================
@@ -136,7 +137,7 @@ class PayloadTransfer(ABC):
 
     @abstractmethod
     def shutdown(self) -> None:
-        """Stop admitting new requests and release resources owned by this adapter.
+        """Stop admitting new requests and release resources created by this adapter.
 
         Called synchronously by ``SimpleStorageUnit`` or ``AsyncSimpleStorageManager``:
         - Server-side (``SimpleStorageUnit``): stop admitting new requests and wait for any
@@ -145,4 +146,6 @@ class PayloadTransfer(ABC):
           callers must finish or cancel in-flight ``request()`` coroutines first; requests queued
           behind internal concurrency gates must not be sent after ``shutdown()`` returns, and any
           buffers still referenced by cancelled native operations must be retained until safe.
+        - Host-supplied listeners (passed via ``address``) and shared socket pools remain owned
+          and closed by their creator rather than by ``shutdown()``.
         """
