@@ -34,7 +34,6 @@ import os
 import pickle
 import shutil
 import sys
-import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -64,7 +63,7 @@ from transfer_queue.storage.payload_transfer import (
 )
 from transfer_queue.storage.payload_transfer.zmq import KEY_NOT_FOUND_MARKER as KEY_NOT_FOUND_MARKER
 from transfer_queue.utils import compact_pickle
-from transfer_queue.utils.common import get_env_bool, limit_pytorch_auto_parallel_threads, log_heavy_operation
+from transfer_queue.utils.common import get_env_bool, set_pytorch_auto_parallel_threads
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -75,7 +74,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     create_zmq_socket,
     format_zmq_address,
-    frame_nbytes,
     get_free_port,
     get_node_ip_address,
 )
@@ -963,17 +961,14 @@ class SimpleStorageUnit:
         self._requests_arrived = 0
         self._arrivals_by_op = {}
         self._storage_lock = Lock()
-
-        # Internal communication address for proxy and workers
-        self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
+        set_pytorch_auto_parallel_threads(target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] init")
 
         # Shutdown event for graceful termination
         self._shutdown_event = Event()
 
-        # Placeholder for zmq_context, proxy_thread and worker_threads
+        # Placeholder for zmq_context, put_get_socket and worker_thread
         self.zmq_context: zmq.Context | None = None
         self.put_get_socket: zmq.Socket | None = None
-        self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
 
         self._metrics: TQMetricsExporter | None = None
@@ -994,11 +989,9 @@ class SimpleStorageUnit:
             self._shutdown_resources,
             self._shutdown_event,
             self.worker_thread,
-            self.proxy_thread,
             self.zmq_context,
             self.put_get_socket,
             self._accept_probe,
-            self.worker_socket,
             self.storage_data,
             self.payload_transfer,
         )
@@ -1009,15 +1002,10 @@ class SimpleStorageUnit:
             self._finalizer()
 
     def _init_zmq_socket(self) -> None:
-        """
-        Initialize ZMQ socket connections between storage unit and controller/clients:
-        - put_get_socket (ROUTER): Handle put/get requests from clients.
-        - worker_socket (DEALER): Backend socket for worker communication.
-        """
+        """Initialize the unit's listening ZMQ ROUTER socket."""
         self.zmq_context = zmq.Context()
         self._node_ip = get_node_ip_address()
 
-        # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
         self.put_get_socket.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
 
@@ -1042,10 +1030,6 @@ class SimpleStorageUnit:
             )
             self._accept_probe.start()
 
-        # Backend: DEALER for worker communication (connected via zmq.proxy)
-        self.worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
-        self.worker_socket.bind(self._inproc_addr)
-
         self.zmq_server_info = ZMQServerInfo(
             role=Role.STORAGE,
             id=str(self.storage_unit_id),
@@ -1054,66 +1038,13 @@ class SimpleStorageUnit:
         )
 
     def _start_process_put_get(self) -> None:
-        """Start worker threads and ZMQ proxy for handling requests."""
-
-        # Start worker thread
+        """Start the worker thread serving the ROUTER socket directly."""
         self.worker_thread = Thread(
             target=self._worker_routine,
             name=f"StorageUnitWorkerThread-{self.storage_unit_id}",
             daemon=True,
         )
         self.worker_thread.start()
-
-        time.sleep(0.5)  # make sure worker thread is ready before zmq.proxy forwarding messages
-
-        # Start proxy thread (ROUTER <-> DEALER)
-        self.proxy_thread = Thread(
-            target=self._proxy_routine,
-            name=f"StorageUnitProxyThread-{self.storage_unit_id}",
-            daemon=True,
-        )
-        self.proxy_thread.start()
-
-    def _proxy_routine(self) -> None:
-        """ZMQ proxy for message forwarding between frontend ROUTER and backend DEALER."""
-        logger.info(f"[{self.storage_unit_id}]: start ZMQ proxy...")
-        assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
-        front, back = self.put_get_socket, self.worker_socket
-        poller = zmq.Poller()
-        poller.register(front, zmq.POLLIN)
-        poller.register(back, zmq.POLLIN)
-        try:
-            # Forwarding by hand rather than via zmq.proxy() so a non-TransferQueue peer on
-            # this exposed TCP port cannot reach the worker and terminate its request loop.
-            while not self._shutdown_event.is_set():
-                events = dict(poller.poll(1000))
-                if front in events:
-                    messages = front.recv_multipart(copy=False)
-                    try:
-                        identity = bytes(messages[0]) if messages else b""
-                        if not identity.startswith(STORAGE_CLIENT_IDENTITY_PREFIXES):
-                            logger.warning(
-                                "[%s]: dropping request with unrecognized ZMQ identity",
-                                self.storage_unit_id,
-                            )
-                            continue
-                        back.send_multipart(messages, copy=False)
-                    finally:
-                        # This thread outlives each request, so drop forwarded payload frames while idle.
-                        del messages
-
-                if back in events:
-                    front.send_multipart(back.recv_multipart(copy=False), copy=False)
-        except zmq.ContextTerminated:
-            logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy stopped gracefully (Context Terminated)")
-        except Exception as e:
-            if self._shutdown_event.is_set():
-                logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy shutting down...")
-            else:
-                logger.exception(f"[{self.storage_unit_id}]: ZMQ Proxy unexpected error: {e}")
-                # Without the proxy nothing reaches the worker, so the unit is as unreachable
-                # as if the worker itself had died.
-                self._abort_process("the ZMQ proxy thread died")
 
     def _worker_routine(self) -> None:
         """Worker thread for processing requests."""
@@ -1133,8 +1064,8 @@ class SimpleStorageUnit:
         """Kill the whole unit process so it fails visibly instead of lingering as a dead unit.
 
         The worker runs as a daemon thread, so re-raising only unwinds that thread while the
-        process, its ROUTER and the proxy stay up and keep queueing requests nobody will ever
-        answer. ``os._exit`` skips atexit/flush handlers that could themselves block here.
+        process and its ROUTER stay up and keep queueing requests nobody will ever answer.
+        ``os._exit`` skips atexit/flush handlers that could themselves block here.
         """
         if self._shutdown_event.is_set():
             return
@@ -1154,46 +1085,37 @@ class SimpleStorageUnit:
         _flush_log_output()
         os._exit(_WORKER_DEATH_EXIT_CODE)
 
-    def _connect_worker_socket(self, poller: zmq.Poller) -> zmq.Socket:
-        worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
-        worker_socket.connect(self._inproc_addr)
-        poller.register(worker_socket, zmq.POLLIN)
-        return worker_socket
-
     def _worker_loop(self, perf_monitor: Any) -> None:
-        """Poll for requests and answer them until shutdown is signalled."""
+        """Poll the ROUTER socket directly and answer requests until shutdown is signalled."""
+        assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
         poller = zmq.Poller()
-        worker_socket = self._connect_worker_socket(poller)
-        try:
-            while not self._shutdown_event.is_set():
-                monitor = self._metrics if self._metrics is not None else perf_monitor
+        poller.register(self.put_get_socket, zmq.POLLIN)
+        while not self._shutdown_event.is_set():
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+            try:
+                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+            except zmq.error.ContextTerminated:
+                logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
+                break
+            except Exception as e:
+                logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
+                continue
+
+            if self._shutdown_event.is_set():
+                break
+
+            if self.put_get_socket in socks:
+                # Keep request handling in a separate scope so payload references are
+                # released before the worker waits for the next request.
                 try:
-                    # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
-                    socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
-                except zmq.error.ContextTerminated:
-                    # ZMQ context was terminated, exit gracefully
-                    logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
-                    break
+                    self._process_one_worker_request(self.put_get_socket, monitor)
                 except Exception as e:
-                    logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
-                    continue
-
-                if self._shutdown_event.is_set():
-                    break
-
-                if worker_socket in socks:
-                    # Keep request handling in a separate scope so payload references are
-                    # released before the worker waits for the next request.
-                    try:
-                        self._process_one_worker_request(worker_socket, monitor)
-                    except Exception as e:
-                        logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
-                        # The socket may be left mid-message; a fresh one keeps the next reply routed correctly.
-                        poller.unregister(worker_socket)
-                        worker_socket.close(linger=0)
-                        worker_socket = self._connect_worker_socket(poller)
-        finally:
-            worker_socket.close(linger=0)
+                    logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
+                    # If an exception occurred mid-multipart after sending the routing identity with
+                    # SNDMORE, flush an empty terminating frame so the next reply is not misrouted.
+                    with suppress(Exception):
+                        self.put_get_socket.send(b"")
 
     def _record_arrival(self, operation: str) -> None:
         with self._storage_lock:
@@ -1215,36 +1137,33 @@ class SimpleStorageUnit:
         with self._measure_payload_op(op_type):
             try:
                 indexes = params["global_indexes"]
-                with limit_pytorch_auto_parallel_threads(
-                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] {operation.value}"
-                ):
-                    if operation == Operation.GET:
-                        fields = params["fields"]
-                        with self._storage_lock:
-                            result = self.storage_data.get_data(fields, indexes)
-                        if (parser := params.get("data_parser")) is not None:
-                            result = _apply_data_parser(result, parser, params.get("parser_args"))
-                        return PayloadReply(payload=result)
-                    if operation == Operation.PUT:
-                        if data is None:
-                            raise TypeError("PUT requires field data")
-                        if (parser := params.get("data_parser")) is not None:
-                            data = _apply_data_parser(data, parser)
-                        with self._storage_lock:
-                            self.storage_data.put_data(data, indexes)
-                        return PayloadReply()
-
-                    merge_fn = params.get("merge_fn")
-                    merge_plan = params.get("merge_plan")
-                    if not callable(merge_fn):
-                        raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
-                    if not isinstance(data, dict) or not data:
-                        raise TypeError("update data must be a non-empty dict")
-                    if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
-                        raise ValueError("merge_plan must describe every update field")
+                if operation == Operation.GET:
+                    fields = params["fields"]
                     with self._storage_lock:
-                        stored_shapes = self.storage_data.apply_update(indexes, data, merge_fn, merge_plan)
-                    return PayloadReply(meta={"stored_shapes": stored_shapes})
+                        result = self.storage_data.get_data(fields, indexes)
+                    if (parser := params.get("data_parser")) is not None:
+                        result = _apply_data_parser(result, parser, params.get("parser_args"))
+                    return PayloadReply(payload=result)
+                if operation == Operation.PUT:
+                    if data is None:
+                        raise TypeError("PUT requires field data")
+                    if (parser := params.get("data_parser")) is not None:
+                        data = _apply_data_parser(data, parser)
+                    with self._storage_lock:
+                        self.storage_data.put_data(data, indexes)
+                    return PayloadReply()
+
+                merge_fn = params.get("merge_fn")
+                merge_plan = params.get("merge_plan")
+                if not callable(merge_fn):
+                    raise TypeError(f"merge_fn must be callable, got {type(merge_fn).__name__}")
+                if not isinstance(data, dict) or not data:
+                    raise TypeError("update data must be a non-empty dict")
+                if not isinstance(merge_plan, dict) or set(merge_plan) != set(data):
+                    raise ValueError("merge_plan must describe every update field")
+                with self._storage_lock:
+                    stored_shapes = self.storage_data.apply_update(indexes, data, merge_fn, merge_plan)
+                return PayloadReply(meta={"stored_shapes": stored_shapes})
             except Exception as exc:
                 missing_key = operation == Operation.GET and isinstance(exc, StorageKeyNotFoundError)
                 if operation == Operation.GET:
@@ -1256,11 +1175,15 @@ class SimpleStorageUnit:
                 detail = str(exc) if missing_key else f"{type(exc).__name__}: {exc}"
                 raise StorageRejected(detail, missing_key=missing_key) from exc
 
-    def _process_one_worker_request(self, worker_socket: zmq.Socket, monitor: Any) -> None:
-        """Process one storage request and send its response."""
-        # Messages received from proxy: [identity, serialized_msg_frame1, ...]
-        messages = worker_socket.recv_multipart(copy=False)
-        identity = messages[0]
+    def _process_one_worker_request(self, router_socket: zmq.Socket, monitor: Any) -> None:
+        """Process one storage request from the ROUTER socket and send its response."""
+        # Multipart frames from ROUTER: [identity, serialized_msg_frame1, ...]
+        messages = router_socket.recv_multipart(copy=False)
+        identity = messages[0] if messages else b""
+        if not bytes(identity).startswith(STORAGE_CLIENT_IDENTITY_PREFIXES):
+            # Drop non-TransferQueue peers (e.g. port scanners) before decoding so they never draw a reply.
+            logger.warning("[%s]: dropping request with unrecognized ZMQ identity", self.storage_unit_id)
+            return
         serialized_msg = messages[1:]
 
         try:
@@ -1277,11 +1200,10 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"undecodable request: {type(e).__name__}: {e}"},
             )
-            worker_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
+            router_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
             return
 
         operation = request_msg.request_type
-        started = time.perf_counter()
 
         try:
             is_payload = isinstance(self.payload_transfer, ZmqPayloadTransfer) and self.payload_transfer.can_handle(
@@ -1345,18 +1267,7 @@ class SimpleStorageUnit:
                 sender_id=self.storage_unit_id,
                 body={"message": f"{self.storage_unit_id}: failed to serialize response: {type(e).__name__}: {e}"},
             ).serialize()
-        else:
-            if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                # This end serializes the get response, so its frames give the true wire size.
-                log_heavy_operation(
-                    self.storage_unit_id,
-                    "get",
-                    time.perf_counter() - started,
-                    sum(frame_nbytes(frame) or 0 for frame in response_frames),
-                    f"samples={len(request_msg.body.get('global_indexes', []))} "
-                    f"fields={list(request_msg.body.get('fields', []))}",
-                )
-        worker_socket.send_multipart([identity] + response_frames, copy=False)
+        router_socket.send_multipart([identity] + response_frames, copy=False)
 
     def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
@@ -1371,12 +1282,7 @@ class SimpleStorageUnit:
         try:
             global_indexes = data_parts.body["global_indexes"]
 
-            with (
-                limit_pytorch_auto_parallel_threads(
-                    target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_clear"
-                ),
-                self._storage_lock,
-            ):
+            with self._storage_lock:
                 self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
 
             response_msg = ZMQMessage.create(
@@ -1544,7 +1450,7 @@ class SimpleStorageUnit:
         updates: list[dict[str, Any]] = []
         bytes_read = 0
         try:
-            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS), self._storage_lock:
+            with self._storage_lock:
                 for shard in request.body["shards"]:
                     records = sorted(shard["records"], key=lambda row: row["offset"])
                     with open(shard["path"], "rb", buffering=0) as f:
@@ -1680,11 +1586,9 @@ class SimpleStorageUnit:
     def _shutdown_resources(
         shutdown_event: Event,
         worker_thread: Thread | None,
-        proxy_thread: Thread | None,
         zmq_context: zmq.Context | None,
         put_get_socket: zmq.Socket | None,
         accept_probe: "AcceptQueueProbe | None" = None,
-        worker_socket: zmq.Socket | None = None,
         storage_data: StorageUnitData | None = None,
         payload_transfer: PayloadTransfer | None = None,
     ) -> None:
@@ -1703,13 +1607,9 @@ class SimpleStorageUnit:
 
         if worker_thread and worker_thread.is_alive():
             worker_thread.join()
-        if proxy_thread and proxy_thread.is_alive():
-            proxy_thread.join()
 
         if put_get_socket:
             put_get_socket.close(linger=0)
-        if worker_socket:
-            worker_socket.close(linger=0)
         if zmq_context:
             zmq_context.term()
         if storage_data is not None:

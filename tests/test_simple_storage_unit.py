@@ -53,6 +53,7 @@ from transfer_queue.utils.serial_utils import MsgpackDecoder, MsgpackEncoder
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
+    ZMQMessageDecodeError,
     ZMQRequestType,
     create_zmq_socket,
 )
@@ -1249,7 +1250,7 @@ def test_worker_survives_a_reply_failing_between_frames():
     stranded, next_client = MockStorageClient(address, ip), MockStorageClient(address, ip)
     stranded.socket.setsockopt(zmq.RCVTIMEO, 1000)
     try:
-        with pytest.raises(zmq.Again):
+        with pytest.raises((zmq.Again, ZMQMessageDecodeError)):
             stranded.send_put(0, [0], {"val": [torch.tensor([1.0])]})
         response = next_client.send_put(1, [1], {"val": [torch.tensor([2.0])]})
         assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE

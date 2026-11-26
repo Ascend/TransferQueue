@@ -669,14 +669,14 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"Failed to {op_name} data on storage unit {target} ({endpoint}): {type(exc).__name__}: {exc}"
                 ) from exc
 
-        if data is not None:
-            log_heavy_operation(
-                self.storage_manager_id,
-                op_name,
-                time.perf_counter() - started,
-                reply.wire_bytes,
-                f"to {target} at {endpoint} {request_context}",
-            )
+        direction = "from" if operation == Operation.GET else "to"
+        log_heavy_operation(
+            self.storage_manager_id,
+            op_name,
+            time.perf_counter() - started,
+            reply.wire_bytes,
+            f"{direction} {target} at {endpoint} {request_context}",
+        )
         return reply
 
     async def _put_to_single_storage_unit(

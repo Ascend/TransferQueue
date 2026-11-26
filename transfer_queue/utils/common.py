@@ -86,32 +86,34 @@ def get_node_round_robin_scheduling_strategies(
     ]
 
 
-@contextmanager
-def limit_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = ""):
-    """Prevent PyTorch from overdoing the automatic parallelism during tensor aggregation operations."""
+def set_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = "") -> int:
+    """Configure PyTorch intra-op CPU parallelism once for the current process."""
     pytorch_current_num_threads = torch.get_num_threads()
-    physical_cores = psutil.cpu_count(logical=False)
+    physical_cores = psutil.cpu_count(logical=False) or 1
     pid = os.getpid()
     if target_num_threads is None:
-        # auto determine target_num_threads
-        if physical_cores >= 16:
-            target_num_threads = 16
-        else:
-            target_num_threads = physical_cores
-
-    if target_num_threads > physical_cores:
+        target_num_threads = 16 if physical_cores >= 16 else physical_cores
+    elif target_num_threads > physical_cores:
         logger.warning(
             f"target_num_threads {target_num_threads} should not exceed total "
             f"physical CPU cores {physical_cores}. Setting to {physical_cores}."
         )
         target_num_threads = physical_cores
 
+    torch.set_num_threads(target_num_threads)
+    logger.debug(
+        f"{info} (pid={pid}): torch.get_num_threads() is {pytorch_current_num_threads}, "
+        f"setting to {target_num_threads}."
+    )
+    return target_num_threads
+
+
+@contextmanager
+def limit_pytorch_auto_parallel_threads(target_num_threads: int | None = None, info: str = ""):
+    """Prevent PyTorch from overdoing the automatic parallelism during tensor aggregation operations."""
+    pid = os.getpid()
+    set_pytorch_auto_parallel_threads(target_num_threads=target_num_threads, info=info)
     try:
-        torch.set_num_threads(target_num_threads)
-        logger.debug(
-            f"{info} (pid={pid}): torch.get_num_threads() is {pytorch_current_num_threads}, "
-            f"setting to {target_num_threads}."
-        )
         yield
     finally:
         # Restore the original number of threads

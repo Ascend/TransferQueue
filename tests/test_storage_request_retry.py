@@ -350,6 +350,30 @@ def test_log_heavy_operation_thresholds(caplog, elapsed, payload_bytes, should_l
 
 
 @pytest.mark.asyncio
+async def test_request_payload_logs_heavy_put_and_get_on_client(caplog):
+    large_bytes = 512 * 2**20
+    transfer = MagicMock(
+        request=AsyncMock(
+            side_effect=[
+                PayloadReply(wire_bytes=large_bytes),
+                PayloadReply(payload={"input_ids": [torch.tensor([1, 2])]}, wire_bytes=large_bytes),
+            ]
+        )
+    )
+    manager = _manager(transfer=transfer)
+    manager.notify_data_update = AsyncMock(return_value=True)
+    data, metadata = _single_sample_batch()
+
+    with caplog.at_level(logging.WARNING):
+        await manager.put_data(data, metadata)
+        await manager.get_data(metadata)
+
+    messages = [r.message for r in caplog.records]
+    assert any("heavy put to unit_a at 10.0.0.7:5555" in m and "serialized_mb=512.0" in m for m in messages)
+    assert any("heavy get from unit_a at 10.0.0.7:5555" in m and "serialized_mb=512.0" in m for m in messages)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "tcp_result, probe_result, expected",
     [

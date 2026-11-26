@@ -78,13 +78,9 @@ def test_unhandled_worker_exception_triggers_the_exit():
     unit = _unit()
     unit._metrics = None
     unit._perf_monitor = MagicMock()
-    unit._node_ip = "127.0.0.1"
-    unit._inproc_addr = "inproc://worker_death_test"
-    unit.zmq_context = MagicMock()
+    unit.put_get_socket = MagicMock()
 
     with (
-        patch.object(simple_storage, "create_zmq_socket", return_value=MagicMock()),
-        patch.object(simple_storage.zmq, "Poller", return_value=MagicMock()),
         patch.object(_StorageUnitClass, "_worker_loop", side_effect=RuntimeError("boom")),
         patch.object(simple_storage.os, "_exit") as exit_call,
     ):
@@ -92,45 +88,3 @@ def test_unhandled_worker_exception_triggers_the_exit():
             unit._worker_routine()
 
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
-
-
-def _failing_poller(shutdown_event: threading.Event | None = None) -> MagicMock:
-    """A proxy poller whose poll raises, optionally after a shutdown has begun."""
-
-    def poll(timeout):
-        if shutdown_event is not None:
-            shutdown_event.set()
-        raise RuntimeError("proxy boom")
-
-    poller = MagicMock()
-    poller.poll.side_effect = poll
-    return poller
-
-
-def test_proxy_death_exits_the_process():
-    """Without the proxy nothing reaches the worker, so the unit is equally unreachable."""
-    unit = _unit()
-    unit.put_get_socket = MagicMock()
-    unit.worker_socket = MagicMock()
-
-    with (
-        patch.object(simple_storage.zmq, "Poller", return_value=_failing_poller()),
-        patch.object(simple_storage.os, "_exit") as exit_call,
-    ):
-        unit._proxy_routine()
-
-    exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
-
-
-def test_proxy_shutdown_does_not_exit():
-    unit = _unit()
-    unit.put_get_socket = MagicMock()
-    unit.worker_socket = MagicMock()
-
-    with (
-        patch.object(simple_storage.zmq, "Poller", return_value=_failing_poller(unit._shutdown_event)),
-        patch.object(simple_storage.os, "_exit") as exit_call,
-    ):
-        unit._proxy_routine()
-
-    exit_call.assert_not_called()

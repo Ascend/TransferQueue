@@ -127,7 +127,11 @@ class ZmqPayloadTransfer(PayloadTransfer):
                         wire_bytes = sum(frame_nbytes(frame) or 0 for frame in frames)
                     await socket.send_multipart(frames, copy=False)
                     del frames
-                    reply = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+                    raw_reply = await socket.recv_multipart(copy=False)
+                    if header.operation == Operation.GET:
+                        wire_bytes = sum(frame_nbytes(frame) or 0 for frame in raw_reply)
+                    reply = ZMQMessage.deserialize(raw_reply)
+                    del raw_reply
         except zmq.error.Again as exc:
             raise TransferTimeout("ZMQ storage request timed out", wire_bytes=wire_bytes) from exc
         except zmq.ZMQError as exc:
