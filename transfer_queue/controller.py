@@ -501,9 +501,8 @@ class DataPartitionStatus:
 
         current_sample_space = self.allocated_samples_num
         if required_samples > current_sample_space:
-            # Expand rows
-            expansion_needed = required_samples - current_sample_space
-            new_samples = current_sample_space + expansion_needed
+            # Leave room for incremental inserts so they do not copy every status tensor on each append.
+            new_samples = max(required_samples, 2 * max(current_sample_space, 1))
             new_fields = self.production_status.shape[1]
 
             expanded_tensor = torch.zeros(new_samples, new_fields, dtype=torch.int8)
@@ -825,11 +824,14 @@ class DataPartitionStatus:
             unconsumed_mask = consumption_status == 0
             row_mask &= unconsumed_mask
 
+        if not field_names:
+            # With no required fields, production bits cannot distinguish active rows from spare capacity.
+            return [idx for idx in torch.where(row_mask)[0].tolist() if idx in self.global_indexes]
+
         # Create column mask for requested fields
         col_mask = torch.zeros(self.allocated_fields_num, dtype=torch.bool)
         field_indices = [self.field_name_mapping[field] for field in field_names]
-        if field_indices:
-            col_mask[field_indices] = True
+        col_mask[field_indices] = True
 
         # Filter production status by masks
         relevant_status = self.production_status[row_mask][:, col_mask]

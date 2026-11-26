@@ -142,6 +142,26 @@ def test_cleared_partition_does_not_observe_reused_index_from_other_partition():
     assert partition.scan_data_status(["x"], task_name="consumer_after_reuse") == []
 
 
+def test_sample_capacity_grows_geometrically(monkeypatch):
+    from transfer_queue.controller import DataPartitionStatus
+
+    monkeypatch.setattr(DataPartitionStatus, "TQ_PRE_ALLOC_SAMPLE_NUM", 2)
+    partition = DataPartitionStatus(partition_id="growth")
+    schema = {"x": {"dtype": "torch.int64", "shape": (1,)}}
+    partition.update_production_status([0, 1], ["x"], schema)
+    partition.mark_consumed("reader", [1])
+
+    partition.update_production_status([2], ["x"], schema)
+    assert partition.allocated_samples_num == 4
+    assert partition.scan_data_status(["x"], "reader") == [0, 2]
+    assert partition.scan_data_status([], "reader") == [0, 2]
+
+    storage = partition.production_status
+    partition.update_production_status([3], ["x"], schema)
+    assert partition.production_status is storage
+    assert partition.scan_data_status(["x"], "reader") == [0, 2, 3]
+
+
 def test_partition_interface():
     """Test the partition interface design."""
     print("Testing partition interface design...")
