@@ -1125,12 +1125,16 @@ class SimpleStorageUnit:
                         break
                     if self._router_tainted or e.errno not in (errno.EAGAIN, errno.EINTR):
                         raise
+                    while self.put_get_socket.getsockopt(zmq.RCVMORE):
+                        self.put_get_socket.recv(copy=False)
                     logger.warning(f"[{self.storage_unit_id}]: transient ZMQ error on request: {e}")
                 except Exception as e:
                     if self._shutdown_event.is_set():
                         break
                     if self._router_tainted:
                         raise
+                    while self.put_get_socket.getsockopt(zmq.RCVMORE):
+                        self.put_get_socket.recv(copy=False)
                     # No SNDMORE frame entered put_get_socket, so keep it bound to preserve queued requests.
                     logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
 
@@ -1195,9 +1199,12 @@ class SimpleStorageUnit:
     def _send_multipart_reply(self, router_socket: zmq.Socket, identity: Any, response_frames: list[Any]) -> None:
         """Send ``[identity, *response_frames]``, marking ``_router_tainted`` if ``send`` fails mid-SNDMORE."""
         # Materialize all ZMQ frames before touching router_socket so buffer/allocation errors
-        # happen prior to queuing any SNDMORE frame.
+        # happen prior to queuing any SNDMORE frame, while honoring copy_threshold so small
+        # frames copy inline in C without waking pyzmq's zero-copy GarbageCollectorThread.
         prepared = [
-            part if isinstance(part, zmq.Frame) else zmq.Frame(memoryview(part), copy=False)
+            part
+            if isinstance(part, zmq.Frame)
+            else zmq.Frame(memoryview(part), copy=None, copy_threshold=router_socket.copy_threshold)
             for part in (identity, *response_frames)
         ]
         last = len(prepared) - 1

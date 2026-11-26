@@ -30,6 +30,7 @@
 
 import errno
 import pickle
+import threading
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -1230,18 +1231,28 @@ def test_undecodable_request_answered_and_worker_survives(storage_setup):
     client.close()
 
 
-@pytest.mark.parametrize("failure_mode", ["before_send", "bad_frame_buffer"])
+@pytest.mark.parametrize("failure_mode", ["before_send", "bad_frame_buffer", "mid_recv_multipart"])
 def test_pre_send_worker_error_preserves_already_queued_concurrent_requests(failure_mode):
     """A request failing before any SNDMORE frame enters ROUTER keeps queued sibling requests intact."""
     unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
     process_request = unit._process_one_worker_request
     initial_router = unit.put_get_socket
     first_failed = False
+    first_arrived = threading.Event()
+    second_sent = threading.Event()
 
     def fail_first_before_sndmore(router_socket, monitor):
         nonlocal first_failed
         if not first_failed:
             first_failed = True
+            first_arrived.set()
+            assert second_sent.wait(timeout=2.0), "client_b did not send in time"
+            if failure_mode == "mid_recv_multipart":
+                # Pop identity + header so remaining payload frames stay queued with RCVMORE=1.
+                router_socket.recv(copy=False)
+                router_socket.recv(copy=False)
+                assert router_socket.getsockopt(zmq.RCVMORE)
+                raise MemoryError("simulated mid-recv_multipart OOM")
             frames = router_socket.recv_multipart(copy=False)
             assert router_socket.poll(2000, zmq.POLLIN), "second request did not queue on ROUTER in time"
             if failure_mode == "bad_frame_buffer":
@@ -1256,10 +1267,13 @@ def test_pre_send_worker_error_preserves_already_queued_concurrent_requests(fail
     client_a.socket.setsockopt(zmq.RCVTIMEO, 500)
     client_b.socket.setsockopt(zmq.RCVTIMEO, 2000)
     try:
+        # Prefix tensor bytes with an allowed identity prefix so un-drained RCVMORE frames would pass
+        # the identity filter and misparse if _worker_loop failed to drain them on error recovery.
+        spoof_like_tensor = torch.frombuffer(bytearray(b"TQ_STORAGE_spoof"), dtype=torch.uint8)
         msg_a = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,
             sender_id="mock_client_a",
-            body={"global_indexes": [0], "data": {"val": [torch.tensor([1.0])]}},
+            body={"global_indexes": [0, 2], "data": {"val": [spoof_like_tensor, torch.tensor([1.0])]}},
         )
         msg_b = ZMQMessage.create(
             request_type=ZMQRequestType.PUT_DATA,
@@ -1267,7 +1281,9 @@ def test_pre_send_worker_error_preserves_already_queued_concurrent_requests(fail
             body={"global_indexes": [1], "data": {"val": [torch.tensor([2.0])]}},
         )
         client_a.socket.send_multipart(msg_a.serialize())
+        assert first_arrived.wait(timeout=2.0), "client_a request did not reach ROUTER in time"
         client_b.socket.send_multipart(msg_b.serialize())
+        second_sent.set()
 
         reply_b = ZMQMessage.deserialize(client_b.socket.recv_multipart(copy=False))
         assert reply_b.request_type == ZMQRequestType.PUT_DATA_RESPONSE

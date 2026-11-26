@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 import zmq
+import zmq.utils.garbage
 
 from transfer_queue.storage import simple_storage
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
@@ -143,7 +144,7 @@ def test_mid_multipart_reply_failure_aborts_process_without_misrouting(fail_on_f
     unit = _unit()
     unit._metrics = None
     unit._perf_monitor = MagicMock()
-    router = MagicMock()
+    router = MagicMock(copy_threshold=zmq.COPY_THRESHOLD)
     calls = 0
 
     def fail_after_sndmore(_frame, flags=0, **_kwargs):
@@ -188,3 +189,32 @@ def test_set_pytorch_threads_falls_back_to_logical_cores_when_physical_is_none(m
         assert "should not exceed" not in caplog.text
     finally:
         torch.set_num_threads(previous)
+
+
+def test_send_multipart_reply_honors_copy_threshold_without_gc_on_small_frames():
+    """Small reply frames must copy inline below copy_threshold instead of waking pyzmq's GC thread."""
+    unit = _unit()
+    ctx = zmq.Context()
+    router = ctx.socket(zmq.ROUTER)
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.IDENTITY, b"TQ_STORAGE_client")
+    router.bind("inproc://copy-threshold-test")
+    dealer.connect("inproc://copy-threshold-test")
+    try:
+        dealer.send(b"ping")
+        identity = router.recv_multipart(copy=False)[0]
+
+        with patch.object(zmq.utils.garbage.gc, "store", wraps=zmq.utils.garbage.gc.store) as gc_store:
+            unit._send_multipart_reply(router, identity, [b"h" * 128, memoryview(b"p" * 1024)])
+            assert dealer.recv_multipart() == [b"h" * 128, b"p" * 1024]
+            gc_store.assert_not_called()
+
+            large_payload = memoryview(bytearray(router.copy_threshold + 1024))
+            unit._send_multipart_reply(router, identity, [b"h" * 128, large_payload])
+            received = dealer.recv_multipart()
+            assert len(received[1]) == len(large_payload)
+            assert gc_store.call_count == 1
+    finally:
+        dealer.close(linger=0)
+        router.close(linger=0)
+        ctx.term()
