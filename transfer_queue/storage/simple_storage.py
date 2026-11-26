@@ -28,12 +28,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import errno
 import logging
 import math
 import os
 import pickle
 import shutil
 import sys
+import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -1085,37 +1087,68 @@ class SimpleStorageUnit:
         _flush_log_output()
         os._exit(_WORKER_DEATH_EXIT_CODE)
 
+    def _rebind_router_socket(self, poller: zmq.Poller) -> None:
+        """Close a mid-message ROUTER socket to discard partial frames and rebind the same port."""
+        assert self.zmq_context is not None and self.put_get_socket is not None
+        with suppress(KeyError):
+            poller.unregister(self.put_get_socket)
+        self.put_get_socket.close(linger=0)
+
+        address = format_zmq_address(self._node_ip, self._put_get_socket_port)
+        replacement = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
+        replacement.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
+        try:
+            for attempt in range(50):
+                try:
+                    replacement.bind(address)
+                    break
+                except zmq.ZMQError as exc:
+                    if exc.errno != errno.EADDRINUSE or self._shutdown_event.is_set() or attempt == 49:
+                        raise
+                    time.sleep(0.01)
+        except BaseException:
+            replacement.close(linger=0)
+            raise
+        self.put_get_socket = replacement
+        poller.register(self.put_get_socket, zmq.POLLIN)
+
     def _worker_loop(self, perf_monitor: Any) -> None:
         """Poll the ROUTER socket directly and answer requests until shutdown is signalled."""
         assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
         poller = zmq.Poller()
         poller.register(self.put_get_socket, zmq.POLLIN)
-        while not self._shutdown_event.is_set():
-            monitor = self._metrics if self._metrics is not None else perf_monitor
-            try:
-                # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
-                socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
-            except zmq.error.ContextTerminated:
-                logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
-                break
-            except Exception as e:
-                logger.warning(f"[{self.storage_unit_id}]: worker poll error: {e}")
-                continue
-
-            if self._shutdown_event.is_set():
-                break
-
-            if self.put_get_socket in socks:
-                # Keep request handling in a separate scope so payload references are
-                # released before the worker waits for the next request.
+        try:
+            while not self._shutdown_event.is_set():
+                monitor = self._metrics if self._metrics is not None else perf_monitor
                 try:
-                    self._process_one_worker_request(self.put_get_socket, monitor)
-                except Exception as e:
-                    logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
-                    # If an exception occurred mid-multipart after sending the routing identity with
-                    # SNDMORE, flush an empty terminating frame so the next reply is not misrouted.
-                    with suppress(Exception):
-                        self.put_get_socket.send(b"")
+                    # The event cannot wake a ZMQ poll, so bound idle shutdown latency.
+                    socks = dict(poller.poll(min(TQ_STORAGE_POLLER_TIMEOUT, 1) * 1000))
+                except zmq.error.ContextTerminated:
+                    logger.info(f"[{self.storage_unit_id}]: worker stopped gracefully (Context Terminated)")
+                    break
+                except zmq.ZMQError as e:
+                    if e.errno == errno.EINTR:
+                        continue
+                    if self._shutdown_event.is_set():
+                        break
+                    raise
+
+                if self._shutdown_event.is_set():
+                    break
+
+                if self.put_get_socket in socks:
+                    # Keep request handling in a separate scope so payload references are
+                    # released before the worker waits for the next request.
+                    try:
+                        self._process_one_worker_request(self.put_get_socket, monitor)
+                    except Exception as e:
+                        if self._shutdown_event.is_set():
+                            break
+                        logger.exception(f"[{self.storage_unit_id}]: worker failed a request: {type(e).__name__}: {e}")
+                        self._rebind_router_socket(poller)
+        finally:
+            if self.put_get_socket is not None:
+                self.put_get_socket.close(linger=0)
 
     def _record_arrival(self, operation: str) -> None:
         with self._storage_lock:

@@ -21,10 +21,12 @@ never answers them, and every caller blocks until its own timeout. Exiting inste
 silent hang into a visible actor failure.
 """
 
+import errno
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+import zmq
 
 from transfer_queue.storage import simple_storage
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
@@ -88,3 +90,45 @@ def test_unhandled_worker_exception_triggers_the_exit():
             unit._worker_routine()
 
     exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
+
+
+def test_unrecoverable_poll_error_exits_on_first_failure():
+    """A broken listening ROUTER (e.g. ENOTSOCK) must abort immediately rather than spin."""
+    unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
+    unit.put_get_socket = MagicMock()
+    poller = MagicMock()
+    poller.poll.side_effect = zmq.ZMQError(errno.ENOTSOCK)
+
+    with (
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
+        patch.object(simple_storage.os, "_exit") as exit_call,
+    ):
+        with pytest.raises(zmq.ZMQError):
+            unit._worker_routine()
+
+    poller.poll.assert_called_once()
+    exit_call.assert_called_once_with(simple_storage._WORKER_DEATH_EXIT_CODE)
+
+
+def test_poll_error_during_shutdown_exits_cleanly():
+    unit = _unit()
+    unit._metrics = None
+    unit._perf_monitor = MagicMock()
+    unit.put_get_socket = MagicMock()
+
+    def poll_then_shutdown(_timeout):
+        unit._shutdown_event.set()
+        raise zmq.ZMQError(errno.ENOTSOCK)
+
+    poller = MagicMock()
+    poller.poll.side_effect = poll_then_shutdown
+
+    with (
+        patch.object(simple_storage.zmq, "Poller", return_value=poller),
+        patch.object(simple_storage.os, "_exit") as exit_call,
+    ):
+        unit._worker_routine()
+
+    exit_call.assert_not_called()
