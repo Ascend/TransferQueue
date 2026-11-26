@@ -38,7 +38,7 @@ import time
 import weakref
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -897,6 +897,11 @@ def _apply_data_parser(field_data: dict[str, Any], data_parser: Callable[..., An
     return parsed
 
 
+def _is_storage_unit_error(exc: Exception) -> bool:
+    """Concurrent clear vs GET missing-key races are expected outcomes, not storage unit errors."""
+    return not (isinstance(exc, StorageRejected) and exc.missing_key)
+
+
 @ray.remote(num_cpus=1)
 class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
@@ -1195,27 +1200,10 @@ class SimpleStorageUnit:
             self._requests_arrived += 1
             self._arrivals_by_op[operation] = self._arrivals_by_op.get(operation, 0) + 1
 
-    @contextmanager
     def _measure_payload_op(self, op_type: str):
-        """Record payload request count and latency, exempting missing-key races from error counts."""
         if self._metrics is None:
-            with self._perf_monitor.measure(op_type=op_type):
-                yield
-            return
-        with suppress(Exception):
-            self._metrics.request_total.labels(op_type=op_type).inc()
-        started = time.perf_counter()
-        try:
-            yield
-        except Exception as exc:
-            if not (isinstance(exc, StorageRejected) and exc.missing_key):
-                with suppress(Exception):
-                    self._metrics.request_errors_total.labels(op_type=op_type).inc()
-            raise
-        finally:
-            elapsed = time.perf_counter() - started
-            with suppress(Exception):
-                self._metrics.request_duration.labels(op_type=op_type).observe(elapsed)
+            return self._perf_monitor.measure(op_type=op_type)
+        return self._metrics.measure(op_type=op_type, count_error=_is_storage_unit_error)
 
     def _handle_payload(self, header: RequestHeader, data: dict[str, Any] | None) -> PayloadReply:
         """Apply storage semantics and observability; parsers run outside ``_storage_lock``."""
