@@ -1,3 +1,4 @@
+# Copyright 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # Copyright 2026 The TransferQueue Team
 # SPDX-License-Identifier: Apache-2.0
 

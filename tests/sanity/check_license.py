@@ -1,4 +1,5 @@
 # Copyright 2024 Bytedance Ltd. and/or its affiliates
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
 # Copyright 2025 The TransferQueue Team
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +20,15 @@ from argparse import ArgumentParser
 from collections.abc import Iterable
 from pathlib import Path
 
-LICENSE_HEADER_RE = re.compile(
-    r"Copyright \d{4}(?:-\d{4})? (?:Huawei Technologies Co\., Ltd\. All Rights Reserved\.|The TransferQueue Team)"
+REQUIRED_COPYRIGHT_PATTERNS = (
+    (
+        "Huawei Technologies Co., Ltd.",
+        re.compile(r"Copyright \d{4}(?:-\d{4})? Huawei Technologies Co\., Ltd\. All Rights Reserved\."),
+    ),
+    (
+        "The TransferQueue Team",
+        re.compile(r"Copyright \d{4}(?:-\d{4})? The TransferQueue Team"),
+    ),
 )
 SUPPORTED_SUFFIXES = {".py", ".rs"}
 IGNORED_DIRS = {
@@ -69,4 +77,5 @@ if __name__ == "__main__":
         path_in_str = str(path)
         print(path_in_str)
         header_text = "\n".join(path.read_text(encoding="utf-8").splitlines()[:20])
-        assert LICENSE_HEADER_RE.search(header_text), f"file {path_in_str} does not contain license"
+        missing = [owner for owner, pattern in REQUIRED_COPYRIGHT_PATTERNS if not pattern.search(header_text)]
+        assert not missing, f"file {path_in_str} is missing copyright header(s) for: {', '.join(missing)}"
