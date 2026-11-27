@@ -17,7 +17,6 @@ from .exceptions import StorageKeyNotFoundError
 from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
-    RayStorageManager,
     StorageManager,
     StorageManagerFactory,
     YuanrongStorageManager,
@@ -33,5 +32,4 @@ __all__ = [
     "AsyncSimpleStorageManager",
     "MooncakeStorageManager",
     "YuanrongStorageManager",
-    "RayStorageManager",
 ]

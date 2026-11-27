@@ -83,7 +83,6 @@ Currently, we support the following storage backends:
 - SimpleStorage: Distributed CPU storage with optional [local SSD offload](docs/ssd_offload.md), storage-side parsing and updates, and shared fields. It is the default backend and needs no external storage service.
 - [Yuanrong](https://gitee.com/openeuler/yuanrong-datasystem) ([usage guide](docs/storage_backends/openyuanrong_datasystem.md), beta, [#PR107](https://github.com/TransferQueue/TransferQueue/pull/107), [#PR96](https://github.com/TransferQueue/TransferQueue/pull/96)): An Ascend native data system that provides hierarchical storage interfaces including HBM/DRAM/SSD.
 - [MooncakeStore](https://github.com/kvcache-ai/Mooncake) (beta, [#PR162](https://github.com/TransferQueue/TransferQueue/pull/162)): A high-performance, KV-based hierarchical storage that supports RDMA transport between GPU and DRAM.
-- [RayRDT](https://docs.ray.io/en/master/ray-core/direct-transport.html) (alpha, [#PR167](https://github.com/TransferQueue/TransferQueue/pull/167)): Ray's new feature that allows Ray to store and pass objects directly between Ray actors.
 
 Among them, `SimpleStorageUnit` serves as our default storage backend, coordinated by the `AsyncSimpleStorageManager` class. Storage units are distributed across eligible Ray nodes. Within SimpleStorage, each partition's rows are balanced across units by row count; this does not account for differences in payload size.
 
@@ -357,8 +356,7 @@ The data plane is organized as follows:
   │   │   ├── __init__.py
   │   │   ├── base.py                   # StorageKVClient, StorageClientFactory
   │   │   ├── yuanrong_client.py        # YuanrongStorageClient
-  │   │   ├── mooncake_client.py        # MooncakeStorageClient
-  │   │   └── ray_storage_client.py     # RayStorageClient
+  │   │   └── mooncake_client.py        # MooncakeStoreClient
 ```
 
 To integrate TransferQueue with a custom storage backend, start by implementing a subclass that inherits from `StorageManager`. This subclass acts as an adapter between the TransferQueue system and the target storage backend. For KV-based storage backends, you can simply inherit from `KVStorageManager`, which can serve as the general manager for all KV-based backends.

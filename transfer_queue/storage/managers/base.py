@@ -806,7 +806,7 @@ class KVStorageManager(StorageManager):
         """
         if data_parser is not None:
             raise NotImplementedError(
-                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
+                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong)."
             )
 
         num_samples = len(metadata.global_indexes)
@@ -873,7 +873,7 @@ class KVStorageManager(StorageManager):
         """
         if data_parser is not None:
             raise NotImplementedError(
-                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
+                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong)."
             )
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")

@@ -26,7 +26,6 @@ from transfer_queue.interface import _single_update_batch, async_kv_batch_update
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.mooncake_manager import MooncakeStorageManager
-from transfer_queue.storage.managers.ray_storage_manager import RayStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import _build_update_field_schema
 from transfer_queue.storage.managers.yuanrong_manager import YuanrongStorageManager
 from transfer_queue.storage.simple_storage import HybridStorageUnitData, StorageKeyNotFoundError, StorageUnitData
@@ -261,9 +260,7 @@ def test_build_update_field_schema_keeps_uniform_column_flat():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "manager_cls", [MooncakeStorageManager, YuanrongStorageManager, RayStorageManager, KVStorageManager]
-)
+@pytest.mark.parametrize("manager_cls", [MooncakeStorageManager, YuanrongStorageManager, KVStorageManager])
 @patch("transfer_queue.storage.managers.base.StorageClientFactory.create")
 @patch.object(KVStorageManager, "_connect_to_controller", lambda self: None)
 async def test_kv_backends_reject_update(mock_create, manager_cls):
