@@ -272,6 +272,9 @@ class AsyncTransferQueueClient:
 
         Raises:
             RuntimeError: If controller communication or response validation fails.
+
+        Use ``await client.async_get_meta(...)`` with the arguments shown in
+        ``TransferQueueClient.get_meta``'s sampling and inspection examples.
         """
         response_msg = await self._request_controller(
             request_type=ZMQRequestType.GET_META,
@@ -303,6 +306,9 @@ class AsyncTransferQueueClient:
         Raises:
             ValueError: If tags are not string-keyed dictionaries of native MessagePack values.
             RuntimeError: If controller communication or response validation fails.
+
+        After updating the tags, call ``await client.async_set_custom_meta(meta)``.
+        See ``TransferQueueClient.set_custom_meta`` for the complete example.
         """
         if not self._controller:
             raise RuntimeError("No controller registered")
@@ -375,6 +381,9 @@ class AsyncTransferQueueClient:
                 tags are not string-keyed native MessagePack dictionaries, or a written field
                 is marked as linked in metadata.
             RuntimeError: If storage fails or a public row still has incoming links.
+
+        Await writes, e.g. ``meta = await client.async_put(output, metadata=meta)``.
+        See ``TransferQueueClient.put`` for initial insertion and write-back examples.
         """
 
         self._require_storage_manager()
@@ -478,6 +487,9 @@ class AsyncTransferQueueClient:
             data_parser: Optional SimpleStorage callback ``data_parser(data, args)``
                 applied before each unit replies; see ``transfer_queue.kv_batch_get``.
             parser_args: Per-sample arguments aligned with ``metadata.global_indexes``.
+
+        After fetching metadata, call ``batch = await client.async_get_data(meta)``.
+        See ``TransferQueueClient.get_data`` for the complete read sequence.
         """
 
         self._require_storage_manager()
@@ -616,6 +628,9 @@ class AsyncTransferQueueClient:
         Flags are 1 for consumed and 0 otherwise. Return ``(None, None)`` when
         the controller supplies no status. Raise RuntimeError on controller errors.
         ``socket`` is retained for compatibility; RPCs use the client's pool.
+
+        Await this query; see ``TransferQueueClient.get_consumption_status`` for
+        filtering sample indexes by their flags.
         """
 
         try:
@@ -649,6 +664,9 @@ class AsyncTransferQueueClient:
         Flags are 1 for ready and 0 otherwise. Return ``(None, None)`` when
         the controller supplies no status. Raise RuntimeError on controller errors.
         ``socket`` is retained for compatibility; RPCs use the client's pool.
+
+        Await this query; see ``TransferQueueClient.get_production_status`` for
+        finding rows with incomplete fields.
         """
         try:
             response_msg = await self._request_controller(
@@ -678,6 +696,9 @@ class AsyncTransferQueueClient:
         """Return whether all samples in the partition are consumed by this task.
 
         Missing or empty consumption status returns False. Controller errors raise RuntimeError.
+
+        See ``TransferQueueClient.get_partition_list`` for a partition scan;
+        await both async calls when adapting that example.
         """
 
         _, consumption_status = await self.async_get_consumption_status(
@@ -697,6 +718,9 @@ class AsyncTransferQueueClient:
         """Return whether all queried field-production flags are ready.
 
         Missing production status returns False. Controller errors raise RuntimeError.
+
+        Use ``await client.async_check_production_status(...)`` with the arguments
+        shown in ``TransferQueueClient.check_production_status``.
         """
         _, production_status = await self.async_get_production_status(
             data_fields=data_fields,
@@ -718,6 +742,9 @@ class AsyncTransferQueueClient:
         ``task_name=None`` resets all tasks; otherwise only the named task is reset.
         Return the controller's success flag, or raise RuntimeError on communication
         or response errors. ``socket`` is retained for compatibility.
+
+        See ``TransferQueueClient.reset_consumption`` for consuming data again;
+        await both the reset and the subsequent metadata fetch.
         """
         body = {"partition_id": partition_id}
         if task_name is not None:
@@ -742,6 +769,9 @@ class AsyncTransferQueueClient:
         """Return partition IDs managed by the controller.
 
         ``socket`` is retained for compatibility; RPCs use the client's pool.
+
+        See ``TransferQueueClient.get_partition_list`` for a partition scan;
+        await both async calls when adapting that example.
         """
         try:
             response_msg = await self._request_controller(
@@ -1275,7 +1305,24 @@ class TransferQueueClient(AsyncTransferQueueClient):
         task_name: str | None = None,
         sampling_config: dict[str, Any] | None = None,
     ) -> BatchMeta:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_get_meta``."""
+        """Fetch sample metadata; see ``async_get_meta`` for arguments and errors.
+
+        Examples:
+            With ``GRPOGroupNSampler`` configured, fetch a ready group of four
+            adjacent samples from an existing partition:
+
+            >>> meta = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...     task_name="rollout", sampling_config={"n_samples_per_prompt": 4},
+            ... )
+
+            Inspect rows even if they are unready or already consumed:
+
+            >>> inspected = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...     mode="force_fetch",
+            ... )
+        """
         return self._run_coroutine(
             self.async_get_meta(
                 data_fields=data_fields,
@@ -1288,7 +1335,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
         )
 
     def set_custom_meta(self, metadata: BatchMeta) -> None:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_set_custom_meta``."""
+        """Publish per-sample tags; see ``async_set_custom_meta`` for validation rules.
+
+        Example:
+            Publish one tag dictionary per sample, in the existing metadata order:
+
+            >>> meta.update_custom_meta([{"score": 0.9} for _ in range(meta.size)])
+            >>> client.set_custom_meta(meta)
+        """
 
         return self._run_coroutine(self.async_set_custom_meta(metadata=metadata))
 
@@ -1299,7 +1353,25 @@ class TransferQueueClient(AsyncTransferQueueClient):
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
     ) -> BatchMeta:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_put``."""
+        """Write payloads and tags, returning the metadata used for the write.
+
+        See ``async_put`` for parser and linked-field constraints. Without metadata,
+        submit all initial data to an empty partition to avoid overwriting rows.
+
+        Examples:
+            With an initialized client, keep four samples per prompt adjacent:
+
+            >>> import torch
+            >>> from tensordict import TensorDict
+            >>> prompts = torch.arange(6).reshape(2, 3).repeat_interleave(4, dim=0)
+            >>> data = TensorDict({"prompts": prompts}, batch_size=[8])
+            >>> meta = client.put(data, partition_id="train_0")
+
+            Write only the new output field to those same rows:
+
+            >>> output = TensorDict({"response": torch.ones(8, 2)}, batch_size=[8])
+            >>> meta = client.put(output, metadata=meta)
+        """
         return self._run_coroutine(
             self.async_put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
         )
@@ -1321,7 +1393,17 @@ class TransferQueueClient(AsyncTransferQueueClient):
         data_parser: Callable[[Any, Any], Any] | None = None,
         parser_args: list | None = None,
     ) -> TensorDict:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_get_data``."""
+        """Read fields in metadata sample order; see ``async_get_data`` for parser options.
+
+        Example:
+            Fetch metadata for four ready samples, then read their payloads:
+
+            >>> meta = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...     task_name="rollout",
+            ... )
+            >>> batch = client.get_data(meta)
+        """
         return self._run_coroutine(
             self.async_get_data(metadata=metadata, data_parser=data_parser, parser_args=parser_args)
         )
@@ -1340,7 +1422,17 @@ class TransferQueueClient(AsyncTransferQueueClient):
         task_name: str,
         partition_id: str,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_get_consumption_status``."""
+        """Return sample indexes and per-task consumption flags; see ``async_get_consumption_status``.
+
+        Example:
+            Find rows the rollout task has not consumed (flag 0):
+
+            >>> indexes, consumed = client.get_consumption_status(
+            ...     task_name="rollout", partition_id="train_0",
+            ... )
+            >>> if consumed is not None:
+            ...     pending_indexes = indexes[consumed == 0].tolist()
+        """
         return self._run_coroutine(self.async_get_consumption_status(task_name, partition_id))
 
     def get_production_status(
@@ -1348,27 +1440,72 @@ class TransferQueueClient(AsyncTransferQueueClient):
         data_fields: list[str],
         partition_id: str,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_get_production_status``."""
+        """Return sample indexes and per-field readiness flags; see ``async_get_production_status``.
+
+        Example:
+            Flags have one row per sample and one column per distinct field.
+            Find rows with at least one field still unready (flag 0):
+
+            >>> indexes, ready = client.get_production_status(
+            ...     data_fields=["prompts", "response"], partition_id="train_0",
+            ... )
+            >>> if ready is not None:
+            ...     incomplete_indexes = indexes[(ready == 0).any(dim=1)].tolist()
+        """
         return self._run_coroutine(self.async_get_production_status(data_fields=data_fields, partition_id=partition_id))
 
     def check_consumption_status(self, task_name: str, partition_id: str) -> bool:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_check_consumption_status``."""
+        """Return whether this task consumed every row; missing or empty status returns False.
+
+        See ``get_partition_list`` for an example using this check across partitions,
+        and ``async_check_consumption_status`` for shared error semantics.
+        """
         return self._run_coroutine(self.async_check_consumption_status(task_name=task_name, partition_id=partition_id))
 
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_check_production_status``."""
+        """Return whether all queried production flags are ready; see ``async_check_production_status``.
+
+        Example:
+            Check whether both fields are ready on every row of an existing partition:
+
+            >>> all_ready = client.check_production_status(
+            ...     data_fields=["prompts", "response"], partition_id="train_0",
+            ... )
+        """
         return self._run_coroutine(
             self.async_check_production_status(data_fields=data_fields, partition_id=partition_id)
         )
 
     def reset_consumption(self, partition_id: str, task_name: str | None = None) -> bool:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_reset_consumption``."""
+        """Allow a task to consume the partition again, or reset all tasks when ``task_name=None``.
+
+        Return the controller's success flag; see ``async_reset_consumption`` for errors.
+
+        Example:
+            Consume ready samples again without rewriting their payloads:
+
+            >>> reset = client.reset_consumption(partition_id="train_0", task_name="rollout")
+            >>> if reset:
+            ...     meta = client.get_meta(
+            ...         data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...         task_name="rollout",
+            ...     )
+        """
         return self._run_coroutine(self.async_reset_consumption(partition_id, task_name))
 
     def get_partition_list(
         self,
     ) -> list[str]:
-        """Blocking counterpart of ``AsyncTransferQueueClient.async_get_partition_list``."""
+        """Return partition IDs managed by the controller; see ``async_get_partition_list``.
+
+        Example:
+            List partitions not yet fully consumed by the rollout task:
+
+            >>> pending_partitions = []
+            >>> for partition_id in client.get_partition_list():
+            ...     if not client.check_consumption_status(task_name="rollout", partition_id=partition_id):
+            ...         pending_partitions.append(partition_id)
+        """
         return self._run_coroutine(self.async_get_partition_list())
 
     # ==================== KV Interface API ====================
