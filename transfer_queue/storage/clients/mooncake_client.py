@@ -159,6 +159,7 @@ class MooncakeStoreClient(StorageKVClient):
 
         self.global_segment_size = int(config.get("global_segment_size", 4096 * 1024 * 1024))
         self.local_buffer_size = int(config.get("local_buffer_size", 1024 * 1024 * 1024))
+        self.use_put_buffer_pool = bool(config.get("use_put_buffer_pool", False))
         self.protocol = config.get("protocol", "tcp")
         self.device_name = config.get("device_name", "")
         if self.device_name is None:
@@ -384,7 +385,7 @@ class MooncakeStoreClient(StorageKVClient):
         """Worker thread for putting tensors via the CPU RDMA path."""
 
         batch_ptrs, batch_sizes, batch_tensors = self._preprocess_tensors_for_put(batch_tensors)
-        if self._buffer_pool is not None and len(set(batch_keys)) == len(batch_keys):
+        if self.use_put_buffer_pool and self._buffer_pool is not None and len(set(batch_keys)) == len(batch_keys):
             fallback: list[int] = []
             for group in split_by_bytes(batch_sizes, self._pool_share_bytes):
                 fallback += self._write_via_buffer_pool(group, batch_keys, batch_sizes, batch_tensors)

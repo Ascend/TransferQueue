@@ -213,6 +213,7 @@ def make_client(local_buffer_size=1 << 30, **extra):
         "local_buffer_size": local_buffer_size,
         # The pool only runs on RDMA; default to it so the pooled-path tests exercise it.
         "protocol": "rdma",
+        "use_put_buffer_pool": True,
     }
     config.update(extra)
     return mcc.MooncakeStoreClient(config)

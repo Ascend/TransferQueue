@@ -68,6 +68,11 @@ backend:
     global_segment_size: 4294967296
     # Local buffer size in bytes **per client** (default: 1GB)
     local_buffer_size: 1073741824
+    # Reuse the pre-registered buffer pool for RDMA PUTs to avoid per-call buffer registration.
+    # WARNING: When `true`, a timed-out PUT still in flight may read a pooled buffer after it is
+    # released and overwritten by a later PUT, causing silent data corruption.
+    # See https://github.com/kvcache-ai/Mooncake/issues/4491
+    use_put_buffer_pool: false
     # Network device name.
     # Set to "" to let Mooncake auto-select available devices.
     device_name: ""
