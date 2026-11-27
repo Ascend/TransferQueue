@@ -28,7 +28,7 @@ import pytest
 import ray
 import torch
 from omegaconf import OmegaConf
-from tensordict import TensorDict
+from tensordict import NonTensorStack, TensorDict
 
 import transfer_queue as tq
 
@@ -508,6 +508,23 @@ class TestKVPutE2E:
 class TestKVBatchPutE2E:
     """End-to-end tests for kv_batch_put functionality."""
 
+    def test_tags_only_rows_keep_tags_when_payload_arrives(self, tq_api):
+        """Publishing payload after tags must retain the existing row metadata."""
+        keys = ["pending_0", "pending_1"]
+        tags = [{"length": 2}, {"length": 3}]
+        tq_api.kv_batch_put(keys, "pending", tags=tags)
+        assert tq_api.kv_list("pending")["pending"] == dict(zip(keys, tags, strict=True))
+        assert tq.get_client().get_meta(["tokens"], 2, "pending", task_name="consumer").size == 0
+
+        fields = TensorDict({"tokens": torch.tensor([[1, 2], [3, 4]])}, [2])
+        tq_api.kv_batch_put(keys, "pending", fields)
+        assert tq_api.kv_list("pending")["pending"] == dict(zip(keys, tags, strict=True))
+        ready = tq.get_client().get_meta(["tokens"], 2, "pending", task_name="consumer")
+        assert ready.size == 2
+        assert ready.custom_meta == tags
+        assert_tensor_equal(tq_api.kv_batch_get(keys, "pending")["tokens"], fields["tokens"])
+        tq_api.kv_clear(keys, "pending")
+
     def test_kv_batch_put_multiple_samples(self, controller, tq_api):
         """Test batch putting multiple samples."""
         partition_id = "test_partition"
@@ -690,8 +707,9 @@ class TestKVGetE2E:
 
         tq_api.kv_clear(keys=key, partition_id=partition_id)
 
-    def test_kv_batch_get_multiple_keys(self, controller, tq_api):
-        """Test getting data for multiple keys."""
+    @pytest.mark.parametrize("order", [[0, 1, 2], [2, 0, 2]], ids=["write_order", "reordered_duplicates"])
+    def test_kv_batch_get_multiple_keys(self, controller, tq_api, order):
+        """GET preserves requested order, including repeated keys."""
         partition_id = "test_partition"
         keys = ["get_multi_0", "get_multi_1", "get_multi_2"]
         expected_data = torch.tensor([[1, 2], [3, 4], [5, 6]])
@@ -699,10 +717,28 @@ class TestKVGetE2E:
         fields = TensorDict({"data": expected_data}, batch_size=3)
         tq_api.kv_batch_put(keys=keys, partition_id=partition_id, fields=fields, tags=[{}, {}, {}])
 
-        retrieved = tq_api.kv_batch_get(keys=keys, partition_id=partition_id)
-        assert_tensor_equal(retrieved["data"], expected_data)
+        retrieved = tq_api.kv_batch_get(keys=[keys[i] for i in order], partition_id=partition_id)
+        assert_tensor_equal(retrieved["data"], expected_data[order])
 
         tq_api.kv_clear(keys=keys, partition_id=partition_id)
+
+    def test_selective_get_preserves_detached_scalar_and_object_columns(self, tq_api):
+        """Selecting mixed fields preserves scalar dtype and non-tensor values."""
+        fields = TensorDict(
+            {
+                "tokens": torch.tensor([[1, 2], [3, 4]]),
+                "length": torch.tensor([2, 3], dtype=torch.int32),
+                "attributes": NonTensorStack({"images": ["image_a"], "size": 16}, {"images": [], "size": 0}),
+            },
+            batch_size=[2],
+        )
+        tq_api.kv_batch_put(["a", "b"], "mixed_fields", fields.detach())
+        result = tq_api.kv_batch_get(["b", "a"], "mixed_fields", select_fields=["length", "attributes"])
+        assert set(result.keys()) == {"length", "attributes"}
+        assert result["length"].dtype == torch.int32
+        assert [value.item() for value in result["length"]] == [3, 2]
+        assert list(result["attributes"]) == [{"images": [], "size": 0}, {"images": ["image_a"], "size": 16}]
+        tq_api.kv_clear(["a", "b"], "mixed_fields")
 
     def test_kv_batch_get_partial_keys(self, controller, tq_api):
         """Test getting data for partial keys."""
@@ -834,6 +870,49 @@ class TestKVGetE2E:
 
 class TestKVBatchGetByMetaE2E:
     """End-to-end tests for kv_batch_get_by_meta functionality."""
+
+    def test_async_metadata_roundtrip_preserves_order_and_in_place_updates(self):
+        """Keys -> metadata -> appended fields -> keys retains row identity."""
+        rows = [torch.arange(i + 1, dtype=torch.int64) + i * 10 for i in range(4)]
+        keys = [f"sample_{i}" for i in range(4)]
+        tags = [{"sample_id": i} for i in range(4)]
+        tq.kv_batch_put(
+            keys,
+            "metadata_roundtrip",
+            TensorDict({"tokens": torch.nested.as_nested_tensor(rows, layout=torch.jagged)}, [4]),
+            tags=tags,
+        )
+
+        async def roundtrip():
+            client = tq.get_client()
+            order = [2, 0, 3, 1]
+            ordered_keys = [keys[i] for i in order]
+            meta = await client.async_kv_retrieve_meta(ordered_keys, "metadata_roundtrip", create=False)
+            meta = meta.select_fields(["tokens"])
+            meta.extra_info = {"step": 3}
+            original_fields = meta.select_fields(["tokens"])
+            assert meta.custom_meta == [tags[i] for i in order]
+            selected = await client.async_get_data(meta)
+            for actual, index in zip(selected["tokens"].unbind(), order, strict=True):
+                torch.testing.assert_close(actual, rows[index])
+
+            output_rows = [rows[i].float() / 10 for i in order]
+            output = TensorDict(
+                {"scores": torch.nested.as_nested_tensor(output_rows, layout=torch.jagged)}, batch_size=[4]
+            )
+            updated = await client.async_put(output, metadata=meta)
+            assert updated is meta
+            assert updated.extra_info == {"step": 3}
+            assert updated.custom_meta == [tags[i] for i in order]
+            assert set(updated.field_names) == {"tokens", "scores"}
+            assert original_fields.field_names == ["tokens"]
+            assert await client.async_kv_retrieve_keys(updated.global_indexes, "metadata_roundtrip") == ordered_keys
+            result = await client.async_get_data(updated.select_fields(["scores"]))
+            for actual, expected in zip(result["scores"].unbind(), output_rows, strict=True):
+                torch.testing.assert_close(actual, expected)
+
+        asyncio.run(roundtrip())
+        tq.kv_clear(keys, "metadata_roundtrip")
 
     def test_kv_batch_get_by_meta_select_fields_override(self, controller, tq_api):
         """Test kv_batch_get_by_meta with select_fields to override meta.fields."""
