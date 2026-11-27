@@ -805,9 +805,7 @@ class KVStorageManager(StorageManager):
         Store tensor data in the backend storage and notify the controller.
         """
         if data_parser is not None:
-            raise NotImplementedError(
-                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
-            )
+            raise NotImplementedError("data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong).")
 
         num_samples = len(metadata.global_indexes)
         if data.batch_size[0] != num_samples:
@@ -872,9 +870,7 @@ class KVStorageManager(StorageManager):
         correct shapes and dtypes, and merge them as a TensorDict according to metadata.
         """
         if data_parser is not None:
-            raise NotImplementedError(
-                "data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong, RayStore)."
-            )
+            raise NotImplementedError("data_parser is not supported for KV-based backends (MooncakeStore, Yuanrong).")
         if not metadata.field_names:
             logger.warning("Attempted to get data, but metadata contains no fields.")
             return TensorDict({}, batch_size=len(metadata))
