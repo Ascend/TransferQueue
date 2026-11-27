@@ -928,6 +928,31 @@ class TestDataPartitionStatusCustomMeta:
         assert result[0]["score"] == 0.9
         assert result[0]["label"] == "updated"
 
+    def test_merge_custom_meta_keeps_keys_it_does_not_send(self):
+        """Test merge_custom_meta adds its keys without dropping the ones already stored."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        partition.merge_custom_meta({0: {"a": 1}})
+        # A writer that only knows its own key must not drop the other writer's key.
+        partition.merge_custom_meta({0: {"b": 2}})
+
+        result = partition.get_custom_meta([0])
+        assert result[0] == {"a": 1, "b": 2}
+
+    def test_merge_custom_meta_overwrites_same_key(self):
+        """Test merge_custom_meta keeps last-write-wins for a key both writers send."""
+        from transfer_queue.controller import DataPartitionStatus
+
+        partition = DataPartitionStatus(partition_id="train_0")
+
+        partition.merge_custom_meta({0: {"score": 0.5, "label": "positive"}})
+        partition.merge_custom_meta({0: {"score": 0.9}})
+
+        result = partition.get_custom_meta([0])
+        assert result[0] == {"score": 0.9, "label": "positive"}
+
     def test_get_custom_meta_returns_only_requested(self):
         """Test get_custom_meta only returns metadata for requested indices."""
         from transfer_queue.controller import DataPartitionStatus

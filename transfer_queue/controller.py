@@ -905,6 +905,22 @@ class DataPartitionStatus:
 
         self.custom_meta.update(custom_meta)
 
+    def merge_custom_meta(self, custom_meta: dict[int, dict]) -> None:
+        """
+        Merge custom_meta into existing per-sample metadata.
+
+        Keys sent here replace the existing value of the same key; keys already stored
+        and absent here are kept, so two writers that set different keys on one sample
+        both land. ``set_custom_meta`` replaces the whole entry instead.
+
+        Args:
+            custom_meta: Dictionary mapping global_index to custom metadata dict.
+                        Entries are merged into the existing dict, which is created if absent.
+        """
+
+        for idx, meta in custom_meta.items():
+            self.custom_meta.setdefault(idx, {}).update(meta)
+
     # ==================== Statistics and Monitoring ====================
     def get_statistics(self) -> dict[str, Any]:
         """Get detailed statistics for this partition."""
@@ -1389,22 +1405,47 @@ class TransferQueueController:
             ... })
         """
 
+        self._apply_custom_meta(partition_custom_meta, merge=False)
+
+    def merge_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]]) -> None:
+        """
+        Merge custom_meta into samples in partitions.
+
+        Keys sent here replace the existing value of the same key; keys already stored
+        and absent here are kept, so two writers that set different keys on one sample
+        both land. ``set_custom_meta`` replaces the whole per-sample dict instead.
+
+        Args:
+            partition_custom_meta: Dictionary mapping partition_id to custom metadata dict.
+                                  Format: {partition_id: {global_index: {metadata_key: metadata_value}}}
+
+        Example:
+            >>> controller.merge_custom_meta({"train_0": {0: {"label": "positive"}}})
+        """
+
+        self._apply_custom_meta(partition_custom_meta, merge=True)
+
+    def _apply_custom_meta(self, partition_custom_meta: dict[str, dict[int, dict]], merge: bool) -> None:
         for partition_id, custom_meta in partition_custom_meta.items():
             partition = self._get_partition(partition_id)
-            if partition:
-                active = partition.global_indexes
-                if custom_meta.keys() <= active:
-                    partition.set_custom_meta(custom_meta)
-                else:
-                    reserved = partition.pre_allocated_global_indexes
-                    owned_meta = {idx: meta for idx, meta in custom_meta.items() if idx in active or idx in reserved}
-                    if owned_meta:
-                        partition.set_custom_meta(owned_meta)
-            else:
+            if not partition:
                 logger.warning(
-                    f"set_custom_meta: partition {partition_id}' not found; "
+                    f"{'merge' if merge else 'set'}_custom_meta: partition {partition_id}' not found; "
                     f"custom_metadata for this partition will be ignored"
                 )
+                continue
+            active = partition.global_indexes
+            if custom_meta.keys() <= active:
+                owned_meta = custom_meta
+            else:
+                reserved = partition.pre_allocated_global_indexes
+                owned_meta = {idx: meta for idx, meta in custom_meta.items() if idx in active or idx in reserved}
+            if not owned_meta:
+                continue
+            if merge:
+                partition.merge_custom_meta(owned_meta)
+            else:
+                partition.set_custom_meta(owned_meta)
 
     def get_metadata(
         self,
@@ -2478,6 +2519,7 @@ class TransferQueueController:
             ZMQRequestType.NOTIFY_DATA_UPDATE: self._handle_notify_data_update_request,
             ZMQRequestType.GET_PARTITION_META: self._handle_get_partition_meta_request,
             ZMQRequestType.SET_CUSTOM_META: self._handle_set_custom_meta_request,
+            ZMQRequestType.MERGE_CUSTOM_META: self._handle_merge_custom_meta_request,
             ZMQRequestType.MARK_CLEARING: self._handle_mark_clearing_request,
             ZMQRequestType.CLEAR_META: self._handle_clear_meta_request,
             ZMQRequestType.CLEAR_PARTITION: self._handle_clear_partition_request,
@@ -2584,6 +2626,14 @@ class TransferQueueController:
             request_msg,
             ZMQRequestType.SET_CUSTOM_META_RESPONSE,
             {"message": "Successfully set custom_meta"},
+        )
+
+    def _handle_merge_custom_meta_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        self.merge_custom_meta(partition_custom_meta=request_msg.body["partition_custom_meta"])
+        return self._make_response(
+            request_msg,
+            ZMQRequestType.MERGE_CUSTOM_META_RESPONSE,
+            {"message": "Successfully merged custom_meta"},
         )
 
     def _handle_mark_clearing_request(self, request_msg: ZMQMessage) -> ZMQMessage:

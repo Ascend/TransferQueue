@@ -939,6 +939,54 @@ impl ControllerState {
                     )]),
                 ))
             }
+            "MERGE_CUSTOM_META" => {
+                let partitions = field(body, "partition_custom_meta")
+                    .and_then(Value::as_map)
+                    .ok_or("partition_custom_meta must be a map")?;
+                for (name, meta) in partitions {
+                    let name = name.as_str().ok_or("partition name must be a string")?;
+                    if let Some(partition) = self.partitions.get_mut(name) {
+                        let rows = meta
+                            .as_map()
+                            .ok_or("partition custom metadata must be a map")?;
+                        for (index, value) in rows {
+                            let index = global_index(index)?;
+                            if !partition.rows.contains_key(&index) {
+                                continue;
+                            }
+                            let incoming = value
+                                .as_map()
+                                .ok_or("merged custom metadata must be a map")?;
+                            if incoming.is_empty() {
+                                continue;
+                            }
+                            // Decode and merge here, in the request loop, so a concurrent update
+                            // of another key on this row cannot be lost to a stale client copy.
+                            let mut merged = match partition.custom_meta.get(&index) {
+                                Some(existing) => existing.decode()?,
+                                None => Value::Map(Vec::new()),
+                            };
+                            let Value::Map(map) = &mut merged else {
+                                return Err("stored custom metadata is not a map".into());
+                            };
+                            for (key, value) in incoming {
+                                map.retain(|entry| &entry.0 != key);
+                                map.push((key.clone(), value.clone()));
+                            }
+                            partition
+                                .custom_meta
+                                .insert(index, RawMsgpack::encode(&merged)?);
+                        }
+                    }
+                }
+                Ok((
+                    "MERGE_CUSTOM_META_RESPONSE",
+                    Body::Fields(vec![(
+                        "message".into(),
+                        "Successfully merged custom_meta".into(),
+                    )]),
+                ))
+            }
             "MARK_CLEARING" => {
                 self.mark_clearing(body)?;
                 Ok((
@@ -1655,6 +1703,26 @@ mod tests {
             ))
             .unwrap();
         assert!(!controller.partitions["pre"].custom_meta.contains_key(&2));
+
+        // 5. MERGE_CUSTOM_META keeps keys it does not send and overwrites the ones it does.
+        let merge_tag = |tag: (Value, Value)| {
+            let row = Value::Map(vec![tag]);
+            let rows = Value::Map(vec![(2.into(), row)]);
+            let partition = Value::Map(vec![("pre".into(), rows)]);
+            req("MERGE_CUSTOM_META", vec![("partition_custom_meta".into(), partition)])
+        };
+        controller.apply(&merge_tag(("rank".into(), "worker_a".into()))).unwrap();
+        controller.apply(&merge_tag(("attempt".into(), 1.into()))).unwrap();
+
+        let merged = controller.partitions["pre"].custom_meta[&2].decode().unwrap();
+        let mut keys: Vec<&str> = merged
+            .as_map()
+            .unwrap()
+            .iter()
+            .filter_map(|(key, _)| key.as_str())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["attempt", "rank"]);
 
         controller
             .partitions

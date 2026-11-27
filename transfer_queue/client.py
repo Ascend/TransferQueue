@@ -327,6 +327,44 @@ class AsyncTransferQueueClient:
         )
         return response_msg.body["metadata"]
 
+    async def _write_custom_meta(
+        self,
+        metadata: BatchMeta,
+        request_type: ZMQRequestType,
+        response_type: ZMQRequestType,
+        socket: zmq.asyncio.Socket | None = None,
+        *,
+        _validate_tags: bool = True,
+    ) -> None:
+        """Send the metadata's custom_meta to the controller as ``request_type``."""
+        assert socket is not None
+
+        if not self._controller:
+            raise RuntimeError("No controller registered")
+
+        global_indexes = metadata.global_indexes
+        custom_meta = metadata.custom_meta
+
+        if not global_indexes or not custom_meta:
+            logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
+            return
+
+        if _validate_tags:
+            self.validate_tags(custom_meta)
+        # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
+        partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
+        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
+            partition_custom_meta[partition_id][index] = tag if tag else {}
+
+        await self._request_controller(
+            socket=socket,
+            request_type=request_type,
+            response_type=response_type,
+            body={
+                "partition_custom_meta": partition_custom_meta,
+            },
+        )
+
     @with_controller_socket
     async def async_set_custom_meta(
         self,
@@ -360,32 +398,51 @@ class AsyncTransferQueueClient:
             ...     batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
             ...     await client.async_set_custom_meta(batch_meta)
         """
-        assert socket is not None
-
-        if not self._controller:
-            raise RuntimeError("No controller registered")
-
-        global_indexes = metadata.global_indexes
-        custom_meta = metadata.custom_meta
-
-        if not global_indexes or not custom_meta:
-            logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
-            return
-
-        if _validate_tags:
-            self.validate_tags(custom_meta)
-        # Build partition_custom_meta in format: {partition_id: {global_index: {meta1:xxx, meta2:xxx}}}
-        partition_custom_meta: dict[str, dict[int, dict[str, Any]]] = {pid: {} for pid in set(metadata.partition_ids)}
-        for partition_id, index, tag in zip(metadata.partition_ids, global_indexes, custom_meta, strict=True):
-            partition_custom_meta[partition_id][index] = tag if tag else {}
-
-        await self._request_controller(
+        await self._write_custom_meta(
+            metadata,
+            ZMQRequestType.SET_CUSTOM_META,
+            ZMQRequestType.SET_CUSTOM_META_RESPONSE,
             socket=socket,
-            request_type=ZMQRequestType.SET_CUSTOM_META,
-            response_type=ZMQRequestType.SET_CUSTOM_META_RESPONSE,
-            body={
-                "partition_custom_meta": partition_custom_meta,
-            },
+            _validate_tags=_validate_tags,
+        )
+
+    @with_controller_socket
+    async def async_merge_custom_meta(
+        self,
+        metadata: BatchMeta,
+        socket: zmq.asyncio.Socket | None = None,
+        *,
+        _validate_tags: bool = True,
+    ) -> None:
+        """
+        Asynchronously merge custom metadata into the controller's per-sample metadata.
+
+        Unlike ``async_set_custom_meta``, which replaces the whole per-sample dict, this
+        merges the keys sent here into the dict the controller already holds. Two writers
+        that set different keys on one sample therefore both land, instead of the second
+        one overwriting the first one's read-modify-write snapshot.
+
+        Args:
+            metadata: BatchMeta containing the samples and the custom metadata to merge.
+            socket: ZMQ async socket for message transmission (injected by decorator)
+
+        Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> async def main():
+            ...     batch_meta = await client.async_get_meta(data_fields=["input_ids"], batch_size=1, ...)
+            ...     batch_meta.update_custom_meta([{"score": 0.9}])
+            ...     await client.async_merge_custom_meta(batch_meta)
+        """
+        await self._write_custom_meta(
+            metadata,
+            ZMQRequestType.MERGE_CUSTOM_META,
+            ZMQRequestType.MERGE_CUSTOM_META_RESPONSE,
+            socket=socket,
+            _validate_tags=_validate_tags,
         )
 
     async def async_put(
@@ -531,7 +588,8 @@ class AsyncTransferQueueClient:
         ):
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
-        await self.async_set_custom_meta(metadata, _validate_tags=False)
+        # Merge, not set: two writers that put different tags on one key must both land.
+        await self.async_merge_custom_meta(metadata, _validate_tags=False)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."
@@ -1692,6 +1750,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._check_production_status = _make_sync(self.async_check_production_status)
         self._get_partition_list = _make_sync(self.async_get_partition_list)
         self._set_custom_meta = _make_sync(self.async_set_custom_meta)
+        self._merge_custom_meta = _make_sync(self.async_merge_custom_meta)
         self._reset_consumption = _make_sync(self.async_reset_consumption)
         self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
         self._kv_prepare_update = _make_sync(self.async_kv_prepare_update)
@@ -1803,6 +1862,30 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """
 
         return self._set_custom_meta(metadata=metadata)
+
+    def merge_custom_meta(self, metadata: BatchMeta) -> None:
+        """Synchronously merge custom metadata into the controller's per-sample metadata.
+
+        Unlike ``set_custom_meta``, which replaces the whole per-sample dict, this merges
+        the keys sent here into the dict the controller already holds.
+
+        Args:
+            metadata: BatchMeta containing the samples and the custom metadata to merge.
+                     The custom_meta should be set using BatchMeta.update_custom_meta()
+                     before calling this method.
+
+        Raises:
+            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
+                MessagePack
+            RuntimeError: If communication fails or controller returns error response
+
+        Example:
+            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=2, ...)
+            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
+            >>> client.merge_custom_meta(batch_meta)
+        """
+
+        return self._merge_custom_meta(metadata=metadata)
 
     def put(
         self,

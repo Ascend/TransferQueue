@@ -23,6 +23,7 @@ This test module validates the KV interface functionality by:
 import asyncio
 import logging
 import os
+import threading
 
 import pytest
 import ray
@@ -373,6 +374,38 @@ class TestKVPutE2E:
         assert_tensor_equal(retrieved["value"], torch.tensor([[10]]))
 
         tq_api.kv_clear(keys=key, partition_id=partition_id)
+
+    def test_kv_put_concurrent_tags_on_one_key_are_merged(self, controller, tq_api):
+        """Test two writers that put different tags on one key both land."""
+        partition_id = "test_partition"
+        keys = [f"concurrent_tag_{i}" for i in range(100)]
+        for key in keys:
+            tq_api.kv_put(key=key, partition_id=partition_id, fields={"value": torch.tensor([1])})
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def add_tag(name: str) -> None:
+            try:
+                for key in keys:
+                    barrier.wait(timeout=30)
+                    tq_api.kv_put(key=key, partition_id=partition_id, fields=None, tag={name: 1})
+            except BaseException as error:  # reported below, so a broken barrier cannot hide
+                errors.append(error)
+
+        threads = [threading.Thread(target=add_tag, args=(name,)) for name in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, errors
+        partition = get_controller_partition(controller, partition_id)
+        lost = [key for key in keys if not {"a", "b"} <= set(partition.custom_meta[partition.keys_mapping[key]])]
+        assert not lost, f"{len(lost)} of {len(keys)} keys lost one of the two tags, first: {lost[:5]}"
+
+        for key in keys:
+            tq_api.kv_clear(keys=key, partition_id=partition_id)
 
     def test_kv_put_partial_update(self, controller, tq_api):
         """Test adding new fields to existing sample."""

@@ -1004,7 +1004,7 @@ async def async_kv_put(
         batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
     else:
         # Directly update custom_meta (tag) to controller
-        await tq_client.async_set_custom_meta(batch_meta, _validate_tags=False)
+        await tq_client.async_merge_custom_meta(batch_meta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
@@ -1117,7 +1117,7 @@ async def async_kv_batch_put(
         batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
     else:
         # Directly update custom_meta (tags) to controller
-        await tq_client.async_set_custom_meta(batch_meta, _validate_tags=False)
+        await tq_client.async_merge_custom_meta(batch_meta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
