@@ -382,10 +382,15 @@ class MooncakeStoreClient(StorageKVClient):
         return meta
 
     def _put_tensors_thread_worker(self, batch_keys: list[str], batch_tensors: list[Tensor]) -> None:
-        """Worker thread for putting tensors via the CPU RDMA path."""
+        """Pool only CPU-backed batches so NPU tensors can be registered directly."""
 
-        batch_ptrs, batch_sizes, batch_tensors = self._preprocess_tensors_for_put(batch_tensors)
-        if self.use_put_buffer_pool and self._buffer_pool is not None and len(set(batch_keys)) == len(batch_keys):
+        batch_ptrs, batch_sizes, batch_tensors, all_cpu = self._preprocess_tensors_for_put(batch_tensors)
+        if (
+            self.use_put_buffer_pool
+            and self._buffer_pool is not None
+            and all_cpu
+            and len(set(batch_keys)) == len(batch_keys)
+        ):
             fallback: list[int] = []
             for group in split_by_bytes(batch_sizes, self._pool_share_bytes):
                 fallback += self._write_via_buffer_pool(group, batch_keys, batch_sizes, batch_tensors)
@@ -912,18 +917,21 @@ class MooncakeStoreClient(StorageKVClient):
         )
 
     @staticmethod
-    def _preprocess_tensors_for_put(values: list[Tensor]) -> tuple[list[int], list[int], list[Tensor]]:
+    def _preprocess_tensors_for_put(values: list[Tensor]) -> tuple[list[int], list[int], list[Tensor], bool]:
         ptr_list: list[int] = []
         size_list: list[int] = []
         tensor_list: list[Tensor] = []  # hold reference for the contiguous tensor
+        all_cpu = True
         for t in values:
             if t.device.type == "cuda":
                 t = t.cpu()
+            elif t.device.type != "cpu":
+                all_cpu = False
             t = t.contiguous()
             tensor_list.append(t)
             ptr_list.append(t.data_ptr())
             size_list.append(t.nbytes)
-        return ptr_list, size_list, tensor_list
+        return ptr_list, size_list, tensor_list, all_cpu
 
     def _register_all_buffers(self, ptrs, sizes):
         for ptr, size in zip(ptrs, sizes, strict=True):
