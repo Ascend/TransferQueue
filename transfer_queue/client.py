@@ -583,8 +583,13 @@ class AsyncTransferQueueClient:
 
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
-        if _validate_tags and not inserted:
-            self.validate_tags(metadata.custom_meta)
+        custom_meta_delta = metadata.custom_meta if custom_meta is None else custom_meta
+        # Only an empty list means "leave the controller's custom_meta untouched".
+        if custom_meta_delta and len(custom_meta_delta) != metadata.size:
+            raise ValueError(f"custom_meta length {len(custom_meta_delta)} must match the batch size: {metadata.size}")
+        # Validated here, before the payload lands; the merge call below then skips it.
+        if _validate_tags:
+            self.validate_tags(custom_meta_delta)
         # A read-modify-write would otherwise turn every link into a private copy without notice.
         linked = sorted({name for links in metadata._links for name in links if name in data.keys()})
         if linked:
@@ -1880,29 +1885,30 @@ class TransferQueueClient(AsyncTransferQueueClient):
 
         return self._set_custom_meta(metadata=metadata)
 
-    def merge_custom_meta(self, metadata: BatchMeta) -> None:
+    def merge_custom_meta(self, metadata: BatchMeta, custom_meta: list[dict[str, Any]] | None = None) -> None:
         """Synchronously merge custom metadata into the controller's per-sample metadata.
 
         Unlike ``set_custom_meta``, which replaces the whole per-sample dict, this merges
         the keys sent here into the dict the controller already holds.
 
         Args:
-            metadata: BatchMeta containing the samples and the custom metadata to merge.
-                     The custom_meta should be set using BatchMeta.update_custom_meta()
-                     before calling this method.
+            metadata: BatchMeta containing the samples to merge custom metadata for.
+            custom_meta: Per-sample metadata to merge, in ``global_indexes`` order. Pass only the
+                     keys this caller is setting: entries read back by a get_meta call are stale,
+                     and merging them would restore keys another writer changed in the meantime.
+                     Defaults to the metadata's own ``custom_meta``.
 
         Raises:
-            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack
+            ValueError: If ``custom_meta`` does not match the batch size, contains non-dict entries, or values not
+                serializable as native MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
             >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=2, ...)
-            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
-            >>> client.merge_custom_meta(batch_meta)
+            >>> client.merge_custom_meta(batch_meta, [{"score": 0.9}, {"score": 0.8}])
         """
 
-        return self._merge_custom_meta(metadata=metadata)
+        return self._merge_custom_meta(metadata=metadata, custom_meta=custom_meta)
 
     def put(
         self,
