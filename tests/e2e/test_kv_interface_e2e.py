@@ -407,6 +407,38 @@ class TestKVPutE2E:
         for key in keys:
             tq_api.kv_clear(keys=key, partition_id=partition_id)
 
+    def test_kv_put_concurrent_tags_do_not_revert_each_other(self, controller, tq_api):
+        """Test a writer does not restore a tag another writer changed after its read."""
+        partition_id = "test_partition"
+        keys = [f"concurrent_tag_revert_{i}" for i in range(100)]
+        for key in keys:
+            tq_api.kv_put(key=key, partition_id=partition_id, fields={"value": torch.tensor([1])}, tag={"a": 0, "b": 0})
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def set_tag(name: str) -> None:
+            try:
+                for key in keys:
+                    barrier.wait(timeout=30)
+                    tq_api.kv_put(key=key, partition_id=partition_id, fields=None, tag={name: 1})
+            except BaseException as error:  # reported below, so a broken barrier cannot hide
+                errors.append(error)
+
+        threads = [threading.Thread(target=set_tag, args=(name,)) for name in ("a", "b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not errors, errors
+        partition = get_controller_partition(controller, partition_id)
+        stale = [key for key in keys if partition.custom_meta[partition.keys_mapping[key]] != {"a": 1, "b": 1}]
+        assert not stale, f"{len(stale)} of {len(keys)} keys kept a stale tag value, first: {stale[:5]}"
+
+        for key in keys:
+            tq_api.kv_clear(keys=key, partition_id=partition_id)
+
     def test_kv_put_partial_update(self, controller, tq_api):
         """Test adding new fields to existing sample."""
         partition_id = "test_partition"

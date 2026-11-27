@@ -332,22 +332,26 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta,
         request_type: ZMQRequestType,
         response_type: ZMQRequestType,
+        custom_meta: list[dict[str, Any]] | None = None,
         socket: zmq.asyncio.Socket | None = None,
         *,
         _validate_tags: bool = True,
     ) -> None:
-        """Send the metadata's custom_meta to the controller as ``request_type``."""
+        """Send ``custom_meta`` (the metadata's own when None) to the controller as ``request_type``."""
         assert socket is not None
 
         if not self._controller:
             raise RuntimeError("No controller registered")
 
         global_indexes = metadata.global_indexes
-        custom_meta = metadata.custom_meta
+        custom_meta = metadata.custom_meta if custom_meta is None else custom_meta
 
         if not global_indexes or not custom_meta:
             logger.debug(f"[{self.client_id}]: Empty BatchMeta or custom_meta provided. No action taken.")
             return
+
+        if len(custom_meta) != metadata.size:
+            raise ValueError(f"custom_meta length {len(custom_meta)} must match the batch size: {metadata.size}")
 
         if _validate_tags:
             self.validate_tags(custom_meta)
@@ -410,6 +414,7 @@ class AsyncTransferQueueClient:
     async def async_merge_custom_meta(
         self,
         metadata: BatchMeta,
+        custom_meta: list[dict[str, Any]] | None = None,
         socket: zmq.asyncio.Socket | None = None,
         *,
         _validate_tags: bool = True,
@@ -422,25 +427,31 @@ class AsyncTransferQueueClient:
         that set different keys on one sample therefore both land, instead of the second
         one overwriting the first one's read-modify-write snapshot.
 
+        Pass ``custom_meta`` to send only the caller's own entries. When it is omitted, the
+        metadata's ``custom_meta`` is sent, and any entry it carries from a retrieve is stale:
+        merging it would restore those keys to the value read before the retrieve.
+
         Args:
-            metadata: BatchMeta containing the samples and the custom metadata to merge.
+            metadata: BatchMeta containing the samples to merge custom metadata for.
+            custom_meta: Per-sample metadata to merge, in ``global_indexes`` order. Each entry
+                must hold only the keys this caller is setting.
             socket: ZMQ async socket for message transmission (injected by decorator)
 
         Raises:
-            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack
+            ValueError: If ``custom_meta`` does not match the batch size, contains non-dict entries, or values not
+                serializable as native MessagePack
             RuntimeError: If communication fails or controller returns error response
 
         Example:
             >>> async def main():
             ...     batch_meta = await client.async_get_meta(data_fields=["input_ids"], batch_size=1, ...)
-            ...     batch_meta.update_custom_meta([{"score": 0.9}])
-            ...     await client.async_merge_custom_meta(batch_meta)
+            ...     await client.async_merge_custom_meta(batch_meta, [{"score": 0.9}])
         """
         await self._write_custom_meta(
             metadata,
             ZMQRequestType.MERGE_CUSTOM_META,
             ZMQRequestType.MERGE_CUSTOM_META_RESPONSE,
+            custom_meta=custom_meta,
             socket=socket,
             _validate_tags=_validate_tags,
         )
@@ -451,6 +462,7 @@ class AsyncTransferQueueClient:
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
+        custom_meta: list[dict[str, Any]] | None = None,
         *,
         _validate_tags: bool = True,
     ) -> BatchMeta:
@@ -481,6 +493,11 @@ class AsyncTransferQueueClient:
                          The number of elements per column must also remain unchanged.
                          Do not change the inner order of values within each column.
                          Only supported by SimpleStorage.
+            custom_meta: Per-sample metadata to merge, in ``global_indexes`` order. Defaults to the
+                         metadata's own ``custom_meta``; pass ``[]`` to leave the controller's
+                         custom metadata untouched, or one entry per sample that holds only the
+                         caller's own keys. Entries read back by a retrieve are stale, so merging
+                         them would restore keys another writer changed in the meantime.
 
         Warning:
             The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
@@ -589,7 +606,7 @@ class AsyncTransferQueueClient:
             await self.storage_manager.put_data(data, metadata, data_parser=data_parser)
 
         # Merge, not set: two writers that put different tags on one key must both land.
-        await self.async_merge_custom_meta(metadata, _validate_tags=False)
+        await self.async_merge_custom_meta(metadata, custom_meta, _validate_tags=False)
 
         logger.debug(
             f"[{self.client_id}]: partition {partition_id} put {metadata.size} samples to storage units successfully."

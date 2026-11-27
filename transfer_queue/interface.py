@@ -980,7 +980,9 @@ async def async_kv_put(
     if batch_meta.size != 1:
         raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match with input `key` size of 1!")
 
-    # 2. register the user-specified tag to BatchMeta
+    # 2. register the user-specified tag to BatchMeta; the wire carries only this entry, so a
+    # tag another writer set is not restored to the value this call read back
+    tag_delta = [] if tag is None else [tag]
     if tag is not None:
         batch_meta.update_custom_meta([tag])
 
@@ -1001,10 +1003,11 @@ async def async_kv_put(
             raise ValueError("`fields` can only be dict or TensorDict")
 
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
+        batch_meta = await tq_client.async_put(
+            fields, batch_meta, data_parser=data_parser, custom_meta=tag_delta, _validate_tags=False
+        )
     else:
-        # Directly update custom_meta (tag) to controller
-        await tq_client.async_merge_custom_meta(batch_meta, _validate_tags=False)
+        await tq_client.async_merge_custom_meta(batch_meta, tag_delta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
@@ -1107,17 +1110,20 @@ async def async_kv_batch_put(
             f"Retrieved BatchMeta size {batch_meta.size} does not match with input `keys` size {len(keys)}!"
         )
 
-    # 2. register the user-specified tags to BatchMeta
+    # 2. register the user-specified tags to BatchMeta; the wire carries only these entries, so
+    # a tag another writer set is not restored to the value this call read back
+    tag_delta = [] if tags is None else tags
     if tags is not None:
         batch_meta.update_custom_meta(tags)
 
     # 3. put data
     if fields is not None:
         # After put, batch_meta.field_names will include the new fields written by user
-        batch_meta = await tq_client.async_put(fields, batch_meta, data_parser=data_parser, _validate_tags=False)
+        batch_meta = await tq_client.async_put(
+            fields, batch_meta, data_parser=data_parser, custom_meta=tag_delta, _validate_tags=False
+        )
     else:
-        # Directly update custom_meta (tags) to controller
-        await tq_client.async_merge_custom_meta(batch_meta, _validate_tags=False)
+        await tq_client.async_merge_custom_meta(batch_meta, tag_delta, _validate_tags=False)
 
     fields_to_return = batch_meta.field_names
 
