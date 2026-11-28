@@ -123,6 +123,12 @@ sample dispatch. Each key identifies a sample within a partition. Start with
 | `(async_)kv_clear` | Delete keys or selected fields |
 | `(async_)kv_clear_unlinked_public` | Reclaim shared data no longer referenced by trajectories |
 
+> **Concurrency**: TQ does not coordinate concurrent writers. The last write to a key or field wins,
+> and tags are stored as one dict per sample, so a writer that sets one tag can overwrite tags another
+> writer set on the same sample. For a sequence that reads, computes and writes back, `kv_put` does not
+> check `kv_global_lock`: take the lock around the sequence **and** make every writer that touches the
+> same keys take it too, or the race remains (see [Tutorial 10](tutorial/10_kv_locks.py)).
+
 **Key Features**
 
 - **Redis-style Semantics**: Familiar KV interface (Put/Get/List) for a zero learning curve.
