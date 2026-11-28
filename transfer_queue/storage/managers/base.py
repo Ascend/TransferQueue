@@ -19,9 +19,9 @@ import itertools
 import os
 import threading
 import time
-import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -35,6 +35,7 @@ from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
+from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.tensor_utils import _pack_tensor_values
@@ -612,8 +613,44 @@ class KVStorageManager(StorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
+        self._io_executor = ThreadPoolExecutor(thread_name_prefix="KVStorageIO")
         self._multi_threads_executor: ThreadPoolExecutor | None = None
-        self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
+
+    async def _run_storage_operation(self, operation: Callable, *args, **kwargs) -> Any:
+        """Run a blocking SDK call with the caller's accelerator context."""
+        streams = [
+            (device, device.current_stream())
+            for device in (torch.cuda, getattr(torch, "npu", None))
+            if device is not None and device.is_initialized()
+        ]
+
+        def run():
+            # Device and stream state are thread-local; a pool worker must not default
+            # to device 0 or a different stream when the caller uses an accelerator.
+            with ExitStack() as stack:
+                for device, stream in streams:
+                    stack.enter_context(device.stream(stream))
+                return operation(*args, **kwargs)
+
+        return await asyncio.get_running_loop().run_in_executor(self._io_executor, run)
+
+    def close(self) -> None:
+        """Drain workers and release controller resources.
+
+        Callers must stop submitting operations before closing the manager.
+        """
+        try:
+            # Cancellation does not stop an SDK worker. Drain it before the caller
+            # can release the client and its backend resources.
+            for name in ("_io_executor", "_multi_threads_executor"):
+                executor = getattr(self, name, None)
+                if executor is not None:
+                    executor.shutdown(wait=True)
+            client = getattr(self, "storage_client", None)
+            if isinstance(client, MooncakeStoreClient):
+                client.close(unmount=False)
+        finally:
+            super().close()
 
     @staticmethod
     def _generate_keys(field_names: list[str], global_indexes: list[int]) -> list[str]:
@@ -652,15 +689,6 @@ class KVStorageManager(StorageManager):
             else:
                 results.extend(field_data)
         return results
-
-    @staticmethod
-    def _shutdown_executor(thread_executor: ThreadPoolExecutor | None) -> None:
-        """
-        A static method to ensure no strong reference to 'self' is held within the
-        finalizer's callback, enabling proper garbage collection.
-        """
-        if thread_executor:
-            thread_executor.shutdown(wait=False)
 
     def _get_executor(self) -> ThreadPoolExecutor:
         """Lazy Creating multi-thread executor for speeding up '_merge_tensors_to_tensordict'"""
@@ -808,8 +836,7 @@ class KVStorageManager(StorageManager):
         keys = self._generate_keys(data_field_names, metadata.global_indexes)
         values = self._generate_values(data)
 
-        loop = asyncio.get_event_loop()
-        custom_backend_meta = await loop.run_in_executor(None, self.storage_client.put, keys, values)
+        custom_backend_meta = await self._run_storage_operation(self.storage_client.put, keys, values)
 
         field_schema = extract_field_schema(data)
 
@@ -863,8 +890,8 @@ class KVStorageManager(StorageManager):
             return TensorDict({}, batch_size=len(metadata))
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         shapes, dtypes, custom_backend_meta = self._get_shape_type_custom_backend_meta_list(metadata)
-        values = self.storage_client.get(
-            keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
+        values = await self._run_storage_operation(
+            self.storage_client.get, keys=keys, shapes=shapes, dtypes=dtypes, custom_backend_meta=custom_backend_meta
         )
         return self._merge_tensors_to_tensordict(metadata, values)
 
@@ -882,4 +909,4 @@ class KVStorageManager(StorageManager):
 
         keys = self._generate_keys(metadata.field_names, metadata.global_indexes)
         _, _, custom_meta = self._get_shape_type_custom_backend_meta_list(metadata)
-        self.storage_client.clear(keys=keys, custom_backend_meta=custom_meta)
+        await self._run_storage_operation(self.storage_client.clear, keys=keys, custom_backend_meta=custom_meta)
