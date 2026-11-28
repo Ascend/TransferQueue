@@ -136,6 +136,9 @@ class MockController:
                     elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
                         response_body = {"message": "success"}
                         response_type = ZMQRequestType.SET_CUSTOM_META_RESPONSE
+                    elif request_msg.request_type == ZMQRequestType.MERGE_CUSTOM_META:
+                        response_body = {"message": "success"}
+                        response_type = ZMQRequestType.MERGE_CUSTOM_META_RESPONSE
                     elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
                         # Mock reset consumption - always succeed
                         response_body = {

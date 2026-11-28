@@ -1916,6 +1916,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         metadata: BatchMeta | None = None,
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
+        custom_meta: list[dict[str, Any]] | None = None,
     ) -> BatchMeta:
         """Synchronously write data to storage units based on metadata.
 
@@ -1997,7 +1998,13 @@ class TransferQueueClient(AsyncTransferQueueClient):
             >>> # This will create metadata in "insert" mode internally.
             >>> metadata = client.put(data=prompts_repeated_batch, partition_id=current_partition_id)
         """
-        return self._put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
+        return self._put(
+            data=data,
+            metadata=metadata,
+            partition_id=partition_id,
+            data_parser=data_parser,
+            custom_meta=custom_meta,
+        )
 
     def update(
         self,
