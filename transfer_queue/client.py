@@ -37,7 +37,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    with_zmq_socket,
 )
 
 logger = get_logger(__name__)
@@ -55,12 +54,6 @@ DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
 # the caller forever. Generous: a busy controller is normal, an unanswered request is not.
 TQ_CONTROLLER_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_SEND_RECV_TIMEOUT", 200))  # seconds
 
-# Pre-bound decorator for controller socket operations.
-with_controller_socket = with_zmq_socket(
-    get_peer=lambda self, target: self._controller,
-    get_pool=lambda self: self.controller_rpc_pool,
-)
-
 
 def _status_tensor(raw: bytes, shape: tuple[int, ...]) -> torch.Tensor:
     if not raw:
@@ -69,15 +62,14 @@ def _status_tensor(raw: bytes, shape: tuple[int, ...]) -> torch.Tensor:
 
 
 class AsyncTransferQueueClient:
-    """Asynchronous client for interacting with TransferQueue controller and storage systems.
+    """Async access to controller metadata and storage payloads.
 
-    This client provides async methods for data transfer operations including getting metadata,
-    reading data from storage, writing data to storage, and clearing data.
+    Use one long-lived event loop to reuse pooled sockets. A new ``asyncio.run()``
+    per call creates a new pool owner and connection. Use ``TransferQueueClient``
+    when the caller has no event loop.
 
-    Await these methods from one long-lived event loop, as the examples below do. Pooled
-    sockets are keyed by their owning loop, so a fresh ``asyncio.run()`` per call gets a
-    fresh socket every time and pays a connect handshake it cannot amortize. Callers with
-    no loop of their own should use ``TransferQueueClient``, which keeps one internally.
+    The optional ``socket`` arguments remain for call compatibility. Controller
+    RPCs always lease a socket from this client's pool.
     """
 
     def __init__(
@@ -87,20 +79,18 @@ class AsyncTransferQueueClient:
         zmq_io_threads: int | None = None,
         zmq_max_sockets: int | None = None,
     ):
-        """Initialize the asynchronous TransferQueue client.
+        """Create a client with its own ZMQ context and controller socket pool.
 
         Args:
-            client_id: Unique identifier for this client instance
-            controller_info: Single controller ZMQ server information
-            zmq_io_threads: Fixed size of the client context's native I/O-thread pool.
-                Defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
-            zmq_max_sockets: Maximum number of sockets the client context may hold open
-                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to
-                ``DEFAULT_CLIENT_ZMQ_MAX_SOCKETS`` (8192) when that is unset -- well above
-                libzmq's own 1023, which large-scale training can exhaust. This ceiling is
-                per-client: a single ``put``/``get`` fans out one socket per storage unit,
-                and a borrowing storage manager shares the same budget. Raising it also
-                requires enough file descriptors (``ulimit -n``).
+            client_id: Unique client identifier.
+            controller_info: Controller endpoint.
+            zmq_io_threads: Native I/O threads; defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
+            zmq_max_sockets: Per-client socket limit. Defaults to
+                ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, or 8192 when unset. The default is
+                clamped to libzmq's limit; an explicit value above that limit raises.
+                Storage managers borrowing this context share the budget, and a
+                PUT/GET may open a socket per storage unit. Large limits also need
+                enough file descriptors (``ulimit -n``).
         """
         if controller_info is None:
             raise ValueError("controller_info cannot be None")
@@ -179,11 +169,10 @@ class AsyncTransferQueueClient:
 
     @staticmethod
     def _release_zmq_context(context: "zmq.asyncio.Context", client_id: str) -> None:
-        """Destroy *context* if it is still open.
+        """Destroy an open context without retaining the client.
 
-        Must stay a staticmethod taking the context explicitly, or the bound method would
-        keep the client alive and never fire. TransferQueueClient's loop thread references
-        the client, deferring this to interpreter exit -- close() remains the supported path.
+        A bound callback would prevent finalization. The synchronous client's loop
+        thread can also retain the client until exit, so callers should use ``close``.
         """
         try:
             if not context.closed:
@@ -196,20 +185,15 @@ class AsyncTransferQueueClient:
         manager_type: str,
         config: dict[str, Any],
     ):
-        """Initialize the storage manager.
+        """Create a registered storage manager with the supplied backend configuration.
 
-        The client's long-lived ZMQ context is offered to every backend uniformly; each
-        registered manager decides whether to borrow it or keep its own, so the client
-        needs no knowledge of specific backend names. Managers build their own pools over
-        whichever context they end up with, one per request scenario.
+        Each manager chooses whether to borrow the client's ZMQ context or create
+        its own, and owns the socket pools it creates on that context.
 
         Args:
-            manager_type: Type of storage manager to create. Supported types include:
-                          AsyncSimpleStorageManager, KVStorageManager (under development), etc.
-            config: Configuration dictionary for the storage manager.
-                    For AsyncSimpleStorageManager, must contain the following required keys:
-                    - zmq_info: ZMQ server information about the storage units
-
+            manager_type: Name registered with ``StorageManagerFactory``.
+            config: Backend settings. SimpleStorage requires ``zmq_info`` with the
+                storage-unit endpoints.
         """
         self.storage_manager = StorageManagerFactory.create(
             manager_type,
@@ -220,37 +204,45 @@ class AsyncTransferQueueClient:
 
     async def _request_controller(
         self,
-        socket: zmq.asyncio.Socket | None,
         request_type: ZMQRequestType,
         response_type: ZMQRequestType,
         body: dict[str, Any],
     ) -> ZMQMessage:
-        """Send one controller request and validate its response type."""
-        assert socket is not None
-        request_msg = ZMQMessage.create(
-            request_type=request_type,  # type: ignore[arg-type]
-            sender_id=self.client_id,
-            receiver_id=self._controller.id,
-            body=body,
-        )
-        await socket.send_multipart(request_msg.serialize())
-        response_serialized = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(response_serialized)
-        logger.debug(f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}")
-        if response_msg.request_type != response_type:
-            message = response_msg.body.get("message", "Unknown error")
-            raise RuntimeError(
-                f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
-                f"from controller {self._controller.id}: {message}"
+        """Lease a socket for one RPC; discard it if transport or response validation fails."""
+        async with self.controller_rpc_pool.alease(self._controller) as socket:
+            request_msg = ZMQMessage.create(
+                request_type=request_type,  # type: ignore[arg-type]
+                sender_id=self.client_id,
+                receiver_id=self._controller.id,
+                body=body,
             )
-        return response_msg
+            await socket.send_multipart(request_msg.serialize())
+            response_serialized = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(response_serialized)
+            logger.debug(
+                f"[{self.client_id}]: Received {response_msg.request_type} from controller {self._controller.id}"
+            )
+            if response_msg.request_type != response_type:
+                message = response_msg.body.get("message", "Unknown error")
+                raise RuntimeError(
+                    f"[{self.client_id}]: Expected {response_type}, got {response_msg.request_type} "
+                    f"from controller {self._controller.id}: {message}"
+                )
+            return response_msg
+
+    def _require_storage_manager(self, operation: str = "performing storage") -> None:
+        """Require an initialized manager before the named storage operation."""
+        if getattr(self, "storage_manager", None) is None:
+            raise RuntimeError(
+                f"[{self.client_id}]: Storage manager not initialized. "
+                f"Call initialize_storage_manager() before {operation} operations."
+            )
 
     # ==================== Basic API ====================
     def validate_tags(self, tags: list[dict[str, Any]]) -> None:
         """Validate that custom per-sample tags are ``str``-keyed ``dict``s of native MessagePack values."""
         serial_utils.validate_metadata_dicts(tags, "tags")
 
-    @with_controller_socket
     async def async_get_meta(
         self,
         data_fields: list[str],
@@ -261,59 +253,30 @@ class AsyncTransferQueueClient:
         sampling_config: dict[str, Any] | None = None,
         socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
-        """Asynchronously fetch data metadata from the controller via ZMQ.
+        """Request sample metadata from the controller.
 
         Args:
-            data_fields: List of data field names to retrieve metadata for
-            batch_size: Number of samples to request in the batch
-            partition_id: Current data partition id
-            mode: Data fetch mode. Options:
-                - 'fetch': Get ready data only
-                - 'force_fetch': Get data regardless of readiness (may return unready samples)
-                - 'insert': Internal usage - should not be used by users
-            task_name: Optional task name associated with the request
-            sampling_config: Optional sampling configuration for custom samplers.
-            socket: ZMQ async socket for message transmission (injected by decorator)
+            data_fields: Fields to include.
+            batch_size: Number of samples to request.
+            partition_id: Partition to query.
+            mode: ``fetch`` selects ready samples through the sampler. ``force_fetch``
+                bypasses readiness, consumption filtering, and the sampler, so rows
+                may be unready or already consumed. ``insert`` is for internal use.
+            task_name: Consumer task name.
+            sampling_config: Custom sampler options, such as
+                ``{"n_samples_per_prompt": 4}`` for ``GRPOGroupNSampler``.
+            socket: Compatibility argument; RPCs use the client's socket pool.
 
         Returns:
-            BatchMeta: Metadata object containing data structure, sample information, and readiness status
+            BatchMeta containing sample identities, field metadata, and readiness.
 
         Raises:
-            RuntimeError: If communication fails or controller returns error response
+            RuntimeError: If controller communication or response validation fails.
 
-        Example:
-            >>> async def main():
-            ...     # Example 1: Basic fetch metadata
-            ...     batch_meta = await client.async_get_meta(
-            ...         data_fields=["input_ids", "attention_mask"],
-            ...         batch_size=4,
-            ...         partition_id="train_0",
-            ...         mode="fetch",
-            ...         task_name="generate_sequences"
-            ...     )
-            ...     print(batch_meta.is_ready)  # True if all samples ready
-            ...
-            ...     # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
-            ...     batch_meta = await client.async_get_meta(
-            ...         data_fields=["input_ids", "attention_mask"],
-            ...         batch_size=8,
-            ...         partition_id="train_0",
-            ...         mode="fetch",
-            ...         task_name="generate_sequences",
-            ...     )
-            ...     print(batch_meta.is_ready)  # True if all samples ready
-            ...
-            ...     # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            ...     # so may include unready and already-consumed samples. No filtering by
-            ...     # consumption status is applied.)
-            ...     batch_meta = await client.async_get_meta(
-            ...         partition_id="train_0",   # optional
-            ...         mode="force_fetch",
-            ...     )
-            ...     print(batch_meta.is_ready)  # May be False if some samples not ready
+        Use ``await client.async_get_meta(...)`` with the arguments shown in
+        ``TransferQueueClient.get_meta``'s sampling and inspection examples.
         """
         response_msg = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.GET_META,
             response_type=ZMQRequestType.GET_META_RESPONSE,
             body={
@@ -327,7 +290,6 @@ class AsyncTransferQueueClient:
         )
         return response_msg.body["metadata"]
 
-    @with_controller_socket
     async def async_set_custom_meta(
         self,
         metadata: BatchMeta,
@@ -335,33 +297,19 @@ class AsyncTransferQueueClient:
         *,
         _validate_tags: bool = True,
     ) -> None:
-        """
-        Asynchronously send custom metadata to the controller.
-
-        This method sends per-sample custom metadata (custom_meta) to the controller.
-        The custom_meta is stored in the controller and can be retrieved along with
-        the BatchMeta in subsequent get_meta calls.
+        """Publish per-sample tags to the controller for subsequent metadata queries.
 
         Args:
-            metadata: BatchMeta containing the samples and their custom metadata to store.
-                     The custom_meta should be set using BatchMeta.update_custom_meta()
-                     before calling this method.
-            socket: ZMQ async socket for message transmission (injected by decorator)
+            metadata: Samples and tags set with ``BatchMeta.update_custom_meta``.
+            socket: Compatibility argument; RPCs use the client's socket pool.
 
         Raises:
-            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack
-            RuntimeError: If communication fails or controller returns error response
+            ValueError: If tags are not string-keyed dictionaries of native MessagePack values.
+            RuntimeError: If controller communication or response validation fails.
 
-        Example:
-            >>> async def main():
-            ...     # Create batch with custom metadata
-            ...     batch_meta = await client.async_get_meta(data_fields=["input_ids"], batch_size=4, ...)
-            ...     batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
-            ...     await client.async_set_custom_meta(batch_meta)
+        After updating the tags, call ``await client.async_set_custom_meta(meta)``.
+        See ``TransferQueueClient.set_custom_meta`` for the complete example.
         """
-        assert socket is not None
-
         if not self._controller:
             raise RuntimeError("No controller registered")
 
@@ -380,7 +328,6 @@ class AsyncTransferQueueClient:
             partition_custom_meta[partition_id][index] = tag if tag else {}
 
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.SET_CUSTOM_META,
             response_type=ZMQRequestType.SET_CUSTOM_META_RESPONSE,
             body={
@@ -397,96 +344,49 @@ class AsyncTransferQueueClient:
         *,
         _validate_tags: bool = True,
     ) -> BatchMeta:
-        """Asynchronously write data to storage units based on metadata.
-
-        If metadata is not provided, it will be created automatically using insert mode
-        with the provided data fields and partition_id.
-
-        During put, the custom_meta in metadata will update the corresponding custom_meta in
-        TransferQueue Controller.
-
-        Note:
-            When using multiple workers for distributed execution, there may be data
-            ordering inconsistencies between workers during put operations.
+        """Write payloads, publish their tags, and return the metadata used for the write.
 
         Args:
-            data: Data to write as TensorDict
-            metadata: Records the metadata of a batch of data samples, containing index and
-                      storage unit information. If None, metadata will be auto-generated.
-            partition_id: Target data partition id (required if metadata is not provided)
-            data_parser: Optional callable to parse reference data (e.g., URLs) into real
-                         content. The input is a slice of the `data` parameter, in plain
-                         dict format (not TensorDict), mapping field_name -> batched values.
-                         For a regular tensor column the value is a batched tensor; for
-                         nested tensors (jagged or strided) and NonTensorStack columns
-                         the values are extracted into a list. It must modify values
-                         in-place based on the original keys; do not add or remove keys.
-                         The number of elements per column must also remain unchanged.
-                         Do not change the inner order of values within each column.
-                         Only supported by SimpleStorage.
+            data: Batched fields to write as a TensorDict.
+            metadata: Destination samples, or None to create them in ``insert`` mode.
+            partition_id: Required when ``metadata`` is None.
+            data_parser: SimpleStorage-only callback run on each storage unit. It
+                receives that unit's slice as a plain field-to-batch dict: dense
+                tensors remain tensors; nested tensors and NonTensorStack columns
+                become lists. Modify values in place while preserving field names,
+                sample count, and sample order. This can turn references such as
+                URLs into payloads.
+
+        Without metadata, start with an empty partition and submit the initial data
+        in one batch to avoid overwriting unconsumed rows. Repeat rows with interleave
+        when producing multiple samples per input. Concurrent producers may observe
+        different sample ordering.
 
         Warning:
-            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
-            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
-            links. A linked field is refused only by the links ``metadata`` still carries, so a
-            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
-            private copies of its linked fields and drops those links. To write back a batch
-            holding linked fields, select the fields to write from ``data``, e.g.
-            ``put(batch.select("response"), metadata=linked)``.
+            The written fields are ``data.keys()``. Selecting fields on BatchMeta
+            filters neither ``data`` nor the controller's links. Only links still
+            present in ``metadata`` protect fields from writes; omitting a link
+            from metadata can create a private copy and drop the controller link.
+            Select the payload instead, e.g. ``data.select("response")``, before
+            writing it with the original linked metadata.
 
-            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
-            to it: the check before writing does not reserve the row; see ``async_link``.
+            Do not overwrite public rows while another worker may link to them:
+            the pre-write link check does not reserve rows. See ``async_link``.
 
         Returns:
-            BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
-                       metadata; will be updated in a future version to reflect the post-put state)
+            The supplied BatchMeta, or the BatchMeta created for this write.
 
         Raises:
-            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
-            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
-                other rows link to: those stay read-only until no row links to them
+            ValueError: If metadata is empty, the required partition is missing,
+                tags are not string-keyed native MessagePack dictionaries, or a written field
+                is marked as linked in metadata.
+            RuntimeError: If storage fails or a public row still has incoming links.
 
-        Example:
-            >>> batch_size = 4
-            >>> seq_len = 16
-            >>> current_partition_id = "train_0"
-            >>> async def main():
-            ...     # Example 1: Normal usage with existing metadata
-            ...     batch_meta = await client.async_get_meta(
-            ...         data_fields=["prompts", "attention_mask"],
-            ...         batch_size=batch_size,
-            ...         partition_id=current_partition_id,
-            ...         mode="fetch",
-            ...         task_name="generate_sequences",
-            ...     )
-            ...     batch = await client.async_get_data(batch_meta)
-            ...     output = TensorDict({"response": torch.randn(batch_size, seq_len)})
-            ...     await client.async_put(data=output, metadata=batch_meta)
-            ...
-            ...     # Example 2: Initial data insertion without pre-existing metadata
-            ...     # BE CAREFUL: this usage may overwrite any unconsumed data in the given
-            ...     # partition_id! Please make sure the corresponding partition_id is empty
-            ...     # before calling the async_put() without metadata.
-            ...     # Now we only support put all the data of the corresponding partition id in
-            ...     # once. You should repeat with interleave the initial data if n_sample > 1
-            ...     # before calling the async_put().
-            ...     original_prompts = torch.randn(batch_size, seq_len)
-            ...     n_samples = 4
-            ...     prompts_repeated = torch.repeat_interleave(original_prompts, n_samples, dim=0)
-            ...     prompts_repeated_batch = TensorDict({"prompts": prompts_repeated})
-            ...     # This will create metadata in "insert" mode internally.
-            ...     metadata = await client.async_put(
-            ...         data=prompts_repeated_batch, partition_id=current_partition_id
-            ...     )
+        Await writes, e.g. ``meta = await client.async_put(output, metadata=meta)``.
+        See ``TransferQueueClient.put`` for initial insertion and write-back examples.
         """
 
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before performing storage operations."
-            )
+        self._require_storage_manager()
 
         for field_name, field_data in data.items():
             if isinstance(field_data, torch.Tensor) and field_data.ndim == 1:
@@ -550,26 +450,22 @@ class AsyncTransferQueueClient:
         merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
-        """Merge new values into fields on SimpleStorage units, storing them where absent.
+        """Merge values into SimpleStorage fields, inserting values where absent.
 
         Args:
-            metadata: Samples to update, already registered with the controller.
-            values: New values aligned with ``metadata``.
-            merge_fn: Called per sample per field as ``merge_fn(old, new)`` on held rows.
-            merge_plan: Per-field column type and held rows, from ``async_kv_prepare_update``.
-            finalize: If False, keep the updated fields hidden from consumers.
+            metadata: Samples already registered with the controller.
+            values: New values in metadata order.
+            merge_fn: ``merge_fn(old, new)`` for each existing sample-field value.
+            merge_plan: Field types and held rows from ``async_kv_prepare_update``.
+            finalize: Whether to make the updated fields available to consumers.
 
         Returns:
-            The same metadata with field_schema and production status updated.
+            The same BatchMeta with updated field schema and production status.
 
         Raises:
-            NotImplementedError: If the storage backend is not SimpleStorage.
+            NotImplementedError: If the backend is not SimpleStorage.
         """
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before performing storage operations."
-            )
+        self._require_storage_manager()
         if not metadata or metadata.size == 0:
             raise ValueError("metadata cannot be none or empty")
 
@@ -584,38 +480,19 @@ class AsyncTransferQueueClient:
         data_parser: Callable[[Any, Any], Any] | None = None,
         parser_args: list | None = None,
     ) -> TensorDict:
-        """Asynchronously fetch data from storage units and organize into TensorDict.
+        """Read the requested fields in metadata sample order as a TensorDict.
 
         Args:
-            metadata: Batch metadata containing data location information and global indexes
-            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
-                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
-            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
+            metadata: Sample locations, indexes, and fields to read.
+            data_parser: Optional SimpleStorage callback ``data_parser(data, args)``
+                applied before each unit replies; see ``transfer_queue.kv_batch_get``.
+            parser_args: Per-sample arguments aligned with ``metadata.global_indexes``.
 
-        Returns:
-            TensorDict containing:
-                - Requested data fields (e.g., "prompts", "attention_mask")
-
-        Example:
-            >>> async def main():
-            ...     batch_meta = await client.async_get_meta(
-            ...         data_fields=["prompts", "attention_mask"],
-            ...         batch_size=4,
-            ...         partition_id="train_0",
-            ...         mode="fetch",
-            ...         task_name="generate_sequences",
-            ...     )
-            ...     batch = await client.async_get_data(batch_meta)
-            ...     print(batch)
-            ...     # TensorDict with fields "prompts", "attention_mask", and sample order
-            ...     # matching metadata global_indexes
+        After fetching metadata, call ``batch = await client.async_get_data(meta)``.
+        See ``TransferQueueClient.get_data`` for the complete read sequence.
         """
 
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before performing storage operations."
-            )
+        self._require_storage_manager()
 
         if not metadata or metadata.size == 0 or len(metadata.field_names) == 0:
             logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to get_data. Returning empty TensorDict.")
@@ -642,20 +519,13 @@ class AsyncTransferQueueClient:
         return results
 
     async def async_clear_partition(self, partition_id: str):
-        """Asynchronously clear the whole partition from all storage units and the controller.
+        """Remove a partition's payloads and controller metadata.
 
-        Args:
-            partition_id: The partition id to clear data for
-
-        Raises:
-            RuntimeError: If clear operation fails
+        Rows are marked unready before their payloads and metadata are removed.
+        A missing partition is a no-op. Raise RuntimeError if clearing fails.
         """
         try:
-            if not hasattr(self, "storage_manager") or self.storage_manager is None:
-                raise RuntimeError(
-                    f"[{self.client_id}]: Storage manager not initialized. "
-                    "Call initialize_storage_manager() before performing storage operations."
-                )
+            self._require_storage_manager()
 
             if not self._controller:
                 raise RuntimeError("No controller registered")
@@ -683,20 +553,13 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"Error in clear operation: {str(e)}") from e
 
     async def async_clear_samples(self, metadata: BatchMeta):
-        """Asynchronously clear specific samples from all storage units and the controller.
+        """Remove the samples described by metadata from storage and the controller.
 
-        Args:
-            metadata: The BatchMeta of the corresponding data to be cleared
-
-        Raises:
-            RuntimeError: If clear operation fails
+        Rows are marked unready before their payloads and metadata are removed.
+        An empty batch is a no-op. Raise RuntimeError if clearing fails.
         """
         try:
-            if not hasattr(self, "storage_manager") or self.storage_manager is None:
-                raise RuntimeError(
-                    f"[{self.client_id}]: Storage manager not initialized. "
-                    "Call initialize_storage_manager() before performing storage operations."
-                )
+            self._require_storage_manager()
 
             if metadata.size == 0:
                 logger.warning(f"[{self.client_id}]: Empty BatchMeta provided to clear_samples. No action taken.")
@@ -718,119 +581,60 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"Error in clear_samples operation: {str(e)}") from e
 
-    @with_controller_socket
     async def _mark_clearing_in_controller(self, metadata: BatchMeta, socket=None):
-        """Mark samples as pending deletion in the controller.
-
-        Args:
-            metadata: The BatchMeta of the data to be marked
-            socket: ZMQ socket (injected by decorator)
-
-        Raises:
-            RuntimeError: If the controller returns an unexpected response
-        """
+        """Clear sample readiness before deletion; raise RuntimeError on an invalid reply."""
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.MARK_CLEARING,
             response_type=ZMQRequestType.MARK_CLEARING_RESPONSE,
             body={"global_indexes": metadata.global_indexes, "partition_ids": metadata.partition_ids},
         )
 
-    @with_controller_socket
     async def _clear_meta_in_controller(self, metadata: BatchMeta, socket=None):
-        """Clear metadata in the controller.
-
-        Args:
-            metadata: The BatchMeta of the corresponding data to be cleared
-            socket: ZMQ socket (injected by decorator)
-
-        Raises:
-            RuntimeError: If clear operation fails
-        """
+        """Remove sample metadata from the controller; raise RuntimeError on failure."""
 
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.CLEAR_META,
             response_type=ZMQRequestType.CLEAR_META_RESPONSE,
             body={"global_indexes": metadata.global_indexes, "partition_ids": metadata.partition_ids},
         )
 
-    @with_controller_socket
     async def _get_partition_meta(self, partition_id: str, socket=None) -> BatchMeta:
-        """Get metadata required for the whole partition from controller.
-
-        Args:
-            partition_id: Partition id to get partition metadata for
-            socket: ZMQ socket (injected by decorator)
-
-        Returns:
-            BatchMeta: Records the metadata of a batch of data samples.
-
-        Raises:
-            RuntimeError: If controller returns error response
-        """
+        """Return a partition's BatchMeta; raise RuntimeError on an invalid controller reply."""
         response_msg = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.GET_PARTITION_META,
             response_type=ZMQRequestType.GET_PARTITION_META_RESPONSE,
             body={"partition_id": partition_id},
         )
         return response_msg.body["metadata"]
 
-    @with_controller_socket
     async def _clear_partition_in_controller(self, partition_id, socket=None):
-        """Clear the whole partition in the controller.
-
-        Args:
-            partition_id: Partition id to clear metadata for
-            socket: ZMQ socket (injected by decorator)
-
-        Raises:
-            RuntimeError: If clear operation fails
-        """
+        """Remove a partition's controller metadata; raise RuntimeError on failure."""
 
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.CLEAR_PARTITION,
             response_type=ZMQRequestType.CLEAR_PARTITION_RESPONSE,
             body={"partition_id": partition_id},
         )
 
     # ==================== Status Query API ====================
-    @with_controller_socket
     async def async_get_consumption_status(
         self,
         task_name: str,
         partition_id: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Get consumption status for current partition in a specific task.
+        """Return sample indexes and consumption flags as tensors for a task in a partition.
 
-        Args:
-            task_name: Name of the task to check consumption for
-            partition_id: Partition id to check consumption status for
-            socket: ZMQ async socket for message transmission (injected by decorator)
+        Flags are 1 for consumed and 0 otherwise. Return ``(None, None)`` when
+        the controller supplies no status. Raise RuntimeError on controller errors.
+        ``socket`` is retained for compatibility; RPCs use the client's pool.
 
-        Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Consumption status tensor for the specified task. 1 for consumed, 0 for not consumed.
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Get consumption status
-            >>> global_index, consumption_status = await client.async_get_consumption_status(
-            ...     task_name="generate_sequences",
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
+        Await this query; see ``TransferQueueClient.get_consumption_status`` for
+        filtering sample indexes by their flags.
         """
 
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.GET_CONSUMPTION,
                 response_type=ZMQRequestType.CONSUMPTION_RESPONSE,
                 body={
@@ -849,39 +653,23 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in get_consumption_status: {str(e)}") from e
 
-    @with_controller_socket
     async def async_get_production_status(
         self,
         data_fields: list[str],
         partition_id: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Get production status for specific data fields and partition.
+        """Return sample indexes and readiness flags as tensors for fields in a partition.
 
-        Args:
-            data_fields: Data fields to check production status for
-            partition_id: Partition id to check production status for
-            socket: ZMQ async socket for message transmission (injected by decorator)
+        Flags are 1 for ready and 0 otherwise. Return ``(None, None)`` when
+        the controller supplies no status. Raise RuntimeError on controller errors.
+        ``socket`` is retained for compatibility; RPCs use the client's pool.
 
-        Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Production status tensor for the specified fields. 1 for ready, 0 for not ready.
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Get production status
-            >>> global_index, production_status = await client.async_get_production_status(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"Global index: {global_index}, Production status: {production_status}")
+        Await this query; see ``TransferQueueClient.get_production_status`` for
+        finding rows with incomplete fields.
         """
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.GET_PRODUCTION,
                 response_type=ZMQRequestType.PRODUCTION_RESPONSE,
                 body={
@@ -905,25 +693,12 @@ class AsyncTransferQueueClient:
         task_name: str,
         partition_id: str,
     ) -> bool:
-        """Check if all samples for current partition have been consumed by a specific task.
+        """Return whether all samples in the partition are consumed by this task.
 
-        Args:
-            task_name: Name of the task to check consumption for
-            partition_id: Partition id to check consumption status for
+        Missing or empty consumption status returns False. Controller errors raise RuntimeError.
 
-        Returns:
-            bool: True if all samples have been consumed by the task, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Check if all samples have been consumed
-            >>> is_consumed = await client.async_check_consumption_status(
-            ...     task_name="generate_sequences",
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"All samples consumed: {is_consumed}")
+        See ``TransferQueueClient.get_partition_list`` for a partition scan;
+        await both async calls when adapting that example.
         """
 
         _, consumption_status = await self.async_get_consumption_status(
@@ -940,26 +715,12 @@ class AsyncTransferQueueClient:
         data_fields: list[str],
         partition_id: str,
     ) -> bool:
-        """Check if the all specific fields of samples for current partition are ready
-        (produced) for consumption.
+        """Return whether all queried field-production flags are ready.
 
-        Args:
-            data_fields: Data fields to check production status for
-            partition_id: Partition id to check production status for
+        Missing production status returns False. Controller errors raise RuntimeError.
 
-        Returns:
-            bool: True if all samples have been produced and ready, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Check if all samples are ready for consumption
-            >>> is_ready = await client.async_check_production_status(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"All samples ready: {is_ready}")
+        Use ``await client.async_check_production_status(...)`` with the arguments
+        shown in ``TransferQueueClient.check_production_status``.
         """
         _, production_status = await self.async_get_production_status(
             data_fields=data_fields,
@@ -970,43 +731,26 @@ class AsyncTransferQueueClient:
             return False
         return torch.all(production_status == 1).item()
 
-    @with_controller_socket
     async def async_reset_consumption(
         self,
         partition_id: str,
         task_name: str | None = None,
         socket: zmq.asyncio.Socket | None = None,
     ) -> bool:
-        """Asynchronously reset consumption status for a partition.
+        """Reset consumption so a partition's samples can be consumed again.
 
-        This allows the same data to be re-consumed, useful for debugging scenarios
-        where the same rollout data needs to be trained multiple times.
+        ``task_name=None`` resets all tasks; otherwise only the named task is reset.
+        Return the controller's success flag, or raise RuntimeError on communication
+        or response errors. ``socket`` is retained for compatibility.
 
-        Args:
-            partition_id: Partition id to reset consumption status for
-            task_name: Name of the task to reset. If None, resets all tasks.
-            socket: ZMQ async socket for message transmission (injected by decorator)
-
-        Returns:
-            bool: True if reset was successful, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Reset consumption for train task to re-train on same data
-            >>> success = await client.async_reset_consumption(
-            ...     partition_id="train_0",
-            ...     task_name="train"
-            ... )
-            >>> print(f"Reset successful: {success}")
+        See ``TransferQueueClient.reset_consumption`` for consuming data again;
+        await both the reset and the subsequent metadata fetch.
         """
         body = {"partition_id": partition_id}
         if task_name is not None:
             body["task_name"] = task_name
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.RESET_CONSUMPTION,
                 response_type=ZMQRequestType.RESET_CONSUMPTION_RESPONSE,
                 body=body,
@@ -1018,26 +762,19 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in reset_consumption: {str(e)}") from e
 
-    @with_controller_socket
     async def async_get_partition_list(
         self,
         socket: zmq.asyncio.Socket | None = None,
     ) -> list[str]:
-        """Asynchronously fetch the list of partition ids from the controller.
+        """Return partition IDs managed by the controller.
 
-        Args:
-            socket: ZMQ socket (injected by decorator)
+        ``socket`` is retained for compatibility; RPCs use the client's pool.
 
-        Returns:
-            list[str]: List of partition ids managed by the controller
-
-        Example:
-            >>> partition_ids = await client.get_partition_list()
-            >>> print(f"Available partitions: {partition_ids}")
+        See ``TransferQueueClient.get_partition_list`` for a partition scan;
+        await both async calls when adapting that example.
         """
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.GET_LIST_PARTITIONS,
                 response_type=ZMQRequestType.LIST_PARTITIONS_RESPONSE,
                 body={},
@@ -1047,7 +784,6 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in get_partition_list: {str(e)}") from e
 
     # ==================== KV Interface API ====================
-    @with_controller_socket
     async def async_kv_retrieve_meta(
         self,
         keys: list[str] | str,
@@ -1055,19 +791,17 @@ class AsyncTransferQueueClient:
         create: bool = False,
         socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
-        """Asynchronously retrieve BatchMeta by user-defined keys.
-
-        Retrieves metadata for given keys from a specified partition.
-        If keys do not exist and `create=True`, they will be automatically registered.
+        """Return metadata for keys in a partition, optionally registering missing keys.
 
         Args:
-            keys: List of keys to retrieve.
-            partition_id: The ID of the logical partition to search for keys.
-            create:  If True, automatically create entries for missing keys.
-            socket: ZMQ socket injected by @with_controller_socket.
+            keys: One key or a nonempty list of string keys.
+            partition_id: Partition containing the keys.
+            create: Whether to register missing keys.
+            socket: Compatibility argument; RPCs use the client's socket pool.
 
-        Returns:
-            BatchMeta: Metadata for the requested keys.
+        Raises:
+            TypeError: If keys is neither a string nor a list of strings.
+            ValueError: If keys is an empty list.
         """
         if isinstance(keys, str):
             keys = [keys]
@@ -1082,7 +816,6 @@ class AsyncTransferQueueClient:
 
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.KV_RETRIEVE_META,
                 response_type=ZMQRequestType.KV_RETRIEVE_META_RESPONSE,
                 body={
@@ -1095,17 +828,14 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}] Failed in async_kv_retrieve_meta: {e}") from e
 
-    @with_controller_socket
     async def async_kv_prepare_update(
         self, keys: list[str], partition_id: str, fields: list[str], socket=None
     ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
-        """Register missing keys and get, per field, its column type and which rows hold it.
+        """Register missing keys and describe each field's type and which rows hold it.
 
-        Returns:
-            The keys' BatchMeta and the ``merge_plan`` that ``async_update`` takes.
+        Return the keys' BatchMeta and the merge plan consumed by ``async_update``.
         """
         response_msg = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.KV_PREPARE_UPDATE,
             response_type=ZMQRequestType.KV_PREPARE_UPDATE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
@@ -1123,39 +853,34 @@ class AsyncTransferQueueClient:
         if metadata.size > 0:
             await self.storage_manager.clear_data(metadata, fields=metadata.field_names)
 
-    @with_controller_socket
     async def _kv_clear_fields_in_controller(
         self, keys: list[str], partition_id: str, fields: list[str], socket=None
     ) -> BatchMeta:
         """Clear fields in the controller and return the cleared cells' metadata."""
         response_msg = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.KV_CLEAR_FIELDS,
             response_type=ZMQRequestType.KV_CLEAR_FIELDS_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "fields": fields},
         )
         return response_msg.body["metadata"]
 
-    @with_controller_socket
     async def async_kv_retrieve_keys(
         self,
         global_indexes: list[int] | int,
         partition_id: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> list[str]:
-        """Asynchronously retrieve keys according to global_indexes from the controller.
+        """Return keys for global indexes in a partition.
 
         Args:
-            global_indexes: List of global_indexes to retrieve from the controller
-            partition_id: The ID of the logical partition to search for global_indexes.
-            socket: ZMQ socket (injected by decorator)
-
-        Returns:
-            keys: list of keys of the corresponding global_indexes
+            global_indexes: One index or a nonempty list of integer indexes.
+            partition_id: Partition to query.
+            socket: Compatibility argument; RPCs use the client's socket pool.
 
         Raises:
-            TypeError: If `global_indexes` is not a list of int or an int
-            RuntimeError: If some indexes in `global_indexes` do not have corresponding keys
+            TypeError: If indexes is neither an integer nor a list of integers.
+            ValueError: If indexes is an empty list.
+            RuntimeError: If any requested index has no key or the controller request fails.
         """
 
         if isinstance(global_indexes, int):
@@ -1171,7 +896,6 @@ class AsyncTransferQueueClient:
 
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.KV_RETRIEVE_KEYS,
                 response_type=ZMQRequestType.KV_RETRIEVE_KEYS_RESPONSE,
                 body={"global_indexes": global_indexes, "partition_id": partition_id},
@@ -1183,38 +907,19 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_retrieve_indexes: {str(e)}") from e
 
-    @with_controller_socket
     async def async_kv_list(
         self,
         partition_id: str | None = None,
         socket: zmq.asyncio.Socket | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Asynchronously retrieve keys and custom_meta from the controller for one or all partitions.
+        """Return ``{partition_id: {key: tags}}`` for one or all partitions.
 
-        Args:
-            partition_id: The specific partition_id to query.
-                If None (default), returns keys from all partitions.
-            socket: ZMQ socket (injected by decorator)
-
-        Returns:
-            A nested dictionary mapping partition IDs to their keys and metadata.
-
-            Structure:
-            {
-                "partition_id": {
-                    "key_name": {
-                        "tag1": <value>,
-                        ... (other metadata)
-                    },
-                    ...,
-                },
-                ...
-            }
+        ``partition_id=None`` queries all partitions. ``socket`` is retained for
+        compatibility; RPCs use the client's pool.
         """
 
         try:
             response_msg = await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.KV_LIST,
                 response_type=ZMQRequestType.KV_LIST_RESPONSE,
                 body={"partition_id": partition_id},
@@ -1223,47 +928,42 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
-    @with_controller_socket
     async def async_kv_describe(
         self,
         keys: list[str],
         partition_id: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> dict[str, Any]:
-        """Asynchronously describe each key's row and its fields' declared types, without payloads.
+        """Describe each key's row and declared field types without reading payloads.
 
-        Unlike ``kv_retrieve_meta``, every row keeps its own produced fields, and a missing
-        key raises instead of being dropped.
+        Each row retains its own produced fields. Unlike ``kv_retrieve_meta``,
+        missing keys raise instead of being omitted.
 
         Returns:
-            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}}, "field_schema":
-            {field: {"is_nested", "is_non_tensor"}}}``.
+            ``{"rows": {key: {"global_index", "fields", "unfinalized", "links", "tag"}},
+            "field_schema": {field: {"is_nested", "is_non_tensor"}}}``.
         """
         response = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.KV_DESCRIBE,
             response_type=ZMQRequestType.KV_DESCRIBE_RESPONSE,
             body={"keys": keys, "partition_id": partition_id},
         )
         return {"rows": response.body["rows"], "field_schema": response.body["field_schema"]}
 
-    @with_controller_socket
     async def async_kv_exists(
         self,
         keys: list[str],
         partition_id: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> dict[str, list[str]]:
-        """Asynchronously map each existing key to its ready fields; see ``kv_exists``."""
+        """Map existing keys to their ready fields; see ``transfer_queue.kv_exists``."""
         response = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.KV_EXISTS,
             response_type=ZMQRequestType.KV_EXISTS_RESPONSE,
             body={"keys": keys, "partition_id": partition_id},
         )
         return response.body["ready"]
 
-    @with_controller_socket
     async def async_kv_link(
         self,
         keys: list[str],
@@ -1272,18 +972,16 @@ class AsyncTransferQueueClient:
         fields: list[str],
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Asynchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
+        """Link fields of each key to its public key's payload; see ``transfer_queue.kv_link``."""
         # Only SimpleStorage resolves links on read; other backends would read the linking key's own cells.
         if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support kv_link")
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.KV_LINK,
             response_type=ZMQRequestType.KV_LINK_RESPONSE,
             body={"keys": keys, "partition_id": partition_id, "public_keys": public_keys, "fields": fields},
         )
 
-    @with_controller_socket
     async def async_link(
         self,
         metadata: BatchMeta,
@@ -1291,34 +989,31 @@ class AsyncTransferQueueClient:
         fields: list[str] | str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> BatchMeta:
-        """Asynchronously make ``fields`` of each row of ``metadata`` read the aligned row of ``public_metadata``.
-
-        The BatchMeta counterpart of ``kv_link``: neither side needs a key, so rows put through a
-        BatchMeta, e.g. ``put(data, partition_id=PUBLIC_PARTITION)``, can be shared too. A linked
-        public row is read-only, and ``clear_samples`` refuses it, until no row links to it;
-        ``kv_clear_unlinked_public`` then frees it.
+        """Link sample fields to the corresponding public rows without requiring keys.
 
         Args:
-            metadata: Rows of one partition, not ``PUBLIC_PARTITION``, that will read ``fields``.
-            public_metadata: Rows of ``PUBLIC_PARTITION`` that produced ``fields``, aligned with ``metadata``.
-            fields: Single field name or list of field names to link.
+            metadata: Rows in one non-public partition that will read the linked fields.
+            public_metadata: Aligned rows in ``PUBLIC_PARTITION`` that produced those fields.
+            fields: One field name or a list of field names.
+
+        A linked public row cannot be overwritten or cleared with ``clear_samples``.
+        After all incoming links are removed, ``kv_clear_unlinked_public`` can free it.
 
         Warning:
-            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
-            to it. A put checks the row's links before writing storage but does not reserve it,
-            so a link accepted in between reads the old payload and then the new one. Write each
-            public row once before linking it; to replace one, wait until no row links to it,
-            overwrite it, wait for the put to return, and only then link to it again.
+            PUT checks links but does not reserve public rows. Overwriting while
+            another worker links can expose both the old and new payloads. Write
+            public rows before linking. To replace them, remove all links, finish
+            the write, then link again.
 
         Returns:
-            ``metadata``'s rows over its fields and ``fields``, carrying the new links and keeping
-            ``metadata``'s ``extra_info`` and ``custom_meta``; reads and puts through it see the links.
+            BatchMeta for the input rows with the union of existing and linked fields,
+            carrying the new links and preserving ``extra_info`` and ``custom_meta``.
+            Subsequent reads and writes through it honor the links.
 
         Raises:
-            ValueError: ``metadata`` spans several partitions or ``public_metadata`` is not all in
-                ``PUBLIC_PARTITION``.
-            RuntimeError: The controller refused the link; see ``TransferQueueController.link``.
-            NotImplementedError: If the storage backend is not SimpleStorage.
+            ValueError: If metadata spans partitions or public_metadata contains non-public rows.
+            RuntimeError: If the controller rejects the link; see ``TransferQueueController.link``.
+            NotImplementedError: If the backend is not SimpleStorage.
         """
         if not isinstance(self.storage_manager, AsyncSimpleStorageManager):
             raise NotImplementedError(f"{type(self.storage_manager).__name__} does not support link")
@@ -1329,7 +1024,6 @@ class AsyncTransferQueueClient:
         if set(public_metadata.partition_ids) != {PUBLIC_PARTITION}:
             raise ValueError(f"public_metadata must cover only partition {PUBLIC_PARTITION!r}")
         response = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.LINK,
             response_type=ZMQRequestType.LINK_RESPONSE,
             body={
@@ -1346,33 +1040,25 @@ class AsyncTransferQueueClient:
         linked.custom_meta = [dict(meta) for meta in metadata.custom_meta]
         return linked
 
-    @with_controller_socket
     async def _check_public_write(self, global_indexes: list[int], socket=None) -> None:
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.CHECK_PUBLIC_WRITE,
             response_type=ZMQRequestType.CHECK_PUBLIC_WRITE_RESPONSE,
             body={"global_indexes": global_indexes},
         )
 
     async def async_clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
-        """Asynchronously clear every ``PUBLIC_PARTITION`` key no key links to; see ``kv_clear_unlinked_public``.
-
-        Returns:
-            The cleared keys.
-        """
+        """Delete unlinked public keys and return their names; see ``kv_clear_unlinked_public``."""
         metadata, keys = await self._mark_unlinked_public_clearing(stale_keys)
         if metadata.size > 0:
             await self.storage_manager.clear_data(metadata)
             await self._clear_meta_in_controller(metadata)
         return keys
 
-    @with_controller_socket
     async def _mark_unlinked_public_clearing(
         self, stale_keys: list[str] | None, socket=None
     ) -> tuple[BatchMeta, list[str]]:
         response = await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING,
             response_type=ZMQRequestType.MARK_UNLINKED_PUBLIC_CLEARING_RESPONSE,
             body={"stale_keys": stale_keys},
@@ -1380,11 +1066,11 @@ class AsyncTransferQueueClient:
         return response.body["metadata"], response.body["keys"]
 
     def close(self) -> None:
-        """Close the client and cleanup resources including storage manager.
+        """Close storage, pooled sockets, and the client's ZMQ context.
 
-        The caller must ensure no RPCs are in flight: this destroys the shared context, and
-        ``destroy()`` calls ``Socket.close()`` internally, which is **not** thread-safe.
-        Subclasses owning a loop thread must join it first (see TransferQueueClient.close).
+        The caller must first finish all RPCs: context destruction closes sockets
+        and is not thread-safe. Subclasses must stop and join their socket-owning
+        threads before calling this method; see ``TransferQueueClient.close``.
         """
         try:
             if hasattr(self, "storage_manager") and self.storage_manager:
@@ -1420,11 +1106,10 @@ class AsyncTransferQueueClient:
             finalizer.detach()
 
     def _can_destroy_zmq_context(self) -> bool:
-        """Whether it is safe to call ``destroy()`` on the shared context.
+        """Return whether all threads borrowing the client's context have stopped.
 
-        A storage manager that *borrowed* this context runs a notify thread the client
-        cannot see, and that thread holds sockets on it, so ask the manager first.
-        Subclasses running their own loop thread extend this.
+        Consult a sharing storage manager for its notify thread. Subclasses add
+        checks for their own socket-owning threads.
         """
         manager = getattr(self, "storage_manager", None)
         if manager is not None:
@@ -1437,7 +1122,6 @@ class AsyncTransferQueueClient:
         return True
 
     # ==================== Selective Data Dump API ====================
-    @with_controller_socket
     async def async_validate_dump_schema(
         self,
         partition_id: str,
@@ -1447,33 +1131,26 @@ class AsyncTransferQueueClient:
         """Reject incompatible destination fields before restoring payloads."""
         field_schema = serial_utils.encode_field_schema(field_schema)
         await self._request_controller(
-            socket=socket,
             request_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA,
             response_type=ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE,
             body={"partition_id": partition_id, "field_schema": field_schema},
         )
 
     async def async_dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
-        """Asynchronously dump the given rows into per-storage-unit shards.
+        """Dump selected rows and fields into per-storage-unit shards.
 
         Args:
-            shard_dir: Directory to write shard files into.
-            fields_by_index: Global index of each row to dump -> its produced fields.
+            shard_dir: Output directory.
+            fields_by_index: Global row indexes mapped to their produced field names.
 
         Returns:
-            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
-            stored field types.
+            ``{"shards", "row_schema"}`` with each shard and the rows' stored field types.
 
         Raises:
-            RuntimeError: If the storage manager is not initialized, or a unit holds
-                no data for a row it was asked to dump.
-            NotImplementedError: If the storage backend does not support dumping.
+            RuntimeError: If storage is uninitialized or a requested row has no stored data.
+            NotImplementedError: If the backend does not support dumps.
         """
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before dump operations."
-            )
+        self._require_storage_manager("dump")
         return await self.storage_manager.dump_rows_by_index(shard_dir, fields_by_index)
 
     async def async_load_rows_by_key(
@@ -1482,21 +1159,17 @@ class AsyncTransferQueueClient:
         rows: dict[str, dict[str, Any]],
         shards: list[dict[str, Any]],
     ) -> int:
-        """Restore selected payloads at the indexes their keys resolve to now; return bytes read.
+        """Restore payloads at their keys' current indexes and return bytes read.
 
-        Failure semantics match ``kv_batch_put``: new keys stay registered and payload
-        writes may be partial, and retrying is idempotent because keys keep their indexes.
+        As with ``kv_batch_put``, new keys remain registered after failure and
+        writes may be partial. Retries are idempotent because keys keep their indexes.
 
         Raises:
-            ValueError: If restored tags contain non-dict entries or values not serializable as native MessagePack.
-            RuntimeError: If the storage manager is not initialized, or a unit fails.
-            NotImplementedError: If the storage backend does not support selective loads.
+            ValueError: If restored tags are not string-keyed native MessagePack dictionaries.
+            RuntimeError: If storage is uninitialized or a unit fails.
+            NotImplementedError: If the backend does not support selective loads.
         """
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before load operations."
-            )
+        self._require_storage_manager("load")
         if not rows:
             return 0
         tags = [row["tag"] for row in rows.values()]
@@ -1512,29 +1185,19 @@ class AsyncTransferQueueClient:
         return bytes_read
 
     # ==================== Checkpoint API ====================
-    @with_controller_socket
     async def async_save_controller_checkpoint(
         self,
         path: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Asynchronously save controller state to a file via ZMQ RPC.
+        """Save controller state to a file on the controller node and wait for acknowledgement.
 
-        Sends a SAVE_CONTROLLER_CHECKPOINT request to the controller and waits
-        for acknowledgement. The controller serializes its state directly to
-        ``path`` in-process.
-
-        Args:
-            path: Absolute path for the output .pkl file. The caller must
-                ensure this path is writable from the node running the controller.
-            socket: ZMQ socket injected by @with_controller_socket.
-
-        Raises:
-            RuntimeError: If the RPC fails or an unexpected response is received.
+        ``path`` must be an absolute .pkl path writable from that node. The controller
+        serializes its own state. ``socket`` is retained for compatibility.
+        Communication or response errors raise RuntimeError.
         """
         try:
             await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT,
                 response_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
                 body={"path": path},
@@ -1542,30 +1205,20 @@ class AsyncTransferQueueClient:
         except Exception as e:
             raise RuntimeError(f"[{self.client_id}]: Error in save_controller_checkpoint: {str(e)}") from e
 
-    @with_controller_socket
     async def async_load_controller_checkpoint(
         self,
         path: str,
         socket: zmq.asyncio.Socket | None = None,
     ) -> None:
-        """Asynchronously restore controller state from a file via ZMQ RPC.
+        """Restore controller state from a file and wait for acknowledgement.
 
-        Sends a LOAD_CONTROLLER_CHECKPOINT request to the controller and waits
-        for acknowledgement. The controller deserializes its state directly from
-        ``path`` in-process, overwriting the current in-memory state.
-
-        Args:
-            path: Absolute path to a .pkl file previously written by
-                ``async_save_controller_checkpoint``. The caller must ensure
-                this path is readable from the node running the controller.
-            socket: ZMQ socket injected by @with_controller_socket.
-
-        Raises:
-            RuntimeError: If the RPC fails or an unexpected response is received.
+        ``path`` must be an absolute .pkl path saved by ``async_save_controller_checkpoint``
+        and readable from the controller node. The controller replaces its in-memory
+        state. ``socket`` is retained for compatibility. Communication or response
+        errors raise RuntimeError.
         """
         try:
             await self._request_controller(
-                socket=socket,
                 request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT,
                 response_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
                 body={"path": path},
@@ -1574,54 +1227,34 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in load_controller_checkpoint: {str(e)}") from e
 
     async def async_save_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Asynchronously save storage state to a directory via StorageManager.
+        """Save storage through the manager, which requests all units concurrently.
 
-        Delegates to the underlying StorageManager, which fans out save requests
-        to all storage units concurrently.
-
-        Args:
-            checkpoint_dir: Directory under which storage unit files are written.
-                The StorageManager creates a ``storage_units/`` subdirectory here.
-
-        Raises:
-            RuntimeError: If the storage manager is not initialized.
-            NotImplementedError: If the storage backend does not support checkpoint.
+        Unit files go under ``checkpoint_dir/storage_units/``. Raise RuntimeError if
+        storage is uninitialized, or NotImplementedError if checkpoints are unsupported.
         """
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before checkpoint operations."
-            )
+        self._require_storage_manager("checkpoint")
         await self.storage_manager.save_checkpoint(checkpoint_dir)
 
     async def async_load_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Asynchronously restore storage state from a directory via StorageManager.
+        """Restore storage through the manager, requesting all units concurrently.
 
-        Delegates to the underlying StorageManager, which fans out load requests
-        to all storage units concurrently. Existing in-memory data is overwritten.
-
-        Args:
-            checkpoint_dir: Directory previously written by
-                ``async_save_storage_checkpoint``, containing the
-                ``storage_units/`` subdirectory and manifest.
+        Existing in-memory data is replaced. ``checkpoint_dir`` must contain the
+        ``storage_units/`` directory and manifest saved by ``async_save_storage_checkpoint``.
 
         Raises:
-            RuntimeError: If the storage manager is not initialized.
-            FileNotFoundError: If the storage unit manifest is missing.
-            ValueError: If the number of storage units does not match the checkpoint.
+            RuntimeError: If storage is uninitialized.
+            FileNotFoundError: If the storage-unit manifest is missing.
+            ValueError: If the number of storage units differs from the checkpoint.
         """
-        if not hasattr(self, "storage_manager") or self.storage_manager is None:
-            raise RuntimeError(
-                f"[{self.client_id}]: Storage manager not initialized. "
-                "Call initialize_storage_manager() before checkpoint operations."
-            )
+        self._require_storage_manager("checkpoint")
         await self.storage_manager.load_checkpoint(checkpoint_dir)
 
 
 class TransferQueueClient(AsyncTransferQueueClient):
-    """Synchronous client wrapper for TransferQueue.
+    """Blocking client backed by one persistent event loop in a background thread.
 
-    Provides synchronous versions of all async methods for convenience.
+    Public methods keep explicit signatures and run their async counterparts on
+    that loop. See those methods for shared arguments, results, and error semantics.
     """
 
     def __init__(
@@ -1631,16 +1264,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
         zmq_io_threads: int | None = None,
         zmq_max_sockets: int | None = None,
     ):
-        """Initialize the synchronous TransferQueue client.
+        """Create a client and start its background event loop.
 
         Args:
-            client_id: Unique identifier for this client instance
-            controller_info: Single controller ZMQ server information
-            zmq_io_threads: Fixed size of the client context's native I/O-thread pool.
-                Defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
-            zmq_max_sockets: Maximum number of sockets the client context may hold open
-                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to
-                ``DEFAULT_CLIENT_ZMQ_MAX_SOCKETS`` (8192) when that is unset.
+            client_id: Unique client identifier.
+            controller_info: Controller endpoint.
+            zmq_io_threads: Native I/O threads; defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
+            zmq_max_sockets: Per-client socket limit; defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``
+                or 8192. See ``AsyncTransferQueueClient`` for shared budgets and limits.
         """
         super().__init__(
             client_id,
@@ -1654,9 +1285,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self._thread = threading.Thread(target=self._start_loop, daemon=True)
         self._thread.start()
 
-        # convert and bind sync methods
-        self._bind_sync_methods()
-
     def _start_loop(self):
         """Start the synchronous loop."""
         asyncio.set_event_loop(self._loop)
@@ -1666,48 +1294,6 @@ class TransferQueueClient(AsyncTransferQueueClient):
         """Run a coroutine on the client's background event loop."""
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         return future.result()
-
-    def _bind_sync_methods(
-        self,
-    ):
-        """Convert and bind synchronous methods."""
-
-        def _make_sync(async_method):
-            def wrapper(*args, **kwargs):
-                return self._run_coroutine(async_method(*args, **kwargs))
-
-            return wrapper
-
-        # Bind internal sync wrappers. Public methods are defined explicitly below
-        # to ensure proper type hints and documentation.
-        self._put = _make_sync(self.async_put)
-        self._update = _make_sync(self.async_update)
-        self._get_meta = _make_sync(self.async_get_meta)
-        self._get_data = _make_sync(self.async_get_data)
-        self._clear_partition = _make_sync(self.async_clear_partition)
-        self._clear_samples = _make_sync(self.async_clear_samples)
-        self._get_consumption_status = _make_sync(self.async_get_consumption_status)
-        self._get_production_status = _make_sync(self.async_get_production_status)
-        self._check_consumption_status = _make_sync(self.async_check_consumption_status)
-        self._check_production_status = _make_sync(self.async_check_production_status)
-        self._get_partition_list = _make_sync(self.async_get_partition_list)
-        self._set_custom_meta = _make_sync(self.async_set_custom_meta)
-        self._reset_consumption = _make_sync(self.async_reset_consumption)
-        self._kv_retrieve_meta = _make_sync(self.async_kv_retrieve_meta)
-        self._kv_prepare_update = _make_sync(self.async_kv_prepare_update)
-        self._kv_retrieve_keys = _make_sync(self.async_kv_retrieve_keys)
-        self._kv_list = _make_sync(self.async_kv_list)
-        self._kv_describe = _make_sync(self.async_kv_describe)
-        self._kv_link = _make_sync(self.async_kv_link)
-        self._clear_unlinked_public = _make_sync(self.async_clear_unlinked_public)
-        self._link = _make_sync(self.async_link)
-        self._validate_dump_schema = _make_sync(self.async_validate_dump_schema)
-        self._dump_rows_by_index = _make_sync(self.async_dump_rows_by_index)
-        self._load_rows_by_key = _make_sync(self.async_load_rows_by_key)
-        self._save_controller_checkpoint = _make_sync(self.async_save_controller_checkpoint)
-        self._load_controller_checkpoint = _make_sync(self.async_load_controller_checkpoint)
-        self._save_storage_checkpoint = _make_sync(self.async_save_storage_checkpoint)
-        self._load_storage_checkpoint = _make_sync(self.async_load_storage_checkpoint)
 
     # ==================== Basic API ====================
     def get_meta(
@@ -1719,90 +1305,46 @@ class TransferQueueClient(AsyncTransferQueueClient):
         task_name: str | None = None,
         sampling_config: dict[str, Any] | None = None,
     ) -> BatchMeta:
-        """Synchronously fetch data metadata from the controller via ZMQ.
+        """Fetch sample metadata; see ``async_get_meta`` for arguments and errors.
 
-        Args:
-            data_fields: List of data field names to retrieve metadata for
-            batch_size: Number of samples to request in the batch
-            partition_id: Current data partition id
-            mode: Data fetch mode. Options:
-                - 'fetch': Get ready data only
-                - 'force_fetch': Get data regardless of readiness (may return unready samples)
-                - 'insert': Internal usage - should not be used by users
-            task_name: Optional task name associated with the request
-            sampling_config: Optional sampling configuration for custom samplers.
+        Examples:
+            With ``GRPOGroupNSampler`` configured, fetch a ready group of four
+            adjacent samples from an existing partition:
 
-
-        Returns:
-            BatchMeta: Metadata object containing data structure, sample information, and readiness status
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Example 1: Basic fetch metadata
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences"
+            >>> meta = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...     task_name="rollout", sampling_config={"n_samples_per_prompt": 4},
             ... )
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 2: Fetch with self-defined samplers (using GRPOGroupNSampler as an example)
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     batch_size=8,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ...     sampling_config={"n_samples_per_prompt": 4}
-            ... )
-            >>> print(batch_meta.is_ready)  # True if all samples ready
-            >>>
-            >>> # Example 3: Force fetch metadata (bypass production status check and Sampler,
-            >>> # so may include unready and already-consumed samples. No filtering by consumption status is applied.)
-            >>> batch_meta = client.get_meta(
-            ...     partition_id="train_0",   # optional
+
+            Inspect rows even if they are unready or already consumed:
+
+            >>> inspected = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
             ...     mode="force_fetch",
             ... )
-            >>> print(batch_meta.is_ready)  # May be False if some samples not ready
         """
-        return self._get_meta(
-            data_fields=data_fields,
-            batch_size=batch_size,
-            partition_id=partition_id,
-            mode=mode,
-            task_name=task_name,
-            sampling_config=sampling_config,
+        return self._run_coroutine(
+            self.async_get_meta(
+                data_fields=data_fields,
+                batch_size=batch_size,
+                partition_id=partition_id,
+                mode=mode,
+                task_name=task_name,
+                sampling_config=sampling_config,
+            )
         )
 
     def set_custom_meta(self, metadata: BatchMeta) -> None:
-        """Synchronously send custom metadata to the controller.
-
-        This method sends per-sample custom metadata (custom_meta) to the controller.
-        The custom_meta is stored in the controller and can be retrieved along with
-        the BatchMeta in subsequent get_meta calls.
-
-        Args:
-            metadata: BatchMeta containing the samples and their custom metadata to store.
-                     The custom_meta should be set using BatchMeta.update_custom_meta()
-                     before calling this method.
-
-        Raises:
-            ValueError: If ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack
-            RuntimeError: If communication fails or controller returns error response
+        """Publish per-sample tags; see ``async_set_custom_meta`` for validation rules.
 
         Example:
-            >>> # Create batch with custom metadata
-            >>> batch_meta = client.get_meta(data_fields=["input_ids"], batch_size=2, ...)
-            >>> batch_meta.update_custom_meta([{"score": 0.9}, {"score": 0.8}])
-            >>> client.set_custom_meta(batch_meta)
+            Publish one tag dictionary per sample, in the existing metadata order:
+
+            >>> meta.update_custom_meta([{"score": 0.9} for _ in range(meta.size)])
+            >>> client.set_custom_meta(meta)
         """
 
-        return self._set_custom_meta(metadata=metadata)
+        return self._run_coroutine(self.async_set_custom_meta(metadata=metadata))
 
     def put(
         self,
@@ -1811,87 +1353,28 @@ class TransferQueueClient(AsyncTransferQueueClient):
         partition_id: str | None = None,
         data_parser: Callable[[Any], Any] | None = None,
     ) -> BatchMeta:
-        """Synchronously write data to storage units based on metadata.
+        """Write payloads and tags, returning the metadata used for the write.
 
-        If metadata is not provided, it will be created automatically using insert mode
-        with the provided data fields and partition_id.
+        See ``async_put`` for parser and linked-field constraints. Without metadata,
+        submit all initial data to an empty partition to avoid overwriting rows.
 
-        During put, the custom_meta in metadata will update the corresponding custom_meta in
-        TransferQueue Controller.
+        Examples:
+            With an initialized client, keep four samples per prompt adjacent:
 
-        Note:
-            When using multiple workers for distributed execution, there may be data
-            ordering inconsistencies between workers during put operations.
+            >>> import torch
+            >>> from tensordict import TensorDict
+            >>> prompts = torch.arange(6).reshape(2, 3).repeat_interleave(4, dim=0)
+            >>> data = TensorDict({"prompts": prompts}, batch_size=[8])
+            >>> meta = client.put(data, partition_id="train_0")
 
-        Args:
-            data: Data to write as TensorDict
-            metadata: Records the metadata of a batch of data samples, containing index and
-                      storage unit information. If None, metadata will be auto-generated.
-            partition_id: Target data partition id (required if metadata is not provided)
-            data_parser: Optional callable to parse reference data (e.g., URLs) into real
-                         content. The input is a slice of the `data` parameter, in plain
-                         dict format (not TensorDict), mapping field_name -> batched values.
-                         For a regular tensor column the value is a batched tensor; for
-                         nested tensors (jagged or strided) and NonTensorStack columns
-                         the values are extracted into a list. It must modify values
-                         in-place based on the original keys; do not add or remove keys.
-                         The number of elements per column must also remain unchanged.
-                         Do not change the inner order of values within each column.
-                         Only supported by SimpleStorage.
+            Write only the new output field to those same rows:
 
-        Warning:
-            The fields written are ``data.keys()``; ``metadata.field_names`` does not restrict
-            them, and ``BatchMeta.select_fields`` filters neither ``data`` nor the controller's
-            links. A linked field is refused only by the links ``metadata`` still carries, so a
-            put through ``linked.select_fields([...])`` of a batch read through ``linked`` stores
-            private copies of its linked fields and drops those links. To write back a batch
-            holding linked fields, select the fields to write from ``data``, e.g.
-            ``put(batch.select("response"), metadata=linked)``.
-
-            Do not overwrite a ``PUBLIC_PARTITION`` row while any worker or client may be linking
-            to it: the check before writing does not reserve the row; see ``async_link``.
-
-        Returns:
-            BatchMeta: The metadata used for the put operation (currently returns the input metadata or auto-retrieved
-                       metadata; will be updated in a future version to reflect the post-put state)
-
-        Raises:
-            ValueError: If metadata is None or empty, if partition_id is None when metadata is not provided,
-                if ``metadata.custom_meta`` contains non-dict entries or values not serializable as native
-                MessagePack, or if ``data`` writes a field that ``metadata`` marks as linked by ``kv_link``
-            RuntimeError: If storage operation fails, or if ``metadata`` names ``PUBLIC_PARTITION`` rows that
-                other rows link to: those stay read-only until no row links to them
-
-        Example:
-            >>> batch_size = 4
-            >>> seq_len = 16
-            >>> current_partition_id = "train_0"
-            >>> # Example 1: Normal usage with existing metadata
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["prompts", "attention_mask"],
-            ...     batch_size=batch_size,
-            ...     partition_id=current_partition_id,
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
-            ... )
-            >>> batch = client.get_data(batch_meta)
-            >>> output = TensorDict({"response": torch.randn(batch_size, seq_len)})
-            >>> client.put(data=output, metadata=batch_meta)
-            >>>
-            >>> # Example 2: Initial data insertion without pre-existing metadata
-            >>> # BE CAREFUL: this usage may overwrite any unconsumed data in the given partition_id!
-            >>> # Please make sure the corresponding partition_id is empty before calling the async_put()
-            >>> # without metadata.
-            >>> # Now we only support put all the data of the corresponding partition id in once. You should repeat with
-            >>> # interleave the initial data if n_sample > 1 before calling the async_put().
-            >>> original_prompts = torch.randn(batch_size, seq_len)
-            >>> n_samples = 4
-            >>> prompts_repeated = torch.repeat_interleave(original_prompts, n_samples, dim=0)
-            >>> prompts_repeated_batch = TensorDict({"prompts": prompts_repeated})
-            >>> # This will create metadata in "insert" mode internally.
-            >>> metadata = client.put(data=prompts_repeated_batch, partition_id=current_partition_id)
+            >>> output = TensorDict({"response": torch.ones(8, 2)}, batch_size=[8])
+            >>> meta = client.put(output, metadata=meta)
         """
-        return self._put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
+        return self._run_coroutine(
+            self.async_put(data=data, metadata=metadata, partition_id=partition_id, data_parser=data_parser)
+        )
 
     def update(
         self,
@@ -1901,11 +1384,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
         merge_plan: dict[str, dict[str, Any]],
         finalize: bool = True,
     ) -> BatchMeta:
-        """Synchronously merge or add values on SimpleStorage units.
-
-        See ``async_update``.
-        """
-        return self._update(metadata, values, merge_fn, merge_plan, finalize=finalize)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_update``."""
+        return self._run_coroutine(self.async_update(metadata, values, merge_fn, merge_plan, finalize=finalize))
 
     def get_data(
         self,
@@ -1913,53 +1393,28 @@ class TransferQueueClient(AsyncTransferQueueClient):
         data_parser: Callable[[Any, Any], Any] | None = None,
         parser_args: list | None = None,
     ) -> TensorDict:
-        """Synchronously fetch data from storage units and organize into TensorDict.
-
-        Args:
-            metadata: Batch metadata containing data location information and global indexes
-            data_parser: Optional ``data_parser(data, args)`` the storage units apply before replying.
-                See ``transfer_queue.kv_batch_get``. Only supported by SimpleStorage.
-            parser_args: Optional per-sample arguments aligned with ``metadata.global_indexes``.
-
-        Returns:
-            TensorDict containing:
-                - Requested data fields (e.g., "prompts", "attention_mask")
+        """Read fields in metadata sample order; see ``async_get_data`` for parser options.
 
         Example:
-            >>> batch_meta = client.get_meta(
-            ...     data_fields=["prompts", "attention_mask"],
-            ...     batch_size=4,
-            ...     partition_id="train_0",
-            ...     mode="fetch",
-            ...     task_name="generate_sequences",
+            Fetch metadata for four ready samples, then read their payloads:
+
+            >>> meta = client.get_meta(
+            ...     data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...     task_name="rollout",
             ... )
-            >>> batch = client.get_data(batch_meta)
-            >>> print(batch)
-            >>> # TensorDict with fields "prompts", "attention_mask", and sample order matching metadata global_indexes
+            >>> batch = client.get_data(meta)
         """
-        return self._get_data(metadata=metadata, data_parser=data_parser, parser_args=parser_args)
+        return self._run_coroutine(
+            self.async_get_data(metadata=metadata, data_parser=data_parser, parser_args=parser_args)
+        )
 
     def clear_partition(self, partition_id: str):
-        """Synchronously clear the whole partition from all storage units and the controller.
-
-        Args:
-            partition_id: The partition id to clear data for
-
-        Raises:
-            RuntimeError: If clear operation fails
-        """
-        return self._clear_partition(partition_id=partition_id)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_clear_partition``."""
+        return self._run_coroutine(self.async_clear_partition(partition_id=partition_id))
 
     def clear_samples(self, metadata: BatchMeta):
-        """Synchronously clear specific samples from all storage units and the controller.
-
-        Args:
-            metadata: The BatchMeta of the corresponding data to be cleared
-
-        Raises:
-            RuntimeError: If clear operation fails
-        """
-        return self._clear_samples(metadata=metadata)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_clear_samples``."""
+        return self._run_coroutine(self.async_clear_samples(metadata=metadata))
 
     # ==================== Status Query API ====================
     def get_consumption_status(
@@ -1967,142 +1422,91 @@ class TransferQueueClient(AsyncTransferQueueClient):
         task_name: str,
         partition_id: str,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Synchronously get consumption status for a specific task and partition.
-
-        Args:
-            task_name: Name of the task to check consumption for
-            partition_id: Partition id to check consumption status for
-
-        Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Consumption status tensor for the specified task. 1 for consumed, 0 for not consumed.
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
+        """Return sample indexes and per-task consumption flags; see ``async_get_consumption_status``.
 
         Example:
-            >>> global_index, consumption_status = client.get_consumption_status(
-            ...     task_name="generate_sequences",
-            ...     partition_id="train_0"
+            Find rows the rollout task has not consumed (flag 0):
+
+            >>> indexes, consumed = client.get_consumption_status(
+            ...     task_name="rollout", partition_id="train_0",
             ... )
-            >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
+            >>> if consumed is not None:
+            ...     pending_indexes = indexes[consumed == 0].tolist()
         """
-        return self._get_consumption_status(task_name, partition_id)
+        return self._run_coroutine(self.async_get_consumption_status(task_name, partition_id))
 
     def get_production_status(
         self,
         data_fields: list[str],
         partition_id: str,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """Synchronously get production status for specific data fields and partition.
-
-        Args:
-            data_fields: Data fields to check production status for
-            partition_id: Partition id to check production status for
-
-        Returns:
-            Tuple of:
-            - Partition global index tensor
-            - Production status tensor for the specified fields. 1 for ready, 0 for not ready.
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
+        """Return sample indexes and per-field readiness flags; see ``async_get_production_status``.
 
         Example:
-            >>> global_index, production_status = client.get_production_status(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     partition_id="train_0"
+            Flags have one row per sample and one column per distinct field.
+            Find rows with at least one field still unready (flag 0):
+
+            >>> indexes, ready = client.get_production_status(
+            ...     data_fields=["prompts", "response"], partition_id="train_0",
             ... )
-            >>> print(f"Global index: {global_index}, Production status: {production_status}")
+            >>> if ready is not None:
+            ...     incomplete_indexes = indexes[(ready == 0).any(dim=1)].tolist()
         """
-        return self._get_production_status(data_fields=data_fields, partition_id=partition_id)
+        return self._run_coroutine(self.async_get_production_status(data_fields=data_fields, partition_id=partition_id))
 
     def check_consumption_status(self, task_name: str, partition_id: str) -> bool:
-        """Synchronously check if all samples for a partition have been consumed by a specific task.
+        """Return whether this task consumed every row; missing or empty status returns False.
 
-        Args:
-            task_name: Name of the task to check consumption for
-            partition_id: Partition id to check consumption status for
-
-        Returns:
-            bool: True if all samples have been consumed by the task, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
-
-        Example:
-            >>> # Check if all samples have been consumed
-            >>> is_consumed = client.check_consumption_status(
-            ...     task_name="generate_sequences",
-            ...     partition_id="train_0"
-            ... )
-            >>> print(f"All samples consumed: {is_consumed}")
+        See ``get_partition_list`` for an example using this check across partitions,
+        and ``async_check_consumption_status`` for shared error semantics.
         """
-        return self._check_consumption_status(task_name=task_name, partition_id=partition_id)
+        return self._run_coroutine(self.async_check_consumption_status(task_name=task_name, partition_id=partition_id))
 
     def check_production_status(self, data_fields: list[str], partition_id: str) -> bool:
-        """Synchronously check if all samples for a partition are ready (produced) for consumption.
-
-        Args:
-            data_fields: Data fields to check production status for
-            partition_id: Partition id to check production status for
-
-        Returns:
-            bool: True if all samples have been produced and ready, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
+        """Return whether all queried production flags are ready; see ``async_check_production_status``.
 
         Example:
-            >>> # Check if all samples are ready for consumption
-            >>> is_ready = client.check_production_status(
-            ...     data_fields=["input_ids", "attention_mask"],
-            ...     partition_id="train_0"
+            Check whether both fields are ready on every row of an existing partition:
+
+            >>> all_ready = client.check_production_status(
+            ...     data_fields=["prompts", "response"], partition_id="train_0",
             ... )
-            >>> print(f"All samples ready: {is_ready}")
         """
-        return self._check_production_status(data_fields=data_fields, partition_id=partition_id)
+        return self._run_coroutine(
+            self.async_check_production_status(data_fields=data_fields, partition_id=partition_id)
+        )
 
     def reset_consumption(self, partition_id: str, task_name: str | None = None) -> bool:
-        """Synchronously reset consumption status for a partition.
+        """Allow a task to consume the partition again, or reset all tasks when ``task_name=None``.
 
-        This allows the same data to be re-consumed, useful for debugging scenarios
-        where the same rollout data needs to be trained multiple times.
-
-        Args:
-            partition_id: Partition id to reset consumption status for
-            task_name: Name of the task to reset. If None, resets all tasks.
-
-        Returns:
-            bool: True if reset was successful, False otherwise
-
-        Raises:
-            RuntimeError: If communication fails or controller returns error response
+        Return the controller's success flag; see ``async_reset_consumption`` for errors.
 
         Example:
-            >>> # Reset consumption for train task to re-train on same data
-            >>> success = client.reset_consumption(
-            ...     partition_id="train_0",
-            ...     task_name="train"
-            ... )
-            >>> print(f"Reset successful: {success}")
+            Consume ready samples again without rewriting their payloads:
+
+            >>> reset = client.reset_consumption(partition_id="train_0", task_name="rollout")
+            >>> if reset:
+            ...     meta = client.get_meta(
+            ...         data_fields=["prompts"], batch_size=4, partition_id="train_0",
+            ...         task_name="rollout",
+            ...     )
         """
-        return self._reset_consumption(partition_id, task_name)
+        return self._run_coroutine(self.async_reset_consumption(partition_id, task_name))
 
     def get_partition_list(
         self,
     ) -> list[str]:
-        """Synchronously fetch the list of partition ids from the controller.
-
-        Returns:
-            list[str]: List of partition ids managed by the controller
+        """Return partition IDs managed by the controller; see ``async_get_partition_list``.
 
         Example:
-            >>> partition_ids = client.get_partition_list()
-            >>> print(f"Available partitions: {partition_ids}")
+            List partitions not yet fully consumed by the rollout task:
+
+            >>> pending_partitions = []
+            >>> for partition_id in client.get_partition_list():
+            ...     if not client.check_consumption_status(task_name="rollout", partition_id=partition_id):
+            ...         pending_partitions.append(partition_id)
         """
-        return self._get_partition_list()
+        return self._run_coroutine(self.async_get_partition_list())
 
     # ==================== KV Interface API ====================
     def kv_retrieve_meta(
@@ -2111,185 +1515,86 @@ class TransferQueueClient(AsyncTransferQueueClient):
         partition_id: str,
         create: bool = False,
     ) -> BatchMeta:
-        """Synchronously retrieve BatchMeta by user-defined keys.
-
-        Retrieves metadata for given keys from a specified partition.
-        If keys do not exist and `create=True`, they will be automatically registered.
-
-        Args:
-            keys: List of keys to retrieve from the controller.
-            partition_id: Logical partition to query.
-            create: If True, automatically create entries for non-existent keys.
-
-        Returns:
-            BatchMeta: Metadata for the requested keys.
-
-        Raises:
-            TypeError: If `keys` is not a list of string or a string
-        """
-        return self._kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_retrieve_meta``."""
+        return self._run_coroutine(self.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=create))
 
     def kv_prepare_update(
         self, keys: list[str], partition_id: str, fields: list[str]
     ) -> tuple[BatchMeta, dict[str, dict[str, Any]]]:
-        """Synchronously register missing keys and get the ``merge_plan`` for ``update``.
-
-        See ``async_kv_prepare_update``.
-        """
-        return self._kv_prepare_update(keys, partition_id, fields)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_prepare_update``."""
+        return self._run_coroutine(self.async_kv_prepare_update(keys, partition_id, fields))
 
     def kv_retrieve_keys(
         self,
         global_indexes: list[int] | int,
         partition_id: str,
     ) -> BatchMeta:
-        """Synchronously retrieve keys according to global_indexes from the controller.
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_retrieve_keys``."""
 
-        Args:
-            global_indexes: List of global_indexes to retrieve from the controller
-            partition_id: The ID of the logical partition to search for global_indexes.
-
-        Returns:
-            keys: list of keys of the corresponding global_indexes
-
-        Raises:
-            TypeError: If `global_indexes` is not a list of int or an int
-            RuntimeError: If some indexes in `global_indexes` do not have corresponding keys
-        """
-
-        return self._kv_retrieve_keys(global_indexes=global_indexes, partition_id=partition_id)
+        return self._run_coroutine(
+            self.async_kv_retrieve_keys(global_indexes=global_indexes, partition_id=partition_id)
+        )
 
     def kv_list(
         self,
         partition_id: str | None = None,
     ) -> dict[str, dict[str, Any]]:
-        """Synchronously retrieve keys and custom_meta from the controller for one or all partitions.
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_list``."""
 
-        Args:
-            partition_id: The specific partition_id to query.
-                If None (default), returns keys from all partitions.
-            socket: ZMQ socket (injected by decorator)
-
-        Returns:
-            A nested dictionary mapping partition IDs to their keys and metadata.
-
-            Structure:
-            {
-                "partition_id": {
-                    "key_name": {
-                        "tag1": <value>,
-                        ... (other metadata)
-                    },
-                    ...,
-                },
-                ...
-            }
-        """
-
-        return self._kv_list(partition_id=partition_id)
+        return self._run_coroutine(self.async_kv_list(partition_id=partition_id))
 
     def kv_describe(self, keys: list[str], partition_id: str) -> dict[str, Any]:
-        """Synchronously describe each key's row and its fields' declared types, without payloads.
-
-        See ``async_kv_describe``.
-        """
-        return self._kv_describe(keys, partition_id)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_describe``."""
+        return self._run_coroutine(self.async_kv_describe(keys, partition_id))
 
     def kv_link(self, keys: list[str], partition_id: str, public_keys: list[str], fields: list[str]) -> None:
-        """Synchronously make ``fields`` of each key read its public key's payload; see ``kv_link``."""
-        return self._kv_link(keys, partition_id, public_keys, fields)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_kv_link``."""
+        return self._run_coroutine(self.async_kv_link(keys, partition_id, public_keys, fields))
 
     def link(self, metadata: BatchMeta, public_metadata: BatchMeta, fields: list[str] | str) -> BatchMeta:
-        """Synchronously make ``fields`` of ``metadata``'s rows read ``public_metadata``'s; see ``async_link``."""
-        return self._link(metadata, public_metadata, fields)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_link``."""
+        return self._run_coroutine(self.async_link(metadata, public_metadata, fields))
 
     def clear_unlinked_public(self, stale_keys: list[str] | None = None) -> list[str]:
-        """Synchronously clear every ``PUBLIC_PARTITION`` key no key links to; return the cleared keys."""
-        return self._clear_unlinked_public(stale_keys)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_clear_unlinked_public``."""
+        return self._run_coroutine(self.async_clear_unlinked_public(stale_keys))
 
     # ==================== Selective Data Dump API ====================
 
     def validate_dump_schema(self, partition_id: str, field_schema: dict) -> None:
-        """Reject incompatible destination fields before restoring payloads."""
-        return self._validate_dump_schema(partition_id, field_schema)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_validate_dump_schema``."""
+        return self._run_coroutine(self.async_validate_dump_schema(partition_id, field_schema))
 
     def dump_rows_by_index(self, shard_dir: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
-        """Synchronously dump the given rows into per-storage-unit shards.
-
-        Args:
-            shard_dir: Directory to write shard files into.
-            fields_by_index: Global index of each row to dump -> its produced fields.
-
-        Returns:
-            ``{"shards", "row_schema"}``: one entry per written shard, and each row's
-            stored field types.
-
-        Raises:
-            RuntimeError: If the storage manager is not initialized, or a unit holds
-                no data for a row it was asked to dump.
-            NotImplementedError: If the storage backend does not support dumping.
-        """
-        return self._dump_rows_by_index(shard_dir, fields_by_index)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_dump_rows_by_index``."""
+        return self._run_coroutine(self.async_dump_rows_by_index(shard_dir, fields_by_index))
 
     def load_rows_by_key(self, partition_id: str, rows: dict, shards: list[dict]) -> int:
-        """Restore selected payloads at the indexes their keys resolve to now; return bytes read."""
-        return self._load_rows_by_key(partition_id, rows, shards)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_load_rows_by_key``."""
+        return self._run_coroutine(self.async_load_rows_by_key(partition_id, rows, shards))
 
     # ==================== Checkpoint API ====================
     def save_controller_checkpoint(self, path: str) -> None:
-        """Synchronously save controller state to a file via ZMQ RPC.
-
-        Args:
-            path: Absolute path for the output .pkl file.
-
-        Raises:
-            RuntimeError: If the RPC fails or an unexpected response is received.
-        """
-        return self._save_controller_checkpoint(path)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_save_controller_checkpoint``."""
+        return self._run_coroutine(self.async_save_controller_checkpoint(path))
 
     def load_controller_checkpoint(self, path: str) -> None:
-        """Synchronously restore controller state from a file via ZMQ RPC.
-
-        Args:
-            path: Absolute path to a .pkl file previously written by
-                ``save_controller_checkpoint``.
-
-        Raises:
-            RuntimeError: If the RPC fails or an unexpected response is received.
-        """
-        return self._load_controller_checkpoint(path)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_load_controller_checkpoint``."""
+        return self._run_coroutine(self.async_load_controller_checkpoint(path))
 
     def save_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Synchronously save storage state to a directory via StorageManager.
-
-        Args:
-            checkpoint_dir: Directory under which storage unit files are written.
-
-        Raises:
-            RuntimeError: If the storage manager is not initialized.
-            NotImplementedError: If the storage backend does not support checkpoint.
-        """
-        return self._save_storage_checkpoint(checkpoint_dir)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_save_storage_checkpoint``."""
+        return self._run_coroutine(self.async_save_storage_checkpoint(checkpoint_dir))
 
     def load_storage_checkpoint(self, checkpoint_dir: str) -> None:
-        """Synchronously restore storage state from a directory via StorageManager.
-
-        Args:
-            checkpoint_dir: Directory previously written by ``save_storage_checkpoint``.
-
-        Raises:
-            RuntimeError: If the storage manager is not initialized.
-            FileNotFoundError: If the storage unit manifest is missing.
-            ValueError: If the number of storage units does not match the checkpoint.
-        """
-        return self._load_storage_checkpoint(checkpoint_dir)
+        """Blocking counterpart of ``AsyncTransferQueueClient.async_load_storage_checkpoint``."""
+        return self._run_coroutine(self.async_load_storage_checkpoint(checkpoint_dir))
 
     def close(self) -> None:
-        """Close the client and cleanup resources including event loop and thread.
+        """Stop and join the background loop before closing shared resources.
 
-        Ordering is load-bearing: the loop thread is joined *before* the base close()
-        destroys the context, since ``destroy()`` is not thread-safe. If the join times
-        out, ``_can_destroy_zmq_context()`` returns False and the context is leaked instead.
+        ZMQ context destruction is not thread-safe. If the thread outlives the join
+        timeout, ``_can_destroy_zmq_context`` prevents destroying its context.
         """
 
         if hasattr(self, "_loop") and self._loop is not None:
@@ -2308,11 +1613,7 @@ class TransferQueueClient(AsyncTransferQueueClient):
         super().close()
 
     def _can_destroy_zmq_context(self) -> bool:
-        """False while the loop thread that owns sockets on the context is still alive.
-
-        Also defers to the base check, which covers a borrowing storage manager's notify
-        thread -- both threads must be gone before ``destroy()`` is safe.
-        """
+        """Allow destruction only after the client and borrowing manager threads stop."""
         thread = getattr(self, "_thread", None)
         if thread is not None and thread.is_alive():
             return False

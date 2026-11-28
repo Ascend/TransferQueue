@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Regression tests for the shared long-lived ZMQ context in with_zmq_socket.
+"""Regression tests for clients sharing a long-lived ZMQ context.
 
 with_zmq_socket used to create and term() a context per RPC call, which churned libzmq
 signaler file descriptors and crashed the process under concurrency (Bad file descriptor
@@ -108,7 +108,7 @@ def echo_controller():
 
 @pytest.mark.asyncio
 async def test_shared_context_reused_across_concurrent_calls(echo_controller, monkeypatch):
-    """Many concurrent decorated RPCs must all reuse the client's single context.
+    """Concurrent RPCs must all reuse the client's single context.
 
     This is the core regression guard: pre-fix, each call created and term()ed its own
     context, which is what corrupted libzmq's signaler FDs under concurrency.
@@ -118,7 +118,7 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
         controller_info=echo_controller.zmq_server_info,
     )
 
-    # Record the context object handed to every socket creation inside the decorator.
+    # Record the context used to create each pooled socket.
     seen_contexts = []
     original_create = zmq_utils.create_zmq_socket
 
@@ -126,7 +126,7 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
         seen_contexts.append(ctx)
         return original_create(ctx, *args, **kwargs)
 
-    # The decorator resolves create_zmq_socket from the zmq_utils module globals.
+    # The pool resolves create_zmq_socket from the zmq_utils module globals.
     monkeypatch.setattr(zmq_utils, "create_zmq_socket", _spy_create)
 
     num_calls = 200
