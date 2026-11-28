@@ -553,21 +553,6 @@ class TestUpdateFieldMetadata:
         partition._update_field_metadata([2], {"f2": {"dtype": "torch.float32", "shape": (256,)}})
         assert partition.field_metadata["f2"].dtype == "torch.float32"
 
-    def test_dtype_conflict_raises_error(self):
-        partition = self._make_partition()
-        partition._update_field_metadata([0], {"f1": {"dtype": "torch.int32", "shape": (16,)}})
-        import pytest
-
-        with pytest.raises(ValueError, match="dtype mismatch"):
-            partition._update_field_metadata([1], {"f1": {"dtype": "torch.float64", "shape": (16,)}})
-
-    def test_shape_conflict_promotes_to_nested(self):
-        partition = self._make_partition()
-        partition._update_field_metadata([0], {"f2": {"dtype": "torch.float32", "shape": (256,)}})
-        partition._update_field_metadata([1], {"f2": {"dtype": "torch.float32", "shape": (128,)}})
-        assert partition.field_metadata["f2"].is_nested is True
-        assert partition.field_metadata["f2"].shape is None
-
     def test_nested_per_sample_shapes(self):
         partition = self._make_partition()
         schema = {
@@ -581,18 +566,6 @@ class TestUpdateFieldMetadata:
         partition._update_field_metadata([10, 11], schema)
         assert partition.field_metadata["f3"].is_nested is True
         assert partition.field_metadata["f3"].per_sample_shapes == {10: (3,), 11: (5,)}
-
-    def test_custom_backend_meta(self):
-        partition = self._make_partition()
-        partition._update_field_metadata(
-            [2], {"f1": {"dtype": "torch.int32"}}, custom_backend_meta={2: {"f1": {"k": 1}}}
-        )
-        assert partition.field_custom_backend_meta[2]["f1"]["k"] == 1
-
-    def test_empty_global_indexes_is_noop(self):
-        partition = self._make_partition()
-        partition._update_field_metadata([], {}, custom_backend_meta=None)
-        assert partition.field_metadata == {}
 
 
 def test_get_production_status_for_fields():

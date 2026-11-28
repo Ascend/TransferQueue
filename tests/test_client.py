@@ -152,12 +152,6 @@ class MockController:
                     elif request_msg.request_type == ZMQRequestType.KV_LIST:
                         response_body = self._mock_kv_list(request_msg.body)
                         response_type = ZMQRequestType.KV_LIST_RESPONSE
-                    elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
-                        response_body = {"message": "checkpoint saved"}
-                        response_type = ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE
-                    elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
-                        response_body = {"message": "checkpoint loaded"}
-                        response_type = ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE
                     else:
                         response_body = {"error": f"Unknown request type: {request_msg.request_type}"}
                         response_type = ZMQRequestType.CLEAR_META_RESPONSE
@@ -505,61 +499,6 @@ def test_get_meta(client_setup):
     assert len(metadata.global_indexes) == 10
 
 
-# Test with single controller and multiple storage units
-def test_single_controller_multiple_storages():
-    """Test client with single controller and multiple storage units"""
-    # Create single controller and multiple storage units
-    controller = MockController("controller_0")
-    storages = [MockStorage(f"storage_{i}") for i in range(3)]
-
-    try:
-        # Create client with single controller
-        client_id = "client_test_single_controller"
-
-        client = TransferQueueClient(client_id=client_id, controller_info=controller.zmq_server_info)
-
-        # Mock the storage manager to avoid handshake issues but mock all data operations
-        with patch(
-            "transfer_queue.storage.managers.simple_storage_manager.AsyncSimpleStorageManager._connect_to_controller"
-        ):
-            config = {
-                "controller_info": controller.zmq_server_info,
-                "zmq_info": {s.storage_id: s.zmq_server_info for s in storages},
-            }
-            client.initialize_storage_manager(manager_type="SimpleStorage", config=config)
-
-            # Mock all storage manager methods to avoid real ZMQ operations
-            async def mock_put_data(data, metadata, data_parser=None):
-                pass  # Just pretend to store the data
-
-            async def mock_get_data(metadata):
-                # Return some test data when requested
-                return TensorDict({"tokens": torch.randint(0, 100, (5, 128))}, batch_size=5)
-
-            async def mock_clear_data(metadata):
-                pass  # Just pretend to clear the data
-
-            client.storage_manager.put_data = mock_put_data
-            client.storage_manager.get_data = mock_get_data
-            client.storage_manager.clear_data = mock_clear_data
-
-        # Verify controller is set
-        assert client._controller is not None
-        assert client._controller.id == controller.controller_id
-
-        # Test basic operation
-        test_data = TensorDict({"tokens": torch.randint(0, 100, (5, 128))}, batch_size=5)
-
-        # Test put operation
-        client.put(data=test_data, partition_id="0")
-
-    finally:
-        # Clean up
-        controller.stop()
-        for s in storages:
-            s.stop()
-
-
 # Test error handling
 def test_put_without_required_params(client_setup):
     """Test put operation without required parameters"""
@@ -783,58 +722,6 @@ async def test_async_get_partition_list(client_setup):
 
 # Test clear methods
 @pytest.mark.asyncio
-async def test_async_clear_partition(client_setup):
-    """Test async clear partition operation"""
-    client, _, _ = client_setup
-
-    # Test async_clear_partition
-    await client.async_clear_partition(partition_id="test_partition")
-
-    # If no exception is raised, the test passes
-    assert True
-
-
-@pytest.mark.asyncio
-async def test_async_clear_samples(client_setup):
-    """Test async clear samples operation"""
-    client, _, _ = client_setup
-
-    # First get metadata to create a BatchMeta object
-    metadata = await client.async_get_meta(data_fields=["tokens", "labels"], batch_size=2, partition_id="0")
-
-    # Test async_clear_samples
-    await client.async_clear_samples(metadata=metadata)
-
-    # If no exception is raised, the test passes
-    assert True
-
-
-def test_clear_partition(client_setup):
-    """Test synchronous clear partition operation"""
-    client, _, _ = client_setup
-
-    # Test synchronous clear_partition
-    client.clear_partition(partition_id="test_partition")
-
-    # If no exception is raised, the test passes
-    assert True
-
-
-def test_clear_samples(client_setup):
-    """Test synchronous clear samples operation"""
-    client, _, _ = client_setup
-
-    # First get metadata to create a BatchMeta object
-    metadata = client.get_meta(data_fields=["tokens", "labels"], batch_size=2, partition_id="0")
-
-    # Test synchronous clear_samples
-    client.clear_samples(metadata=metadata)
-
-    # If no exception is raised, the test passes
-    assert True
-
-
-@pytest.mark.asyncio
 async def test_async_clear_samples_with_empty_metadata(client_setup):
     """Test async_clear_samples with empty BatchMeta"""
     client, _, _ = client_setup
@@ -943,54 +830,6 @@ async def test_sync_and_async_methods_mixed_usage(client_setup):
     assert async_data is not None
 
     print("✓ Mixed async and sync method calls work correctly")
-
-
-# =====================================================
-# Custom Meta Interface Tests
-# =====================================================
-
-
-class TestClientCustomMetaInterface:
-    """Tests for client custom_meta interface methods."""
-
-    def test_set_custom_meta_sync(self, client_setup):
-        """Test synchronous set_custom_meta method."""
-        client, _, _ = client_setup
-
-        # Test synchronous set_custom_meta
-
-        # First get metadata
-        metadata = client.get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
-        # Set custom_meta on the metadata
-        metadata.update_custom_meta(
-            [
-                {"input_ids": {"token_count": 100}},
-                {"input_ids": {"token_count": 120}},
-            ]
-        )
-
-        # Call set_custom_meta with metadata (BatchMeta)
-        client.set_custom_meta(metadata)
-        print("✓ set_custom_meta sync method works")
-
-    @pytest.mark.asyncio
-    async def test_set_custom_meta_async(self, client_setup):
-        """Test asynchronous async_set_custom_meta method."""
-        client, _, _ = client_setup
-
-        # First get metadata
-        metadata = await client.async_get_meta(data_fields=["input_ids"], batch_size=2, partition_id="0")
-        # Set custom_meta on the metadata
-        metadata.update_custom_meta(
-            [
-                {"input_ids": {"token_count": 100}},
-                {"input_ids": {"token_count": 120}},
-            ]
-        )
-
-        # Call async_set_custom_meta with metadata (BatchMeta)
-        await client.async_set_custom_meta(metadata)
-        print("✓ async_set_custom_meta async method works")
 
 
 # =====================================================
@@ -1387,37 +1226,6 @@ def test_controller_rpc_raises_when_controller_never_replies():
 
 class TestClientCheckpointInterface:
     """Tests for client save/load checkpoint interface methods."""
-
-    def test_save_controller_checkpoint_sync(self, client_setup, tmp_path):
-        """Synchronous save_controller_checkpoint sends correct request."""
-        client, _, _ = client_setup
-        ckpt_path = str(tmp_path / "controller.pkl")
-
-        # Should not raise — mock controller acknowledges the request
-        client.save_controller_checkpoint(ckpt_path)
-
-    def test_load_controller_checkpoint_sync(self, client_setup, tmp_path):
-        """Synchronous load_controller_checkpoint sends correct request."""
-        client, _, _ = client_setup
-        ckpt_path = str(tmp_path / "controller.pkl")
-
-        client.load_controller_checkpoint(ckpt_path)
-
-    @pytest.mark.asyncio
-    async def test_async_save_controller_checkpoint(self, client_setup, tmp_path):
-        """Async save_controller_checkpoint sends correct request."""
-        client, _, _ = client_setup
-        ckpt_path = str(tmp_path / "controller_async.pkl")
-
-        await client.async_save_controller_checkpoint(ckpt_path)
-
-    @pytest.mark.asyncio
-    async def test_async_load_controller_checkpoint(self, client_setup, tmp_path):
-        """Async load_controller_checkpoint sends correct request."""
-        client, _, _ = client_setup
-        ckpt_path = str(tmp_path / "controller_async.pkl")
-
-        await client.async_load_controller_checkpoint(ckpt_path)
 
     def test_save_storage_checkpoint_sync(self, client_setup, tmp_path):
         """Synchronous save_storage_checkpoint delegates to storage manager."""

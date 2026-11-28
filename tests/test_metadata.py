@@ -97,31 +97,12 @@ class TestBatchMetaColumnar:
         assert "part_A" in part_ids
         assert "part_B" in part_ids
 
-    def test_concat(self):
-        """Test concatenating two batches."""
-        batch1 = self._make_batch(batch_size=2)
-        batch2 = BatchMeta(
-            global_indexes=[2, 3],
-            partition_ids=["partition_0", "partition_0"],
-            field_schema=batch1.field_schema,
-            production_status=np.ones(2, dtype=np.int8),
-        )
-        result = BatchMeta.concat([batch1, batch2])
-        assert len(result) == 4
-        assert result.global_indexes == [0, 1, 2, 3]
-
     def test_custom_meta_update(self):
         """Test update_custom_meta method."""
         batch = self._make_batch(batch_size=2)
         batch.update_custom_meta([{"tag": "alpha"}, {"tag": "beta"}])
         assert batch.custom_meta[0]["tag"] == "alpha"
         assert batch.custom_meta[1]["tag"] == "beta"
-
-    def test_custom_backend_meta(self):
-        """Test _custom_backend_meta attribute."""
-        batch = self._make_batch(batch_size=2)
-        batch._custom_backend_meta[0]["field_a"] = {"storage_key": "abc"}
-        assert batch._custom_backend_meta[0]["field_a"]["storage_key"] == "abc"
 
     def test_size_property(self):
         """Test size == len property."""

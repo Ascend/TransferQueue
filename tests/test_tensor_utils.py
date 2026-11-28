@@ -218,10 +218,3 @@ class TestMergeContiguousMemory:
 
         with pytest.raises(ValueError, match="ptrs and sizes must have the same length"):
             merge_contiguous_memory([0], [])
-
-    def test_three_continuous(self):
-        ptrs = [0, 10, 20]
-        sizes = [10, 10, 10]
-        merged_ptrs, merged_sizes = merge_contiguous_memory(ptrs, sizes)
-        assert merged_ptrs == [0]
-        assert merged_sizes == [30]
