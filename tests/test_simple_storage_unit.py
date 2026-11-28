@@ -1198,6 +1198,50 @@ def test_storage_unit_checkpoint_load_missing_file(storage_setup, tmp_path):
     client.close()
 
 
+@pytest.mark.parametrize("operation", ["save_checkpoint", "load_checkpoint", "dump_rows", "load_rows"])
+def test_failed_storage_operation_preserves_reply_and_existing_data(storage_setup, tmp_path, operation):
+    _, address, ip = storage_setup
+    client = MockStorageClient(address, ip)
+    try:
+        value = torch.tensor([4, 5, 6])
+        assert client.send_put(0, [0], {"tokens": [value]}).request_type == ZMQRequestType.PUT_DATA_RESPONSE
+        path = str(tmp_path / "missing" / "data.pkl")
+        requests = {
+            "save_checkpoint": (
+                ZMQRequestType.SAVE_STORAGE_CHECKPOINT,
+                {"path": path},
+                ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
+            ),
+            "load_checkpoint": (
+                ZMQRequestType.LOAD_STORAGE_CHECKPOINT,
+                {"path": path},
+                ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,
+            ),
+            "dump_rows": (
+                ZMQRequestType.DUMP_ROWS,
+                {"path": path, "fields_by_index": {0: ["tokens"]}},
+                ZMQRequestType.DUMP_ROWS_RESPONSE,
+            ),
+            "load_rows": (
+                ZMQRequestType.LOAD_ROWS,
+                {"shards": [{"path": path, "records": []}]},
+                ZMQRequestType.LOAD_ROWS_RESPONSE,
+            ),
+        }
+        request_type, body, expected_type = requests[operation]
+        request = ZMQMessage.create(request_type=request_type, sender_id="manager", body=body)
+        client.socket.send_multipart(request.serialize())
+        reply = ZMQMessage.deserialize(client.socket.recv_multipart(copy=False))
+        assert reply.request_type == expected_type
+        assert reply.body["success"] is False
+        assert path in reply.body["message"]
+        restored = client.send_get(0, [0], ["tokens"])
+        assert restored.request_type == ZMQRequestType.GET_DATA_RESPONSE
+        torch.testing.assert_close(restored.body["data"]["tokens"][0], value)
+    finally:
+        client.close()
+
+
 def test_foreign_payload_dropped_and_unit_stays_usable(storage_setup):
     """A non-TransferQueue peer (e.g. a TLS probe) must not stop the unit worker."""
     _, put_get_address, storage_ip = storage_setup

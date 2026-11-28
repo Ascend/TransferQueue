@@ -17,12 +17,37 @@ import logging
 import operator
 import os
 from functools import reduce
+from typing import Any
 
 import torch
+from tensordict import NonTensorStack
 from torch import Tensor
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("TQ_LOGGING_LEVEL", logging.WARNING))
+
+
+def _pack_tensor_values(values: list[Any], fallback_logger: logging.Logger | None = None) -> Tensor | NonTensorStack:
+    """Stack scalars, otherwise try jagged, strided, then object storage."""
+    if all(isinstance(v, Tensor) for v in values) and all(v.dim() == 0 for v in values):
+        return torch.stack(values)
+    try:
+        return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+    except (RuntimeError, TypeError) as exc:
+        if fallback_logger is not None:
+            fallback_logger.warning(
+                f"Failed to pack nested tensor with jagged layout. "
+                f"Falling back to strided layout. Detailed error: {exc}"
+            )
+        try:
+            return torch.nested.as_nested_tensor(values, layout=torch.strided)
+        except (RuntimeError, TypeError) as exc:
+            if fallback_logger is not None:
+                fallback_logger.warning(
+                    f"Failed to pack nested tensor with strided layout. "
+                    f"Falling back to NonTensorStack. Detailed error: {exc}"
+                )
+            return NonTensorStack(*values)
 
 
 def allocate_empty_tensors(

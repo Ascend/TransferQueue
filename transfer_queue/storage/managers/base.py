@@ -37,6 +37,7 @@ from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils import serial_utils
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.tensor_utils import _pack_tensor_values
 from transfer_queue.utils.zmq_utils import (
     STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
@@ -627,10 +628,7 @@ class KVStorageManager(StorageManager):
         Returns:
             list[str]: List of keys, e.g., ['0@field_a', '1@field_a', '0@field_b', ...]
         """
-        sorted_fields = sorted(field_names)
-        keys_suffixes = ["@" + f for f in sorted_fields]
-        keys_prefixes = [f"{i}" for i in global_indexes]
-        return [pfx + sfx for sfx, pfx in itertools.product(keys_suffixes, keys_prefixes)]
+        return [f"{index}@{field}" for field in sorted(field_names) for index in global_indexes]
 
     @staticmethod
     def _generate_values(data: TensorDict) -> list[Any]:
@@ -735,18 +733,7 @@ class KVStorageManager(StorageManager):
             if not (isinstance(first_value, torch.Tensor) and isinstance(last_value, torch.Tensor)):
                 return field, NonTensorStack(*chunk)
 
-            # Scalar tensors cannot be represented as jagged nested tensors;
-            # stack them densely to avoid noisy fallback warnings.
-            if all(isinstance(v, torch.Tensor) for v in chunk) and all(v.dim() == 0 for v in chunk):
-                return field, torch.stack(chunk)
-
-            try:
-                return field, torch.nested.as_nested_tensor(chunk, layout=torch.jagged)
-            except (RuntimeError, TypeError):
-                try:
-                    return field, torch.nested.as_nested_tensor(chunk, layout=torch.strided)
-                except (RuntimeError, TypeError):
-                    return field, NonTensorStack(*chunk)
+            return field, _pack_tensor_values(chunk)
 
         executor = self._get_executor()
         use_multi_threads = num_fields > 1 and executor is not None

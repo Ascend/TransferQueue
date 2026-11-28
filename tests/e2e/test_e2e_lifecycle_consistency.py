@@ -16,6 +16,9 @@
 import os
 import sys
 import time
+from collections import Counter, defaultdict
+from threading import Lock
+from uuid import uuid4
 
 import numpy as np
 import pytest
@@ -137,11 +140,87 @@ def e2e_client(ray_cluster, backend_name):
     if backend_name not in BACKEND_CONFIGS:
         raise ValueError(f"Unknown backend: {backend_name}. Available: {list(BACKEND_CONFIGS.keys())}")
 
+    if backend_name == "MooncakeStore_GDR":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required for the GDR backend")
+        # The client selects GDR only when a CUDA context already exists.
+        torch.cuda.init()
+
     config = BACKEND_CONFIGS[backend_name]
     transfer_queue.init(OmegaConf.create(config))
     client = transfer_queue.get_client()
     yield client
     transfer_queue.close()
+
+
+@pytest.mark.parametrize("write", [True, False], ids=["put", "get"])
+def test_batch_transfer_retries_only_failed_keys(e2e_client, backend_name, monkeypatch, write):
+    if backend_name not in ("MooncakeStore", "MooncakeStore_GDR"):
+        pytest.skip("Requires the Mooncake batch transfer SDK")
+    client = e2e_client.storage_manager.storage_client
+    if backend_name == "MooncakeStore_GDR":
+        assert client._gdr_staging is not None
+    store = client._store
+    keys = [f"retry-{uuid4().hex}-{i}" for i in range(3)]
+    values = [torch.arange(3), {"tokens": [4, 5]}, torch.tensor(7.0)]
+    shapes = [(3,), None, ()]
+    dtypes = [torch.int64, None, torch.float32]
+    method = "batch_upsert_from" if write else "batch_get_into"
+    transfer = getattr(store, method)
+    attempts = Counter()
+    pointers = defaultdict(set)
+    lock = Lock()
+
+    def fail_selected_once(batch_keys, ptrs, sizes, **kwargs):
+        # Only inject the failure; successful entries still cross the real SDK and service.
+        with lock:
+            accepted = []
+            for i, key in enumerate(batch_keys):
+                attempts[key] += 1
+                pointers[key].add(ptrs[i])
+                if key not in keys[:2] or attempts[key] > 1:
+                    accepted.append(i)
+        results = [-1] * len(batch_keys)
+        if accepted:
+            codes = transfer(
+                [batch_keys[i] for i in accepted],
+                [ptrs[i] for i in accepted],
+                [sizes[i] for i in accepted],
+                **kwargs,
+            )
+            for i, code in zip(accepted, codes, strict=True):
+                results[i] = code
+        return results
+
+    class TransferBoundary:
+        def __getattr__(self, name):
+            return getattr(store, name)
+
+    boundary = TransferBoundary()
+    setattr(boundary, method, fail_selected_once)
+    metadata = None
+    try:
+        if write:
+            monkeypatch.setattr(client, "_store", boundary)
+        metadata = client.put(keys, values)
+        if not write:
+            monkeypatch.setattr(client, "_store", boundary)
+        order = [2, 0, 1]
+        restored = client.get(
+            [keys[i] for i in order],
+            [shapes[i] for i in order],
+            [dtypes[i] for i in order],
+            [metadata[i] for i in order],
+        )
+        assert attempts == {keys[0]: 2, keys[1]: 2, keys[2]: 1}
+        assert all(len(addresses) == 1 for addresses in pointers.values())
+        for value, index in zip(restored, order, strict=True):
+            if isinstance(values[index], torch.Tensor):
+                torch.testing.assert_close(value.cpu(), values[index])
+            else:
+                assert value == values[index]
+    finally:
+        client.clear(keys, metadata)
 
 
 def generate_complex_data(indices: list[int], device: torch.device | None = None) -> TensorDict:

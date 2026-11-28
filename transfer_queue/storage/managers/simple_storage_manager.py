@@ -43,6 +43,7 @@ from transfer_queue.storage.payload_transfer import (
 )
 from transfer_queue.utils.common import log_heavy_operation
 from transfer_queue.utils.logging_utils import get_logger
+from transfer_queue.utils.tensor_utils import _pack_tensor_values
 from transfer_queue.utils.zmq_utils import (
     TQ_SOCKET_POOL_SIZE,
     ZMQMessage,
@@ -736,30 +737,8 @@ class AsyncSimpleStorageManager(StorageManager):
         """
         if not values:
             raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
-        non_none = [v for v in values if v is not None]
-        if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
-            if len(non_none) == len(values):
-                # Scalar tensors cannot be represented as jagged nested tensors;
-                # stack them densely to avoid noisy fallback warnings.
-                if all(v.dim() == 0 for v in non_none):
-                    return torch.stack(non_none)
-                # Pure tensor list — try nested tensor
-                try:
-                    return torch.nested.as_nested_tensor(values, layout=torch.jagged)
-                except (RuntimeError, TypeError) as e:
-                    logger.warning(
-                        f"Failed to pack nested tensor with jagged layout. "
-                        f"Falling back to strided layout. Detailed error: {e}"
-                    )
-                    try:
-                        return torch.nested.as_nested_tensor(values, layout=torch.strided)
-                    except (RuntimeError, TypeError) as e2:
-                        logger.warning(
-                            f"Failed to pack nested tensor with strided layout. "
-                            f"Falling back to NonTensorStack. Detailed error: {e2}"
-                        )
-                        return NonTensorStack(*values)
-            # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
+        if all(isinstance(v, torch.Tensor) for v in values):
+            return _pack_tensor_values(values, logger)
         return NonTensorStack(*values)
 
     async def get_data(
@@ -798,13 +777,13 @@ class AsyncSimpleStorageManager(StorageManager):
         # parses those fields in one call and replies with the parsed part only.
         rows_by_fields: dict[tuple[str, ...], list[int]] = defaultdict(list)
         args_by_fields: dict[tuple[str, ...], list[Any]] = defaultdict(list)
-        slots: dict[tuple[int, str], tuple[tuple[str, ...], int]] = {}  # (sample, field) -> (fields, row)
-        linked_slots: dict[tuple, tuple[tuple[str, ...], int]] = {}  # (source, fields, arg) -> slot
+        destinations: dict[tuple[str, ...], list[list[int]]] = defaultdict(list)
+        linked_rows: dict[tuple, int] = {}  # (source, fields, arg) -> row within its field group
         for pos, (global_index, links) in enumerate(zip(metadata.global_indexes, metadata._links, strict=True)):
             parser_arg = None if parser_args is None else parser_args[pos]
             own = tuple(f for f in metadata.field_names if f not in links)
             if own:
-                slots.update({(pos, f): (own, len(rows_by_fields[own])) for f in own})
+                destinations[own].append([pos])
                 rows_by_fields[own].append(global_index)
                 args_by_fields[own].append(parser_arg)
             fields_by_source: dict[int, list[str]] = defaultdict(list)
@@ -814,11 +793,12 @@ class AsyncSimpleStorageManager(StorageManager):
             for source, source_fields in fields_by_source.items():
                 fields = tuple(source_fields)
                 linked = (source, fields, _parser_arg_identity(parser_arg, pos))
-                if linked not in linked_slots:
-                    linked_slots[linked] = (fields, len(rows_by_fields[fields]))
+                if linked not in linked_rows:
+                    linked_rows[linked] = len(rows_by_fields[fields])
                     rows_by_fields[fields].append(source)
                     args_by_fields[fields].append(parser_arg)
-                slots.update({(pos, f): linked_slots[linked] for f in fields})
+                    destinations[fields].append([])
+                destinations[fields][linked_rows[linked]].append(pos)
         requests = [
             (su_id, fields, group)
             for fields, rows in rows_by_fields.items()
@@ -850,14 +830,13 @@ class AsyncSimpleStorageManager(StorageManager):
             )
             raise
 
-        values: dict[tuple[tuple[tuple[str, ...], int], str], Any] = {}
+        ordered_data: dict[str, list[Any]] = {field: [None] * metadata.size for field in metadata.field_names}
         for (_, fields, group), (_, su_data) in zip(requests, results, strict=True):
             for field in fields:
                 for i, row in enumerate(group.batch_positions):
-                    values[(fields, row), field] = su_data[field][i]
-        ordered_data = {
-            field: [values[slots[pos, field], field] for pos in range(metadata.size)] for field in metadata.field_names
-        }
+                    value = su_data[field][i]
+                    for pos in destinations[fields][row]:
+                        ordered_data[field][pos] = value
 
         tensor_data = {field: self._pack_field_values(v) for field, v in ordered_data.items()}
 
@@ -920,18 +899,34 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"{type(result).__name__}: {result}"
                 )
 
+    async def _storage_request(
+        self,
+        socket: zmq.Socket,
+        target: str,
+        operation: ZMQRequestType,
+        body: dict[str, Any],
+        *,
+        copy: bool = False,
+    ) -> ZMQMessage:
+        """Exchange one administrative request using its caller's socket lease."""
+        request = ZMQMessage.create(
+            request_type=operation,
+            sender_id=self.storage_manager_id,
+            receiver_id=target,
+            body=body,
+        )
+        await socket.send_multipart(request.serialize(), copy=copy)
+        return ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
+
     @with_storage_unit_socket
     async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.CLEAR_DATA,
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "fields": fields},
+        response_msg = await self._storage_request(
+            socket,
+            target_storage_unit,
+            ZMQRequestType.CLEAR_DATA,
+            {"global_indexes": global_indexes, "fields": fields},
+            copy=True,
         )
-
-        await socket.send_multipart(request_msg.serialize())
-        messages = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(messages)
 
         if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
             raise RuntimeError(
@@ -954,15 +949,9 @@ class AsyncSimpleStorageManager(StorageManager):
         socket: zmq.Socket = None,
     ):
         try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"path": path},
+            response_msg = await self._storage_request(
+                socket, target_storage_unit, ZMQRequestType.SAVE_STORAGE_CHECKPOINT, {"path": path}
             )
-            await socket.send_multipart(request_msg.serialize(), copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
             if (
                 response_msg.request_type != ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE
                 or not response_msg.body.get("success")
@@ -984,15 +973,9 @@ class AsyncSimpleStorageManager(StorageManager):
         socket: zmq.Socket = None,
     ):
         try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"path": path},
+            response_msg = await self._storage_request(
+                socket, target_storage_unit, ZMQRequestType.LOAD_STORAGE_CHECKPOINT, {"path": path}
             )
-            await socket.send_multipart(request_msg.serialize(), copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
             if (
                 response_msg.request_type != ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
                 or not response_msg.body.get("success")
@@ -1016,15 +999,12 @@ class AsyncSimpleStorageManager(StorageManager):
     ) -> dict[str, Any]:
         """Ask one storage unit to write the rows it owns into a shard file."""
         try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"path": path, "fields_by_index": fields_by_index},
+            response_msg = await self._storage_request(
+                socket,
+                target_storage_unit,
+                ZMQRequestType.DUMP_ROWS,
+                {"path": path, "fields_by_index": fields_by_index},
             )
-            await socket.send_multipart(request_msg.serialize(), copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
             if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get("success"):
                 raise RuntimeError(
                     f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
@@ -1163,14 +1143,9 @@ class AsyncSimpleStorageManager(StorageManager):
         target_storage_unit: str,
         socket: zmq.Socket = None,
     ) -> dict[str, Any]:
-        request = ZMQMessage.create(
-            request_type=ZMQRequestType.LOAD_ROWS,
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={"shards": shards},
+        response = await self._storage_request(
+            socket, target_storage_unit, ZMQRequestType.LOAD_ROWS, {"shards": shards}
         )
-        await socket.send_multipart(request.serialize(), copy=False)
-        response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
         if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
             raise RuntimeError(
                 f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"

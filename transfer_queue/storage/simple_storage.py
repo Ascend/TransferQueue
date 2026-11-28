@@ -817,7 +817,7 @@ class HybridStorageUnitData(StorageUnitData):
         self._ssd_store.close()
 
 
-# Readers for the selective dump records that SimpleStorageUnit._handle_dump_rows writes.
+# Readers for the selective dump records that SimpleStorageUnit._dump_rows writes.
 def read_dump_row(file, offset: int, length: int, global_index: int, fields: list[str]) -> dict:
     """Read and validate exactly one record against its expected index and fields."""
     file.seek(offset)
@@ -1258,21 +1258,13 @@ class SimpleStorageUnit:
 
             if is_payload:
                 response_msg = self.payload_transfer.handle_request(request_msg)
-            elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
-                with monitor.measure(op_type="CLEAR_DATA"):
-                    response_msg = self._handle_clear(request_msg)
-            elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+            elif operation in (ZMQRequestType.CLEAR_DATA, ZMQRequestType.DUMP_ROWS, ZMQRequestType.LOAD_ROWS):
+                with monitor.measure(op_type=operation.name):
+                    response_msg = self._handle_storage_request(request_msg)
+            elif operation == ZMQRequestType.GET_METRICS:
                 response_msg = self._handle_get_metrics()
-            elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
-                response_msg = self._handle_save_checkpoint(request_msg)
-            elif operation == ZMQRequestType.DUMP_ROWS:  # type: ignore[arg-type]
-                with monitor.measure(op_type="DUMP_ROWS"):
-                    response_msg = self._handle_dump_rows(request_msg)
-            elif operation == ZMQRequestType.LOAD_ROWS:  # type: ignore[arg-type]
-                with monitor.measure(op_type="LOAD_ROWS"):
-                    response_msg = self._handle_load_rows(request_msg)
-            elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
-                response_msg = self._handle_load_checkpoint(request_msg)
+            elif operation in (ZMQRequestType.SAVE_STORAGE_CHECKPOINT, ZMQRequestType.LOAD_STORAGE_CHECKPOINT):
+                response_msg = self._handle_storage_request(request_msg)
             else:
                 response_msg = ZMQMessage.create(
                     request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
@@ -1312,37 +1304,59 @@ class SimpleStorageUnit:
             ).serialize()
         self._send_multipart_reply(router_socket, identity, response_frames)
 
-    def _handle_clear(self, data_parts: ZMQMessage) -> ZMQMessage:
-        """
-        Handle clear request, clear data in storage unit according to given global_indexes.
-
-        Args:
-            data_parts: ZMQMessage from client, including target global_indexes and optional fields.
-
-        Returns:
-            Clear data success response ZMQMessage.
-        """
+    def _handle_storage_request(self, request: ZMQMessage) -> ZMQMessage:
+        """Run an administrative operation and encode its existing response contract."""
+        operation = request.request_type
+        response_type, label = {
+            ZMQRequestType.CLEAR_DATA: (ZMQRequestType.CLEAR_DATA_RESPONSE, "clear"),
+            ZMQRequestType.SAVE_STORAGE_CHECKPOINT: (
+                ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,
+                "save checkpoint",
+            ),
+            ZMQRequestType.LOAD_STORAGE_CHECKPOINT: (
+                ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,
+                "load checkpoint",
+            ),
+            ZMQRequestType.DUMP_ROWS: (ZMQRequestType.DUMP_ROWS_RESPONSE, "dump rows"),
+            ZMQRequestType.LOAD_ROWS: (ZMQRequestType.LOAD_ROWS_RESPONSE, "load rows"),
+        }[operation]
+        # Missing path/field parameters remain worker errors, as on the original wire path.
+        path = (
+            request.body["path"]
+            if operation
+            in (
+                ZMQRequestType.SAVE_STORAGE_CHECKPOINT,
+                ZMQRequestType.LOAD_STORAGE_CHECKPOINT,
+                ZMQRequestType.DUMP_ROWS,
+            )
+            else ""
+        )
+        fields = request.body["fields_by_index"] if operation == ZMQRequestType.DUMP_ROWS else {}
+        body: dict[str, Any]
         try:
-            global_indexes = data_parts.body["global_indexes"]
-
-            with self._storage_lock:
-                self.storage_data.clear(global_indexes, data_parts.body.get("fields"))
-
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"message": f"Clear data in storage unit id #{self.storage_unit_id} successfully."},
-            )
-        except Exception as e:
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.CLEAR_DATA_ERROR,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={
+            if operation == ZMQRequestType.CLEAR_DATA:
+                with self._storage_lock:
+                    self.storage_data.clear(request.body["global_indexes"], request.body.get("fields"))
+                body = {"message": f"Clear data in storage unit id #{self.storage_unit_id} successfully."}
+            elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:
+                body = self._save_checkpoint(path)
+            elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:
+                body = self._load_checkpoint(path)
+            elif operation == ZMQRequestType.DUMP_ROWS:
+                body = self._dump_rows(path, fields)
+            else:
+                body = self._load_rows(request.body["shards"])
+        except Exception as exc:
+            if operation == ZMQRequestType.CLEAR_DATA:
+                response_type = ZMQRequestType.CLEAR_DATA_ERROR
+                body = {
                     "message": f"Failed to clear data in storage unit id #{self.storage_unit_id}, "
-                    f"detail error message: {str(e)}"
-                },
-            )
-        return response_msg
+                    f"detail error message: {str(exc)}"
+                }
+            else:
+                logger.error(f"[{self.storage_unit_id}]: {label} failed: {exc}")
+                body = {"success": False, "message": str(exc)}
+        return ZMQMessage.create(request_type=response_type, sender_id=self.storage_unit_id, body=body)
 
     def _handle_get_metrics(self) -> ZMQMessage:
         """Handle GET_METRICS request by returning storage unit statistics.
@@ -1411,187 +1425,104 @@ class SimpleStorageUnit:
             body=metrics,
         )
 
-    def _handle_save_checkpoint(self, data_parts) -> ZMQMessage:
-        """Write storage unit data directly to its checkpoint path.
+    def _save_checkpoint(self, path: str) -> dict[str, Any]:
+        """Write storage state to a path accessible from the owner unit."""
+        with self._storage_lock:
+            self.storage_data.save_checkpoint(path, self.storage_unit_id)
+        logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
+        return {"success": True}
 
-        Args:
-            data_parts: ZMQMessage from client, containing ``path`` in body:
-                absolute path for the output manifest. The caller must ensure
-                this path is reachable from the node running this actor
-                (shared filesystem required for multi-node setups).
+    def _dump_rows(self, path: str, fields_by_index: dict[int, list[str]]) -> dict[str, Any]:
+        """Write independent row records and return offsets and schemas, never payloads."""
+        with self._storage_lock:
+            missing = fields_by_index.keys() - self.storage_data._active_keys
+            if missing:
+                raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
+            row_offsets = {}
+            row_schema = {}
+            with open(path, "wb") as f:
+                for index in sorted(fields_by_index):
+                    # Reused global indexes can retain fields no longer present in metadata.
+                    fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
+                    # Controller metadata can trail the stored values, so report what each
+                    # row actually holds; only type metadata leaves the unit.
+                    row_schema[index] = {
+                        name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
+                        for name, value in fields.items()
+                    }
+                    offset = f.tell()
+                    compact_pickle.dump({"global_index": index, "fields": fields}, f)
+                    row_offsets[index] = [offset, f.tell() - offset]
+                f.flush()
+                os.fsync(f.fileno())
+        logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
+        return {
+            "success": True,
+            "dumped_rows": len(fields_by_index),
+            "missing_rows": [],
+            "row_offsets": row_offsets,
+            "row_schema": row_schema,
+        }
 
-        Returns:
-            ZMQMessage with ``success=True`` on success, or ``success=False``
-            and ``message`` containing the error string on failure.
-        """
-        path = data_parts.body["path"]
-        try:
-            with self._storage_lock:
-                self.storage_data.save_checkpoint(path, self.storage_unit_id)
-            logger.info(f"[{self.storage_unit_id}]: saved checkpoint to {path}")
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"success": True},
-            )
-        except Exception as e:
-            logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
-    def _handle_dump_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Write independent row records and return their offsets, never their payloads."""
-        path = request.body["path"]
-        fields_by_index = request.body["fields_by_index"]
-        try:
-            with self._storage_lock:
-                missing = fields_by_index.keys() - self.storage_data._active_keys
-                if missing:
-                    raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
-                row_offsets = {}
-                row_schema = {}
-                with open(path, "wb") as f:
-                    for index in sorted(fields_by_index):
-                        # Reused global indexes can retain fields no longer present in metadata.
-                        fields = {name: self.storage_data.field_data[name][index] for name in fields_by_index[index]}
-                        # Controller metadata can trail the stored values, so report what each
-                        # row actually holds; only type metadata leaves the unit.
-                        row_schema[index] = {
-                            name: (value.dtype, tuple(value.shape)) if isinstance(value, torch.Tensor) else None
-                            for name, value in fields.items()
-                        }
-                        offset = f.tell()
-                        compact_pickle.dump({"global_index": index, "fields": fields}, f)
-                        row_offsets[index] = [offset, f.tell() - offset]
-                    f.flush()
-                    os.fsync(f.fileno())
-            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(fields_by_index), path)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={
-                    "success": True,
-                    "dumped_rows": len(fields_by_index),
-                    "missing_rows": [],
-                    "row_offsets": row_offsets,
-                    "row_schema": row_schema,
-                },
-            )
-        except Exception as e:
-            logger.error("[%s]: dump rows failed: %s", self.storage_unit_id, e)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
-    def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Seek to assigned records and merge them into local storage at current indexes."""
+    def _load_rows(self, shards: list[dict[str, Any]]) -> dict[str, Any]:
+        """Read assigned records and return metadata updates in their saved readiness states."""
         updates: list[dict[str, Any]] = []
         bytes_read = 0
-        try:
-            with self._storage_lock:
-                for shard in request.body["shards"]:
-                    records = sorted(shard["records"], key=lambda row: row["offset"])
-                    with open(shard["path"], "rb", buffering=0) as f:
-                        # Bound temporary payload memory while retaining batched schema updates.
-                        for start in range(0, len(records), 128):
-                            groups = defaultdict(list)
-                            for row in records[start : start + 128]:
-                                fields = read_dump_row(
-                                    f, row["offset"], row["length"], row["source_index"], row["fields"]
-                                )
-                                validate_dump_values(fields, shard["field_schema"], row["source_index"])
-                                groups[(tuple(row["fields"]), tuple(row["unfinalized"]))].append((row, fields))
-                                bytes_read += row["length"]
-                            for (signature, unfinalized), rows in groups.items():
-                                indexes = [row["target_index"] for row, _ in rows]
-                                values = {name: [fields[name] for _, fields in rows] for name in signature}
-                                self.storage_data.put_data(values, indexes)
-                                source_indexes = [row["source_index"] for row, _ in rows]
-                                finalized = tuple(name for name in signature if name not in unfinalized)
-                                # Publish each field with the readiness it had when dumped.
-                                for names, ready in ((finalized, True), (unfinalized, False)):
-                                    if names:
-                                        schema = select_dump_schema(
-                                            shard["field_schema"], source_indexes, indexes, names
-                                        )
-                                        updates.append(
-                                            {"global_indexes": indexes, "field_schema": schema, "ready": ready}
-                                        )
-            logger.info(
-                "[%s]: loaded %s rows (%s bytes)",
-                self.storage_unit_id,
-                sum(len(update["global_indexes"]) for update in updates),
-                bytes_read,
-            )
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": True, "updates": updates, "bytes_read": bytes_read},
-            )
-        except Exception as e:
-            logger.error("[%s]: load rows failed: %s", self.storage_unit_id, e)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
+        with self._storage_lock:
+            for shard in shards:
+                records = sorted(shard["records"], key=lambda row: row["offset"])
+                with open(shard["path"], "rb", buffering=0) as f:
+                    # Bound temporary payload memory while retaining batched schema updates.
+                    for start in range(0, len(records), 128):
+                        groups = defaultdict(list)
+                        for row in records[start : start + 128]:
+                            fields = read_dump_row(f, row["offset"], row["length"], row["source_index"], row["fields"])
+                            validate_dump_values(fields, shard["field_schema"], row["source_index"])
+                            groups[(tuple(row["fields"]), tuple(row["unfinalized"]))].append((row, fields))
+                            bytes_read += row["length"]
+                        for (signature, unfinalized), rows in groups.items():
+                            indexes = [row["target_index"] for row, _ in rows]
+                            values = {name: [fields[name] for _, fields in rows] for name in signature}
+                            self.storage_data.put_data(values, indexes)
+                            source_indexes = [row["source_index"] for row, _ in rows]
+                            finalized = tuple(name for name in signature if name not in unfinalized)
+                            # Publish each field with the readiness it had when dumped.
+                            for names, ready in ((finalized, True), (unfinalized, False)):
+                                if names:
+                                    schema = select_dump_schema(shard["field_schema"], source_indexes, indexes, names)
+                                    updates.append({"global_indexes": indexes, "field_schema": schema, "ready": ready})
+        logger.info(
+            "[%s]: loaded %s rows (%s bytes)",
+            self.storage_unit_id,
+            sum(len(update["global_indexes"]) for update in updates),
+            bytes_read,
+        )
+        return {"success": True, "updates": updates, "bytes_read": bytes_read}
+
+    def _load_checkpoint(self, path: str) -> dict[str, Any]:
+        """Restore storage state and report changes in capacity and contents."""
+        with self._storage_lock:
+            previous_key_count = self.storage_data.active_key_count
+            checkpoint_size = self.storage_data.load_checkpoint(path)
+            active_key_count = self.storage_data.active_key_count
+            field_count = len(self.storage_data.field_data)
+
+        if checkpoint_size != self.storage_unit_size:
+            logger.warning(
+                f"[{self.storage_unit_id}]: storage_unit_size mismatch — "
+                f"checkpoint={checkpoint_size}, current={self.storage_unit_size}"
             )
 
-    def _handle_load_checkpoint(self, data_parts) -> ZMQMessage:
-        """Restore storage unit data directly from its checkpoint path.
-
-        Args:
-            data_parts: ZMQMessage from client, containing ``path`` in body:
-                absolute path to a .pkl file previously written by
-                ``_handle_save_checkpoint``. The caller must ensure this path
-                is reachable from the node running this actor
-                (shared filesystem required for multi-node setups).
-
-        Returns:
-            ZMQMessage with ``success=True`` on success, or ``success=False``
-            and ``message`` containing the error string on failure.
-        """
-        path = data_parts.body["path"]
-        try:
-            with self._storage_lock:
-                previous_key_count = self.storage_data.active_key_count
-                checkpoint_size = self.storage_data.load_checkpoint(path)
-                active_key_count = self.storage_data.active_key_count
-                field_count = len(self.storage_data.field_data)
-
-            if checkpoint_size != self.storage_unit_size:
-                logger.warning(
-                    f"[{self.storage_unit_id}]: storage_unit_size mismatch — "
-                    f"checkpoint={checkpoint_size}, current={self.storage_unit_size}"
-                )
-
-            if previous_key_count:
-                logger.warning(
-                    f"[{self.storage_unit_id}]: overwriting {previous_key_count} "
-                    f"existing keys with checkpoint data from {path}"
-                )
-
-            logger.info(
-                f"[{self.storage_unit_id}]: loaded checkpoint from {path} — "
-                f"{active_key_count} keys, {field_count} fields"
-            )
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"success": True},
+        if previous_key_count:
+            logger.warning(
+                f"[{self.storage_unit_id}]: overwriting {previous_key_count} "
+                f"existing keys with checkpoint data from {path}"
             )
 
-        except Exception as e:
-            logger.error(f"[{self.storage_unit_id}]: load checkpoint failed: {e}")
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
+        logger.info(
+            f"[{self.storage_unit_id}]: loaded checkpoint from {path} — {active_key_count} keys, {field_count} fields"
+        )
+        return {"success": True}
 
     @staticmethod
     def _cumulative_bucket_counts(hist) -> list[float]:
