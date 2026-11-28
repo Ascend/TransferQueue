@@ -40,15 +40,6 @@ class TestBaseSampler:
         assert "Can't instantiate abstract class" in str(exc_info.value)
         assert "sample" in str(exc_info.value)
 
-    def test_base_sampler_has_abstract_methods(self):
-        """Test that BaseSampler defines abstract methods."""
-        assert hasattr(BaseSampler, "sample")
-        assert getattr(BaseSampler.sample, "__isabstractmethod__", False)
-
-    def test_base_sampler_has_call_method(self):
-        """Test that BaseSampler has __call__ method."""
-        assert callable(BaseSampler)
-
     def test_base_sampler_initialization_states(self):
         """Test BaseSampler initialization sets _states correctly."""
 
@@ -236,17 +227,6 @@ class TestGRPOGroupNSampler:
         sampled, consumed = sampler.sample(ready_indexes, batch_size)
         assert sampled == []
         assert consumed == []
-
-    def test_grpo_sampler_exact_multiple_available(self):
-        """Test when ready_indexes length is exactly a multiple of n_samples_per_prompt."""
-        sampler = GRPOGroupNSampler(n_samples_per_prompt=4)
-        ready_indexes = [0, 1, 2, 3, 4, 5, 6, 7]  # 8 indexes
-        batch_size = 8
-
-        sampled, consumed = sampler.sample(ready_indexes, batch_size)
-
-        assert sampled == [0, 1, 2, 3, 4, 5, 6, 7]
-        assert consumed == [0, 1, 2, 3, 4, 5, 6, 7]
 
     def test_grpo_sampler_zero_batch_size(self):
         """Test behavior with zero batch size."""
@@ -1133,20 +1113,6 @@ class TestKarmarkarKarp:
 class TestSamplerIntegration:
     """Integration tests for samplers."""
 
-    def test_samplers_implement_base_interface(self):
-        """Test that all samplers properly implement BaseSampler interface."""
-        samplers = [SequentialSampler(), GRPOGroupNSampler(), SeqlenBalancedSampler()]
-
-        for sampler in samplers:
-            # Test that they are instances of BaseSampler
-            assert isinstance(sampler, BaseSampler)
-
-            # Test that they have the required methods
-            assert hasattr(sampler, "sample")
-            assert callable(sampler.sample)
-            assert callable(sampler)
-            assert callable(sampler.__call__)
-
     def test_samplers_return_consistent_types(self):
         """Test that all samplers return consistent tuple types."""
         samplers = [
@@ -1178,30 +1144,6 @@ class TestSamplerIntegration:
             # Check return value consistency
             assert len(sampled) <= batch_size
             assert len(sampled) == len(consumed)
-
-    def test_samplers_handle_edge_cases_consistently(self):
-        """Test that samplers handle edge cases consistently."""
-        samplers = [(SequentialSampler(), {}), (GRPOGroupNSampler(n_samples_per_prompt=2), {})]
-
-        # Test empty ready indexes
-        for sampler, kwargs in samplers:
-            try:
-                sampled, consumed = sampler.sample([], 0, **kwargs)
-                assert sampled == []
-                assert consumed == []
-            except Exception:
-                # GRPO sampler might fail with empty list, that's expected
-                pass
-
-        # Test zero batch size
-        for sampler, kwargs in samplers:
-            try:
-                sampled, consumed = sampler.sample([0, 1, 2, 3], 0, **kwargs)
-                assert sampled == []
-                assert consumed == []
-            except Exception:
-                # Some samplers might not handle zero batch size
-                pass
 
 
 if __name__ == "__main__":

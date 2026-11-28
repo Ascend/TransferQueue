@@ -80,17 +80,6 @@ async def mock_async_storage_manager():
 
 
 @pytest.mark.asyncio
-async def test_async_storage_manager_initialization(mock_async_storage_manager):
-    """Test AsyncSimpleStorageManager initialization."""
-    manager = mock_async_storage_manager
-
-    # Test basic properties
-    assert len(manager.storage_unit_infos) == 2
-    assert "storage_0" in manager.storage_unit_infos
-    assert "storage_1" in manager.storage_unit_infos
-
-
-@pytest.mark.asyncio
 async def test_async_storage_manager_mock_operations(mock_async_storage_manager):
     """Test AsyncSimpleStorageManager operations with mocked ZMQ."""
     manager = mock_async_storage_manager

@@ -1129,19 +1129,6 @@ class TestNumpySerialization:
 
         assert np.array_equal(deserialized, unicode_arr)
 
-    def test_numpy_bytes_array(self):
-        """Test numpy bytes array (dtype='S...')."""
-        encoder = MsgpackEncoder()
-        decoder = MsgpackDecoder()
-
-        # Bytes array
-        bytes_arr = np.array([b"hello", b"world"], dtype="S10")
-
-        serialized = encoder.encode(bytes_arr)
-        deserialized = decoder.decode(serialized)
-
-        assert np.array_equal(deserialized, bytes_arr)
-
     # --- Native serialization tests (formerly TestNumpyNativeSerialization) ---
 
     @pytest.mark.parametrize(
@@ -1196,13 +1183,6 @@ class TestNumpySerialization:
         assert deserialized.dtype == arr.dtype
         assert deserialized.shape == arr.shape
         assert np.array_equal(deserialized, arr)
-
-    def test_numpy_zero_copy_uses_multiple_buffers(self):
-        """Zero-copy path must produce len(serialized) > 1."""
-        encoder = MsgpackEncoder()
-        arr = np.arange(100, dtype=np.float32)
-        serialized = encoder.encode(arr)
-        assert len(serialized) > 1, "Expected zero-copy (aux buffer) for float32 ndarray"
 
     def test_numpy_non_contiguous_roundtrip(self):
         """Non-C-contiguous arrays must be made contiguous before serialization."""

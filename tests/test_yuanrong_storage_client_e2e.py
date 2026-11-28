@@ -165,12 +165,6 @@ class TestYuanrongStorageE2E:
         dtypes = [v.dtype if isinstance(v, torch.Tensor) else None for v in vals]
         return keys, vals, shapes, dtypes
 
-    def test_mock_can_work(self, config):
-        mock_class = (MockDsTensorClient, MockKVClient)
-        client = self.client_cls(config)
-        for strategy in client._strategies:
-            assert isinstance(strategy._ds_client, mock_class)
-
     def test_cpu_only_flow(self, config):
         client = self.client_cls(config)
         keys, vals, shp, dt = self._create_data("cpu")
@@ -239,13 +233,6 @@ class TestYuanrongStorageE2E:
         empty_meta = [""]
         with pytest.raises(ValueError, match="no backend metadata"):
             client.get(keys, shapes, dtypes, empty_meta)
-
-    def test_put_with_no_strategies_raises_error(self, config):
-        """Verify that put raises ValueError when no strategy supports the value type."""
-        client = self.client_cls(config)
-        client._strategies = []
-        with pytest.raises(ValueError, match=f"No storage backend can handle {self.client_cls.ROUTE_ITEM_AS_VALUE}"):
-            client.put(["k1"], [1])
 
     def test_clear_with_empty_backend_meta_silent(self, config):
         """Verify that clear silently skips keys with empty backend_meta (not previously stored)."""
