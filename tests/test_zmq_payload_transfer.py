@@ -465,7 +465,7 @@ def test_storage_handler_allows_concurrent_admin_while_parser_runs(monkeypatch):
                 {"value": [torch.tensor([3])]},
             )
             concurrent_clear = executor.submit(
-                unit._handle_clear,
+                unit._handle_storage_request,
                 ZMQMessage.create(
                     request_type=ZMQRequestType.CLEAR_DATA, sender_id="manager", body={"global_indexes": [1]}
                 ),

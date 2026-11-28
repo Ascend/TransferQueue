@@ -444,87 +444,69 @@ class MooncakeStoreClient(StorageKVClient):
 
         use_gdr_path = self.use_gdr and self._gdr_staging is not None
 
-        gpu_tensor_indices: list[int] = []
-        gpu_tensor_keys: list[str] = []
-        gpu_tensor_shapes: list[Any] = []
-        gpu_tensor_dtypes: list[Any] = []
-        cpu_tensor_indices: list[int] = []
-        cpu_tensor_keys: list[str] = []
-        cpu_tensor_shapes: list[Any] = []
-        cpu_tensor_dtypes: list[Any] = []
-        non_tensor_indices: list[int] = []
-        non_tensor_keys: list[str] = []
-        non_tensor_packed_sizes: list[int] = []
+        tensor_indices = [i for i, dtype in enumerate(dtypes) if dtype is not None]
+        non_tensor_indices = [i for i, dtype in enumerate(dtypes) if dtype is None]
 
-        for i, dtype in enumerate(dtypes):
-            if dtype is not None:
-                if use_gdr_path:
-                    gpu_tensor_indices.append(i)
-                    gpu_tensor_keys.append(keys[i])
-                    gpu_tensor_shapes.append(shapes[i])
-                    gpu_tensor_dtypes.append(dtype)
-                else:
-                    cpu_tensor_indices.append(i)
-                    cpu_tensor_keys.append(keys[i])
-                    cpu_tensor_shapes.append(shapes[i])
-                    cpu_tensor_dtypes.append(dtype)
-            else:
-                non_tensor_indices.append(i)
-                non_tensor_keys.append(keys[i])
-
-        if (gpu_tensor_indices and use_gdr_path) or non_tensor_indices:
+        if (tensor_indices and use_gdr_path) or non_tensor_indices:
             if custom_backend_meta is None or len(custom_backend_meta) != len(keys):
                 raise ValueError(
                     "custom_backend_meta is required when GDR is enabled (for n_chunks) "
                     "or when any dtype is None (for packed_size)."
                 )
 
+        packed_sizes = []
         if non_tensor_indices:
             assert custom_backend_meta is not None
-            for j in non_tensor_indices:
-                meta = custom_backend_meta[j]
+            for i in non_tensor_indices:
+                meta = custom_backend_meta[i]
                 assert meta is not None
-                non_tensor_packed_sizes.append(meta["packed_size"])
+                packed_sizes.append(meta["packed_size"])
 
         results = [None] * len(keys)
-
-        if gpu_tensor_keys:
+        if tensor_indices and use_gdr_path:
             assert custom_backend_meta is not None
-            gpu_tensor_meta = [custom_backend_meta[i] for i in gpu_tensor_indices]
-            retrieved, batch_idx = self._get_tensors_gdr(
-                gpu_tensor_keys, gpu_tensor_shapes, gpu_tensor_dtypes, gpu_tensor_indices, gpu_tensor_meta
+            retrieved, indexes = self._get_tensors_gdr(
+                [keys[i] for i in tensor_indices],
+                [shapes[i] for i in tensor_indices],
+                [dtypes[i] for i in tensor_indices],
+                tensor_indices,
+                [custom_backend_meta[i] for i in tensor_indices],
             )
-            for idx, val in zip(batch_idx, retrieved, strict=True):
-                results[idx] = val
+            for idx, value in zip(indexes, retrieved, strict=True):
+                results[idx] = value
 
         futures = []
         with ThreadPoolExecutor(
             max_workers=MAX_BATCH_WORKER_THREADS,
             initializer=self._bind_npu_device,
         ) as executor:
-            for i in range(0, len(cpu_tensor_indices), BATCH_SIZE_LIMIT):
-                batch_keys = cpu_tensor_keys[i : i + BATCH_SIZE_LIMIT]
-                batch_shapes = cpu_tensor_shapes[i : i + BATCH_SIZE_LIMIT]
-                batch_dtypes = cpu_tensor_dtypes[i : i + BATCH_SIZE_LIMIT]
-                batch_indexes = cpu_tensor_indices[i : i + BATCH_SIZE_LIMIT]
+            if not use_gdr_path:
+                for start in range(0, len(tensor_indices), BATCH_SIZE_LIMIT):
+                    indexes = tensor_indices[start : start + BATCH_SIZE_LIMIT]
+                    futures.append(
+                        executor.submit(
+                            self._get_tensors_thread_worker,
+                            [keys[i] for i in indexes],
+                            [shapes[i] for i in indexes],
+                            [dtypes[i] for i in indexes],
+                            indexes,
+                        )
+                    )
+            for start in range(0, len(non_tensor_indices), BATCH_SIZE_LIMIT):
+                indexes = non_tensor_indices[start : start + BATCH_SIZE_LIMIT]
                 futures.append(
                     executor.submit(
-                        self._get_tensors_thread_worker, batch_keys, batch_shapes, batch_dtypes, batch_indexes
+                        self._get_bytes_thread_worker,
+                        [keys[i] for i in indexes],
+                        packed_sizes[start : start + BATCH_SIZE_LIMIT],
+                        indexes,
                     )
                 )
 
-            for i in range(0, len(non_tensor_indices), BATCH_SIZE_LIMIT):
-                batch_keys = non_tensor_keys[i : i + BATCH_SIZE_LIMIT]
-                batch_packed_sizes = non_tensor_packed_sizes[i : i + BATCH_SIZE_LIMIT]
-                batch_indexes = non_tensor_indices[i : i + BATCH_SIZE_LIMIT]
-                futures.append(
-                    executor.submit(self._get_bytes_thread_worker, batch_keys, batch_packed_sizes, batch_indexes)
-                )
-
             for future in as_completed(futures):
-                retrieved_values, batch_indexes = future.result()
-                for idx, val in zip(batch_indexes, retrieved_values, strict=True):
-                    results[idx] = val
+                retrieved_values, indexes = future.result()
+                for idx, value in zip(indexes, retrieved_values, strict=True):
+                    results[idx] = value
 
         return results
 
@@ -756,122 +738,52 @@ class MooncakeStoreClient(StorageKVClient):
         Caller owns the memory regions (register/unregister and lifetime of the
         backing tensors/buffers).
         """
-        results = self._store.batch_upsert_from(batch_keys, batch_ptrs, batch_sizes, config=self.replica_config)
-        if len(results) != len(batch_keys):
-            raise RuntimeError(f"batch_upsert_from returned {len(results)} results, expected {len(batch_keys)}")
-
-        failed_indices = [j for j, r in enumerate(results) if r != 0]
-        if not failed_indices:
-            return
-
-        current_failed_keys = [batch_keys[i] for i in failed_indices]
-        current_failed_codes = [results[i] for i in failed_indices]
-        current_failed_indices = failed_indices
-
-        logger.error(
-            f"batch_upsert_from failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
-            f"Retrying up to {MAX_RETRIES} times..."
-        )
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            retry_ptrs = [batch_ptrs[i] for i in current_failed_indices]
-            retry_sizes = [batch_sizes[i] for i in current_failed_indices]
-
-            retry_results = self._store.batch_upsert_from(
-                current_failed_keys, retry_ptrs, retry_sizes, config=self.replica_config
-            )
-
-            next_failed_indices = []
-            next_failed_keys = []
-            next_failed_codes = []
-
-            for i, ret in enumerate(retry_results):
-                if ret != 0:
-                    next_failed_indices.append(current_failed_indices[i])
-                    next_failed_keys.append(current_failed_keys[i])
-                    next_failed_codes.append(ret)
-
-            if not next_failed_indices:
-                logger.info("batch_upsert_from succeeded after retransmission.")
-                return
-
-            logger.error(
-                f"batch_upsert_from retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
-                f"with error codes {next_failed_codes}."
-            )
-
-            current_failed_indices = next_failed_indices
-            current_failed_keys = next_failed_keys
-            current_failed_codes = next_failed_codes
-
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS)
-
-        raise RuntimeError(
-            f"batch_upsert_from failed for keys {current_failed_keys} with error codes "
-            f"{current_failed_codes} after retrying {MAX_RETRIES} times."
-        )
+        self._transfer_with_retry(batch_keys, batch_ptrs, batch_sizes, write=True)
 
     def _batch_get_into_with_retry(
         self, batch_keys: list[str], batch_buffer_ptrs: list[int], batch_nbytes: list[int]
     ) -> None:
-        """Run ``batch_get_into`` with per-key retry; raise on permanent failure.
+        """Read with per-key retry, reusing the caller's registered receive buffers."""
+        self._transfer_with_retry(batch_keys, batch_buffer_ptrs, batch_nbytes, write=False)
 
-        Caller owns the receive buffers (allocate/register/unregister).
-        """
-        ret_codes = self._store.batch_get_into(batch_keys, batch_buffer_ptrs, batch_nbytes)
-        if len(ret_codes) != len(batch_keys):
-            raise RuntimeError(f"batch_get_into returned {len(ret_codes)} results, expected {len(batch_keys)}")
-
-        failed_indices = [i for i, ret in enumerate(ret_codes) if ret < 0]
-        if not failed_indices:
-            return
-
-        current_failed_keys = [batch_keys[i] for i in failed_indices]
-        current_failed_codes = [ret_codes[i] for i in failed_indices]
-        current_failed_indices = failed_indices
-
-        logger.error(
-            f"batch_get_into failed for keys {current_failed_keys} with error codes {current_failed_codes}. "
-            f"Retrying up to {MAX_RETRIES} times..."
-        )
-
-        for attempt in range(1, MAX_RETRIES + 1):
-            # Reuse the originally allocated pointers; no need to allocate/register new buffers.
-            retry_ptrs = [batch_buffer_ptrs[i] for i in current_failed_indices]
-            retry_nbytes = [batch_nbytes[i] for i in current_failed_indices]
-
-            retry_codes = self._store.batch_get_into(current_failed_keys, retry_ptrs, retry_nbytes)
-
-            next_failed_indices = []
-            next_failed_keys = []
-            next_failed_codes = []
-
-            for i, ret in enumerate(retry_codes):
-                if ret < 0:
-                    next_failed_indices.append(current_failed_indices[i])
-                    next_failed_keys.append(current_failed_keys[i])
-                    next_failed_codes.append(ret)
-
-            if not next_failed_indices:
-                logger.info("batch_get_into succeeded after retransmission.")
-                return
-
-            logger.error(
-                f"batch_get_into retry {attempt}/{MAX_RETRIES} failed for {len(next_failed_keys)} keys "
-                f"with error codes {next_failed_codes}."
+    def _transfer_with_retry(self, keys: list[str], ptrs: list[int], sizes: list[int], *, write: bool) -> None:
+        """Retry only failed positions without changing their registered buffers."""
+        operation = self._store.batch_upsert_from if write else self._store.batch_get_into
+        name = "batch_upsert_from" if write else "batch_get_into"
+        kwargs = {"config": self.replica_config} if write else {}
+        pending = list(range(len(keys)))
+        current_keys = keys
+        for attempt in range(MAX_RETRIES + 1):
+            results = operation(
+                current_keys,
+                ptrs if attempt == 0 else [ptrs[i] for i in pending],
+                sizes if attempt == 0 else [sizes[i] for i in pending],
+                **kwargs,
             )
-
-            current_failed_indices = next_failed_indices
-            current_failed_keys = next_failed_keys
-            current_failed_codes = next_failed_codes
-
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SECONDS)
-
+            if attempt == 0 and len(results) != len(keys):
+                raise RuntimeError(f"{name} returned {len(results)} results, expected {len(keys)}")
+            failed = [(pending[i], code) for i, code in enumerate(results) if (code != 0 if write else code < 0)]
+            if not failed:
+                if attempt:
+                    logger.info(f"{name} succeeded after retransmission.")
+                return
+            pending = [i for i, _ in failed]
+            current_keys = [keys[i] for i in pending]
+            codes = [code for _, code in failed]
+            if attempt == 0:
+                logger.error(
+                    f"{name} failed for keys {current_keys} with error codes {codes}. "
+                    f"Retrying up to {MAX_RETRIES} times..."
+                )
+            else:
+                logger.error(
+                    f"{name} retry {attempt}/{MAX_RETRIES} failed for {len(current_keys)} keys "
+                    f"with error codes {codes}."
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SECONDS)
         raise RuntimeError(
-            f"batch_get_into failed for keys {current_failed_keys} with error codes "
-            f"{current_failed_codes} after retrying {MAX_RETRIES} times."
+            f"{name} failed for keys {current_keys} with error codes {codes} after retrying {MAX_RETRIES} times."
         )
 
     @staticmethod

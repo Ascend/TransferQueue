@@ -17,13 +17,44 @@
 
 import pytest
 import torch
+from tensordict import NonTensorStack
 
 from transfer_queue.utils.tensor_utils import (
+    _pack_tensor_values,
     allocate_empty_tensors,
     compute_stride,
     get_nbytes,
     merge_contiguous_memory,
 )
+
+
+@pytest.mark.parametrize(
+    "values,layout,nested",
+    [
+        ([torch.tensor(3), torch.tensor(7)], torch.strided, False),
+        ([torch.arange(3), torch.arange(3) + 10], torch.jagged, True),
+        ([torch.arange(2), torch.arange(5)], torch.jagged, True),
+        ([torch.arange(6).reshape(2, 3), torch.arange(6).reshape(3, 2)], torch.strided, True),
+    ],
+    ids=["scalars", "equal_lengths", "variable_lengths", "variable_dimensions"],
+)
+def test_pack_tensor_values_preserves_rows_and_layout(values, layout, nested):
+    packed = _pack_tensor_values(values)
+    assert packed.layout == layout
+    assert packed.is_nested == nested
+    for actual, expected in zip(packed.unbind(), values, strict=True):
+        torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("middle", [None, {"tokens": [1, 2]}, "text"])
+def test_pack_tensor_values_keeps_objects_between_tensors(middle):
+    values = [torch.tensor([3]), middle, torch.tensor([7, 8])]
+    packed = _pack_tensor_values(values)
+    assert isinstance(packed, NonTensorStack)
+    actual = packed.tolist()
+    torch.testing.assert_close(actual[0], values[0])
+    assert actual[1] == middle
+    torch.testing.assert_close(actual[2], values[2])
 
 
 class TestComputeStride:

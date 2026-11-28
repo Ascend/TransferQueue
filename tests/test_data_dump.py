@@ -41,7 +41,7 @@ def test_dump_excludes_unselected_tensor_storage(unit, tmp_path, row_count):
     unit.storage_data.put_data({"x": batch}, list(range(64)))
     path = tmp_path / "shard.pkl"
     indexes = list(range(row_count))
-    reply = unit._handle_dump_rows(
+    reply = unit._handle_storage_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
@@ -119,7 +119,7 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
     batch = torch.arange(8 * 4096, dtype=torch.float32).reshape(8, 4096)
     unit.storage_data.put_data({"x": batch, "stale": batch}, list(range(8)))
     path = tmp_path / "shard.pkl"
-    reply = unit._handle_dump_rows(
+    reply = unit._handle_storage_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
@@ -158,7 +158,7 @@ def test_unit_reads_only_assigned_ranges_and_merges(unit, tmp_path, monkeypatch)
                 "length": length,
             }
         )
-    loaded = unit._handle_load_rows(
+    loaded = unit._handle_storage_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -203,7 +203,7 @@ def test_unit_rejects_invalid_records(unit, tmp_path, problem):
         record["length"] += 1
     else:
         record["fields"] = ["missing"]
-    reply = unit._handle_load_rows(
+    reply = unit._handle_storage_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.LOAD_ROWS,
             sender_id="test",
@@ -227,7 +227,7 @@ def test_load_refuses_other_backends_before_registering_keys(monkeypatch, tmp_pa
 
 def test_dump_reports_every_rows_stored_types(unit, tmp_path):
     unit.storage_data.put_data({"x": [torch.arange(2), torch.arange(3)], "y": [None, {"key": "value"}]}, [9, 10])
-    response = unit._handle_dump_rows(
+    response = unit._handle_storage_request(
         ZMQMessage.create(
             request_type=ZMQRequestType.DUMP_ROWS,
             sender_id="test",
