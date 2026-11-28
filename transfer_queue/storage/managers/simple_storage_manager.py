@@ -50,7 +50,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQRequestType,
     ZMQServerInfo,
     ZMQSocketPool,
-    with_zmq_socket,
 )
 
 logger = get_logger(__name__)
@@ -164,26 +163,6 @@ def _build_update_field_schema(
 
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
-
-# Pre-bound decorator for storage-unit socket operations.
-with_storage_unit_socket = with_zmq_socket(
-    get_peer=lambda self, target: self.storage_unit_infos[target],
-    get_pool=lambda self: self.storage_rpc_pool,
-    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-)
-
-# Same endpoint as above but with the short diagnostic timeout, used only after a failure.
-with_storage_unit_probe_socket = with_zmq_socket(
-    get_peer=lambda self, target: self.storage_unit_infos[target],
-    get_pool=lambda self: self.storage_probe_pool,
-    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-)
-
-with_storage_unit_dump_socket = with_zmq_socket(
-    get_peer=lambda self, target: self.storage_unit_infos[target],
-    get_pool=lambda self: self.storage_dump_pool,
-    resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-)
 
 
 class RoutingGroup(NamedTuple):
@@ -339,24 +318,24 @@ class AsyncSimpleStorageManager(StorageManager):
             return "endpoint unknown (unit not registered with this manager)"
         return f"{info.ip}:{info.ports.get('put_get_socket')}"
 
-    @with_storage_unit_probe_socket
-    async def _probe_storage_unit(self, target_storage_unit: str, socket: zmq.Socket = None) -> dict[str, Any]:
-        """Ask a storage unit for its own counters over a brand-new socket.
+    async def _probe_storage_unit(self, target_storage_unit: str) -> dict[str, Any]:
+        """Read the unit's counters through the dedicated probe pool.
 
         Served by the same worker thread as put and get, so an answer proves the unit is serving.
         """
-        request_msg = ZMQMessage.create(
-            request_type=ZMQRequestType.GET_METRICS,  # type: ignore[arg-type]
-            sender_id=f"{self.storage_manager_id}_probe",
-            receiver_id=target_storage_unit,
-            body={},
-        )
-        await socket.send_multipart(request_msg.serialize())
-        messages = await socket.recv_multipart(copy=False)
-        response_msg = ZMQMessage.deserialize(messages)
-        if response_msg.request_type != ZMQRequestType.METRICS_RESPONSE:
-            raise RuntimeError(f"unexpected probe response type {response_msg.request_type}")
-        return response_msg.body
+        async with self.storage_probe_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            request_msg = ZMQMessage.create(
+                request_type=ZMQRequestType.GET_METRICS,  # type: ignore[arg-type]
+                sender_id=f"{self.storage_manager_id}_probe",
+                receiver_id=target_storage_unit,
+                body={},
+            )
+            await socket.send_multipart(request_msg.serialize())
+            messages = await socket.recv_multipart(copy=False)
+            response_msg = ZMQMessage.deserialize(messages)
+            if response_msg.request_type != ZMQRequestType.METRICS_RESPONSE:
+                raise RuntimeError(f"unexpected probe response type {response_msg.request_type}")
+            return response_msg.body
 
     async def _diagnose_storage_unit(self, target_storage_unit: str) -> str:
         """Report whether the unit is reachable and serving after a request to it timed out.
@@ -918,20 +897,21 @@ class AsyncSimpleStorageManager(StorageManager):
         await socket.send_multipart(request.serialize(), copy=copy)
         return ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
 
-    @with_storage_unit_socket
-    async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None, socket=None):
-        response_msg = await self._storage_request(
-            socket,
-            target_storage_unit,
-            ZMQRequestType.CLEAR_DATA,
-            {"global_indexes": global_indexes, "fields": fields},
-            copy=True,
-        )
-
-        if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
-            raise RuntimeError(
-                f"Failed to clear storage {target_storage_unit}: {response_msg.body.get('message', 'Unknown error')}"
+    async def _clear_single_storage_unit(self, global_indexes, fields=None, target_storage_unit=None):
+        async with self.storage_rpc_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            response_msg = await self._storage_request(
+                socket,
+                target_storage_unit,
+                ZMQRequestType.CLEAR_DATA,
+                {"global_indexes": global_indexes, "fields": fields},
+                copy=True,
             )
+
+            if response_msg.request_type != ZMQRequestType.CLEAR_DATA_RESPONSE:
+                raise RuntimeError(
+                    f"Failed to clear storage {target_storage_unit}: "
+                    f"{response_msg.body.get('message', 'Unknown error')}"
+                )
 
     def get_zmq_server_info(self) -> dict[str, ZMQServerInfo]:
         """Get ZMQ server information for all storage units.
@@ -941,87 +921,79 @@ class AsyncSimpleStorageManager(StorageManager):
         """
         return self.storage_unit_infos
 
-    @with_storage_unit_socket
-    async def _save_single_storage_unit(
-        self,
-        path: str,
-        target_storage_unit: str,
-        socket: zmq.Socket = None,
-    ):
-        try:
-            response_msg = await self._storage_request(
-                socket, target_storage_unit, ZMQRequestType.SAVE_STORAGE_CHECKPOINT, {"path": path}
-            )
-            if (
-                response_msg.request_type != ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE
-                or not response_msg.body.get("success")
-            ):
-                raise RuntimeError(
-                    f"Storage unit {target_storage_unit} failed to save checkpoint to {path}: "
-                    f"{response_msg.body.get('message', 'unknown error')}"
+    async def _save_single_storage_unit(self, path: str, target_storage_unit: str):
+        async with self.storage_rpc_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            try:
+                response_msg = await self._storage_request(
+                    socket, target_storage_unit, ZMQRequestType.SAVE_STORAGE_CHECKPOINT, {"path": path}
                 )
-        except Exception as e:
-            raise RuntimeError(
-                f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}"
-            ) from e
-
-    @with_storage_unit_socket
-    async def _load_single_storage_unit(
-        self,
-        path: str,
-        target_storage_unit: str,
-        socket: zmq.Socket = None,
-    ):
-        try:
-            response_msg = await self._storage_request(
-                socket, target_storage_unit, ZMQRequestType.LOAD_STORAGE_CHECKPOINT, {"path": path}
-            )
-            if (
-                response_msg.request_type != ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
-                or not response_msg.body.get("success")
-            ):
+                if (
+                    response_msg.request_type != ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE
+                    or not response_msg.body.get("success")
+                ):
+                    raise RuntimeError(
+                        f"Storage unit {target_storage_unit} failed to save checkpoint to {path}: "
+                        f"{response_msg.body.get('message', 'unknown error')}"
+                    )
+            except Exception as e:
                 raise RuntimeError(
-                    f"Storage unit {target_storage_unit} failed to load checkpoint from {path}: "
-                    f"{response_msg.body.get('message', 'unknown error')}"
-                )
-        except Exception as e:
-            raise RuntimeError(
-                f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
-            ) from e
+                    f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}"
+                ) from e
 
-    @with_storage_unit_dump_socket
+    async def _load_single_storage_unit(self, path: str, target_storage_unit: str):
+        async with self.storage_rpc_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            try:
+                response_msg = await self._storage_request(
+                    socket, target_storage_unit, ZMQRequestType.LOAD_STORAGE_CHECKPOINT, {"path": path}
+                )
+                if (
+                    response_msg.request_type != ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE
+                    or not response_msg.body.get("success")
+                ):
+                    raise RuntimeError(
+                        f"Storage unit {target_storage_unit} failed to load checkpoint from {path}: "
+                        f"{response_msg.body.get('message', 'unknown error')}"
+                    )
+            except Exception as e:
+                raise RuntimeError(
+                    f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
+                ) from e
+
     async def _dump_single_shard(
         self,
         path: str,
         target_storage_unit: str,
         fields_by_index: dict[int, list[str]],
-        socket: zmq.Socket = None,
     ) -> dict[str, Any]:
         """Ask one storage unit to write the rows it owns into a shard file."""
-        try:
-            response_msg = await self._storage_request(
-                socket,
-                target_storage_unit,
-                ZMQRequestType.DUMP_ROWS,
-                {"path": path, "fields_by_index": fields_by_index},
-            )
-            if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get("success"):
-                raise RuntimeError(
-                    f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
-                    f"{response_msg.body.get('message', 'unknown error')}"
+        async with self.storage_dump_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            try:
+                response_msg = await self._storage_request(
+                    socket,
+                    target_storage_unit,
+                    ZMQRequestType.DUMP_ROWS,
+                    {"path": path, "fields_by_index": fields_by_index},
                 )
-            missing_rows = response_msg.body["missing_rows"]
-            if missing_rows:
-                # The controller reported these rows as produced, so a unit that has no
-                # data for them means the two disagree. Never write a half table.
+                if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get(
+                    "success"
+                ):
+                    raise RuntimeError(
+                        f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
+                        f"{response_msg.body.get('message', 'unknown error')}"
+                    )
+                missing_rows = response_msg.body["missing_rows"]
+                if missing_rows:
+                    # The controller reported these rows as produced, so a unit that has no
+                    # data for them means the two disagree. Never write a half table.
+                    raise RuntimeError(
+                        f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
+                    )
+                return response_msg.body
+            except Exception as e:
                 raise RuntimeError(
-                    f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
-                )
-            return response_msg.body
-        except Exception as e:
-            raise RuntimeError(
-                f"[{self.storage_manager_id}]: Error dumping shard from storage unit {target_storage_unit}: {str(e)}"
-            ) from e
+                    f"[{self.storage_manager_id}]: Error dumping shard from storage unit "
+                    f"{target_storage_unit}: {str(e)}"
+                ) from e
 
     async def dump_rows_by_index(
         self,
@@ -1136,21 +1108,20 @@ class AsyncSimpleStorageManager(StorageManager):
         )
         return bytes_read
 
-    @with_storage_unit_dump_socket
     async def _load_selected_rows(
         self,
         shards: list[dict[str, Any]],
         target_storage_unit: str,
-        socket: zmq.Socket = None,
     ) -> dict[str, Any]:
-        response = await self._storage_request(
-            socket, target_storage_unit, ZMQRequestType.LOAD_ROWS, {"shards": shards}
-        )
-        if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
-            raise RuntimeError(
-                f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
+        async with self.storage_dump_pool.alease(self.storage_unit_infos[target_storage_unit]) as socket:
+            response = await self._storage_request(
+                socket, target_storage_unit, ZMQRequestType.LOAD_ROWS, {"shards": shards}
             )
-        return response.body
+            if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
+                raise RuntimeError(
+                    f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
+                )
+            return response.body
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
