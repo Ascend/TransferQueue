@@ -716,11 +716,12 @@ class MooncakeStoreClient(StorageKVClient):
             if not (ret == 0 or ret == -704):
                 logger.error(f"remove failed for key `{actual_keys[i]}` with error code: {ret}")
 
-    def close(self):
-        """Closes MooncakeStore.
+    def close(self, *, unmount: bool = True) -> None:
+        """Release transfer buffers and optionally unmount the store.
 
         Callers must have finished their reads first: the pool refuses to close while a
         buffer is still leased, and the store owns the memory those buffers point into.
+        Managers keep the segment mounted because it may hold other clients' data.
         """
         if self._buffer_pool is not None:
             self._buffer_pool.close()
@@ -728,7 +729,7 @@ class MooncakeStoreClient(StorageKVClient):
         if self._gdr_staging is not None:
             self._gdr_staging.close(self._store)
             self._gdr_staging = None
-        if self._store:
+        if unmount and self._store:
             self._store.close()
             self._store = None
 

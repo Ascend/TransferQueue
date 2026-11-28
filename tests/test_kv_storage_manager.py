@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -252,6 +253,10 @@ def test_merge_tensors_to_tensordict(mock_create, test_data):
                 assert torch.equal(t1, t2)
         else:
             assert complex_tensordict[key] == complex_data[key]
+
+    worker = manager._get_executor().submit(threading.current_thread).result()
+    manager.close()
+    assert not worker.is_alive()
 
 
 def test_get_shape_type_custom_backend_meta_list_without_custom_backend_meta(test_data):

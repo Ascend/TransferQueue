@@ -13,11 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import os
 import sys
 import time
 from collections import Counter, defaultdict
-from threading import Lock
+from threading import Event, Lock, current_thread
 from uuid import uuid4
 
 import numpy as np
@@ -151,6 +152,117 @@ def e2e_client(ray_cluster, backend_name):
     client = transfer_queue.get_client()
     yield client
     transfer_queue.close()
+
+
+@pytest.mark.parametrize("operation", ["get", "clear"])
+def test_async_storage_wait_allows_other_coroutines(e2e_client, backend_name, monkeypatch, operation):
+    if backend_name == "SimpleStorage":
+        pytest.skip("Requires a synchronous KV SDK")
+    manager = e2e_client.storage_manager
+    partition = f"async-storage-{uuid4().hex}"
+    data = TensorDict({"tokens": torch.arange(6).reshape(2, 3), "score": torch.tensor([[1.0], [2.0]])}, batch_size=2)
+    e2e_client.put(data=data, partition_id=partition)
+    metadata = poll_for_meta(e2e_client, partition, list(data.keys()), 2, partition, mode="fetch")
+    entered, release = Event(), Event()
+    sdk_call = getattr(manager.storage_client, operation)
+
+    def wait_then_call(*args, **kwargs):
+        entered.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("The event loop could not release the waiting SDK call")
+        return sdk_call(*args, **kwargs)
+
+    async def run():
+        async def release_from_loop():
+            while not entered.is_set():
+                await asyncio.sleep(0.001)
+            release.set()
+
+        request = manager.get_data(metadata) if operation == "get" else manager.clear_data(metadata, fields=["tokens"])
+        result, _ = await asyncio.wait_for(asyncio.gather(request, release_from_loop()), timeout=10)
+        if operation == "get":
+            for index in range(2):
+                torch.testing.assert_close(result["tokens"][index].cpu(), data["tokens"][index])
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(manager.storage_client, operation, wait_then_call)
+            asyncio.run(run())
+        remaining = e2e_client.get_data(metadata.select_fields(["score"]))
+        for index in range(2):
+            torch.testing.assert_close(remaining["score"][index].cpu(), data["score"][index])
+    finally:
+        release.set()
+        e2e_client.clear_partition(partition)
+
+
+def test_kv_close_releases_workers_and_transfer_buffers(e2e_client, backend_name):
+    if backend_name not in ("MooncakeStore", "MooncakeStore_GDR"):
+        pytest.skip("Requires client-hosted storage segments")
+    original = e2e_client.storage_manager
+    manager = type(original)(controller_info=original.controller_info, config=dict(original.config))
+    client = manager.storage_client
+    partition = f"close-storage-{uuid4().hex}"
+    data = TensorDict({"tokens": torch.arange(6).reshape(2, 3), "score": torch.tensor([[1.0], [2.0]])}, batch_size=2)
+    try:
+        e2e_client.put(data=data, partition_id=partition)
+        metadata = poll_for_meta(e2e_client, partition, list(data.keys()), 2, partition, mode="fetch")
+        result = asyncio.run(manager.get_data(metadata))
+        torch.testing.assert_close(result["tokens"][1].cpu(), data["tokens"][1])
+        worker = manager._get_executor().submit(current_thread).result()
+        io_executor = getattr(manager, "_io_executor", None)
+        io_worker = io_executor.submit(current_thread).result() if io_executor is not None else None
+        manager.close()
+        manager.close()
+        assert not worker.is_alive()
+        assert io_worker is None or not io_worker.is_alive()
+        assert client._buffer_pool is None
+        assert client._gdr_staging is None
+        # Closing a reader releases its resources without removing shared data.
+        remaining = e2e_client.get_data(metadata)
+        torch.testing.assert_close(remaining["tokens"][1].cpu(), data["tokens"][1])
+    finally:
+        manager.close()
+        e2e_client.clear_partition(partition)
+
+
+def test_async_get_preserves_accelerator_context(e2e_client, backend_name, monkeypatch):
+    if backend_name == "MooncakeStore_GDR":
+        accelerator = torch.cuda
+    elif backend_name == "Yuanrong" and hasattr(torch, "npu") and torch.npu.is_available():
+        accelerator = torch.npu
+    else:
+        pytest.skip("Requires an accelerator storage backend")
+    device = accelerator.device_count() - 1
+    stream = accelerator.Stream(device=device)
+    original = e2e_client.storage_manager
+    partition = f"device-context-{uuid4().hex}"
+    with accelerator.device(device), accelerator.stream(stream):
+        manager = type(original)(controller_info=original.controller_info, config=dict(original.config))
+        tensor = torch.arange(6, device=stream.device).reshape(2, 3)
+        data = TensorDict({"tokens": tensor}, batch_size=2)
+        metadata = e2e_client.get_meta(
+            partition_id=partition, data_fields=["tokens"], batch_size=2, mode="insert", task_name=partition
+        )
+        try:
+            asyncio.run(manager.put_data(data, metadata))
+            metadata = poll_for_meta(e2e_client, partition, ["tokens"], 2, partition, mode="fetch")
+            sdk_get = manager.storage_client.get
+
+            def get_on_caller_device(*args, **kwargs):
+                assert accelerator.current_device() == device
+                assert accelerator.current_stream() == stream
+                return sdk_get(*args, **kwargs)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(manager.storage_client, "get", get_on_caller_device)
+                result = asyncio.run(manager.get_data(metadata))
+            assert result["tokens"].device == tensor.device
+            for index in range(2):
+                torch.testing.assert_close(result["tokens"][index], tensor[index])
+        finally:
+            manager.close()
+            e2e_client.clear_partition(partition)
 
 
 @pytest.mark.parametrize("write", [True, False], ids=["put", "get"])
