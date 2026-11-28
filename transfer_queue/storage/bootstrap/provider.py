@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import wraps
 from typing import Callable
 
 
@@ -24,15 +23,11 @@ class StorageBootstrapProvider:
 
     @classmethod
     def register_provider(cls, name: str):
-        """Decorator to register storage provider & returns function."""
+        """Register a storage bootstrap function."""
 
         def decorator(fn):
-            @wraps(fn)
-            def wrapper(*args, **kwargs):
-                return fn(*args, **kwargs)
-
-            cls._providers[name.lower()] = wrapper
-            return wrapper
+            cls._providers[name.lower()] = fn
+            return fn
 
         return decorator
 

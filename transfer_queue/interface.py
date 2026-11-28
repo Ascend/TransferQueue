@@ -35,6 +35,7 @@ import subprocess
 import time
 import warnings
 from collections import Counter, defaultdict
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 from typing import Any, Callable
@@ -63,8 +64,17 @@ from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
 
-_TQ_CLIENT: Any = None
-_TQ_STORAGE: Any = None
+
+@dataclass
+class _StorageResources:
+    """Resources returned by the selected backend in the initializing process."""
+
+    backend: str
+    handles: Any = None
+
+
+_TQ_CLIENT: TransferQueueClient | None = None
+_TQ_STORAGE: _StorageResources | None = None
 _TQ_CONTROLLER: Any = None
 # True only in the process whose init() created the controller. Other processes
 # attach to the same named actor, so their close() must not tear it down.
@@ -76,54 +86,28 @@ _SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S = 15
 _CONTROLLER_SHUTDOWN_TIMEOUT_S = 5
 
 
-def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClient:
+def _initialize_client(conf: DictConfig) -> TransferQueueClient:
+    """Create the local client once, using the controller's resolved configuration."""
     global _TQ_CLIENT
     if _TQ_CLIENT is None:
-        if conf is None:
-            _init_from_existing()
-            assert _TQ_CLIENT is not None, (
-                "TransferQueueController has not been initialized yet. Please call init() first."
-            )
-            return _TQ_CLIENT
-
-        pid = os.getpid()
         _TQ_CLIENT = TransferQueueClient(
-            client_id=f"TransferQueueClient_{pid}", controller_info=conf.controller.zmq_info
+            client_id=f"TransferQueueClient_{os.getpid()}", controller_info=conf.controller.zmq_info
         )
-
         backend_name = conf.backend.storage_backend
-
         _TQ_CLIENT.initialize_storage_manager(manager_type=backend_name, config=conf.backend[backend_name])
-
     return _TQ_CLIENT
 
 
-def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
-    global _TQ_STORAGE
-
-    if _TQ_STORAGE is None:
-        _TQ_STORAGE = {}
-        backend_name = conf.backend.storage_backend
-        provider_fn = StorageBootstrapProvider.get_provider(backend_name)
-        if provider_fn is not None:
-            backend_resources = provider_fn(conf)
-            if backend_resources is not None:
-                _TQ_STORAGE[backend_name] = backend_resources
-            else:
-                logger.error(f"Not found available {backend_name} storage resources, please check the config.")
-        else:
-            logger.error(
-                f"Storage backend {backend_name} not registered. Please add it to the StorageBootstrapProvider."
-            )
-    return conf
+def _maybe_create_tq_client() -> TransferQueueClient:
+    """Return the local client, attaching to an existing runtime if needed."""
+    if _TQ_CLIENT is None:
+        _init_from_existing()
+        assert _TQ_CLIENT is not None, "TransferQueueController has not been initialized yet. Please call init() first."
+    return _TQ_CLIENT
 
 
 def _init_from_existing() -> bool:
-    """Initialize the TransferQueueClient from existing controller.
-
-    Returns:
-        True if successfully initialized from existing controller, False otherwise.
-    """
+    """Attach the local client; return False when no controller exists."""
     global _TQ_CONTROLLER
     try:
         if _TQ_CONTROLLER is None:
@@ -135,19 +119,13 @@ def _init_from_existing() -> bool:
 
     logger.info("Found existing TransferQueueController instance. Connecting...")
 
-    conf = None
-    while conf is None:
-        conf = ray.get(_TQ_CONTROLLER.get_config.remote())
-        if conf is not None:
-            _maybe_create_tq_client(conf)
-
-            logger.info("TransferQueueClient initialized.")
-            return True
-
+    while (conf := ray.get(_TQ_CONTROLLER.get_config.remote())) is None:
         logger.debug("Waiting for controller to initialize... Retrying in 1s")
         time.sleep(1)
 
-    return False
+    _initialize_client(conf)
+    logger.info("TransferQueueClient initialized.")
+    return True
 
 
 # ==================== Initialization API ====================
@@ -243,7 +221,7 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     lock_settings = _lock_settings()
 
     try:
-        global _TQ_CONTROLLER, _TQ_IS_OWNER
+        global _TQ_CONTROLLER, _TQ_IS_OWNER, _TQ_STORAGE
         _TQ_CONTROLLER = controller_cls.options(  # type: ignore[attr-defined]
             name="TransferQueueController", namespace=ray_namespace()
         ).remote(sampler=sampler)
@@ -262,7 +240,18 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
         raise
     final_conf.controller.zmq_info = controller_zmq_info
 
-    final_conf = _maybe_create_tq_storage(final_conf)
+    if _TQ_STORAGE is None:
+        backend_name = final_conf.backend.storage_backend
+        _TQ_STORAGE = _StorageResources(backend_name)
+        provider_fn = StorageBootstrapProvider.get_provider(backend_name)
+        if provider_fn is not None:
+            _TQ_STORAGE.handles = provider_fn(final_conf)
+            if _TQ_STORAGE.handles is None:
+                logger.error(f"Not found available {backend_name} storage resources, please check the config.")
+        else:
+            logger.error(
+                f"Storage backend {backend_name} not registered. Please add it to the StorageBootstrapProvider."
+            )
 
     ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
@@ -282,12 +271,12 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
             if storage_zmq_info:
                 ray.get(_TQ_CONTROLLER.register_storage_units_for_metrics.remote(storage_zmq_info))
             # Start metrics exporter on each storage unit
-            if _TQ_STORAGE and "SimpleStorage" in _TQ_STORAGE:
-                futures = [handle.start_metrics.remote(port=0) for handle in _TQ_STORAGE["SimpleStorage"].values()]
-                ray.get(futures)
+            if _TQ_STORAGE is not None and _TQ_STORAGE.backend == "SimpleStorage":
+                if _TQ_STORAGE.handles is not None:
+                    ray.get([handle.start_metrics.remote(port=0) for handle in _TQ_STORAGE.handles.values()])
         logger.info(f"Prometheus metrics endpoint: http://{metrics_endpoint}/metrics")
 
-    _maybe_create_tq_client(final_conf)
+    _initialize_client(final_conf)
     return final_conf
 
 
@@ -308,54 +297,54 @@ def close():
     global _TQ_IS_OWNER
 
     try:
-        if _TQ_STORAGE:
-            for key, value in _TQ_STORAGE.items():
-                if key == "SimpleStorage":
-                    # Only the initializing process owns and shuts down these storage actors.
-                    storage_handles = list(value.values())
-                    try:
-                        ray.get(
-                            [storage.shutdown.remote() for storage in storage_handles],
-                            timeout=_SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S,
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to gracefully shut down SimpleStorage units: {e}")
-                    finally:
-                        for storage in storage_handles:
-                            ray.kill(storage)
-                elif key == "MooncakeStore":
-                    check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
-                    if check.returncode == 0:
-                        pids = check.stdout.strip().replace("\n", ", ")
-                        logger.warning(
-                            f"TransferQueue will not stop mooncake_master process with PID: {pids}. "
-                            f"Consider manually killing the mooncake_master."
-                        )
+        if _TQ_STORAGE is not None and _TQ_STORAGE.handles is not None:
+            backend_name, handles = _TQ_STORAGE.backend, _TQ_STORAGE.handles
+            if backend_name == "SimpleStorage":
+                # Only the initializing process owns and shuts down these storage actors.
+                storage_handles = list(handles.values())
+                try:
+                    ray.get(
+                        [storage.shutdown.remote() for storage in storage_handles],
+                        timeout=_SIMPLE_STORAGE_SHUTDOWN_TIMEOUT_S,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to gracefully shut down SimpleStorage units: {e}")
+                finally:
+                    for storage in storage_handles:
+                        ray.kill(storage)
+            elif backend_name == "MooncakeStore":
+                check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
+                if check.returncode == 0:
+                    pids = check.stdout.strip().replace("\n", ", ")
+                    logger.warning(
+                        f"TransferQueue will not stop mooncake_master process with PID: {pids}. "
+                        f"Consider manually killing the mooncake_master."
+                    )
 
-                    # Terminate offload client process if it was started
-                    if isinstance(value, dict):
-                        offload_proc = value.get("offload_client_process")
-                        if offload_proc is not None and offload_proc.poll() is None:
-                            offload_proc.terminate()
-                            try:
-                                offload_proc.wait(timeout=5)
-                            except subprocess.TimeoutExpired:
-                                offload_proc.kill()
-                            logger.info(f"Terminated mooncake_client offload process (PID: {offload_proc.pid}).")
-
-                    if _TQ_CLIENT:
+                # Terminate offload client process if it was started
+                if isinstance(handles, dict):
+                    offload_proc = handles.get("offload_client_process")
+                    if offload_proc is not None and offload_proc.poll() is None:
+                        offload_proc.terminate()
                         try:
-                            ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
-                            if ret < 0:
-                                logger.error("Failed to remove existing keys in mooncake_master.")
-                            else:
-                                logger.info("Successfully removed all existing keys in mooncake_master.")
-                        except Exception:
-                            pass
-                elif key == "Yuanrong":
-                    cleanup_yuanrong_resources(value)
-                else:
-                    logger.warning(f"close for _TQ_STORAGE with key {key} is not supported for now.")
+                            offload_proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            offload_proc.kill()
+                        logger.info(f"Terminated mooncake_client offload process (PID: {offload_proc.pid}).")
+
+                if _TQ_CLIENT:
+                    try:
+                        ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
+                        if ret < 0:
+                            logger.error("Failed to remove existing keys in mooncake_master.")
+                        else:
+                            logger.info("Successfully removed all existing keys in mooncake_master.")
+                    except Exception:
+                        pass
+            elif backend_name == "Yuanrong":
+                cleanup_yuanrong_resources(handles)
+            else:
+                logger.warning(f"close for _TQ_STORAGE with key {backend_name} is not supported for now.")
 
         _TQ_STORAGE = None
     except Exception:
