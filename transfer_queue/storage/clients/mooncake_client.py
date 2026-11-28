@@ -400,12 +400,16 @@ class MooncakeStoreClient(StorageKVClient):
             batch_ptrs = [batch_ptrs[i] for i in fallback]
             batch_sizes = [batch_sizes[i] for i in fallback]
 
-        batch_ptr_reduced, batch_sizes_reduced = merge_contiguous_memory(batch_ptrs, batch_sizes)
-        self._register_all_buffers(batch_ptr_reduced, batch_sizes_reduced)
+        self._write_from_registered_tensors(batch_keys, batch_ptrs, batch_sizes)
+
+    def _write_from_registered_tensors(self, keys: list[str], ptrs: list[int], nbytes: list[int]) -> None:
+        """Register the send regions for one transfer, upsert from them, then unregister."""
+        region_ptrs, region_sizes = merge_contiguous_memory(ptrs, nbytes)
+        self._register_all_buffers(region_ptrs, region_sizes)
         try:
-            self._batch_upsert_with_retry(batch_keys, batch_ptrs, batch_sizes)
+            self._batch_upsert_with_retry(keys, ptrs, nbytes)
         finally:
-            self._unregister_all_buffers(batch_ptr_reduced)
+            self._unregister_all_buffers(region_ptrs)
 
     def _write_via_buffer_pool(
         self,
@@ -456,7 +460,9 @@ class MooncakeStoreClient(StorageKVClient):
         buffers, batch_sizes = serial_utils.batch_encode_into(
             batch_values, alloc, num_workers=MAX_SERIAL_WORKER_THREADS
         )
-        self._put_tensors_thread_worker(batch_keys, cast(list[Tensor], buffers))
+        batch_ptrs = [cast(Tensor, b).data_ptr() for b in buffers]
+
+        self._write_from_registered_tensors(batch_keys, batch_ptrs, batch_sizes)
 
         return batch_sizes
 

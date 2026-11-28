@@ -539,40 +539,43 @@ def test_empty_tensor_reads_like_the_register_path(store, monkeypatch):
 
 def test_public_put_get_and_overwrite_mixed_values(store, monkeypatch):
     client, pool = make_client_and_pool(monkeypatch)
-    keys = ["matrix", "metadata", "scalar", "tokens"]
+    keys = ["matrix", "metadata", "scalar", "tokens", "payload"]
     matrix = torch.arange(12, dtype=torch.float32).reshape(3, 4).t()
     assert not matrix.is_contiguous()
-    values = [matrix, {"step": 1, "labels": ["a", "b"]}, torch.tensor(17), torch.arange(5, dtype=torch.int16)]
-    shapes = [tuple(matrix.shape), None, (), (5,)]
-    dtypes = [torch.float32, None, torch.int64, torch.int16]
+    values = [matrix, {"step": 1, "labels": ["a", "b"]}, torch.tensor(17), torch.arange(5, dtype=torch.int16), b"v1"]
+    shapes = [tuple(matrix.shape), None, (), (5,), None]
+    dtypes = [torch.float32, None, torch.int64, torch.int16, None]
 
     meta = client.put(keys, values)
 
-    assert meta[0] is None and meta[2:] == [None, None]
-    assert meta[1] == {"packed_size": len(store.objects["metadata"])}
-    assert store.registered == [] and store.unregistered == []
+    assert meta[0] is None and meta[2:4] == [None, None]
+    for index in [1, 4]:
+        assert meta[index] == {"packed_size": len(store.objects[keys[index]])}
+    for batch_keys, ptrs, sizes in store.put_calls:
+        if "metadata" in batch_keys:
+            assert batch_keys == ["metadata", "payload"]
+            assert ptrs[1] == ptrs[0] + sizes[0]
+            assert store.registered == [(ptrs[0], sum(sizes))]
+            assert store.unregistered == [ptrs[0]]
+        else:
+            for ptr, size in zip(ptrs, sizes, strict=True):
+                assert pool.arena.data_ptr() <= ptr < ptr + size <= pool.arena.data_ptr() + pool.capacity
+
     first = client.get(keys, shapes, dtypes, meta)
     for index in [0, 2, 3]:
         assert first[index].dtype == values[index].dtype
         assert first[index].shape == values[index].shape
         assert torch.equal(first[index], values[index])
-    assert first[1] == values[1]
+    assert first[1] == values[1] and first[4] == values[4]
 
-    updated = [matrix + 10, {"step": 2, "labels": []}, torch.tensor(-3), values[3] + 4]
-    store.registered.clear()
-    store.unregistered.clear()
+    updated = [matrix + 10, {"step": 2, "labels": []}, torch.tensor(-3), values[3] + 4, b"updated"]
     meta = client.put(keys, updated)
-
-    assert store.registered == [] and store.unregistered == []
-    for _, ptrs, sizes in store.put_calls:
-        for ptr, size in zip(ptrs, sizes, strict=True):
-            assert pool.arena.data_ptr() <= ptr < ptr + size <= pool.arena.data_ptr() + pool.capacity
     second = client.get(keys, shapes, dtypes, meta)
     for index in [0, 2, 3]:
         assert torch.equal(second[index], updated[index])
         # Reusing pooled memory must not overwrite tensors returned by an earlier read.
         assert torch.equal(first[index], values[index])
-    assert second[1] == updated[1]
+    assert second[1] == updated[1] and second[4] == updated[4]
     assert pool.active == {} and pool.returned == len(pool.acquired)
 
 
