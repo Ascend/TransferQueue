@@ -97,6 +97,34 @@ class TestBatchMetaColumnar:
         assert "part_A" in part_ids
         assert "part_B" in part_ids
 
+    @pytest.mark.parametrize("indices", [[2, 0, 2], []])
+    def test_select_samples_preserves_shapes_and_isolation(self, indices):
+        shapes = [(2,), (3,), (1,)]
+        batch = BatchMeta(
+            global_indexes=[10, 20, 30],
+            partition_ids=["p0", "p1", "p0"],
+            field_schema={
+                "tokens": {"dtype": torch.int64, "is_nested": True, "per_sample_shapes": shapes},
+                "score": {"dtype": torch.float32, "shape": [1], "per_sample_shapes": None},
+                "label": {"dtype": None, "is_non_tensor": True},
+            },
+            production_status=np.array([1, 0, 1], dtype=np.int8),
+        )
+
+        selected = batch.select_samples(indices)
+
+        assert selected.global_indexes == [batch.global_indexes[i] for i in indices]
+        assert selected.partition_ids == [batch.partition_ids[i] for i in indices]
+        np.testing.assert_array_equal(selected.production_status, batch.production_status[indices])
+        assert selected.field_schema["tokens"]["per_sample_shapes"] == [shapes[i] for i in indices]
+        assert selected.field_schema["score"]["per_sample_shapes"] is None
+        assert "per_sample_shapes" not in selected.field_schema["label"]
+
+        selected.field_schema["tokens"]["per_sample_shapes"].append((99,))
+        selected.field_schema["score"]["shape"][0] = 99
+        assert batch.field_schema["tokens"]["per_sample_shapes"] == [(2,), (3,), (1,)]
+        assert batch.field_schema["score"]["shape"] == [1]
+
     def test_custom_meta_update(self):
         """Test update_custom_meta method."""
         batch = self._make_batch(batch_size=2)

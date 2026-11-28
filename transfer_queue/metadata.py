@@ -526,9 +526,10 @@ class BatchMeta:
 
         new_field_schema = {}
         for field_name, meta in self.field_schema.items():
-            new_meta = copy.deepcopy(meta)
-            if meta.get("per_sample_shapes") is not None:
-                new_meta["per_sample_shapes"] = [meta["per_sample_shapes"][i] for i in sample_indices]
+            new_meta = copy.deepcopy({key: value for key, value in meta.items() if key != "per_sample_shapes"})
+            if "per_sample_shapes" in meta:
+                shapes = meta["per_sample_shapes"]
+                new_meta["per_sample_shapes"] = None if shapes is None else [shapes[i] for i in sample_indices]
             new_field_schema[field_name] = new_meta
 
         new_custom_meta = [copy.deepcopy(self.custom_meta[i]) for i in sample_indices]

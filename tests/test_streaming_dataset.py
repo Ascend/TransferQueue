@@ -17,7 +17,7 @@ import torch
 from tensordict import TensorDict
 
 from transfer_queue.dataloader.streaming_dataset import chunk_batch_fn
-from transfer_queue.metadata import BatchMeta
+from transfer_queue.metadata import BatchMeta, extract_field_schema
 
 
 def test_chunk_batch_fn_dense():
@@ -40,7 +40,7 @@ def test_chunk_batch_fn_mixed_dense_and_jagged():
     values = [torch.tensor([1, 2]), torch.tensor([3, 4, 5]), torch.tensor([6])]
     nested = torch.nested.as_nested_tensor(values, layout=torch.jagged)
     td = TensorDict({"a": nested, "b": torch.arange(3)}, batch_size=(3,))
-    meta = BatchMeta(global_indexes=[0, 1, 2], partition_ids=["p"] * 3)
+    meta = BatchMeta(global_indexes=[0, 1, 2], partition_ids=["p"] * 3, field_schema=extract_field_schema(td))
     chunks = chunk_batch_fn(td, meta, micro_batch_size=2)
     assert len(chunks) == 2
     assert chunks[0][0].batch_size == (2,)
@@ -52,6 +52,10 @@ def test_chunk_batch_fn_mixed_dense_and_jagged():
     assert chunks[1][0]["a"].is_nested
     assert torch.equal(chunks[1][0]["a"][0], torch.tensor([6]))
     assert torch.equal(chunks[1][0]["b"], torch.tensor([2]))
+    assert [chunk_meta.global_indexes for _, chunk_meta in chunks] == [[0, 1], [2]]
+    for chunk_td, chunk_meta in chunks:
+        assert chunk_meta.get_shapes("a") == [tuple(value.shape) for value in chunk_td["a"].unbind()]
+        assert chunk_meta.get_shapes("b") == [(1,)] * len(chunk_meta)
 
 
 def test_chunk_batch_fn_strided():
