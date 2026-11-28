@@ -586,7 +586,11 @@ class TestKVBatchPutE2E:
         assert tq_api.kv_list("pending")["pending"] == dict(zip(keys, tags, strict=True))
         ready = tq.get_client().get_meta(["tokens"], 2, "pending", task_name="consumer")
         assert ready.size == 2
-        assert ready.custom_meta == tags
+        # Rows come back in index order, and an index may be reused from the global pool, so
+        # the rows need not follow the key order: compare the tags by value, not by position.
+        assert sorted(ready.custom_meta, key=lambda meta: meta["length"]) == sorted(
+            tags, key=lambda meta: meta["length"]
+        )
         assert_tensor_equal(tq_api.kv_batch_get(keys, "pending")["tokens"], fields["tokens"])
         tq_api.kv_clear(keys, "pending")
 
