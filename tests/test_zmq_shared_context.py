@@ -15,10 +15,9 @@
 
 """Regression tests for clients sharing a long-lived ZMQ context.
 
-with_zmq_socket used to create and term() a context per RPC call, which churned libzmq
-signaler file descriptors and crashed the process under concurrency (Bad file descriptor
--> SIGABRT). It now reuses the owner's context and leases sockets from a shared pool, so
-these tests assert every concurrent call sees the SAME context, alive until close().
+RPCs borrow their owner's context and lease sockets from a shared pool. Creating and
+terminating a context per call can crash libzmq under concurrency, so these tests assert
+every concurrent call sees the same context, alive until close().
 Pool-specific behavior is covered in test_zmq_socket_pool.py.
 """
 

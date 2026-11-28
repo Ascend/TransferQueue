@@ -23,8 +23,7 @@ from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import wraps
-from typing import Any, Callable, TypeAlias
+from typing import Any, TypeAlias
 from uuid import uuid4
 
 import psutil
@@ -622,55 +621,6 @@ class ZMQSocketPool:
                     sock.close(linger=0)
             except Exception as e:
                 logger.debug(f"[{self._owner_id}]: Error closing pooled socket: {e}")
-
-
-def with_zmq_socket(
-    *,
-    get_peer: Callable[[Any, str | None], ZMQServerInfo],
-    get_pool: Callable[[Any], ZMQSocketPool],
-    resolve_target: Callable[[tuple, dict], str | None] | None = None,
-):
-    """Create a reusable async decorator that injects a pooled request socket.
-
-    Lifecycle: resolve peer -> lease a socket from ``self``'s pool -> inject as the
-    ``socket`` kwarg -> return it to the pool if the call succeeded, else discard it.
-
-    The socket name and timeout come from the pool, which serves one request scenario.
-
-    Args:
-        get_peer: Callable that returns ``ZMQServerInfo`` for the target.
-            For single-target scenarios, ignore the target parameter.
-            Example: ``lambda self, target: self.server_info``
-            Example: ``lambda self, target: self.storage_unit_infos[target]``
-        get_pool: Callable that returns the pool for this scenario.
-            Example: ``lambda self: self.controller_rpc_pool``
-        resolve_target: Optional callable that extracts target identifier from
-            function arguments. Receives (args, kwargs) and returns target name.
-            Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
-    """
-
-    def decorator(func: Callable):
-        @wraps(func)
-        async def wrapper(self, *args, **kwargs):
-            target_name: str | None = None
-            if resolve_target is not None:
-                target_name = resolve_target(args, kwargs)
-
-            server_info = get_peer(self, target_name)
-            if server_info is None:
-                raise RuntimeError(f"get_peer returned None for target '{target_name}'")
-
-            pool = get_pool(self)
-            if pool is None:
-                raise RuntimeError("get_pool returned None")
-
-            async with pool.alease(server_info) as sock:
-                kwargs["socket"] = sock
-                return await func(self, *args, **kwargs)
-
-        return wrapper
-
-    return decorator
 
 
 def process_zmq_server_info(handlers: dict[Any, Any] | Any):

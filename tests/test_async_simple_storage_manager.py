@@ -14,6 +14,8 @@
 # limitations under the License.
 
 import logging
+from collections import defaultdict
+from contextlib import ExitStack
 from unittest.mock import AsyncMock, Mock, patch
 
 import numpy as np
@@ -23,11 +25,72 @@ import torch
 import zmq
 from tensordict import NonTensorStack, TensorDict
 
+from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import AsyncSimpleStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import _parser_arg_identity
+from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
+
+
+@pytest_asyncio.fixture
+async def live_storage_manager(monkeypatch):
+    """Run a controller and storage unit locally, recording replies at the real ZMQ boundary."""
+    monkeypatch.setattr("transfer_queue.controller.get_node_ip_address", lambda: "127.0.0.1")
+    monkeypatch.setattr("transfer_queue.storage.simple_storage.get_node_ip_address", lambda: "127.0.0.1")
+    with ExitStack() as cleanup:
+        controller = TransferQueueController.__ray_metadata__.modified_class()
+        cleanup.callback(controller.shutdown)
+        unit = SimpleStorageUnit.__ray_metadata__.modified_class({})
+        cleanup.callback(unit.shutdown)
+        manager = AsyncSimpleStorageManager(
+            controller.get_zmq_server_info(), {"zmq_info": {unit.storage_unit_id: unit.get_zmq_server_info()}}
+        )
+        cleanup.callback(manager.close)
+        replies = defaultdict(list)
+        send_reply = unit._send_multipart_reply
+
+        def record_reply(socket, identity, frames):
+            replies[ZMQMessage.deserialize(frames).request_type].append(bytes(identity))
+            send_reply(socket, identity, frames)
+
+        monkeypatch.setattr(unit, "_send_multipart_reply", record_reply)
+        yield controller, manager, unit, replies
+
+
+@pytest.mark.asyncio
+async def test_storage_probe_reuses_connection_separately_from_rpc(live_storage_manager):
+    controller, manager, unit, replies = live_storage_manager
+    data = TensorDict({"tokens": torch.tensor([[1, 2], [3, 4]])}, batch_size=2)
+    metadata = controller.get_metadata(["tokens"], "train", mode="insert", batch_size=2)
+    await manager.put_data(data, metadata)
+    assert (await manager._probe_storage_unit(target_storage_unit=unit.storage_unit_id))["active_keys"] == 2
+    await manager.clear_data(metadata)
+    assert (await manager._probe_storage_unit(target_storage_unit=unit.storage_unit_id))["active_keys"] == 0
+
+    (written,) = replies[ZMQRequestType.PUT_DATA_RESPONSE]
+    (cleared,) = replies[ZMQRequestType.CLEAR_DATA_RESPONSE]
+    first_probe, second_probe = replies[ZMQRequestType.METRICS_RESPONSE]
+    assert written == cleared
+    assert first_probe == second_probe
+    assert first_probe != cleared
+
+
+@pytest.mark.asyncio
+async def test_failed_storage_restore_discards_connection(live_storage_manager, tmp_path):
+    _, manager, unit, replies = live_storage_manager
+    checkpoint = str(tmp_path / "checkpoint")
+    await manager.save_checkpoint(checkpoint)
+    with pytest.raises(RuntimeError, match="Error restoring for storage unit"):
+        await manager._load_single_storage_unit(str(tmp_path / "missing.pkl"), target_storage_unit=unit.storage_unit_id)
+    await manager.load_checkpoint(checkpoint)
+    await manager.load_checkpoint(checkpoint)
+
+    failed, restored, reused = replies[ZMQRequestType.LOAD_STORAGE_CHECKPOINT_RESPONSE]
+    assert failed == replies[ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE][0]
+    assert failed != restored
+    assert restored == reused
 
 
 @pytest_asyncio.fixture
